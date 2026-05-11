@@ -1173,6 +1173,102 @@ impl Qwen35Bringup {
                     rvllm_core::CudaCtx::setup()));
             }
         }
+
+        // (7) fused_rope_qwen_partial_f16kv: apply Qwen partial RoPE
+        // to q (in-place, rotary_dim of head_dim — only first 64 of
+        // 256), and write rotated K + raw V into the per-layer KV
+        // cache at slot=`position`. Q is rotated in place
+        // (q_in == q_out aliasing is safe — each thread owns its
+        // own (i, i+rotary_dim/2) pair).
+        let kv_cache = self.kv_cache.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_full_attn_qkv_only: kv_cache absent".into(),
+        ))?;
+        let rope = self.rope_tables.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_full_attn_qkv_only: rope_tables absent".into(),
+        ))?;
+        let full_idx = kv_cache.layer_idx_to_full_idx[layer_idx].ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            format!("apply_full_attn_qkv_only: layer {layer_idx} not full-attn"),
+        ))?;
+        let layer_kv = &kv_cache.layers[full_idx];
+
+        // Inline allocate positions + slot_mapping i32 device buffers.
+        // For this smoke we always position=0 (single token at start).
+        // Phase 2c-B-C will thread the real `position` through from
+        // the request.
+        let pos_region = arena.region(
+            "qwen35_fattn_positions", 4, 4)?;
+        let slot_region = arena.region(
+            "qwen35_fattn_slot_mapping", 4, 4)?;
+        let zero_bytes: [u8; 4] = [0u8; 4];
+        unsafe {
+            use cudarc::driver::sys::*;
+            for dst in [pos_region.device_ptr(), slot_region.device_ptr()] {
+                let rc = cuMemcpyHtoDAsync_v2(
+                    dst as CUdeviceptr,
+                    zero_bytes.as_ptr() as *const _, 4,
+                    stream_raw as CUstream,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 fattn positions/slot HtoD",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+        }
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut q_in = scr.q_out_ptr;
+            let mut k_in = scr.k_out_ptr;
+            let mut v_in = scr.v_out_ptr;
+            let mut q_out = scr.q_out_ptr; // in-place
+            let mut key_cache = layer_kv.k_ptr;
+            let mut value_cache = layer_kv.v_ptr;
+            let mut cos = rope.cos_ptr;
+            let mut sin = rope.sin_ptr;
+            let mut positions_ptr = pos_region.device_ptr();
+            let mut slot_ptr = slot_region.device_ptr();
+            let mut num_tokens: i32 = 1;
+            let mut nh = n_q_heads;
+            let mut nkh = n_kv_heads;
+            let mut hd = head_dim;
+            let mut rd: i32 = rope.rotary_dim as i32;
+            let args = [
+                (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut key_cache) as *mut u64 as *mut core::ffi::c_void,
+                (&mut value_cache) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+                (&mut positions_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut slot_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut num_tokens) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_fused_rope_qwen_partial_f16kv.raw() as CUfunction,
+                1, n_q_heads as u32, 1,
+                (head_dim as u32 / 2), 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 fused_rope_qwen_partial_f16kv launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
         Ok(())
     }
 
