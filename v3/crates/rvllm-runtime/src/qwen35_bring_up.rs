@@ -2371,6 +2371,60 @@ impl Qwen35Bringup {
         Ok(predicted as u32)
     }
 
+    /// Phase 2c-E: run prefill over `prompt_ids` (accumulates KV
+    /// cache + linear-attn state, discarding all per-step
+    /// argmaxes), then decode up to `max_new_tokens` steps from
+    /// the last prompt position. `on_token` is called for each
+    /// generated token and may short-circuit by returning `false`.
+    /// Returns total completion tokens emitted.
+    ///
+    /// Arena is checkpointed before each forward step and
+    /// restored after the predicted token has been read back,
+    /// so a long prompt + long decode reuses the same scratch
+    /// slab. Persistent state (KV cache, linear-attn SSM,
+    /// conv1d ring) lives below the checkpoint and is untouched.
+    pub unsafe fn generate_session(
+        &self,
+        prompt_ids: &[u32],
+        max_new_tokens: u32,
+        mut on_token: impl FnMut(u32, u32) -> bool,
+    ) -> Result<u32> {
+        if prompt_ids.is_empty() {
+            return Ok(0);
+        }
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "generate_session: arena absent".into()))?;
+        let ck = arena.checkpoint();
+
+        // Prefill: walk every prompt token; KV slot = its position.
+        let prompt_len = prompt_ids.len() as u32;
+        let mut last_predicted: u32 = 0;
+        for (p, &tok) in prompt_ids.iter().enumerate() {
+            last_predicted = self.forward_all_layers_smoke(tok, p as u32)?;
+            // Free this step's scratch; persistent state above ck
+            // is not touched.
+            arena.restore(ck);
+        }
+
+        // Decode: feed `last_predicted` at position = prompt_len,
+        // then its successor at prompt_len+1, etc.
+        let mut emitted: u32 = 0;
+        for step in 0..max_new_tokens {
+            let pos = prompt_len + step;
+            let tok = last_predicted;
+            let predicted = self.forward_all_layers_smoke(tok, pos)?;
+            arena.restore(ck);
+            let cont = on_token(predicted, pos + 1);
+            emitted += 1;
+            last_predicted = predicted;
+            if !cont {
+                break;
+            }
+        }
+        Ok(emitted)
+    }
+
     /// Phase 2c-B-A: apply one layer's dense MLP block to
     /// `h_residual` in place. Reads `h_residual`, writes
     /// `h_residual = h_residual + down_proj(SiLU(gate(h_norm)) *

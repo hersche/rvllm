@@ -126,16 +126,44 @@ pub async fn spawn_cuda_worker(
                     .ok().unwrap_or_else(|| "outside".to_string());
                 tracing::info!("qwen35 forward mode: {qwen35_fwd_mode}");
                 while let Some(req) = req_rx.blocking_recv() {
-                    // Phase 2c-A / 2c-B-A smoke. Env-selected:
-                    //   outside (default) — embed → norm → lm_head → argmax,
-                    //                       skipping all 64 layers.
-                    //   dense_mlp         — embed → dense_mlp(0) →
-                    //                       norm → lm_head → argmax,
-                    //                       still skipping attn + 63 other
-                    //                       layers.
-                    // Both emit one Token + Done event so the operator
-                    // can probe each path via /v1/chat/completions.
+                    // Phase 2c-A → 2c-E mode dispatch:
+                    //   outside, dense_mlp, qkv_mlp, linear, all_layers
+                    //     — single-token probes (1 Token + Done).
+                    //   generate (default Phase 2c-E)
+                    //     — full prefill + decode loop, streams Token
+                    //       events up to max_new_tokens.
                     let last_tok = req.prompt_ids.last().copied().unwrap_or(1);
+                    if qwen35_fwd_mode == "generate" {
+                        let prompt_ids = req.prompt_ids.clone();
+                        let max_new = req.max_new_tokens.max(1);
+                        let prompt_len = prompt_ids.len() as u32;
+                        let events_tx = req.events_tx.clone();
+                        let result = unsafe {
+                            bringup.generate_session(
+                                &prompt_ids, max_new,
+                                |tok_id, pos| {
+                                    events_tx.send(GenerateEvent::Token {
+                                        id: tok_id, position: pos,
+                                    }).is_ok()
+                                },
+                            )
+                        };
+                        match result {
+                            Ok(emitted) => {
+                                let _ = req.events_tx.send(GenerateEvent::Done {
+                                    finish: FinishReason::Length,
+                                    completion_tokens: emitted,
+                                    prompt_tokens: prompt_len,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = req.events_tx.send(GenerateEvent::Error(
+                                    format!("qwen35 generate: {e:?}"),
+                                ));
+                            }
+                        }
+                        continue;
+                    }
                     let result = match qwen35_fwd_mode.as_str() {
                         "dense_mlp" => unsafe {
                             bringup.forward_one_dense_mlp_smoke(last_tok)
@@ -165,7 +193,7 @@ pub async fn spawn_cuda_worker(
                         }
                         Err(e) => {
                             let _ = req.events_tx.send(GenerateEvent::Error(
-                                format!("qwen35 outside-smoke: {e:?}"),
+                                format!("qwen35 single-tok smoke: {e:?}"),
                             ));
                         }
                     }
