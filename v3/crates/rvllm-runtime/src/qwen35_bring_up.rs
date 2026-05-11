@@ -89,6 +89,34 @@ pub struct Qwen35LinearState {
     pub num_ssm_heads: usize,
     pub d_state: usize,
     pub layer_idx_to_linear_idx: Vec<Option<usize>>,
+    /// Per-linear-layer causal-conv1d state ring (ks-1 timesteps
+    /// of conv input × conv_dim per layer). Zero-initialised at
+    /// bring-up; consumed by `conv_state_advance_f16` then
+    /// updated in-place every linear-attn forward step. Indexed
+    /// the same way as the delta-rule state (via
+    /// `layer_idx_to_linear_idx`).
+    pub conv_state_base_ptr: u64,
+    pub conv_state_per_layer_bytes: usize,
+}
+
+/// Linear-attention head/dim config for Qwen 3.5. Read at bring-up
+/// from `config.json` (`text_config.linear_num_{key,value}_heads`,
+/// `linear_{key,value}_head_dim`, `linear_conv_kernel_dim`). Derived
+/// fields (`key_dim`, `value_dim`, `conv_dim`, `v_per_k`) are
+/// pre-computed so the per-layer forward path doesn't recompute them
+/// on every layer.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen35LaDims {
+    pub num_k_heads: usize,
+    pub num_v_heads: usize,
+    pub head_k_dim: usize,
+    pub head_v_dim: usize,
+    pub conv_kernel_dim: usize,
+    pub key_dim: usize,         // num_k_heads * head_k_dim
+    pub value_dim: usize,       // num_v_heads * head_v_dim
+    pub conv_dim: usize,        // 2*key_dim + value_dim  (= in_proj_qkv n)
+    pub v_per_k: usize,         // num_v_heads / num_k_heads
 }
 
 /// Host-built partial-rotary cos/sin tables. Shape
@@ -219,6 +247,11 @@ pub struct Qwen35Bringup {
     pub outside_kernels: Option<Qwen35OutsideKernels>,
     #[cfg(feature = "cuda")]
     pub cublaslt: Option<CublasLt>,
+    /// Linear-attn head/dim config. Always present once `load()`
+    /// completes; defaulted to Qwen 3.5 27B (`16/48/128/128, ks=4`)
+    /// when the config is missing the keys.
+    #[cfg(feature = "cuda")]
+    pub la_dims: Option<Qwen35LaDims>,
 }
 
 impl std::fmt::Debug for Qwen35Bringup {
@@ -327,11 +360,25 @@ impl Qwen35Bringup {
                 kv_max_pos, n_kv_heads, head_dim,
             );
 
-            // Linear-attn SSM state: 48 layers × num_value_heads
-            // × value_head_dim × value_head_dim × 2 bytes (f16).
-            // Read from text_config; defaults match Qwen 3.5 27B.
-            let (num_ssm_heads, d_state) = qwen35_linear_dims(&paths.model_dir);
-            let per_layer_state_bytes = num_ssm_heads * d_state * d_state * 2;
+            // Linear-attn config (read once). Determines:
+            //   - delta-rule SSM state shape  [num_v_heads, hkd, hvd]
+            //   - causal-conv1d state shape   [ks-1, conv_dim]
+            //   - in_proj_{qkv,z} / out_proj split  inside per-layer fwd
+            let la_dims = qwen35_la_dims(&paths.model_dir);
+            eprintln!(
+                "[qwen35] linear-attn dims: kh={}/{} vh={}/{} \
+                 conv_dim={} ks={} v_per_k={} value_dim={}",
+                la_dims.num_k_heads, la_dims.head_k_dim,
+                la_dims.num_v_heads, la_dims.head_v_dim,
+                la_dims.conv_dim, la_dims.conv_kernel_dim,
+                la_dims.v_per_k, la_dims.value_dim,
+            );
+
+            // Delta-rule SSM state: 48 layers × num_v_heads × hkd × hvd × 2.
+            // Stored contiguously; per-layer offset =
+            // linear_attn_rank × per_layer_bytes.
+            let per_layer_state_bytes =
+                la_dims.num_v_heads * la_dims.head_k_dim * la_dims.head_v_dim * 2;
             let mut layer_idx_to_linear_idx: Vec<Option<usize>> =
                 vec![None; arch.base.num_hidden_layers];
             let mut n_linear_layers = 0usize;
@@ -345,23 +392,44 @@ impl Qwen35Bringup {
             let linear_state_region = arena.region(
                 "qwen35_linear_state", total_linear_state_bytes, 16)?;
             zero_region(linear_state_region.device_ptr(), total_linear_state_bytes)?;
+
+            // Causal-conv1d state: (ks-1) timesteps of conv input
+            // per linear-attn layer.
+            //   per-layer = (ks-1) × conv_dim × 2 bytes
+            //   total     = n_linear_layers × per-layer
+            // Zero-initialised: the first call to `conv_state_advance`
+            // walks zeros for the leading 3 timesteps, matching a
+            // session-fresh state. Updated in-place per forward step.
+            let conv_state_per_layer_bytes =
+                (la_dims.conv_kernel_dim.saturating_sub(1))
+                    * la_dims.conv_dim * 2;
+            let conv_state_total_bytes =
+                n_linear_layers * conv_state_per_layer_bytes;
+            let conv_state_region = arena.region(
+                "qwen35_conv_state", conv_state_total_bytes.max(1), 16)?;
+            if conv_state_total_bytes > 0 {
+                zero_region(conv_state_region.device_ptr(), conv_state_total_bytes)?;
+            }
             let linear_state = Qwen35LinearState {
                 base_ptr: linear_state_region.device_ptr(),
                 per_layer_bytes: per_layer_state_bytes,
                 n_linear_layers,
-                num_ssm_heads,
-                d_state,
+                num_ssm_heads: la_dims.num_v_heads,
+                d_state: la_dims.head_v_dim,
                 layer_idx_to_linear_idx,
+                conv_state_base_ptr: conv_state_region.device_ptr(),
+                conv_state_per_layer_bytes,
             };
             eprintln!(
                 "[qwen35] linear-attn state: {} layers × \
-                 {} MiB/layer = {:.2} GiB total \
-                 (num_ssm_heads={}, d_state={}, zero-init)",
+                 {} MiB delta + {} KiB conv per layer = \
+                 {:.2} GiB delta + {:.2} MiB conv (zero-init)",
                 n_linear_layers,
                 per_layer_state_bytes / (1024 * 1024),
+                conv_state_per_layer_bytes / 1024,
                 total_linear_state_bytes as f64
                     / (1024.0 * 1024.0 * 1024.0),
-                num_ssm_heads, d_state,
+                conv_state_total_bytes as f64 / (1024.0 * 1024.0),
             );
 
             // Per-decode-token scratch. All buffers F16 except logits
@@ -603,6 +671,7 @@ impl Qwen35Bringup {
                 scratch: Some(scratch),
                 outside_kernels: Some(outside_kernels),
                 cublaslt: Some(cublaslt),
+                la_dims: Some(la_dims),
             });
         }
         #[cfg(not(feature = "cuda"))]
@@ -1829,22 +1898,66 @@ fn build_rope_tables(
 /// non-canonical checkpoints; production-style configs always have
 /// them.
 #[cfg(feature = "cuda")]
+impl Qwen35LinearState {
+    /// Device pointer to layer `linear_idx`'s delta-rule state
+    /// slice (shape `[num_v_heads, hkd, hvd]` f16). Indexed by
+    /// `layer_idx_to_linear_idx[absolute_layer_idx]`.
+    pub fn delta_state_ptr(&self, linear_idx: usize) -> u64 {
+        let off = linear_idx.saturating_mul(self.per_layer_bytes);
+        let total = self.n_linear_layers * self.per_layer_bytes;
+        if off + self.per_layer_bytes > total { return 0; }
+        self.base_ptr + off as u64
+    }
+
+    /// Device pointer to layer `linear_idx`'s causal-conv1d state
+    /// slice (shape `[ks-1, conv_dim]` f16). Returns 0 if the
+    /// per-layer bytes are 0 (i.e. the model has no linear-attn
+    /// layers — defensive, shouldn't happen for Qwen 3.5).
+    pub fn conv_state_ptr(&self, linear_idx: usize) -> u64 {
+        if self.conv_state_per_layer_bytes == 0 { return 0; }
+        let off = linear_idx.saturating_mul(self.conv_state_per_layer_bytes);
+        let total = self.n_linear_layers * self.conv_state_per_layer_bytes;
+        if off + self.conv_state_per_layer_bytes > total { return 0; }
+        self.conv_state_base_ptr + off as u64
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn qwen35_linear_dims(model_dir: &Path) -> (usize, usize) {
+    let d = qwen35_la_dims(model_dir);
+    (d.num_v_heads, d.head_v_dim)
+}
+
+/// Full linear-attn head/dim probe — read from `text_config`
+/// (linear_num_{key,value}_heads, linear_{key,value}_head_dim,
+/// linear_conv_kernel_dim). Defaults match Qwen 3.5 27B
+/// (16/48/128/128, ks=4) — production checkpoints always carry the
+/// keys; the defaults exist only so test fixtures don't have to
+/// duplicate them.
+#[cfg(feature = "cuda")]
+fn qwen35_la_dims(model_dir: &Path) -> Qwen35LaDims {
     let p = model_dir.join("config.json");
-    let bytes = match std::fs::read(&p) {
-        Ok(b) => b,
-        Err(_) => return (32, 128),
+    let parsed = std::fs::read(&p).ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let v = parsed.as_ref();
+    let tc = match v {
+        Some(v) if v["text_config"]["hidden_size"].is_u64() => &v["text_config"],
+        Some(v) => v,
+        None => &serde_json::Value::Null,
     };
-    let v: serde_json::Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(_) => return (32, 128),
-    };
-    let tc = if v["text_config"]["hidden_size"].is_u64() {
-        &v["text_config"]
-    } else { &v };
-    let nvh = tc["linear_num_value_heads"].as_u64().unwrap_or(32) as usize;
-    let vhd = tc["linear_value_head_dim"].as_u64().unwrap_or(128) as usize;
-    (nvh, vhd)
+    let num_k_heads = tc["linear_num_key_heads"].as_u64().unwrap_or(16) as usize;
+    let num_v_heads = tc["linear_num_value_heads"].as_u64().unwrap_or(48) as usize;
+    let head_k_dim = tc["linear_key_head_dim"].as_u64().unwrap_or(128) as usize;
+    let head_v_dim = tc["linear_value_head_dim"].as_u64().unwrap_or(128) as usize;
+    let conv_kernel_dim = tc["linear_conv_kernel_dim"].as_u64().unwrap_or(4) as usize;
+    let key_dim = num_k_heads * head_k_dim;
+    let value_dim = num_v_heads * head_v_dim;
+    let conv_dim = 2 * key_dim + value_dim;
+    let v_per_k = if num_k_heads == 0 { 0 } else { num_v_heads / num_k_heads };
+    Qwen35LaDims {
+        num_k_heads, num_v_heads, head_k_dim, head_v_dim,
+        conv_kernel_dim, key_dim, value_dim, conv_dim, v_per_k,
+    }
 }
 
 #[cfg(feature = "cuda")]
