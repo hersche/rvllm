@@ -127,18 +127,52 @@ pub struct Qwen35Scratch {
     pub scratch_bytes: usize,
 }
 
-/// Outside-path kernel handles for Phase 2c-A: embed lookup,
-/// fused (RMSNorm + FP8 quant) for lm-head input, FP8 lm-head
-/// GEMM via cuBLASLt, GPU-side argmax. Per-layer transformer
-/// kernels land in Phase 2c-B.
+/// Outside-path + per-layer kernel handles. Phase 2c-A loads the
+/// outside set (embed / final-norm-with-FP8-quant / argmax /
+/// cuBLASLt fp8_gemm). Phase 2c-B adds the layer kernels for
+/// full-attn / linear-attn / dense MLP dispatch. Dispatch itself
+/// (the per-layer forward loop) lands in Phase 2c-B-core.
 #[cfg(feature = "cuda")]
 pub struct Qwen35OutsideKernels {
+    // ── Outside path (Phase 2c-A) ───────────────────────────
     pub embedding_gather_f16_mod: LoadedModule,
     pub fn_embedding_gather_f16: KernelFn,
     pub fused_rmsnorm_fp8_quant_mod: LoadedModule,
     pub fn_fused_rmsnorm_fp8_quant: KernelFn,
     pub argmax_mod: LoadedModule,
     pub fn_argmax_f16: KernelFn,
+    // ── Per-layer (Phase 2c-B) — RMSNorm + dense MLP ────────
+    pub rmsnorm_inplace_f16_mod: LoadedModule,
+    pub fn_rmsnorm_inplace_f16: KernelFn,
+    pub fp8_gemv_dual_silu_mod: LoadedModule,
+    pub fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu: KernelFn,
+    pub fp8_quantize_per_token_f16_mod: LoadedModule,
+    pub fn_fp8_quantize_per_token_f16: KernelFn,
+    // ── Per-layer (Phase 2c-B) — full-attn ─────────────────
+    pub split_q_gate_f16_mod: LoadedModule,
+    pub fn_split_q_gate_f16: KernelFn,
+    pub fused_rope_qwen_partial_f16kv_mod: LoadedModule,
+    pub fn_fused_rope_qwen_partial_f16kv: KernelFn,
+    pub flash_attention_mod: LoadedModule,
+    pub fn_flash_attention_2_decode_f16io: KernelFn,
+    pub sigmoid_mul_f16_mod: LoadedModule,
+    pub fn_sigmoid_mul_f16: KernelFn,
+    // ── Per-layer (Phase 2c-B) — linear-attn ───────────────
+    pub conv_state_advance_f16_mod: LoadedModule,
+    pub fn_conv_state_advance_f16: KernelFn,
+    pub causal_conv1d_f16_mod: LoadedModule,
+    pub fn_causal_conv1d_f16: KernelFn,
+    pub qwen_linear_alpha_beta_f16_mod: LoadedModule,
+    pub fn_qwen_linear_alpha_beta_f16: KernelFn,
+    pub qwen_linear_silu_l2_gqa_f16_mod: LoadedModule,
+    pub fn_qwen_linear_silu_l2_gqa_f16: KernelFn,
+    pub gated_delta_rule_decode_f16_mod: LoadedModule,
+    pub fn_gated_delta_rule_decode_f16: KernelFn,
+    pub qwen_linear_rmsnorm_gated_f16_mod: LoadedModule,
+    pub fn_qwen_linear_rmsnorm_gated_f16: KernelFn,
+    // ── Vector residual add (used after attn + MLP) ────────
+    pub f16_plus_f32_inplace_f16_mod: LoadedModule,
+    pub fn_f16_plus_f32_inplace_f16: KernelFn,
 }
 
 /// Phase 2c-A engine handle. Adds outside kernels + cuBLASLt on
@@ -377,6 +411,7 @@ impl Qwen35Bringup {
             let manifest = rvllm_kernels::manifest::KernelManifest::load_and_verify(
                 &manifest_path)?;
             let kernels = Arc::new(KernelLoader::new(manifest));
+            // Outside path (Phase 2c-A).
             let embedding_gather_f16_mod = kernels.load_ptx("embedding_gather_f16")?;
             let fn_embedding_gather_f16 =
                 embedding_gather_f16_mod.get_function("embedding_gather_f16_kernel")?;
@@ -386,6 +421,68 @@ impl Qwen35Bringup {
                 .get_function("fused_rmsnorm_fp8_quant_kernel")?;
             let argmax_mod = kernels.load_ptx("argmax")?;
             let fn_argmax_f16 = argmax_mod.get_function("argmax_f16_kernel")?;
+
+            // Per-layer (Phase 2c-B) — RMSNorm + dense MLP.
+            let rmsnorm_inplace_f16_mod = kernels.load_ptx("rmsnorm_inplace_f16")?;
+            let fn_rmsnorm_inplace_f16 = rmsnorm_inplace_f16_mod
+                .get_function("rmsnorm_inplace_f16_kernel")?;
+            let fp8_gemv_dual_silu_mod = kernels.load_ptx(
+                "fp8_gemv_blockwise_wpr_native_f16in_dual_silu")?;
+            let fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu =
+                fp8_gemv_dual_silu_mod.get_function(
+                    "fp8_gemv_blockwise_wpr_native_f16in_dual_silu_kernel")?;
+            let fp8_quantize_per_token_f16_mod =
+                kernels.load_ptx("fp8_quantize_per_token_f16")?;
+            let fn_fp8_quantize_per_token_f16 = fp8_quantize_per_token_f16_mod
+                .get_function("fp8_quantize_per_token_f16_kernel")?;
+
+            // Per-layer (Phase 2c-B) — full-attn.
+            let split_q_gate_f16_mod = kernels.load_ptx("split_q_gate_f16")?;
+            let fn_split_q_gate_f16 = split_q_gate_f16_mod
+                .get_function("split_q_gate_f16_kernel")?;
+            let fused_rope_qwen_partial_f16kv_mod =
+                kernels.load_ptx("fused_rope_qwen_partial_f16kv")?;
+            let fn_fused_rope_qwen_partial_f16kv =
+                fused_rope_qwen_partial_f16kv_mod
+                    .get_function("fused_rope_qwen_partial_f16kv_kernel")?;
+            let flash_attention_mod = kernels.load_ptx("flash_attention")?;
+            let fn_flash_attention_2_decode_f16io = flash_attention_mod
+                .get_function("flash_attention_2_decode_f16io_kernel")?;
+            let sigmoid_mul_f16_mod = kernels.load_ptx("sigmoid_mul_f16")?;
+            let fn_sigmoid_mul_f16 = sigmoid_mul_f16_mod
+                .get_function("sigmoid_mul_f16_kernel")?;
+
+            // Per-layer (Phase 2c-B) — linear-attn.
+            let conv_state_advance_f16_mod =
+                kernels.load_ptx("conv_state_advance_f16")?;
+            let fn_conv_state_advance_f16 = conv_state_advance_f16_mod
+                .get_function("conv_state_advance_f16_kernel")?;
+            let causal_conv1d_f16_mod = kernels.load_ptx("causal_conv1d_f16")?;
+            let fn_causal_conv1d_f16 = causal_conv1d_f16_mod
+                .get_function("causal_conv1d_f16_kernel")?;
+            let qwen_linear_alpha_beta_f16_mod =
+                kernels.load_ptx("qwen_linear_alpha_beta_f16")?;
+            let fn_qwen_linear_alpha_beta_f16 = qwen_linear_alpha_beta_f16_mod
+                .get_function("qwen_linear_alpha_beta_f16_kernel")?;
+            let qwen_linear_silu_l2_gqa_f16_mod =
+                kernels.load_ptx("qwen_linear_silu_l2_gqa_f16")?;
+            let fn_qwen_linear_silu_l2_gqa_f16 = qwen_linear_silu_l2_gqa_f16_mod
+                .get_function("qwen_linear_silu_l2_gqa_f16_kernel")?;
+            let gated_delta_rule_decode_f16_mod =
+                kernels.load_ptx("gated_delta_rule_decode_f16")?;
+            let fn_gated_delta_rule_decode_f16 = gated_delta_rule_decode_f16_mod
+                .get_function("gated_delta_rule_decode_f16_kernel")?;
+            let qwen_linear_rmsnorm_gated_f16_mod =
+                kernels.load_ptx("qwen_linear_rmsnorm_gated_f16")?;
+            let fn_qwen_linear_rmsnorm_gated_f16 = qwen_linear_rmsnorm_gated_f16_mod
+                .get_function("qwen_linear_rmsnorm_gated_f16_kernel")?;
+
+            // Vector residual.
+            let f16_plus_f32_inplace_f16_mod =
+                kernels.load_ptx("f16_plus_f32_inplace_f16")?;
+            let fn_f16_plus_f32_inplace_f16 = f16_plus_f32_inplace_f16_mod
+                .get_function("f16_plus_f32_inplace_f16_kernel")?;
+
             let outside_kernels = Qwen35OutsideKernels {
                 embedding_gather_f16_mod,
                 fn_embedding_gather_f16,
@@ -393,6 +490,34 @@ impl Qwen35Bringup {
                 fn_fused_rmsnorm_fp8_quant,
                 argmax_mod,
                 fn_argmax_f16,
+                rmsnorm_inplace_f16_mod,
+                fn_rmsnorm_inplace_f16,
+                fp8_gemv_dual_silu_mod,
+                fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu,
+                fp8_quantize_per_token_f16_mod,
+                fn_fp8_quantize_per_token_f16,
+                split_q_gate_f16_mod,
+                fn_split_q_gate_f16,
+                fused_rope_qwen_partial_f16kv_mod,
+                fn_fused_rope_qwen_partial_f16kv,
+                flash_attention_mod,
+                fn_flash_attention_2_decode_f16io,
+                sigmoid_mul_f16_mod,
+                fn_sigmoid_mul_f16,
+                conv_state_advance_f16_mod,
+                fn_conv_state_advance_f16,
+                causal_conv1d_f16_mod,
+                fn_causal_conv1d_f16,
+                qwen_linear_alpha_beta_f16_mod,
+                fn_qwen_linear_alpha_beta_f16,
+                qwen_linear_silu_l2_gqa_f16_mod,
+                fn_qwen_linear_silu_l2_gqa_f16,
+                gated_delta_rule_decode_f16_mod,
+                fn_gated_delta_rule_decode_f16,
+                qwen_linear_rmsnorm_gated_f16_mod,
+                fn_qwen_linear_rmsnorm_gated_f16,
+                f16_plus_f32_inplace_f16_mod,
+                fn_f16_plus_f32_inplace_f16,
             };
 
             // cuBLASLt for the FP8 lm_head matmul. 32 MiB workspace
@@ -404,7 +529,12 @@ impl Qwen35Bringup {
                 cublaslt_ws_region.device_ptr(), cublaslt_ws_bytes)?;
             eprintln!(
                 "[qwen35] cuBLASLt initialised with {} MiB workspace; \
-                 outside kernels (embed, rmsnorm+fp8q, argmax) loaded.",
+                 outside + per-layer kernel set loaded (embed, rmsnorm \
+                 ×3 variants, fp8_gemv_dual_silu, fp8_quantize_per_token, \
+                 split_q_gate, fused_rope_qwen_partial, flash_attention, \
+                 sigmoid_mul, conv_state_advance, causal_conv1d, \
+                 qwen_linear_alpha_beta / silu_l2_gqa / rmsnorm_gated, \
+                 gated_delta_rule_decode, residual_add, argmax).",
                 cublaslt_ws_bytes / (1024 * 1024),
             );
 
