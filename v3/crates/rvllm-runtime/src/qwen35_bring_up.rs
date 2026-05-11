@@ -1080,6 +1080,40 @@ impl Qwen35Bringup {
             }
         }
 
+        // (3.5) q_norm: per-head RMSNorm on q. Grid (n_q_heads, 1, 1),
+        // block (head_dim.min(1024), 1, 1). Kernel signature is the
+        // same `(x_inout, gamma, eps, hidden)` 4-arg form as the
+        // pre-attn input_layernorm above — `gamma` is `q_norm`
+        // [head_dim], hidden=head_dim, the n_q_heads grid dim
+        // broadcasts the same gamma across heads.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut q_ptr = scr.q_out_ptr;
+            let mut gamma_ptr = full.q_norm.offset_bytes;
+            let mut eps_arg = eps;
+            let mut hd = head_dim;
+            let args = [
+                (&mut q_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gamma_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut eps_arg) as *mut f32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_rmsnorm_inplace_f16.raw() as CUfunction,
+                n_q_heads as u32, 1, 1,
+                (head_dim as u32).min(1024), 1, 1, 32 * 4,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 q_norm launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
         // (4) K projection: [1024, 5120] FP8 GEMV → k_out_ptr.
         let kv_n = (n_kv_heads * head_dim) as u32; // 1024
         unsafe {
@@ -1107,6 +1141,37 @@ impl Qwen35Bringup {
                 scr.h_work_ptr,
                 stream_raw,
             )?;
+        }
+
+        // (6) k_norm: per-kv-head RMSNorm. Mirrors q_norm. Grid
+        // (n_kv_heads, 1, 1), block (head_dim, 1, 1). gamma is
+        // k_norm [head_dim].
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut k_ptr = scr.k_out_ptr;
+            let mut gamma_ptr = full.k_norm.offset_bytes;
+            let mut eps_arg = eps;
+            let mut hd = head_dim;
+            let args = [
+                (&mut k_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gamma_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut eps_arg) as *mut f32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_rmsnorm_inplace_f16.raw() as CUfunction,
+                n_kv_heads as u32, 1, 1,
+                (head_dim as u32).min(1024), 1, 1, 32 * 4,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 k_norm launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
         }
         Ok(())
     }
