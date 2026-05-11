@@ -923,6 +923,323 @@ impl Qwen35Bringup {
         Ok(predicted as u32)
     }
 
+    /// Phase 2c-B-B-i: apply ONE full-attn layer's Q/K/V
+    /// projections + `split_q_gate` in place. Does NOT run RoPE,
+    /// KV-write, FA-2 decode, sigmoid_mul, or o_proj — those
+    /// land in Phase 2c-B-B-ii/iii. The h_residual is RMSNormed
+    /// into h_work and three FP8 GEMVs fire against the layer's
+    /// q/k/v weights. q is split into q (kept in q_out_ptr) +
+    /// gate (kept in q_gate_ptr) by `split_q_gate_f16`.
+    ///
+    /// Used by `forward_layer3_qkv_plus_mlp_smoke` to validate
+    /// the full-attn projection path at the actual Qwen 3.5
+    /// shape (Q=12288=2·24·256 with attn_output_gate, K/V=1024).
+    pub unsafe fn apply_full_attn_qkv_only(&self, layer_idx: usize) -> Result<()> {
+        let arch = &self.arch;
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_full_attn_qkv_only: model absent".into(),
+        ))?;
+        let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_full_attn_qkv_only: scratch absent".into(),
+        ))?;
+        let ker = self.outside_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_full_attn_qkv_only: outside_kernels absent".into(),
+        ))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_full_attn_qkv_only: stream absent".into(),
+        ))?;
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_full_attn_qkv_only: arena absent".into(),
+        ))?;
+        let layer = model.layers.get(layer_idx).ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            format!("apply_full_attn_qkv_only: layer {layer_idx} out of range"),
+        ))?;
+        // Reject linear-attn slots — caller's bug.
+        let full = match &layer.attn {
+            rvllm_loader::qwen35_weights::Qwen35LayerAttn::Full(f) => f,
+            rvllm_loader::qwen35_weights::Qwen35LayerAttn::Linear(_) => {
+                return Err(corrupt(
+                    self.paths.model_dir.clone(),
+                    format!("apply_full_attn_qkv_only: layer {layer_idx} is \
+                             linear-attention; this helper only handles \
+                             full-attn slots"),
+                ));
+            }
+        };
+
+        let hidden = arch.base.hidden_size as i32;
+        let head_dim = arch.base.head_dim as i32;
+        let n_q_heads = arch.base.num_attention_heads as i32;
+        let n_kv_heads = arch.base.num_key_value_heads as i32;
+        let eps = arch.base.rms_norm_eps;
+        let stream_raw = stream.raw() as u64;
+
+        // (1) h_work ← rmsnorm(h_residual, input_layernorm). Same
+        // kernel + sig as the dense-MLP path; uses input_layernorm
+        // instead of post_attention_layernorm.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                scr.h_work_ptr as CUdeviceptr,
+                scr.h_residual_ptr as CUdeviceptr,
+                (hidden as usize) * 2,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 fattn dtod h_work",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut hw_ptr = scr.h_work_ptr;
+            let mut gamma_ptr = full.input_layernorm.offset_bytes;
+            let mut eps_arg = eps;
+            let mut hd = hidden;
+            let args = [
+                (&mut hw_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gamma_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut eps_arg) as *mut f32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_rmsnorm_inplace_f16.raw() as CUfunction,
+                1, 1, 1, (hidden as u32).min(1024), 1, 1, 32 * 4,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 fattn input_ln launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (2) Q projection: [12288, 5120] FP8 GEMV → qg_interleaved
+        // F16 [n_q_heads, 2*head_dim] = [24, 512] = 12288 elems
+        // (24 KiB). Allocated inline; cheap.
+        let fp8_gemv_fn = ker.fn_fp8_gemv_wpr_native_f16in.ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_full_attn_qkv_only: fp8_gemv_wpr_native_f16in unavailable".into(),
+        ))?;
+        let qg_bytes = (2 * (n_q_heads as usize) * (head_dim as usize)) * 2;
+        let qg_region = arena.region("qwen35_fattn_qg_interleaved", qg_bytes, 16)?;
+        let qg_ptr = qg_region.device_ptr();
+        let q_n = (2 * n_q_heads * head_dim) as u32; // 12288
+        unsafe {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m: 1, n: q_n, k: hidden as u32,
+            }.launch(
+                fp8_gemv_fn,
+                qg_ptr,
+                full.q_proj.offset_bytes,
+                full.q_proj.blockscale_ptr.unwrap_or(0),
+                scr.h_work_ptr,
+                stream_raw,
+            )?;
+        }
+
+        // (3) split_q_gate_f16: qg [n_heads, 2*hd] → q (q_out_ptr),
+        // gate (q_gate_ptr). Grid (n_heads, num_tokens=1), block hd.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut q_out = scr.q_out_ptr;
+            let mut g_out = scr.q_gate_ptr;
+            let mut qg_in = qg_ptr;
+            let mut nh = n_q_heads;
+            let mut hd = head_dim;
+            let args = [
+                (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut g_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut qg_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_split_q_gate_f16.raw() as CUfunction,
+                n_q_heads as u32, 1, 1, head_dim as u32, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 split_q_gate_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (4) K projection: [1024, 5120] FP8 GEMV → k_out_ptr.
+        let kv_n = (n_kv_heads * head_dim) as u32; // 1024
+        unsafe {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m: 1, n: kv_n, k: hidden as u32,
+            }.launch(
+                fp8_gemv_fn,
+                scr.k_out_ptr,
+                full.k_proj.offset_bytes,
+                full.k_proj.blockscale_ptr.unwrap_or(0),
+                scr.h_work_ptr,
+                stream_raw,
+            )?;
+        }
+
+        // (5) V projection: [1024, 5120] FP8 GEMV → v_out_ptr.
+        unsafe {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m: 1, n: kv_n, k: hidden as u32,
+            }.launch(
+                fp8_gemv_fn,
+                scr.v_out_ptr,
+                full.v_proj.offset_bytes,
+                full.v_proj.blockscale_ptr.unwrap_or(0),
+                scr.h_work_ptr,
+                stream_raw,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Phase 2c-B-B-i smoke: embed → apply_full_attn_qkv_only(3)
+    /// → dense_mlp(3) → final-norm → lm_head → argmax. Layer 3
+    /// is the first full-attn slot in the 3:1 linear:full
+    /// pattern. Q/K/V projections execute on layer 3's actual
+    /// weights but the attention block itself is still SKIPPED
+    /// (no RoPE, KV-write, FA-2, sigmoid_mul, o_proj).
+    pub unsafe fn forward_layer3_qkv_plus_mlp_smoke(&self, token_id: u32) -> Result<u32> {
+        let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_layer3_qkv_plus_mlp_smoke: scratch absent".into()))?;
+        let ker = self.outside_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_layer3_qkv_plus_mlp_smoke: outside_kernels absent".into()))?;
+        let cublaslt = self.cublaslt.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_layer3_qkv_plus_mlp_smoke: cublaslt absent".into()))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_layer3_qkv_plus_mlp_smoke: stream absent".into()))?;
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_layer3_qkv_plus_mlp_smoke: arena absent".into()))?;
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_layer3_qkv_plus_mlp_smoke: model absent".into()))?;
+        let arch = &self.arch;
+        let hidden = arch.base.hidden_size as u32;
+        let vocab = arch.base.vocab_size as u32;
+        let eps = arch.base.rms_norm_eps;
+        let stream_raw = stream.raw() as u64;
+        let token_bytes = (token_id as i32).to_le_bytes();
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyHtoDAsync_v2(
+                scr.token_in_ptr as CUdeviceptr,
+                token_bytes.as_ptr() as *const _, 4,
+                stream_raw as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 qkv-mlp HtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        unsafe {
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens: 1, hidden, vocab,
+            }.launch(
+                ker.fn_embedding_gather_f16,
+                scr.h_residual_ptr,
+                model.outside.embed_tokens.offset_bytes,
+                scr.token_in_ptr,
+                stream_raw,
+            )?;
+        }
+        // QKV projections on layer 3 (first full-attn layer).
+        self.apply_full_attn_qkv_only(3)?;
+        // Dense MLP on layer 3.
+        self.apply_dense_mlp_layer(3)?;
+        // Final-norm + lm_head + argmax (same as Phase 2c-A tail).
+        let hidden_fp8_region = arena.region(
+            "qwen35_qkvmlp_hidden_fp8", hidden as usize, 16)?;
+        let hidden_scale_region = arena.region(
+            "qwen35_qkvmlp_hidden_scale", 4, 4)?;
+        unsafe {
+            rvllm_fused::FusedRmsnormFp8QuantLaunch {
+                num_tokens: 1, hidden, eps,
+            }.launch(
+                ker.fn_fused_rmsnorm_fp8_quant,
+                hidden_fp8_region.device_ptr(),
+                hidden_scale_region.device_ptr(),
+                scr.h_residual_ptr,
+                model.outside.final_norm.offset_bytes,
+                stream_raw,
+            )?;
+        }
+        unsafe {
+            cublaslt.fp8_gemm(
+                hidden_fp8_region.device_ptr(),
+                model.outside.lm_head_fp8.offset_bytes,
+                scr.logits_ptr,
+                1, vocab as i32, hidden as i32,
+                hidden_scale_region.device_ptr(),
+                model.outside.lm_head_fp8.scale_ptr,
+                stream_raw,
+            )?;
+        }
+        unsafe {
+            use cudarc::driver::sys::*;
+            let block_dim: u32 = vocab.min(1024);
+            let mut row_ptr = scr.logits_ptr;
+            let mut out_ptr = scr.token_out_ptr;
+            let mut vsz: i32 = vocab as i32;
+            let args = [
+                (&mut row_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vsz) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_argmax_f16.raw() as CUfunction,
+                1, 1, 1, block_dim, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 qkv-mlp argmax",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        stream.fence()?;
+        let mut predicted: i32 = 0;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                &mut predicted as *mut i32 as *mut _,
+                scr.token_out_ptr as CUdeviceptr, 4);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 qkv-mlp DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        Ok(predicted as u32)
+    }
+
     /// Phase 2c-B-A: apply one layer's dense MLP block to
     /// `h_residual` in place. Reads `h_residual`, writes
     /// `h_residual = h_residual + down_proj(SiLU(gate(h_norm)) *

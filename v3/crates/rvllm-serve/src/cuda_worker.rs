@@ -140,6 +140,9 @@ pub async fn spawn_cuda_worker(
                         "dense_mlp" => unsafe {
                             bringup.forward_one_dense_mlp_smoke(last_tok)
                         },
+                        "qkv_mlp" => unsafe {
+                            bringup.forward_layer3_qkv_plus_mlp_smoke(last_tok)
+                        },
                         _ => unsafe { bringup.forward_outside_only_smoke(last_tok) },
                     };
                     match result {
