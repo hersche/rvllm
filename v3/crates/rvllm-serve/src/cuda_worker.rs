@@ -143,6 +143,9 @@ pub async fn spawn_cuda_worker(
                         "qkv_mlp" => unsafe {
                             bringup.forward_layer3_qkv_plus_mlp_smoke(last_tok)
                         },
+                        "linear" => unsafe {
+                            bringup.forward_layer0_linear_smoke(last_tok)
+                        },
                         _ => unsafe { bringup.forward_outside_only_smoke(last_tok) },
                     };
                     match result {

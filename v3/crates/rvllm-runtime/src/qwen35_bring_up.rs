@@ -992,6 +992,135 @@ impl Qwen35Bringup {
         Ok(predicted as u32)
     }
 
+    /// Phase 2c-C-b smoke: embed → apply_linear_attn_layer(0) →
+    /// final-norm → lm_head → argmax. Layer 0 is the first
+    /// linear-attn slot in the 3:1 pattern. Drives the full
+    /// 10-op Gated DeltaNet block against layer 0's real
+    /// weights; full-attn + all other 63 layers are still
+    /// SKIPPED.
+    pub unsafe fn forward_layer0_linear_smoke(&self, token_id: u32) -> Result<u32> {
+        let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_layer0_linear_smoke: scratch absent".into()))?;
+        let ker = self.outside_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_layer0_linear_smoke: outside_kernels absent".into()))?;
+        let cublaslt = self.cublaslt.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_layer0_linear_smoke: cublaslt absent".into()))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_layer0_linear_smoke: stream absent".into()))?;
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_layer0_linear_smoke: arena absent".into()))?;
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_layer0_linear_smoke: model absent".into()))?;
+        let arch = &self.arch;
+        let hidden = arch.base.hidden_size as u32;
+        let vocab = arch.base.vocab_size as u32;
+        let eps = arch.base.rms_norm_eps;
+        let stream_raw = stream.raw() as u64;
+
+        // (1) HtoD token id + embed.
+        let token_bytes = (token_id as i32).to_le_bytes();
+        {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyHtoDAsync_v2(
+                scr.token_in_ptr as CUdeviceptr,
+                token_bytes.as_ptr() as *const _,
+                4, stream_raw as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 la-smoke HtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        rvllm_fused::EmbeddingGatherLaunch {
+            num_tokens: 1, hidden, vocab,
+        }.launch(
+            ker.fn_embedding_gather_f16,
+            scr.h_residual_ptr,
+            model.outside.embed_tokens.offset_bytes,
+            scr.token_in_ptr,
+            stream_raw,
+        )?;
+
+        // (2) Linear-attn forward on layer 0.
+        self.apply_linear_attn_layer(0)?;
+
+        // (3) Final RMSNorm + FP8 quant.
+        let hidden_fp8_region = arena.region(
+            "qwen35_la_hidden_fp8", hidden as usize, 16)?;
+        let hidden_scale_region = arena.region(
+            "qwen35_la_hidden_scale", 4, 4)?;
+        rvllm_fused::FusedRmsnormFp8QuantLaunch {
+            num_tokens: 1, hidden, eps,
+        }.launch(
+            ker.fn_fused_rmsnorm_fp8_quant,
+            hidden_fp8_region.device_ptr(),
+            hidden_scale_region.device_ptr(),
+            scr.h_residual_ptr,
+            model.outside.final_norm.offset_bytes,
+            stream_raw,
+        )?;
+
+        // (4) cuBLASLt fp8_gemm: logits.
+        cublaslt.fp8_gemm(
+            hidden_fp8_region.device_ptr(),
+            model.outside.lm_head_fp8.offset_bytes,
+            scr.logits_ptr,
+            1, vocab as i32, hidden as i32,
+            hidden_scale_region.device_ptr(),
+            model.outside.lm_head_fp8.scale_ptr,
+            stream_raw,
+        )?;
+
+        // (5) argmax + DtoH.
+        {
+            use cudarc::driver::sys::*;
+            let block_dim: u32 = vocab.min(1024);
+            let mut row_ptr = scr.logits_ptr;
+            let mut out_ptr = scr.token_out_ptr;
+            let mut vsz: i32 = vocab as i32;
+            let args = [
+                (&mut row_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vsz) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_argmax_f16.raw() as CUfunction,
+                1, 1, 1, block_dim, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 la-smoke argmax",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        stream.fence()?;
+        let mut predicted: i32 = 0;
+        {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                &mut predicted as *mut i32 as *mut _,
+                scr.token_out_ptr as CUdeviceptr, 4);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 la-smoke DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        Ok(predicted as u32)
+    }
+
     /// Phase 2c-B-B-i: apply ONE full-attn layer's Q/K/V
     /// projections + `split_q_gate` in place. Does NOT run RoPE,
     /// KV-write, FA-2 decode, sigmoid_mul, or o_proj — those
@@ -1496,6 +1625,461 @@ impl Qwen35Bringup {
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
                     "qwen35 attn vector_add_f16 (residual) launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase 2c-C-b: linear-attn (Gated DeltaNet) forward block.
+    ///
+    /// Port of qwen36::apply_layer_linear_attn for the Qwen 3.5
+    /// dense family. 13-op kernel chain:
+    ///
+    ///   1. input_layernorm(h_residual → h_work)
+    ///   2. in_proj_qkv FP8 GEMV       → qkv [conv_dim]
+    ///   3. conv_state_advance + causal_conv1d → conv_out
+    ///   4. silu_l2_gqa                → q, k (GQA-expanded), v
+    ///   5. alpha_beta                 → alpha, beta (per v-head, f32)
+    ///   6. gated_delta_rule_decode    → readout, state update
+    ///   7. in_proj_z FP8 GEMV         → z [value_dim]
+    ///   8. rmsnorm_gated              → gated [value_dim]
+    ///   9. out_proj FP8 GEMV          → out [hidden]
+    ///  10. h_residual += out
+    ///
+    /// All intermediates allocate via the arena; the persistent
+    /// state lives on `linear_state` (delta-rule SSM state + conv
+    /// state).
+    pub unsafe fn apply_linear_attn_layer(&self, layer_idx: usize) -> Result<()> {
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer: model absent".into()))?;
+        let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer: scratch absent".into()))?;
+        let ker = self.outside_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer: outside_kernels absent".into()))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer: stream absent".into()))?;
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer: arena absent".into()))?;
+        let la_dims = self.la_dims.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer: la_dims absent".into()))?;
+        let linear_state = self.linear_state.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer: linear_state absent".into()))?;
+        let layer = model.layers.get(layer_idx).ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            format!("apply_linear_attn_layer: layer {layer_idx} out of range"),
+        ))?;
+        let la = match &layer.attn {
+            rvllm_loader::qwen35_weights::Qwen35LayerAttn::Linear(l) => l,
+            rvllm_loader::qwen35_weights::Qwen35LayerAttn::Full(_) => {
+                return Err(corrupt(
+                    self.paths.model_dir.clone(),
+                    format!("apply_linear_attn_layer: layer {layer_idx} is \
+                             full-attention; use apply_full_attn_qkv_only"),
+                ));
+            }
+        };
+        let linear_idx = linear_state.layer_idx_to_linear_idx
+            .get(layer_idx).copied().flatten()
+            .ok_or_else(|| corrupt(
+                self.paths.model_dir.clone(),
+                format!("apply_linear_attn_layer: layer {layer_idx} not \
+                         linear-attn"),
+            ))?;
+
+        let stream_raw = stream.raw() as u64;
+        let arch = &self.arch;
+        let hidden = arch.base.hidden_size as i32;
+        let hidden_u = hidden as u32;
+        let hidden_bytes = (hidden as usize) * 2;
+        let eps = arch.base.rms_norm_eps;
+        let num_k_heads = la_dims.num_k_heads;
+        let num_v_heads = la_dims.num_v_heads;
+        let head_k_dim = la_dims.head_k_dim;
+        let head_v_dim = la_dims.head_v_dim;
+        let key_dim = la_dims.key_dim;
+        let v_per_k = la_dims.v_per_k;
+        let conv_dim = la_dims.conv_dim;
+        let ks = la_dims.conv_kernel_dim;
+        let fp8_gemv_fn = ker.fn_fp8_gemv_wpr_native_f16in.ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer: fp8_gemv_wpr_native_f16in unavailable".into(),
+        ))?;
+
+        // (1) input_layernorm: copy h_residual → h_work, then
+        // rmsnorm in-place. We need a clean copy so the residual at
+        // step (10) still sees the un-normed pre-layer value.
+        {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                scr.h_work_ptr,
+                scr.h_residual_ptr,
+                hidden_bytes,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 la copy h_residual->h_work",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        {
+            use cudarc::driver::sys::*;
+            let mut x = scr.h_work_ptr;
+            let mut gamma = la.input_layernorm.offset_bytes;
+            let mut eps_a = eps;
+            let mut hd = hidden;
+            let args = [
+                (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gamma) as *mut u64 as *mut core::ffi::c_void,
+                (&mut eps_a) as *mut f32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_rmsnorm_inplace_f16.raw() as CUfunction,
+                1, 1, 1,
+                (hidden_u).min(1024), 1, 1, 32 * 4,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 la input_layernorm",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (2) in_proj_qkv FP8 GEMV → qkv [conv_dim].
+        let qkv_n = conv_dim as u32;
+        let qkv_bytes = conv_dim * 2;
+        let qkv_region = arena.region("qwen35_la_qkv", qkv_bytes, 16)?;
+        let qkv_bs = la.in_proj_qkv.blockscale_ptr.ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer: in_proj_qkv blockscale missing".into()))?;
+        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+            m: 1, n: qkv_n, k: hidden_u,
+        }.launch(
+            fp8_gemv_fn,
+            qkv_region.device_ptr(),
+            la.in_proj_qkv.offset_bytes,
+            qkv_bs,
+            scr.h_work_ptr,
+            stream_raw,
+        )?;
+
+        // (3a) conv_state_advance: assemble conv_in = [ks-1 from
+        // state | cur qkv], rotate state to drop oldest + append cur.
+        let conv_in_bytes = ks * conv_dim * 2;
+        let conv_in_region = arena.region("qwen35_la_cin", conv_in_bytes, 16)?;
+        let conv_state_p = linear_state.conv_state_ptr(linear_idx);
+        {
+            use cudarc::driver::sys::*;
+            let mut conv_in = conv_in_region.device_ptr();
+            let mut state = conv_state_p;
+            let mut cur = qkv_region.device_ptr();
+            let mut ts_i: i32 = conv_dim as i32;
+            let args = [
+                (&mut conv_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut state) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cur) as *mut u64 as *mut core::ffi::c_void,
+                (&mut ts_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((conv_dim as u32 + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                ker.fn_conv_state_advance_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 la conv_state_advance",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (3b) causal_conv1d: conv_in [ks, conv_dim] × conv1d w → conv_out.
+        let conv_out_region = arena.region("qwen35_la_cout", qkv_bytes, 16)?;
+        {
+            use cudarc::driver::sys::*;
+            let mut output = conv_out_region.device_ptr();
+            let mut input = conv_in_region.device_ptr();
+            let mut weight = la.conv1d.offset_bytes;
+            let mut sl: i32 = 1;
+            let mut ch: i32 = conv_dim as i32;
+            let mut k_arg: i32 = ks as i32;
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                (&mut weight) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sl) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ch) as *mut i32 as *mut core::ffi::c_void,
+                (&mut k_arg) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid_x: u32 = (conv_dim as u32 + block - 1) / block;
+            let rc = cuLaunchKernel(
+                ker.fn_causal_conv1d_f16.raw() as CUfunction,
+                grid_x, 1, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 la causal_conv1d_f16",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (4) silu_l2_gqa: conv_out → q [num_v_heads, head_k_dim],
+        // k [num_v_heads, head_k_dim] (GQA-expanded), v [num_v_heads,
+        // head_v_dim] (silu+pack).
+        let qk_bytes_pre = num_v_heads * head_k_dim * 2;
+        let v_bytes_pre  = num_v_heads * head_v_dim * 2;
+        let q_region = arena.region("qwen35_la_q", qk_bytes_pre, 16)?;
+        let k_region = arena.region("qwen35_la_k", qk_bytes_pre, 16)?;
+        let v_region = arena.region("qwen35_la_v", v_bytes_pre, 16)?;
+        {
+            use cudarc::driver::sys::*;
+            let mut q_out = q_region.device_ptr();
+            let mut k_out = k_region.device_ptr();
+            let mut v_out = v_region.device_ptr();
+            let mut conv_p = conv_out_region.device_ptr();
+            let mut vus_i: i32 = num_v_heads as i32;
+            let mut hkd_i: i32 = head_k_dim as i32;
+            let mut hvd_i: i32 = head_v_dim as i32;
+            let mut kd_i:  i32 = key_dim as i32;
+            let mut nvh:   i32 = num_v_heads as i32;
+            let mut vpk:   i32 = v_per_k as i32;
+            let args = [
+                (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut conv_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hkd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut kd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nvh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut vpk) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = head_k_dim.max(head_v_dim) as u32;
+            let rc = cuLaunchKernel(
+                ker.fn_qwen_linear_silu_l2_gqa_f16.raw() as CUfunction,
+                num_v_heads as u32, 1, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 la silu_l2_gqa",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (5) alpha_beta: read in_proj_a + in_proj_b weights against
+        // the post-norm input → alpha[vus] + beta[vus] f32.
+        let alpha_region = arena.region("qwen35_la_alpha", num_v_heads * 4, 16)?;
+        let beta_region  = arena.region("qwen35_la_beta",  num_v_heads * 4, 16)?;
+        {
+            use cudarc::driver::sys::*;
+            let mut a_out = alpha_region.device_ptr();
+            let mut b_out = beta_region.device_ptr();
+            let mut a_w_p = la.in_proj_a.offset_bytes;
+            let mut b_w_p = la.in_proj_b.offset_bytes;
+            let mut a_log_p = la.a_log.offset_bytes;
+            let mut dt_bias_p = la.dt_bias.offset_bytes;
+            let mut in_p = scr.h_work_ptr;
+            let mut vus_i: i32 = num_v_heads as i32;
+            let mut h_i: i32 = hidden;
+            let args = [
+                (&mut a_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut b_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut a_w_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut b_w_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut a_log_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut dt_bias_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut in_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut h_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256u32.min(hidden_u).max(1);
+            let rc = cuLaunchKernel(
+                ker.fn_qwen_linear_alpha_beta_f16.raw() as CUfunction,
+                num_v_heads as u32, 1, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 la alpha_beta",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (6) gated_delta_rule_decode: forget + delta correction +
+        // state update + readout. State is updated in-place.
+        let layer_state_ptr = linear_state.delta_state_ptr(linear_idx);
+        let scale = 1.0_f32 / (head_k_dim as f32).sqrt();
+        let v_bytes = num_v_heads * head_v_dim * 2;
+        let readout_region = arena.region("qwen35_la_readout", v_bytes, 16)?;
+        {
+            use cudarc::driver::sys::*;
+            let mut state = layer_state_ptr;
+            let mut q_ptr = q_region.device_ptr();
+            let mut k_ptr = k_region.device_ptr();
+            let mut v_ptr = v_region.device_ptr();
+            let mut a_ptr = alpha_region.device_ptr();
+            let mut b_ptr = beta_region.device_ptr();
+            let mut o_ptr = readout_region.device_ptr();
+            let mut scale_arg = scale;
+            let mut hvd_i = head_v_dim as i32;
+            let mut hkd_i = head_k_dim as i32;
+            let args = [
+                (&mut state) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut a_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut b_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut o_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut scale_arg) as *mut f32 as *mut core::ffi::c_void,
+                (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hkd_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let smem: u32 = (2 * head_k_dim as u32 + head_v_dim as u32) * 4;
+            let rc = cuLaunchKernel(
+                ker.fn_gated_delta_rule_decode_f16.raw() as CUfunction,
+                num_v_heads as u32, 1, 1,
+                head_v_dim as u32, 1, 1,
+                smem,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 la gated_delta_rule_decode_f16",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (7) in_proj_z FP8 GEMV → z [value_dim].
+        let z_n = la.in_proj_z.shape[0] as u32;
+        let z_bs = la.in_proj_z.blockscale_ptr.ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer: in_proj_z blockscale missing".into()))?;
+        let z_region = arena.region("qwen35_la_z", (z_n as usize) * 2, 16)?;
+        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+            m: 1, n: z_n, k: hidden_u,
+        }.launch(
+            fp8_gemv_fn,
+            z_region.device_ptr(),
+            la.in_proj_z.offset_bytes,
+            z_bs,
+            scr.h_work_ptr,
+            stream_raw,
+        )?;
+
+        // (8) rmsnorm_gated: per-v-head RMSNorm + silu(z) gate fused
+        // → gated [value_dim] f16.
+        let gated_region = arena.region("qwen35_la_gated", v_bytes, 16)?;
+        {
+            use cudarc::driver::sys::*;
+            let mut g_out = gated_region.device_ptr();
+            let mut r_in = readout_region.device_ptr();
+            let mut z_in = z_region.device_ptr();
+            let mut gamma_p = la.norm.offset_bytes;
+            let mut vus_i: i32 = num_v_heads as i32;
+            let mut hvd_i: i32 = head_v_dim as i32;
+            let mut eps_f: f32 = 1e-6;
+            let args = [
+                (&mut g_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut r_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut z_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gamma_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut eps_f) as *mut f32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_qwen_linear_rmsnorm_gated_f16.raw() as CUfunction,
+                num_v_heads as u32, 1, 1,
+                head_v_dim as u32, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 la rmsnorm_gated",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (9) out_proj FP8 GEMV → o_out [hidden].
+        let out_n = la.out_proj.shape[0] as u32;
+        let out_k = la.out_proj.shape[1] as u32;
+        let out_bs = la.out_proj.blockscale_ptr.ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer: out_proj blockscale missing".into()))?;
+        let out_region = arena.region("qwen35_la_out", (out_n as usize) * 2, 16)?;
+        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+            m: 1, n: out_n, k: out_k,
+        }.launch(
+            fp8_gemv_fn,
+            out_region.device_ptr(),
+            la.out_proj.offset_bytes,
+            out_bs,
+            gated_region.device_ptr(),
+            stream_raw,
+        )?;
+
+        // (10) h_residual += out (residual sum).
+        {
+            use cudarc::driver::sys::*;
+            let mut dst = scr.h_residual_ptr;
+            let mut src = out_region.device_ptr();
+            let mut nn: i32 = hidden;
+            let args = [
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((hidden_u + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                ker.fn_vector_add_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 la residual vector_add_f16",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup()));
             }
