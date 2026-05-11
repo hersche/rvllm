@@ -27,7 +27,10 @@ use rvllm_core::{DType, LoaderCtx, LoaderError, Result, RvllmError};
 use rvllm_mem::HbmArena;
 
 use crate::fp8_quant::{check_clamp_gate, quantize_per_tensor_ref, FP8_E4M3_MAX};
-use crate::qwen35_weights::{Qwen35LoadedModel, Qwen35LoadedOutside};
+use crate::qwen35_weights::{
+    Qwen35DenseMlpBlock, Qwen35FullAttnLayer, Qwen35Layer, Qwen35LayerAttn,
+    Qwen35LinearAttnLayer, Qwen35LoadedModel, Qwen35LoadedOutside,
+};
 use crate::safetensors::{ShardHeader, ShardIndex, TensorEntry};
 use crate::weights::{F16Weight, Fp8Weight};
 
@@ -236,26 +239,161 @@ pub fn load_qwen35_outside(
     load_outside_via_ctx(&ctx)
 }
 
-/// Phase 1b entry point (TODO): full model. Will fill the 64 per-layer
-/// slots (linear vs full attention by `layer_types[idx]`) plus the
-/// dense MLP block on every layer, plus optional Qwen3-VL vision
-/// tower (loaded via the existing `qwen36_load::load_qwen36_vision`
-/// since the on-disk shape is identical).
+/// Phase 1b entry point: outside tensors + every per-layer block
+/// (linear-attn or full-attn) + dense MLP block. Vision tower is
+/// optional and not loaded here yet (Phase 3 covers the Qwen3-VL
+/// ViT upload).
 pub fn load_qwen35_model(
-    _model_dir: &Path,
-    _arena: &HbmArena,
-    _layer_types: &[crate::load::LayerAttnType],
+    model_dir: &Path,
+    arena: &HbmArena,
+    layer_types: &[crate::load::LayerAttnType],
 ) -> Result<Qwen35LoadedModel> {
-    Err(RvllmError::Loader {
-        err: LoaderError::Corrupt {
-            detail: "qwen35: load_qwen35_model is Phase 1b TODO — \
-                     outside-only loader available via \
-                     load_qwen35_outside today; see \
-                     v3/QWEN35_BRINGUP_PLAN.md".into(),
-        },
-        ctx: LoaderCtx { path: _model_dir.to_path_buf(), tensor: None },
-        bt: std::backtrace::Backtrace::capture(),
+    let ctx = LoadCtx::new(model_dir, arena)?;
+    let outside = load_outside_via_ctx(&ctx)?;
+
+    let mut layers: Vec<Qwen35Layer> = Vec::with_capacity(layer_types.len());
+    let mut n_full = 0usize;
+    let mut n_linear = 0usize;
+    let load_started = std::time::Instant::now();
+
+    for (l, ty) in layer_types.iter().enumerate() {
+        let attn = match ty {
+            crate::load::LayerAttnType::Full => {
+                n_full += 1;
+                Qwen35LayerAttn::Full(load_full_attn_layer(&ctx, l)?)
+            }
+            crate::load::LayerAttnType::Linear
+            | crate::load::LayerAttnType::SlidingAttention => {
+                n_linear += 1;
+                Qwen35LayerAttn::Linear(load_linear_attn_layer(&ctx, l)?)
+            }
+        };
+        let mlp = load_dense_mlp_block(&ctx, l)?;
+        if l == 0 || l == layer_types.len() - 1 || (l + 1) % 16 == 0 {
+            eprintln!(
+                "[qwen35-loader] layer {l}/{total} loaded ({attn_kind}) \
+                 [{elapsed:.1}s elapsed, arena.used={:.2} GiB]",
+                arena.used() as f64 / (1024.0 * 1024.0 * 1024.0),
+                total = layer_types.len(),
+                attn_kind = match ty {
+                    crate::load::LayerAttnType::Full => "full",
+                    crate::load::LayerAttnType::Linear => "linear",
+                    crate::load::LayerAttnType::SlidingAttention => "sliding",
+                },
+                elapsed = load_started.elapsed().as_secs_f64(),
+            );
+        }
+        layers.push(Qwen35Layer { attn, mlp });
+    }
+
+    eprintln!(
+        "[qwen35-loader] per-layer upload complete: \
+         {n_full} full-attn + {n_linear} linear-attn layers, \
+         dense MLP on every layer. \
+         Total wall: {:.1}s, arena.used={:.2} GiB.",
+        load_started.elapsed().as_secs_f64(),
+        arena.used() as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
+
+    Ok(Qwen35LoadedModel { outside, layers, vision: None })
+}
+
+fn load_full_attn_layer(ctx: &LoadCtx, layer_idx: usize) -> Result<Qwen35FullAttnLayer> {
+    let ln = |s: &str| format!("{QWEN35_PREFIX}.layers.{layer_idx}.{s}");
+
+    // All four are GemmaRMSNorm-style; gamma centred at 0, add +1.
+    let (input_layernorm, _) = ctx.upload_f16_with_bias(
+        "qwen35_input_ln", &ln("input_layernorm.weight"), 1.0)?;
+    let (post_attention_layernorm, _) = ctx.upload_f16_with_bias(
+        "qwen35_post_attn_ln", &ln("post_attention_layernorm.weight"), 1.0)?;
+    let (q_norm, _) = ctx.upload_f16_with_bias(
+        "qwen35_q_norm", &ln("self_attn.q_norm.weight"), 1.0)?;
+    let (k_norm, _) = ctx.upload_f16_with_bias(
+        "qwen35_k_norm", &ln("self_attn.k_norm.weight"), 1.0)?;
+
+    let q_proj = ctx.upload_fp8_blockwise("qwen35_q_proj", &ln("self_attn.q_proj.weight"))?;
+    let k_proj = ctx.upload_fp8_blockwise("qwen35_k_proj", &ln("self_attn.k_proj.weight"))?;
+    let v_proj = ctx.upload_fp8_blockwise("qwen35_v_proj", &ln("self_attn.v_proj.weight"))?;
+    let o_proj = ctx.upload_fp8_blockwise("qwen35_o_proj", &ln("self_attn.o_proj.weight"))?;
+
+    if layer_idx == 3 {
+        eprintln!(
+            "[qwen35-loader] full-attn layer {layer_idx}: q={:?} k={:?} v={:?} o={:?}",
+            q_proj.shape, k_proj.shape, v_proj.shape, o_proj.shape,
+        );
+    }
+
+    Ok(Qwen35FullAttnLayer {
+        input_layernorm,
+        post_attention_layernorm,
+        q_norm,
+        k_norm,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
     })
+}
+
+fn load_linear_attn_layer(ctx: &LoadCtx, layer_idx: usize) -> Result<Qwen35LinearAttnLayer> {
+    let ln = |s: &str| format!("{QWEN35_PREFIX}.layers.{layer_idx}.{s}");
+
+    let (input_layernorm, _) = ctx.upload_f16_with_bias(
+        "qwen35_input_ln", &ln("input_layernorm.weight"), 1.0)?;
+    let (post_attention_layernorm, _) = ctx.upload_f16_with_bias(
+        "qwen35_post_attn_ln", &ln("post_attention_layernorm.weight"), 1.0)?;
+    let (a_log, _) = ctx.upload_f16("qwen35_a_log", &ln("linear_attn.A_log"))?;
+    let (dt_bias, _) = ctx.upload_f16("qwen35_dt_bias", &ln("linear_attn.dt_bias"))?;
+    let (conv1d, _) = ctx.upload_f16("qwen35_conv1d", &ln("linear_attn.conv1d.weight"))?;
+    let (in_proj_a, _) = ctx.upload_f16("qwen35_in_proj_a", &ln("linear_attn.in_proj_a.weight"))?;
+    let (in_proj_b, _) = ctx.upload_f16("qwen35_in_proj_b", &ln("linear_attn.in_proj_b.weight"))?;
+    // RMSNormGated: gamma centred at 1 already, no bias.
+    let (norm, _) = ctx.upload_f16("qwen35_la_norm", &ln("linear_attn.norm.weight"))?;
+
+    let in_proj_qkv =
+        ctx.upload_fp8_blockwise("qwen35_la_in_qkv", &ln("linear_attn.in_proj_qkv.weight"))?;
+    let in_proj_z =
+        ctx.upload_fp8_blockwise("qwen35_la_in_z", &ln("linear_attn.in_proj_z.weight"))?;
+    let out_proj =
+        ctx.upload_fp8_blockwise("qwen35_la_out", &ln("linear_attn.out_proj.weight"))?;
+
+    if layer_idx == 0 {
+        eprintln!(
+            "[qwen35-loader] linear-attn layer {layer_idx}: \
+             qkv={:?} z={:?} out={:?} a_log={:?} conv1d={:?}",
+            in_proj_qkv.shape, in_proj_z.shape, out_proj.shape,
+            a_log.shape, conv1d.shape,
+        );
+    }
+
+    Ok(Qwen35LinearAttnLayer {
+        input_layernorm,
+        post_attention_layernorm,
+        a_log,
+        dt_bias,
+        conv1d,
+        in_proj_a,
+        in_proj_b,
+        in_proj_qkv,
+        in_proj_z,
+        norm,
+        out_proj,
+    })
+}
+
+fn load_dense_mlp_block(ctx: &LoadCtx, layer_idx: usize) -> Result<Qwen35DenseMlpBlock> {
+    let ln = |s: &str| format!("{QWEN35_PREFIX}.layers.{layer_idx}.mlp.{s}");
+    let gate_proj = ctx.upload_fp8_blockwise("qwen35_gate_proj", &ln("gate_proj.weight"))?;
+    let up_proj = ctx.upload_fp8_blockwise("qwen35_up_proj", &ln("up_proj.weight"))?;
+    let down_proj = ctx.upload_fp8_blockwise("qwen35_down_proj", &ln("down_proj.weight"))?;
+    if layer_idx == 0 {
+        eprintln!(
+            "[qwen35-loader] dense MLP layer {layer_idx}: \
+             gate={:?} up={:?} down={:?}",
+            gate_proj.shape, up_proj.shape, down_proj.shape,
+        );
+    }
+    Ok(Qwen35DenseMlpBlock { gate_proj, up_proj, down_proj })
 }
 
 fn load_outside_via_ctx(ctx: &LoadCtx) -> Result<Qwen35LoadedOutside> {

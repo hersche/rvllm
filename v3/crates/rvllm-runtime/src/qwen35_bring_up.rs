@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use rvllm_core::{LoaderCtx, LoaderError, Result, RvllmError};
 #[cfg(feature = "cuda")]
-use rvllm_loader::qwen35_weights::Qwen35LoadedOutside;
+use rvllm_loader::qwen35_weights::Qwen35LoadedModel;
 #[cfg(feature = "cuda")]
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
 
@@ -60,8 +60,10 @@ pub struct Qwen35Bringup {
     pub arena: Option<HbmArena<'static>>,
     #[cfg(feature = "cuda")]
     pub stream: Option<Stream>,
+    /// Loaded weights (outside tensors + 64 per-layer slots). Access
+    /// `.outside.embed_tokens` etc. through `model.as_ref()`.
     #[cfg(feature = "cuda")]
-    pub outside: Option<Qwen35LoadedOutside>,
+    pub model: Option<Qwen35LoadedModel>,
 }
 
 impl std::fmt::Debug for Qwen35Bringup {
@@ -107,15 +109,19 @@ impl Qwen35Bringup {
             let arena: HbmArena<'static> = unsafe { std::mem::transmute(arena) };
             let stream = Stream::new(&ctx)?;
 
-            let outside = rvllm_loader::qwen35_load::load_qwen35_outside(
-                &paths.model_dir, &arena,
+            // Phase 1b: full per-layer upload. Reads `layer_types`
+            // from the arch (3:1 linear:full pattern in the 27B
+            // dense checkpoint) and routes each slot to the matching
+            // builder. Dense MLP lands on every layer.
+            let model = rvllm_loader::qwen35_load::load_qwen35_model(
+                &paths.model_dir, &arena, &arch.base.layer_types,
             )?;
 
             eprintln!(
-                "[qwen35] Phase 1a complete: arch validated + outside \
-                 tensors uploaded. Per-layer weights + forward path \
-                 still pending (Phase 1b / 2). See \
-                 v3/QWEN35_BRINGUP_PLAN.md."
+                "[qwen35] Phase 1b complete: arch + outside + all \
+                 {} layers uploaded. Forward path still pending \
+                 (Phase 2). See v3/QWEN35_BRINGUP_PLAN.md.",
+                arch.base.num_hidden_layers,
             );
 
             return Ok(Self {
@@ -123,7 +129,7 @@ impl Qwen35Bringup {
                 ctx: Some(ctx),
                 arena: Some(arena),
                 stream: Some(stream),
-                outside: Some(outside),
+                model: Some(model),
             });
         }
         #[cfg(not(feature = "cuda"))]
@@ -136,6 +142,7 @@ impl Qwen35Bringup {
         }
     }
 }
+
 
 #[derive(Debug)]
 pub enum Qwen35Error {

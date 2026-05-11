@@ -114,9 +114,9 @@ pub async fn spawn_cuda_worker(
                 };
                 let _ = ready_tx.send(Ok(()));
                 tracing::info!(
-                    "Qwen 3.5 dense — Phase 1a complete (arch + outside \
-                     tensors). Per-layer + forward path still pending \
-                     (Phase 1b / 2). Per-request generation will return \
+                    "Qwen 3.5 dense — Phase 1b complete (arch + outside \
+                     + all 64 layers FP8). Forward path still pending \
+                     (Phase 2). Per-request generation will return \
                      ForwardNotImplemented. See QWEN35_BRINGUP_PLAN.md."
                 );
                 while let Some(req) = req_rx.blocking_recv() {
