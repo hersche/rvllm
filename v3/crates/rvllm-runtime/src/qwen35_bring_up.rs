@@ -29,6 +29,10 @@ use std::sync::Arc;
 
 use rvllm_core::{LoaderCtx, LoaderError, Result, RvllmError};
 #[cfg(feature = "cuda")]
+use rvllm_cutlass::cublaslt::CublasLt;
+#[cfg(feature = "cuda")]
+use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
+#[cfg(feature = "cuda")]
 use rvllm_loader::qwen35_weights::Qwen35LoadedModel;
 #[cfg(feature = "cuda")]
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
@@ -123,8 +127,26 @@ pub struct Qwen35Scratch {
     pub scratch_bytes: usize,
 }
 
-/// Phase 2b engine handle. Adds scratch / KV cache / RoPE tables /
-/// linear-attn state on top of Phase 1b (arch + weights).
+/// Outside-path kernel handles for Phase 2c-A: embed lookup,
+/// fused (RMSNorm + FP8 quant) for lm-head input, FP8 lm-head
+/// GEMM via cuBLASLt, GPU-side argmax. Per-layer transformer
+/// kernels land in Phase 2c-B.
+#[cfg(feature = "cuda")]
+pub struct Qwen35OutsideKernels {
+    pub embedding_gather_f16_mod: LoadedModule,
+    pub fn_embedding_gather_f16: KernelFn,
+    pub fused_rmsnorm_fp8_quant_mod: LoadedModule,
+    pub fn_fused_rmsnorm_fp8_quant: KernelFn,
+    pub argmax_mod: LoadedModule,
+    pub fn_argmax_f16: KernelFn,
+}
+
+/// Phase 2c-A engine handle. Adds outside kernels + cuBLASLt on
+/// top of Phase 2b (substrate). Forward path now executes the
+/// embed → final-RMSNorm → lm_head → argmax pipe end-to-end,
+/// SKIPPING all 64 transformer layers. Output is structurally
+/// valid (a token id) but semantically meaningless until Phase
+/// 2c-B wires the per-layer forward.
 pub struct Qwen35Bringup {
     pub paths: Qwen35EnginePaths,
     pub arch: Qwen35Arch,
@@ -147,6 +169,10 @@ pub struct Qwen35Bringup {
     pub rope_tables: Option<Qwen35RopeTables>,
     #[cfg(feature = "cuda")]
     pub scratch: Option<Qwen35Scratch>,
+    #[cfg(feature = "cuda")]
+    pub outside_kernels: Option<Qwen35OutsideKernels>,
+    #[cfg(feature = "cuda")]
+    pub cublaslt: Option<CublasLt>,
 }
 
 impl std::fmt::Debug for Qwen35Bringup {
@@ -342,11 +368,53 @@ impl Qwen35Bringup {
                 hidden, intermediate, vocab,
             );
 
+            // ── Phase 2c-A: outside-path kernels + cuBLASLt ──
+            // Loads the four kernels needed to drive the
+            // embed→final-norm→lm_head→argmax pipe. Layer
+            // kernels (RoPE, FA-2, FP8 GEMV, linear-attn, etc.)
+            // land in Phase 2c-B.
+            let manifest_path = paths.kernels_dir.join("sm_121/manifest.json");
+            let manifest = rvllm_kernels::manifest::KernelManifest::load_and_verify(
+                &manifest_path)?;
+            let kernels = Arc::new(KernelLoader::new(manifest));
+            let embedding_gather_f16_mod = kernels.load_ptx("embedding_gather_f16")?;
+            let fn_embedding_gather_f16 =
+                embedding_gather_f16_mod.get_function("embedding_gather_f16_kernel")?;
+            let fused_rmsnorm_fp8_quant_mod =
+                kernels.load_ptx("fused_rmsnorm_fp8_quant")?;
+            let fn_fused_rmsnorm_fp8_quant = fused_rmsnorm_fp8_quant_mod
+                .get_function("fused_rmsnorm_fp8_quant_kernel")?;
+            let argmax_mod = kernels.load_ptx("argmax")?;
+            let fn_argmax_f16 = argmax_mod.get_function("argmax_f16_kernel")?;
+            let outside_kernels = Qwen35OutsideKernels {
+                embedding_gather_f16_mod,
+                fn_embedding_gather_f16,
+                fused_rmsnorm_fp8_quant_mod,
+                fn_fused_rmsnorm_fp8_quant,
+                argmax_mod,
+                fn_argmax_f16,
+            };
+
+            // cuBLASLt for the FP8 lm_head matmul. 32 MiB workspace
+            // (matches Qwen 3.6 / Gemma 4 sizing).
+            let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;
+            let cublaslt_ws_region = arena.region(
+                "qwen35_cublaslt_ws", cublaslt_ws_bytes, 256)?;
+            let cublaslt = CublasLt::new(
+                cublaslt_ws_region.device_ptr(), cublaslt_ws_bytes)?;
             eprintln!(
-                "[qwen35] Phase 2b complete: arch + outside + {} layers \
+                "[qwen35] cuBLASLt initialised with {} MiB workspace; \
+                 outside kernels (embed, rmsnorm+fp8q, argmax) loaded.",
+                cublaslt_ws_bytes / (1024 * 1024),
+            );
+
+            eprintln!(
+                "[qwen35] Phase 2c-A complete: arch + outside + {} layers \
                  + KV cache + linear-attn state + RoPE tables + decode \
-                 scratch. arena.used={:.2} GiB. Forward path still \
-                 pending (Phase 2c). See v3/QWEN35_BRINGUP_PLAN.md.",
+                 scratch + outside kernels + cuBLASLt. arena.used={:.2} \
+                 GiB. Forward path = embed→final-norm→lm_head→argmax \
+                 (transformer layers SKIPPED — Phase 2c-B is the layer \
+                 dispatch). See v3/QWEN35_BRINGUP_PLAN.md.",
                 arch.base.num_hidden_layers,
                 arena.used() as f64 / (1024.0 * 1024.0 * 1024.0),
             );
@@ -361,6 +429,8 @@ impl Qwen35Bringup {
                 linear_state: Some(linear_state),
                 rope_tables: Some(rope_tables),
                 scratch: Some(scratch),
+                outside_kernels: Some(outside_kernels),
+                cublaslt: Some(cublaslt),
             });
         }
         #[cfg(not(feature = "cuda"))]
@@ -371,6 +441,168 @@ impl Qwen35Bringup {
             );
             Ok(Self { paths, arch, arena_bytes })
         }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Qwen35Bringup {
+    /// Phase 2c-A: outside-only smoke forward. Drives the
+    /// embed → final-RMSNorm-with-FP8-quant → cuBLASLt fp8_gemm
+    /// lm_head → argmax_f16 pipe end-to-end. ALL 64 TRANSFORMER
+    /// LAYERS ARE SKIPPED — the output token id is structurally
+    /// valid (HtoD → forward → DtoH all work) but semantically
+    /// meaningless until Phase 2c-B wires the per-layer forward.
+    ///
+    /// Useful right now as a kernel-load + scratch + cuBLASLt
+    /// integration smoke. Mirrors the qwen36
+    /// `forward_outside_only` pattern.
+    pub unsafe fn forward_outside_only_smoke(&self, token_id: u32) -> Result<u32> {
+        let arch = &self.arch;
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "Qwen35Bringup::forward_outside_only_smoke: model not loaded".into(),
+        ))?;
+        let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "Qwen35Bringup::forward_outside_only_smoke: scratch absent".into(),
+        ))?;
+        let ker = self.outside_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "Qwen35Bringup::forward_outside_only_smoke: outside_kernels absent".into(),
+        ))?;
+        let cublaslt = self.cublaslt.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "Qwen35Bringup::forward_outside_only_smoke: cublaslt absent".into(),
+        ))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "Qwen35Bringup::forward_outside_only_smoke: stream absent".into(),
+        ))?;
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "Qwen35Bringup::forward_outside_only_smoke: arena absent".into(),
+        ))?;
+        let hidden = arch.base.hidden_size as u32;
+        let vocab = arch.base.vocab_size as u32;
+        let eps = arch.base.rms_norm_eps;
+        let stream_raw = stream.raw() as u64;
+
+        // (1) HtoD token id.
+        let token_bytes = (token_id as i32).to_le_bytes();
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyHtoDAsync_v2(
+                scr.token_in_ptr as CUdeviceptr,
+                token_bytes.as_ptr() as *const _,
+                4,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 HtoD token",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // (2) Embedding gather → h_residual.
+        unsafe {
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens: 1, hidden, vocab,
+            }.launch(
+                ker.fn_embedding_gather_f16,
+                scr.h_residual_ptr,
+                model.outside.embed_tokens.offset_bytes,
+                scr.token_in_ptr,
+                stream_raw,
+            )?;
+        }
+
+        // (3) Final RMSNorm + per-token FP8 quantize on the (unmodified)
+        // residual. Output: fp8 hidden + per-token f32 scale ready for
+        // cuBLASLt fp8_gemm.
+        let hidden_fp8_region = arena.region(
+            "qwen35_smoke_hidden_fp8", hidden as usize, 16)?;
+        let hidden_scale_region = arena.region(
+            "qwen35_smoke_hidden_scale", 4, 4)?;
+        unsafe {
+            rvllm_fused::FusedRmsnormFp8QuantLaunch {
+                num_tokens: 1, hidden, eps,
+            }.launch(
+                ker.fn_fused_rmsnorm_fp8_quant,
+                hidden_fp8_region.device_ptr(),
+                hidden_scale_region.device_ptr(),
+                scr.h_residual_ptr,
+                model.outside.final_norm.offset_bytes,
+                stream_raw,
+            )?;
+        }
+
+        // (4) cuBLASLt FP8 GEMM: [1, hidden] · [vocab, hidden]^T → [1, vocab].
+        unsafe {
+            cublaslt.fp8_gemm(
+                hidden_fp8_region.device_ptr(),
+                model.outside.lm_head_fp8.offset_bytes,
+                scr.logits_ptr,
+                1, vocab as i32, hidden as i32,
+                hidden_scale_region.device_ptr(),
+                model.outside.lm_head_fp8.scale_ptr,
+                stream_raw,
+            )?;
+        }
+
+        // (5) argmax_f16 — but wait, fp8_gemm writes f16 logits NOT
+        // f32. Re-use the f32 logits_ptr slot for the f16 output
+        // (it's pre-allocated as `vocab * 4` bytes which is larger
+        // than `vocab * 2` so the f16 fits).
+        // argmax_f16_kernel signature: (logits_ptr, out_token_ptr, vsz).
+        unsafe {
+            use cudarc::driver::sys::*;
+            let block_dim: u32 = vocab.min(1024);
+            let mut row_ptr = scr.logits_ptr;
+            let mut out_ptr = scr.token_out_ptr;
+            let mut vsz: i32 = vocab as i32;
+            let args = [
+                (&mut row_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vsz) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_argmax_f16.raw() as CUfunction,
+                1, 1, 1, block_dim, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 argmax_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        stream.fence()?;
+
+        // (6) DtoH predicted token.
+        let mut predicted: i32 = 0;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                &mut predicted as *mut i32 as *mut _,
+                scr.token_out_ptr as CUdeviceptr,
+                4,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 DtoH predicted",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(predicted as u32)
     }
 }
 

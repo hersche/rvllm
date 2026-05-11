@@ -103,7 +103,7 @@ pub async fn spawn_cuda_worker(
                     fa3_so: paths.fa3_so.clone(),
                     policy_json: paths.policy_json.clone(),
                 };
-                let _bringup = match Qwen35Bringup::load(q35_paths, arena_bytes) {
+                let bringup = match Qwen35Bringup::load(q35_paths, arena_bytes) {
                     Ok(b) => b,
                     Err(e) => {
                         let _ = ready_tx.send(Err(format!(
@@ -114,17 +114,40 @@ pub async fn spawn_cuda_worker(
                 };
                 let _ = ready_tx.send(Ok(()));
                 tracing::info!(
-                    "Qwen 3.5 dense — Phase 2b complete (arch + outside \
-                     + 64 layers + KV cache + linear-attn state + RoPE \
-                     + scratch). Per-request generation still returns \
-                     ForwardNotImplemented (Phase 2c is the forward \
-                     loop). See QWEN35_BRINGUP_PLAN.md."
+                    "Qwen 3.5 dense — Phase 2c-A complete (substrate + \
+                     outside kernels + cuBLASLt). Per-request generation \
+                     drives embed → final-RMSNorm → lm_head → argmax \
+                     with the 64 transformer layers SKIPPED — the output \
+                     token is structurally valid but semantically \
+                     meaningless until Phase 2c-B. See \
+                     QWEN35_BRINGUP_PLAN.md."
                 );
                 while let Some(req) = req_rx.blocking_recv() {
-                    let _ = req.events_tx.send(GenerateEvent::Error(
-                        "qwen35: forward path not wired yet \
-                         (Phase 0 only — see QWEN35_BRINGUP_PLAN.md)".into(),
-                    ));
+                    // Phase 2c-A smoke: route each request through
+                    // forward_outside_only_smoke with the last prompt
+                    // token. Emits ONE Token event per request (the
+                    // post-forward argmax) so the operator can probe
+                    // the pipeline end-to-end via /v1/chat/completions
+                    // while transformer layers are pending.
+                    let last_tok = req.prompt_ids.last().copied().unwrap_or(1);
+                    match unsafe { bringup.forward_outside_only_smoke(last_tok) } {
+                        Ok(predicted) => {
+                            let _ = req.events_tx.send(GenerateEvent::Token {
+                                id: predicted,
+                                position: req.prompt_ids.len() as u32,
+                            });
+                            let _ = req.events_tx.send(GenerateEvent::Done {
+                                finish: FinishReason::Length,
+                                completion_tokens: 1,
+                                prompt_tokens: req.prompt_ids.len() as u32,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = req.events_tx.send(GenerateEvent::Error(
+                                format!("qwen35 outside-smoke: {e:?}"),
+                            ));
+                        }
+                    }
                 }
                 return;
             }
