@@ -122,28 +122,112 @@ Breaking down into measurable sub-phases:
     `rope_theta = 1e7`; upload as F16Weight. Mirrors Qwen 3.6's
     pattern in `qwen36_bring_up::Qwen36RopeTables`.
 
-  **Phase 2c — Per-layer forward**
-  * Full-attn layer: RMSNorm → QKV FP8 GEMV → split q/gate from
-    interleaved 2×head_dim output (the attn_output_gate
-    convention) → q_norm/k_norm → partial RoPE (only rotary_dim
-    of head_dim) → KV-write → FA-2 decode with BF16 KV →
-    sigmoid(gate)*attn → o_proj FP8 GEMV → residual.
-  * Linear-attn layer: in_proj_qkv FP8 GEMV → in_proj_z FP8 GEMV
-    → in_proj_a/b BF16 GEMV (small) → conv1d state advance +
-    depthwise causal conv → gated_delta_rule_decode kernel
-    (reuse Qwen 3.6's, no changes) → RMSNormGated → out_proj
-    FP8 GEMV → residual.
-  * Dense MLP: gate FP8 GEMV + up FP8 GEMV (fuse via
-    `fp8_gemv_dual_silu` from the Qwen 3.6 kit, even though
-    Qwen 3.6 used it for routed experts — math is identical) →
-    silu_mul → down FP8 GEMV → residual.
-  * `forward_qwen35_decode(token_id, position)` glues all of
-    the above.
+  **Phase 2c-A — Outside-only smoke forward (DONE — 9164ccf)**
+    HTTP-reachable forward that drives
+      embed → final-RMSNorm-with-FP8-quant → cuBLASLt fp8_gemm
+        → argmax_f16 → DtoH
+    skipping all 64 transformer layers. Output token is structurally
+    valid but semantically meaningless. Proves the kernel-load +
+    scratch + cuBLASLt + HTTP roundtrip end-to-end.
 
-  **Phase 2d — Greedy generate + prefill loop**
-  * `generate_qwen35`: HtoD token, forward each prompt token,
-    decode loop. Mirrors the Mistral 3.5 / Qwen 3.6 entry. Initial
-    smoke target: "Hallo!" → first sane German continuation.
+  **Phase 2c-B — Per-layer forward (NEXT)**
+
+  Kernel inventory needed for the dispatch loop. Every entry is
+  already a `kernels/*.ptx` file (loaded today by Qwen 3.6); add a
+  field+load line per kernel into `Qwen35OutsideKernels`:
+
+    Full-attn (16 layers) + outside path adds:
+      rmsnorm_inplace_f16          — input_layernorm, post_attn_ln,
+                                       q_norm, k_norm.
+      fp8_gemv_blockwise_*          — q_proj, k_proj, v_proj, o_proj
+                                       (blockwise = block-128
+                                       scale_inv layout).
+      split_q_gate_f16              — split q_proj's interleaved
+                                       [n_heads, 2*head_dim] output
+                                       into q + gate halves.
+      fused_rope_qwen_partial_f16kv — partial RoPE (rotary_dim=64
+                                       of head_dim=256) + KV-write
+                                       fused.
+      flash_attention               — FA-2 decode with F16 KV.
+      sigmoid_mul_f16               — applies the q_gate to attn out
+                                       before o_proj.
+
+    Linear-attn (48 layers) adds:
+      conv_state_advance_f16        — conv1d state slide + history
+                                       assembly.
+      causal_conv1d_f16             — depthwise causal 1D conv.
+      qwen_linear_alpha_beta_f16    — alpha/beta scalars from
+                                       in_proj_a/b.
+      qwen_linear_silu_l2_gqa_f16   — silu + Q/K L2 norm + GQA expand
+                                       + V silu-pack.
+      gated_delta_rule_decode_f16   — Gated-DeltaNet decode-step
+                                       (one-launch state update +
+                                       readout).
+      qwen_linear_rmsnorm_gated_f16 — per-v-head RMSNormGated with
+                                       silu(z) gate.
+
+    Dense MLP (every layer) adds:
+      fp8_gemv_blockwise_wpr_native_f16in_dual_silu — fused
+                                       (gate FP8 GEMV) + (up FP8
+                                       GEMV) + silu_mul → one
+                                       launch per layer for the
+                                       gate+up halves.
+      fp8_gemv_blockwise_wpr_native_f16in           — single FP8
+                                       GEMV for down_proj (blockwise
+                                       scale).
+                                       Note: Qwen 3.6 only loads the
+                                       dual/dual_silu/indirect
+                                       variants; the single-blockwise
+                                       wpr_native_f16in needs adding
+                                       OR the down_proj can route
+                                       through a non-fused dual call
+                                       with the second weight zeroed
+                                       (waste). Best to add the
+                                       single-GEMV PTX entry.
+
+  Per-layer dispatch (`forward_qwen35_decode(token, position)`):
+    h_residual ← embed_gather(token)
+    for layer in 0..64:
+      h_work ← rmsnorm(h_residual, input_layernorm)
+      attn_out ← match layer_types[layer]:
+        Full        → full_attn(h_work, layer, position)
+        Linear      → linear_attn(h_work, layer)
+      h_residual += attn_out                          # post-attn residual
+      h_work ← rmsnorm(h_residual, post_attn_ln)
+      h_residual += dense_mlp(h_work, layer)          # post-mlp residual
+    h_work ← rmsnorm(h_residual, final_norm)
+    logits ← lm_head FP8 GEMM(h_work)
+    return argmax(logits)
+
+  **Phase 2c-C — generate + prefill loop**
+    Mirrors Mistral 3.5 / Qwen 3.6's `generate_with_prompt` —
+    HtoD prompt tokens, per-position forward to seed KV cache +
+    linear-attn state, then decode loop.
+
+  Down-projection note: Qwen 3.6 doesn't ship a single-output
+  blockwise FP8 GEMV (only dual / dual_silu / indirect); for
+  Qwen 3.5's `mlp.down_proj` and the full-attn `o_proj` /
+  `linear_attn.out_proj` we route through cuBLASLt's
+  `fp8_gemm_blockwise` at M=1 (the same path Qwen 3.6 / Gemma 4
+  use for blockwise FP8 GEMM elsewhere). Adding a dedicated
+  single-GEMV PTX is a Phase 5 perf opt.
+
+  Verified PTX availability (Phase 2c-B prerequisites):
+  ✓ rmsnorm_inplace_f16
+  ✓ split_q_gate_f16
+  ✓ fused_rope_qwen_partial_f16kv
+  ✓ flash_attention   (FA-2 decode kernel)
+  ✓ sigmoid_mul_f16
+  ✓ conv_state_advance_f16
+  ✓ causal_conv1d_f16
+  ✓ qwen_linear_alpha_beta_f16
+  ✓ qwen_linear_silu_l2_gqa_f16
+  ✓ gated_delta_rule_decode_f16
+  ✓ qwen_linear_rmsnorm_gated_f16
+  ✓ fp8_gemv_blockwise_wpr_native_f16in_dual_silu
+  ✗ fp8_gemv_blockwise_wpr_native_f16in (single)
+       → cuBLASLt fp8_gemm_blockwise fallback for now;
+         dedicated PTX in Phase 5 perf pass.
 
 ### Phase 3 — Vision tower
 * Port the Qwen 3.6 ViT forward (27 blocks identical shape).
