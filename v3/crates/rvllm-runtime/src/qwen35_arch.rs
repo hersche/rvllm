@@ -42,6 +42,15 @@ pub struct Qwen35Arch {
     pub vision_depth: Option<usize>,
     /// Vision merger output size (= language hidden_size).
     pub vision_out_hidden_size: Option<usize>,
+    /// Phase 2 prep: RoPE specifics. Qwen 3.5 27B dense ships
+    /// `partial_rotary_factor = 0.25` (only 64 of 256 head_dim is
+    /// rotated) and `rope_theta = 10_000_000`. The mRoPE section
+    /// split [11, 11, 10] is for multimodal positional encoding
+    /// (temporal/height/width) and is currently unused on the
+    /// text-only decode path.
+    pub rope_partial_rotary_factor: f32,
+    pub rope_theta: f32,
+    pub mrope_section: Option<[u32; 3]>,
 }
 
 impl Qwen35Arch {
@@ -139,6 +148,28 @@ impl Qwen35Arch {
         let vision_out_hidden_size = v["vision_config"]["out_hidden_size"]
             .as_u64().map(|n| n as usize);
 
+        // Phase 2 prep: RoPE specifics. The config nests under
+        // text_config.rope_parameters; partial_rotary_factor lives
+        // both there and (legacy) at text_config top-level.
+        let rope_partial_rotary_factor = tc["rope_parameters"]["partial_rotary_factor"]
+            .as_f64()
+            .or_else(|| tc["partial_rotary_factor"].as_f64())
+            .unwrap_or(1.0) as f32;
+        let rope_theta = tc["rope_parameters"]["rope_theta"]
+            .as_f64()
+            .or_else(|| tc["rope_theta"].as_f64())
+            .unwrap_or(10_000.0) as f32;
+        let mrope_section = tc["rope_parameters"]["mrope_section"]
+            .as_array()
+            .and_then(|arr| {
+                if arr.len() == 3 {
+                    let a = arr[0].as_u64()? as u32;
+                    let b = arr[1].as_u64()? as u32;
+                    let c = arr[2].as_u64()? as u32;
+                    Some([a, b, c])
+                } else { None }
+            });
+
         Ok(Some(Self {
             base,
             attn_output_gate,
@@ -149,15 +180,22 @@ impl Qwen35Arch {
             vision_hidden_size,
             vision_depth,
             vision_out_hidden_size,
+            rope_partial_rotary_factor,
+            rope_theta,
+            mrope_section,
         }))
     }
 
     pub fn log_summary(&self) {
+        let rotary_dim = (self.base.head_dim as f32
+                          * self.rope_partial_rotary_factor) as usize;
         eprintln!(
             "[loader] Qwen 3.5 dense: {} layers ({} linear + {} full), \
              hidden={}, heads={}/{} kvh, hd={}, vocab={}, \
              intermediate={}, attn_output_gate={}, tied_emb={}, \
-             mtp={}, image_token_id={:?}, vision={:?}d×{:?}h→{:?}",
+             mtp={}, image_token_id={:?}, vision={:?}d×{:?}h→{:?}, \
+             rope_theta={:.1e}, partial_rotary={} (rotary_dim={}), \
+             mrope_section={:?}",
             self.base.num_hidden_layers,
             self.n_linear,
             self.n_full,
@@ -174,6 +212,10 @@ impl Qwen35Arch {
             self.vision_depth,
             self.vision_hidden_size,
             self.vision_out_hidden_size,
+            self.rope_theta,
+            self.rope_partial_rotary_factor,
+            rotary_dim,
+            self.mrope_section,
         );
     }
 }

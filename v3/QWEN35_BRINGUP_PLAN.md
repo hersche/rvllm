@@ -90,18 +90,60 @@ BF16, [248320, 5120]), `model.norm.weight`, the 27 ViT blocks
 * Inventory validator: 64 layers × correct kind, vision blocks,
   embed/head, MTP optional.
 
-### Phase 2 — Decoder forward (text-only)
-* Engine state: arena, KV cache (matching `layer_types`),
-  scratch buffers, runtime flags.
-* Full-attn layer: RMSNorm → fused QKV (FP8 GEMV at decode, FP8
-  GEMM at prefill) → q_norm/k_norm → RoPE → KV-write → attention
-  (FA-2 BF16 KV) → o_proj with output-gate split → residual.
-* Linear-attn layer: in_proj_qkv + in_proj_z + in_proj_a/b →
-  conv1d → Gated DeltaNet (reuse Qwen 3.6 kernels) → out_proj.
-* Dense MLP: gate_proj + up_proj + silu_mul + down_proj (steal
-  the Mistral 3.5 dense MLP code path; identical shape).
-* Embed + final RMSNorm + lm_head.
-* Smoke: short-prompt greedy → first sane German/English token.
+### Phase 2 — Decoder forward (text-only) — multi-session
+
+Breaking down into measurable sub-phases:
+
+  **Phase 2a — Forward-kernel registration**
+  Reuse `Qwen36OutsideKernels` directly. The Qwen 3.6 kernel set
+  is shape-generic; the only Qwen-3.6-only entries are the MoE
+  router / topk / shared-gate / indirect-FP8-GEMV kernels which
+  Qwen 3.5 simply doesn't dispatch. Loading those kernels anyway
+  costs ~0 (PTX modules cached, no GPU memory until launched).
+
+  Concrete deliverable: refactor `Qwen36Bringup::load`'s inline
+  PTX-loading block into a `pub fn load_outside_kernels(kernels:
+  &KernelLoader) -> Qwen36OutsideKernels`, then call it from
+  `Qwen35Bringup::load`. Risk: medium — touches a working
+  ~500-LOC block in qwen36_bring_up. Mitigation: extract is pure
+  motion + compile-tested.
+
+  **Phase 2b — Scratch + KV cache + RoPE tables**
+  * `Mistral35Scratch`-style struct with per-decode-token buffers
+    (h_residual, h_work, q_out, k_out, v_out, attn_out, o_out,
+    gate_out, up_out, silu_mid, down_out, logits, token_out).
+  * KV cache: BF16 [max_pos, n_kv_heads, head_dim] per FULL-attn
+    layer (16 total at 27B). Linear-attn layers carry SSM state
+    instead (per-head `[head_dim_v, head_dim_v]` covariance);
+    Qwen 3.6 already allocates this — reuse helper.
+  * RoPE tables (cos/sin): `rotary_dim = head_dim *
+    partial_rotary_factor = 256 * 0.25 = 64`. Build the
+    `[max_pos, rotary_dim/2]` cos/sin tables host-side from
+    `rope_theta = 1e7`; upload as F16Weight. Mirrors Qwen 3.6's
+    pattern in `qwen36_bring_up::Qwen36RopeTables`.
+
+  **Phase 2c — Per-layer forward**
+  * Full-attn layer: RMSNorm → QKV FP8 GEMV → split q/gate from
+    interleaved 2×head_dim output (the attn_output_gate
+    convention) → q_norm/k_norm → partial RoPE (only rotary_dim
+    of head_dim) → KV-write → FA-2 decode with BF16 KV →
+    sigmoid(gate)*attn → o_proj FP8 GEMV → residual.
+  * Linear-attn layer: in_proj_qkv FP8 GEMV → in_proj_z FP8 GEMV
+    → in_proj_a/b BF16 GEMV (small) → conv1d state advance +
+    depthwise causal conv → gated_delta_rule_decode kernel
+    (reuse Qwen 3.6's, no changes) → RMSNormGated → out_proj
+    FP8 GEMV → residual.
+  * Dense MLP: gate FP8 GEMV + up FP8 GEMV (fuse via
+    `fp8_gemv_dual_silu` from the Qwen 3.6 kit, even though
+    Qwen 3.6 used it for routed experts — math is identical) →
+    silu_mul → down FP8 GEMV → residual.
+  * `forward_qwen35_decode(token_id, position)` glues all of
+    the above.
+
+  **Phase 2d — Greedy generate + prefill loop**
+  * `generate_qwen35`: HtoD token, forward each prompt token,
+    decode loop. Mirrors the Mistral 3.5 / Qwen 3.6 entry. Initial
+    smoke target: "Hallo!" → first sane German continuation.
 
 ### Phase 3 — Vision tower
 * Port the Qwen 3.6 ViT forward (27 blocks identical shape).

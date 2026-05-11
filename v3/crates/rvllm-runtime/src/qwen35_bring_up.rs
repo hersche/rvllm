@@ -217,7 +217,9 @@ mod tests {
             "vocab_size": 248320, "max_position_embeddings": 262144,
             "rms_norm_eps": 1e-5, "hidden_act": "silu",
             "tie_word_embeddings": false, "attn_output_gate": true,
-            "rope_parameters": {"rope_theta": 5000000.0},
+            "rope_parameters": {"rope_theta": 5000000.0,
+                                  "partial_rotary_factor": 0.25,
+                                  "mrope_section": [11, 11, 10]},
             "layer_types": [
               "linear_attention","linear_attention","linear_attention","full_attention",
               "linear_attention","linear_attention","linear_attention","full_attention"
@@ -225,6 +227,9 @@ mod tests {
           }
         }"#
     }
+    // Note: arch_parses_rope_fields expects rope_theta=5e6 because
+    // the qwen35_full() fixture uses that value (vs the real
+    // checkpoint's 1e7) for compactness.
 
     #[test]
     fn arch_parses_dense_qwen35() {
@@ -265,20 +270,23 @@ mod tests {
     }
 
     #[test]
-    fn phase0_load_succeeds_then_generate_path_is_not_implemented() {
+    fn arch_parses_rope_fields() {
         let tmp = tempdir();
         write_config(&tmp, qwen35_full());
-        let paths = Qwen35EnginePaths {
-            model_dir: tmp,
-            kernels_dir: PathBuf::from("/tmp/k"),
-            cutlass_so: PathBuf::from("/tmp/c"),
-            fa3_so: PathBuf::from("/tmp/f"),
-            policy_json: PathBuf::from("/tmp/p"),
-        };
-        let bringup = Qwen35Bringup::load(paths, 0).expect("Phase 0 load ok");
-        assert_eq!(bringup.arch.n_linear, 6);
-        // Forward not wired — sanity-check the typed error exists.
-        let e = Qwen35Error::ForwardNotImplemented.to_string();
-        assert!(e.contains("Phase 0"));
+        let arch = Qwen35Arch::from_dir(&tmp).unwrap().expect("dense qwen35");
+        assert_eq!(arch.rope_partial_rotary_factor, 0.25);
+        assert!((arch.rope_theta - 5_000_000.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn typed_errors_render_helpful_messages() {
+        // Verify the typed error messages still point at the plan
+        // doc so operators get clear breadcrumbs.
+        let fwd = Qwen35Error::ForwardNotImplemented.to_string();
+        assert!(fwd.contains("Phase 0"));
+        let ldr = Qwen35Error::LoaderNotImplemented.to_string();
+        assert!(ldr.contains("Phase 1"));
+        let vis = Qwen35Error::VisionNotImplemented.to_string();
+        assert!(vis.contains("Phase 3"));
     }
 }
