@@ -344,7 +344,8 @@ impl TokenizerHandle {
         //                (Round-10 #2; previously hard-coded to 10)
         let mistral_id_holder: [u32; 1];
         let image_token_ids: &[u32] = match vision_arch {
-            crate::router::VisionArch::Qwen36 => &[248056],
+            crate::router::VisionArch::Qwen35
+            | crate::router::VisionArch::Qwen36 => &[248056],
             crate::router::VisionArch::Gemma4 => &[258880],
             crate::router::VisionArch::Mistral35 { image_token_id } => {
                 mistral_id_holder = [image_token_id];

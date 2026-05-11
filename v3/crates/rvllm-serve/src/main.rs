@@ -169,6 +169,8 @@ async fn main() -> anyhow_compat::Result<()> {
                 .unwrap_or(false)
         }
         ModelFamily::Auto | ModelFamily::Qwen36 | ModelFamily::Gemma4 => true,
+        // Qwen 3.5 Phase 0: vision tower not yet loaded.
+        ModelFamily::Qwen35 => false,
     };
     let state = AppState {
         config: config.clone(), tokenizer, worker, started_at,

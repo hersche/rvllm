@@ -56,6 +56,12 @@ pub struct AppState {
 /// from `config.json` inspection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VisionArch {
+    /// Qwen 3.5 27B dense (Qwen3VL-style ViT — same shape as Qwen 3.6:
+    /// 27 blocks, hidden=1152, intermediate=4304). `<|image_pad|>` =
+    /// 248056. Shares the Qwen3.6 predictor at admission time
+    /// (`predict_qwen_num_tokens`) since the ViT is identical; only
+    /// the language decoder differs (dense vs MoE).
+    Qwen35,
     /// Qwen 3.6 35B-A3B (Qwen3VL-style ViT, full-head rotary, Qwen
     /// PatchMerger). `<|image_pad|>` = 248056, predictor =
     /// `predict_qwen_num_tokens`.

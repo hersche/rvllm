@@ -2516,7 +2516,8 @@ fn collect_vision_items(
             let (num_tokens, num_soft_tokens, merged_h, merged_w) = match vision_arch {
                 crate::router::VisionArch::Gemma4 => predict_gemma_num_tokens(w, h)
                     .map(|n| (n, n, 0u32, 0u32)),
-                crate::router::VisionArch::Qwen36 => predict_qwen_num_tokens(w, h)
+                crate::router::VisionArch::Qwen35
+                | crate::router::VisionArch::Qwen36 => predict_qwen_num_tokens(w, h)
                     .map(|n| (n, n, 0u32, 0u32)),
                 crate::router::VisionArch::Mistral35 { .. } => predict_mistral35_num_tokens(w, h)
                     .map(|s| (s.total_tokens, s.num_soft_tokens, s.merged_h, s.merged_w)),
@@ -2591,7 +2592,7 @@ fn reject_oversized_prompt(
     //     check, so admitting a 32k prompt blows past the cache
     //     and corrupts the arena.
     let (kv_capacity_tokens, source) = match vision_arch {
-        crate::router::VisionArch::Qwen36 => {
+        crate::router::VisionArch::Qwen35 | crate::router::VisionArch::Qwen36 => {
             // `cap` is the value the CLI parsed (or the env override).
             // main.rs mirrors it back into RVLLM_MAX_TOKENS_CAP so the
             // Qwen runtime's bring-up reads the same number.

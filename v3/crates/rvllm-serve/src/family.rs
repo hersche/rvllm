@@ -85,6 +85,7 @@ pub fn resolve_model_family(
     // config.json — Qwen probe handles its own absence gracefully).
     let mistral_image_token = is_mistral35(model_dir)?;
     let mistral_match = mistral_image_token.is_some();
+    let qwen35_match = is_qwen35(model_dir);
     let qwen_match = is_qwen36(model_dir);
 
     match selected {
@@ -93,6 +94,11 @@ pub fn resolve_model_family(
                 Ok(ResolvedFamily {
                     family: ModelFamily::Mistral35,
                     vision_arch: VisionArch::Mistral35 { image_token_id },
+                })
+            } else if qwen35_match {
+                Ok(ResolvedFamily {
+                    family: ModelFamily::Qwen35,
+                    vision_arch: VisionArch::Qwen35,
                 })
             } else if qwen_match {
                 Ok(ResolvedFamily {
@@ -120,6 +126,20 @@ pub fn resolve_model_family(
                 })
             }
         }
+        ModelFamily::Qwen35 => {
+            if qwen35_match {
+                Ok(ResolvedFamily {
+                    family: ModelFamily::Qwen35,
+                    vision_arch: VisionArch::Qwen35,
+                })
+            } else {
+                Err(FamilyResolveError::Mismatch {
+                    requested: "qwen35",
+                    path: model_dir.join("config.json"),
+                    markers: collect_markers(model_dir),
+                })
+            }
+        }
         ModelFamily::Qwen36 => {
             if qwen_match {
                 Ok(ResolvedFamily {
@@ -140,7 +160,7 @@ pub fn resolve_model_family(
             // refusing here is the right thing — the user explicitly
             // asked for Gemma 4 and silently loading another family
             // would defeat the purpose of the explicit flag.
-            if mistral_match || qwen_match {
+            if mistral_match || qwen35_match || qwen_match {
                 Err(FamilyResolveError::Mismatch {
                     requested: "gemma4",
                     path: model_dir.join("config.json"),
@@ -224,6 +244,13 @@ fn is_mistral35(model_dir: &Path) -> Result<Option<u32>, FamilyResolveError> {
             }
         }
     }
+}
+
+fn is_qwen35(model_dir: &Path) -> bool {
+    matches!(
+        rvllm_runtime::qwen35_arch::Qwen35Arch::from_dir(model_dir),
+        Ok(Some(_))
+    )
 }
 
 fn is_qwen36(model_dir: &Path) -> bool {

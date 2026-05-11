@@ -19,6 +19,7 @@ use std::time::Duration;
 pub enum ModelFamily {
     #[default]
     Auto,
+    Qwen35,
     Qwen36,
     Gemma4,
     Mistral35,
@@ -33,6 +34,7 @@ impl ModelFamily {
         let norm = s.trim().to_ascii_lowercase();
         match norm.as_str() {
             "auto" | "" => Ok(ModelFamily::Auto),
+            "qwen35" | "qwen-35" | "qwen3.5" | "qwen-3.5" => Ok(ModelFamily::Qwen35),
             "qwen36" | "qwen-36" | "qwen3.6" | "qwen-3.6" => Ok(ModelFamily::Qwen36),
             "gemma4" | "gemma-4" => Ok(ModelFamily::Gemma4),
             "mistral35" | "mistral-35" | "mistral3.5" | "mistral-3.5" => {
@@ -45,6 +47,7 @@ impl ModelFamily {
     pub fn as_str(self) -> &'static str {
         match self {
             ModelFamily::Auto => "auto",
+            ModelFamily::Qwen35 => "qwen35",
             ModelFamily::Qwen36 => "qwen36",
             ModelFamily::Gemma4 => "gemma4",
             ModelFamily::Mistral35 => "mistral35",
@@ -53,7 +56,7 @@ impl ModelFamily {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("--model-family must be one of auto|qwen36|gemma4|mistral35 (got: {0:?})")]
+#[error("--model-family must be one of auto|qwen35|qwen36|gemma4|mistral35 (got: {0:?})")]
 pub struct ModelFamilyParseError(pub String);
 
 impl std::str::FromStr for ModelFamily {

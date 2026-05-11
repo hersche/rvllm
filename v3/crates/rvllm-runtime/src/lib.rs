@@ -72,6 +72,8 @@ pub mod engine;
 pub mod gemma4_bring_up;
 pub mod gemma4_layer_exec;
 pub mod layer_exec;
+pub mod qwen35_arch;
+pub mod qwen35_bring_up;
 pub mod qwen36_arch;
 pub mod mistral35_bring_up;
 pub mod mistral35_layer_ref;

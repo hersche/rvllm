@@ -89,6 +89,44 @@ pub async fn spawn_cuda_worker(
             // checkpoint, and per-request errors carry the same
             // "kernel not implemented" reason instead of corrupting
             // arena state.
+            // Qwen 3.5 27B dense — Phase 0 only. Parse arch + log
+            // summary, then reject every generate request with a
+            // typed error pointing at QWEN35_BRINGUP_PLAN.md.
+            if matches!(family, ModelFamily::Qwen35) {
+                use rvllm_runtime::qwen35_bring_up::{
+                    Qwen35Bringup, Qwen35EnginePaths,
+                };
+                let q35_paths = Qwen35EnginePaths {
+                    model_dir: paths.model_dir.clone(),
+                    kernels_dir: paths.kernels_dir.clone(),
+                    cutlass_so: paths.cutlass_so.clone(),
+                    fa3_so: paths.fa3_so.clone(),
+                    policy_json: paths.policy_json.clone(),
+                };
+                let _bringup = match Qwen35Bringup::load(q35_paths, arena_bytes) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "Qwen35Bringup::load: {e:?}"
+                        )));
+                        return;
+                    }
+                };
+                let _ = ready_tx.send(Ok(()));
+                tracing::info!(
+                    "Qwen 3.5 dense — Phase 0 only. Forward path not \
+                     wired; per-request generation will return \
+                     ForwardNotImplemented. See \
+                     v3/QWEN35_BRINGUP_PLAN.md."
+                );
+                while let Some(req) = req_rx.blocking_recv() {
+                    let _ = req.events_tx.send(GenerateEvent::Error(
+                        "qwen35: forward path not wired yet \
+                         (Phase 0 only — see QWEN35_BRINGUP_PLAN.md)".into(),
+                    ));
+                }
+                return;
+            }
             if matches!(family, ModelFamily::Mistral35) {
                 let bringup = match rvllm_runtime::mistral35_bring_up::Mistral35Bringup::load(
                     paths,
@@ -519,7 +557,7 @@ pub async fn spawn_cuda_worker(
             // probe. `Gemma4` selection short-circuits straight to the
             // Gemma 4 loader.
             let qwen_probe = match family {
-                ModelFamily::Gemma4 => Ok(None),
+                ModelFamily::Gemma4 | ModelFamily::Qwen35 => Ok(None),
                 ModelFamily::Qwen36 => {
                     rvllm_runtime::qwen36_arch::Qwen36Arch::from_dir(&paths.model_dir)
                         .and_then(|opt| match opt {
