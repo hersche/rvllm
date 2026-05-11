@@ -1269,6 +1269,168 @@ impl Qwen35Bringup {
                     rvllm_core::CudaCtx::setup()));
             }
         }
+
+        // (8) flash_attention_2_decode_f16io: single-token decode
+        // attention against the KV cache. The cache layout is
+        //   [max_pos, num_kv_heads, head_dim] f16
+        // which matches the FA-2 paged-attn assumption when we treat
+        //   block_size = 1, num_blocks = max_pos,
+        //   block_tables = identity [0],
+        //   context_lens = [1]   (position 0, single-token smoke)
+        // For Phase 2c-B-C we'll thread the real `position+1` context
+        // length through and expand block_tables to identity[0..pos+1].
+        let bt_region = arena.region(
+            "qwen35_fattn_block_tables", 4, 16)?;
+        let cl_region = arena.region(
+            "qwen35_fattn_context_lens", 4, 16)?;
+        let zero_i32: [u8; 4] = 0i32.to_le_bytes();
+        let one_i32: [u8; 4] = 1i32.to_le_bytes();
+        unsafe {
+            bt_region.copy_from_host(&zero_i32)?;
+            cl_region.copy_from_host(&one_i32)?;
+        }
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+        const FA2_THREADS: i32 = 128;
+        const FA2_BC: i32 = 32;
+        let smem_bytes =
+            2 * FA2_BC * head_dim * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+        unsafe {
+            use cudarc::driver::sys::*;
+            if smem_bytes as u32 >= 48 * 1024 {
+                let rc = cuFuncSetAttribute(
+                    ker.fn_flash_attention_2_decode_f16io.raw() as CUfunction,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    smem_bytes,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 fa2-decode cuFuncSetAttribute",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            let mut output = scr.attn_out_ptr;
+            let mut query = scr.q_out_ptr;
+            let mut key_cache = layer_kv.k_ptr;
+            let mut value_cache = layer_kv.v_ptr;
+            let mut block_tables = bt_region.device_ptr();
+            let mut context_lens = cl_region.device_ptr();
+            let mut scale_arg = scale;
+            let mut nh = n_q_heads;
+            let mut nkvh = n_kv_heads;
+            let mut hd = head_dim;
+            let mut bs: i32 = 1;
+            let mut mbps: i32 = 1;
+            let mut window: i32 = -1;
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut query) as *mut u64 as *mut core::ffi::c_void,
+                (&mut key_cache) as *mut u64 as *mut core::ffi::c_void,
+                (&mut value_cache) as *mut u64 as *mut core::ffi::c_void,
+                (&mut block_tables) as *mut u64 as *mut core::ffi::c_void,
+                (&mut context_lens) as *mut u64 as *mut core::ffi::c_void,
+                (&mut scale_arg) as *mut f32 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut bs) as *mut i32 as *mut core::ffi::c_void,
+                (&mut mbps) as *mut i32 as *mut core::ffi::c_void,
+                (&mut window) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_flash_attention_2_decode_f16io.raw() as CUfunction,
+                1, n_q_heads as u32, 1,
+                FA2_THREADS as u32, 1, 1,
+                smem_bytes as u32,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 flash_attention_2_decode_f16io launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (9) sigmoid_mul_f16: apply the attn_output_gate finisher.
+        //   attn_out = sigmoid(q_gate) * attn_out   element-wise
+        // Layout: 1-D over n = n_q_heads * head_dim.
+        let gated_n = (n_q_heads * head_dim) as i32;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut out = scr.attn_out_ptr;
+            let mut vals = scr.attn_out_ptr;
+            let mut gate = scr.q_gate_ptr;
+            let mut n_arg = gated_n;
+            let args = [
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vals) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gate) as *mut u64 as *mut core::ffi::c_void,
+                (&mut n_arg) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let grid_x: u32 = ((gated_n as u32) + 255) / 256;
+            let rc = cuLaunchKernel(
+                ker.fn_sigmoid_mul_f16.raw() as CUfunction,
+                grid_x, 1, 1, 256, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 sigmoid_mul_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (10) o_proj: FP8 GEMV [hidden, n_q_heads*head_dim] —
+        // reuses the Fp8GemvF16InLaunch path. Output goes to
+        // scr.o_out_ptr.
+        let o_n = hidden as u32;
+        let o_k = (n_q_heads * head_dim) as u32;
+        unsafe {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m: 1, n: o_n, k: o_k,
+            }.launch(
+                fp8_gemv_fn,
+                scr.o_out_ptr,
+                full.o_proj.offset_bytes,
+                full.o_proj.blockscale_ptr.unwrap_or(0),
+                scr.attn_out_ptr,
+                stream_raw,
+            )?;
+        }
+
+        // (11) h_residual += o_out (F16 + F16 → F16).
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut dst = scr.h_residual_ptr;
+            let mut src = scr.o_out_ptr;
+            let mut n_arg: i32 = hidden;
+            let args = [
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                (&mut n_arg) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let grid_x: u32 = ((hidden as u32) + 255) / 256;
+            let rc = cuLaunchKernel(
+                ker.fn_vector_add_f16.raw() as CUfunction,
+                grid_x, 1, 1, 256, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 attn vector_add_f16 (residual) launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
         Ok(())
     }
 
