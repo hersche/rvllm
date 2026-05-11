@@ -146,6 +146,9 @@ pub async fn spawn_cuda_worker(
                         "linear" => unsafe {
                             bringup.forward_layer0_linear_smoke(last_tok)
                         },
+                        "all_layers" => unsafe {
+                            bringup.forward_all_layers_smoke(last_tok, 0)
+                        },
                         _ => unsafe { bringup.forward_outside_only_smoke(last_tok) },
                     };
                     match result {
