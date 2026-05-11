@@ -24,8 +24,14 @@
 //!     codex round on the new arch).
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 use rvllm_core::{LoaderCtx, LoaderError, Result, RvllmError};
+#[cfg(feature = "cuda")]
+use rvllm_loader::qwen35_weights::Qwen35LoadedOutside;
+#[cfg(feature = "cuda")]
+use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
 
 use crate::qwen35_arch::Qwen35Arch;
 
@@ -40,20 +46,38 @@ pub struct Qwen35EnginePaths {
     pub policy_json: PathBuf,
 }
 
-/// Phase 0 engine handle. Holds the validated arch + paths.
-/// Phase 1+ will extend this with the arena, weight handles, KV
-/// cache, scratch buffers — mirroring the Mistral / Qwen 3.6
-/// engines.
-#[derive(Debug)]
+/// Phase 1a engine handle. Holds the validated arch + paths +
+/// outside-tensor uploads (embed_tokens, final_norm, lm_head, FP8
+/// lm-head mirror). Phase 1b+ will fill the 64 per-layer slots
+/// and the vision tower.
 pub struct Qwen35Bringup {
     pub paths: Qwen35EnginePaths,
     pub arch: Qwen35Arch,
     pub arena_bytes: usize,
+    #[cfg(feature = "cuda")]
+    pub ctx: Option<Arc<CudaContextHandle>>,
+    #[cfg(feature = "cuda")]
+    pub arena: Option<HbmArena<'static>>,
+    #[cfg(feature = "cuda")]
+    pub stream: Option<Stream>,
+    #[cfg(feature = "cuda")]
+    pub outside: Option<Qwen35LoadedOutside>,
+}
+
+impl std::fmt::Debug for Qwen35Bringup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Qwen35Bringup")
+            .field("paths", &self.paths)
+            .field("arch", &self.arch)
+            .field("arena_bytes", &self.arena_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Qwen35Bringup {
-    /// Phase 0 only: parse + validate `config.json`, log the arch
-    /// summary. Does NOT upload weights or wire any forward path.
+    /// Phase 1a: parse + validate `config.json`, allocate the arena,
+    /// upload outside-the-stack tensors. NO per-layer upload, NO
+    /// forward path. See QWEN35_BRINGUP_PLAN.md.
     pub fn load(paths: Qwen35EnginePaths, arena_bytes: usize) -> Result<Self> {
         let arch = Qwen35Arch::from_dir(&paths.model_dir)?
             .ok_or_else(|| corrupt(
@@ -63,17 +87,53 @@ impl Qwen35Bringup {
                  num_experts absent/0, intermediate_size present)".into(),
             ))?;
         arch.log_summary();
-        eprintln!(
-            "[qwen35] Phase 0 ONLY: arch validated, NO weight upload, \
-             NO forward path. See v3/QWEN35_BRINGUP_PLAN.md for the \
-             phase plan. Any generate request will fail clean with \
-             `Qwen35Error::ForwardNotImplemented`."
-        );
-        Ok(Self {
-            paths,
-            arch,
-            arena_bytes,
-        })
+
+        #[cfg(feature = "cuda")]
+        {
+            let ctx = Arc::new(CudaContextHandle::init(0)?);
+            #[cfg(feature = "gb10")]
+            let arena = {
+                let (major, minor) = ctx.compute_capability();
+                let target = rvllm_core::CompileTarget::from_compute_capability(
+                    major, minor);
+                if matches!(target, Some(rvllm_core::CompileTarget::Sm121)) {
+                    rvllm_mem::UnifiedArena::new(&ctx, arena_bytes)?.into_inner()
+                } else {
+                    HbmArena::new(&ctx, arena_bytes)?
+                }
+            };
+            #[cfg(not(feature = "gb10"))]
+            let arena = HbmArena::new(&ctx, arena_bytes)?;
+            let arena: HbmArena<'static> = unsafe { std::mem::transmute(arena) };
+            let stream = Stream::new(&ctx)?;
+
+            let outside = rvllm_loader::qwen35_load::load_qwen35_outside(
+                &paths.model_dir, &arena,
+            )?;
+
+            eprintln!(
+                "[qwen35] Phase 1a complete: arch validated + outside \
+                 tensors uploaded. Per-layer weights + forward path \
+                 still pending (Phase 1b / 2). See \
+                 v3/QWEN35_BRINGUP_PLAN.md."
+            );
+
+            return Ok(Self {
+                paths, arch, arena_bytes,
+                ctx: Some(ctx),
+                arena: Some(arena),
+                stream: Some(stream),
+                outside: Some(outside),
+            });
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            eprintln!(
+                "[qwen35] Phase 0 ONLY (no-cuda build): arch validated, \
+                 NO weight upload. See v3/QWEN35_BRINGUP_PLAN.md."
+            );
+            Ok(Self { paths, arch, arena_bytes })
+        }
     }
 }
 

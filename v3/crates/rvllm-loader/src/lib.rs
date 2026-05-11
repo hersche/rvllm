@@ -25,6 +25,8 @@ pub mod load;
 pub mod load_multiformat;
 pub mod mistral35_arch;
 pub mod mistral35_weights;
+pub mod qwen35_load;
+pub mod qwen35_weights;
 pub mod qwen36_load;
 pub mod qwen36_weights;
 pub mod safetensors;

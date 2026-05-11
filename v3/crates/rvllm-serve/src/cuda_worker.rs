@@ -114,10 +114,10 @@ pub async fn spawn_cuda_worker(
                 };
                 let _ = ready_tx.send(Ok(()));
                 tracing::info!(
-                    "Qwen 3.5 dense — Phase 0 only. Forward path not \
-                     wired; per-request generation will return \
-                     ForwardNotImplemented. See \
-                     v3/QWEN35_BRINGUP_PLAN.md."
+                    "Qwen 3.5 dense — Phase 1a complete (arch + outside \
+                     tensors). Per-layer + forward path still pending \
+                     (Phase 1b / 2). Per-request generation will return \
+                     ForwardNotImplemented. See QWEN35_BRINGUP_PLAN.md."
                 );
                 while let Some(req) = req_rx.blocking_recv() {
                     let _ = req.events_tx.send(GenerateEvent::Error(
