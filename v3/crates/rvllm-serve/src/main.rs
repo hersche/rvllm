@@ -85,7 +85,7 @@ struct Cli {
 
     /// Model family to load. `auto` (default) inspects config.json
     /// markers; explicit values assert match and refuse to silently
-    /// fall through. Accepted: `auto`, `qwen36`, `gemma4`,
+    /// fall through. Accepted: `auto`, `qwen35`, `qwen36`, `gemma4`,
     /// `mistral35`.
     #[arg(long, env = "RVLLM_MODEL_FAMILY", default_value = "auto")]
     model_family: String,
