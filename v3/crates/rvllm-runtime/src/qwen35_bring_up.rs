@@ -124,6 +124,10 @@ pub struct Qwen35Scratch {
     pub down_out_ptr: u64,     // F16 [hidden]
     pub logits_ptr: u64,       // F32 [vocab]
     pub token_out_ptr: u64,    // i32 [1]
+    // ── Phase 2c-B scratch: FP8-quantized intermediate for the
+    // dense MLP's down_proj cuBLASLt fp8_gemm_blockwise call.
+    pub silu_mid_fp8_ptr: u64,    // FP8 [intermediate]
+    pub silu_mid_scales_ptr: u64, // F32 [intermediate / 128]
     pub scratch_bytes: usize,
 }
 
@@ -148,6 +152,12 @@ pub struct Qwen35OutsideKernels {
     pub fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu: KernelFn,
     pub fp8_quantize_per_token_f16_mod: LoadedModule,
     pub fn_fp8_quantize_per_token_f16: KernelFn,
+    /// Single-output FP8 GEMV with F16 input + blockwise scale.
+    /// Qwen 3.6's M=1 fallback when cuBLASLt has no blockwise FP8
+    /// algo (the sm_121 case). Reused here for down_proj. SM100+
+    /// gated — `None` on older devices, but GB10 (sm_121) has it.
+    pub fp8_gemv_mod: LoadedModule,
+    pub fn_fp8_gemv_wpr_native_f16in: Option<KernelFn>,
     // ── Per-layer (Phase 2c-B) — full-attn ─────────────────
     pub split_q_gate_f16_mod: LoadedModule,
     pub fn_split_q_gate_f16: KernelFn,
@@ -173,6 +183,8 @@ pub struct Qwen35OutsideKernels {
     // ── Vector residual add (used after attn + MLP) ────────
     pub f16_plus_f32_inplace_f16_mod: LoadedModule,
     pub fn_f16_plus_f32_inplace_f16: KernelFn,
+    pub vector_add_f16_mod: LoadedModule,
+    pub fn_vector_add_f16: KernelFn,
 }
 
 /// Phase 2c-A engine handle. Adds outside kernels + cuBLASLt on
@@ -388,6 +400,10 @@ impl Qwen35Bringup {
                 logits_ptr: arena.region(
                     "qwen35_logits", vocab * 4, 16)?.device_ptr(),
                 token_out_ptr: arena.region("qwen35_token_out", 4, 4)?.device_ptr(),
+                silu_mid_fp8_ptr: arena.region(
+                    "qwen35_silu_mid_fp8", intermediate, 16)?.device_ptr(),
+                silu_mid_scales_ptr: arena.region(
+                    "qwen35_silu_mid_scales", (intermediate / 128) * 4, 16)?.device_ptr(),
                 scratch_bytes:
                     f16_bytes(hidden) * 4 +  // h_residual, h_work, o_out, down_out
                     f16_bytes(n_q_heads * head_dim) * 3 +  // q_out, q_gate, attn_out
@@ -435,6 +451,25 @@ impl Qwen35Bringup {
                 kernels.load_ptx("fp8_quantize_per_token_f16")?;
             let fn_fp8_quantize_per_token_f16 = fp8_quantize_per_token_f16_mod
                 .get_function("fp8_quantize_per_token_f16_kernel")?;
+            // Single-output FP8 GEMV (gemma4-launcher Fp8GemvF16InLaunch
+            // entry point). Used as the M=1 down_proj fallback when
+            // cuBLASLt blockwise FP8 has no sm_121 algo.
+            let fp8_gemv_mod = kernels.load_ptx(rvllm_kernels::FP8_GEMV_PTX_STEM)?;
+            let fn_fp8_gemv_wpr_native_f16in = {
+                let (major, minor) = ctx.compute_capability();
+                let target = rvllm_core::CompileTarget::from_compute_capability(
+                    major, minor);
+                match target {
+                    Some(t) if rvllm_kernels::Fp8GemvVariant::WprNativeF16In
+                        .available_for(t) =>
+                    {
+                        Some(fp8_gemv_mod.get_function(
+                            rvllm_kernels::Fp8GemvVariant::WprNativeF16In
+                                .entry_point())?)
+                    }
+                    _ => None,
+                }
+            };
 
             // Per-layer (Phase 2c-B) — full-attn.
             let split_q_gate_f16_mod = kernels.load_ptx("split_q_gate_f16")?;
@@ -482,6 +517,9 @@ impl Qwen35Bringup {
                 kernels.load_ptx("f16_plus_f32_inplace_f16")?;
             let fn_f16_plus_f32_inplace_f16 = f16_plus_f32_inplace_f16_mod
                 .get_function("f16_plus_f32_inplace_f16_kernel")?;
+            let vector_add_f16_mod = kernels.load_ptx("vector_add_f16")?;
+            let fn_vector_add_f16 = vector_add_f16_mod
+                .get_function("vector_add_f16_kernel")?;
 
             let outside_kernels = Qwen35OutsideKernels {
                 embedding_gather_f16_mod,
@@ -496,6 +534,8 @@ impl Qwen35Bringup {
                 fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu,
                 fp8_quantize_per_token_f16_mod,
                 fn_fp8_quantize_per_token_f16,
+                fp8_gemv_mod,
+                fn_fp8_gemv_wpr_native_f16in,
                 split_q_gate_f16_mod,
                 fn_split_q_gate_f16,
                 fused_rope_qwen_partial_f16kv_mod,
@@ -518,6 +558,8 @@ impl Qwen35Bringup {
                 fn_qwen_linear_rmsnorm_gated_f16,
                 f16_plus_f32_inplace_f16_mod,
                 fn_f16_plus_f32_inplace_f16,
+                vector_add_f16_mod,
+                fn_vector_add_f16,
             };
 
             // cuBLASLt for the FP8 lm_head matmul. 32 MiB workspace
@@ -733,6 +775,361 @@ impl Qwen35Bringup {
             }
         }
         Ok(predicted as u32)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Qwen35Bringup {
+    /// Phase 2c-B-A smoke forward: embed → dense_mlp(layer 0) →
+    /// final RMSNorm + FP8 quant → cuBLASLt fp8_gemm → argmax.
+    /// Applies ONE layer's dense MLP path on actual model weights.
+    /// Attention block (linear or full) is still SKIPPED. Output
+    /// token is closer to "real" than Phase 2c-A's pure outside
+    /// pipe but still not a valid model forward.
+    pub unsafe fn forward_one_dense_mlp_smoke(&self, token_id: u32) -> Result<u32> {
+        // First-stage embed → h_residual is identical to the Phase
+        // 2c-A path; reuse its inner steps by manually walking them.
+        let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_one_dense_mlp_smoke: scratch absent".into(),
+        ))?;
+        let ker = self.outside_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_one_dense_mlp_smoke: outside_kernels absent".into(),
+        ))?;
+        let cublaslt = self.cublaslt.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_one_dense_mlp_smoke: cublaslt absent".into(),
+        ))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_one_dense_mlp_smoke: stream absent".into(),
+        ))?;
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_one_dense_mlp_smoke: arena absent".into(),
+        ))?;
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_one_dense_mlp_smoke: model absent".into(),
+        ))?;
+        let arch = &self.arch;
+        let hidden = arch.base.hidden_size as u32;
+        let vocab = arch.base.vocab_size as u32;
+        let eps = arch.base.rms_norm_eps;
+        let stream_raw = stream.raw() as u64;
+
+        // (1) HtoD token id + embed lookup.
+        let token_bytes = (token_id as i32).to_le_bytes();
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyHtoDAsync_v2(
+                scr.token_in_ptr as CUdeviceptr,
+                token_bytes.as_ptr() as *const _,
+                4, stream_raw as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 mlp-smoke HtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        unsafe {
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens: 1, hidden, vocab,
+            }.launch(
+                ker.fn_embedding_gather_f16,
+                scr.h_residual_ptr,
+                model.outside.embed_tokens.offset_bytes,
+                scr.token_in_ptr,
+                stream_raw,
+            )?;
+        }
+
+        // (2) Apply layer 0's dense MLP block in place on h_residual.
+        self.apply_dense_mlp_layer(0)?;
+
+        // (3) Final RMSNorm + FP8 quantize → h_fp8 + per-token scale.
+        let hidden_fp8_region = arena.region(
+            "qwen35_mlp_hidden_fp8", hidden as usize, 16)?;
+        let hidden_scale_region = arena.region(
+            "qwen35_mlp_hidden_scale", 4, 4)?;
+        unsafe {
+            rvllm_fused::FusedRmsnormFp8QuantLaunch {
+                num_tokens: 1, hidden, eps,
+            }.launch(
+                ker.fn_fused_rmsnorm_fp8_quant,
+                hidden_fp8_region.device_ptr(),
+                hidden_scale_region.device_ptr(),
+                scr.h_residual_ptr,
+                model.outside.final_norm.offset_bytes,
+                stream_raw,
+            )?;
+        }
+
+        // (4) cuBLASLt fp8_gemm: logits = h_fp8 · lm_head_fp8^T.
+        unsafe {
+            cublaslt.fp8_gemm(
+                hidden_fp8_region.device_ptr(),
+                model.outside.lm_head_fp8.offset_bytes,
+                scr.logits_ptr,
+                1, vocab as i32, hidden as i32,
+                hidden_scale_region.device_ptr(),
+                model.outside.lm_head_fp8.scale_ptr,
+                stream_raw,
+            )?;
+        }
+
+        // (5) argmax_f16 over logits row.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let block_dim: u32 = vocab.min(1024);
+            let mut row_ptr = scr.logits_ptr;
+            let mut out_ptr = scr.token_out_ptr;
+            let mut vsz: i32 = vocab as i32;
+            let args = [
+                (&mut row_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vsz) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_argmax_f16.raw() as CUfunction,
+                1, 1, 1, block_dim, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 mlp-smoke argmax",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        stream.fence()?;
+        let mut predicted: i32 = 0;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                &mut predicted as *mut i32 as *mut _,
+                scr.token_out_ptr as CUdeviceptr, 4);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 mlp-smoke DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        Ok(predicted as u32)
+    }
+
+    /// Phase 2c-B-A: apply one layer's dense MLP block to
+    /// `h_residual` in place. Reads `h_residual`, writes
+    /// `h_residual = h_residual + down_proj(SiLU(gate(h_norm)) *
+    /// up(h_norm))` where `h_norm = rmsnorm(h_residual,
+    /// post_attention_layernorm[layer_idx])`.
+    ///
+    /// Used by Phase 2c-B-A's `forward_dense_mlp_smoke` to
+    /// validate the MLP path on real model weights without yet
+    /// running the attention block. Phase 2c-B-core will fold
+    /// this into the per-layer forward loop.
+    pub unsafe fn apply_dense_mlp_layer(&self, layer_idx: usize) -> Result<()> {
+        let arch = &self.arch;
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_dense_mlp_layer: model absent".into(),
+        ))?;
+        let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_dense_mlp_layer: scratch absent".into(),
+        ))?;
+        let ker = self.outside_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_dense_mlp_layer: outside_kernels absent".into(),
+        ))?;
+        let cublaslt = self.cublaslt.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_dense_mlp_layer: cublaslt absent".into(),
+        ))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_dense_mlp_layer: stream absent".into(),
+        ))?;
+        let layer = model.layers.get(layer_idx).ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            format!("apply_dense_mlp_layer: layer {layer_idx} out of range"),
+        ))?;
+        let hidden = arch.base.hidden_size as i32;
+        let intermediate = arch.base.intermediate_size as i32;
+        let eps = arch.base.rms_norm_eps;
+        let stream_raw = stream.raw() as u64;
+
+        // (1) h_work ← rmsnorm(h_residual, post_attn_layernorm).
+        // Kernel is in-place: we DtoD copy first then norm.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                scr.h_work_ptr as CUdeviceptr,
+                scr.h_residual_ptr as CUdeviceptr,
+                (hidden as usize) * 2,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 mlp dtod h_work",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        // Kernel signature: (x_inout, gamma, eps, hidden). Grid
+        // (num_tokens, 1, 1), block (min(hidden, 1024), 1, 1),
+        // smem = 32 * 4 (warp-reduction scratch). Mirrors
+        // gemma4_launcher::RmsnormInplaceLaunch.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut hw_ptr = scr.h_work_ptr;
+            let mut gamma_ptr = post_attn_ln_ptr(&layer.attn);
+            let mut eps_arg = eps;
+            let mut hd = hidden;
+            let args = [
+                (&mut hw_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gamma_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut eps_arg) as *mut f32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block_dim = (hidden as u32).min(1024);
+            let rc = cuLaunchKernel(
+                ker.fn_rmsnorm_inplace_f16.raw() as CUfunction,
+                1, 1, 1, block_dim, 1, 1, 32 * 4,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 rmsnorm_inplace_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // (2) silu_mid ← SiLU(gate(h_work)) * up(h_work)
+        // grid (ceil(N/8), M), block 256. M=1, N=intermediate.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut out_ptr = scr.silu_mid_ptr;
+            let mut wg_ptr = layer.mlp.gate_proj.offset_bytes;
+            let mut wu_ptr = layer.mlp.up_proj.offset_bytes;
+            let mut sg_ptr = layer.mlp.gate_proj.blockscale_ptr.unwrap_or(0);
+            let mut su_ptr = layer.mlp.up_proj.blockscale_ptr.unwrap_or(0);
+            let mut inp_ptr = scr.h_work_ptr;
+            let mut m_arg: i32 = 1;
+            let mut n_arg: i32 = intermediate;
+            let mut k_arg: i32 = hidden;
+            let mut ncb: i32 = hidden / 128;
+            let args = [
+                (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut wg_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut wu_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sg_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut su_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut inp_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut m_arg) as *mut i32 as *mut core::ffi::c_void,
+                (&mut n_arg) as *mut i32 as *mut core::ffi::c_void,
+                (&mut k_arg) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let grid_x: u32 = ((intermediate as u32) + 7) / 8;
+            let rc = cuLaunchKernel(
+                ker.fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu.raw() as CUfunction,
+                grid_x, 1, 1, 256, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 fp8_gemv_dual_silu launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // (3+4) down_out ← FP8 GEMV with F16 input + blockwise
+        // weight scale. Single launch via the gemma4-style
+        // launcher; takes F16 input directly (no separate FP8
+        // quantize step) and consumes the blockwise scale at
+        // `b_chscale` (the parameter slot is shape-agnostic —
+        // qwen36 reuses it with blockwise scales for the same
+        // reason). M=1 single-row path; the looped variant
+        // applies if M>1.
+        let fp8_gemv_fn = ker.fn_fp8_gemv_wpr_native_f16in.ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_dense_mlp_layer: fp8_gemv_wpr_native_f16in unavailable \
+             (need sm_100+; GB10/sm_121 should have it)".into(),
+        ))?;
+        unsafe {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m: 1,
+                n: hidden as u32,
+                k: intermediate as u32,
+            }.launch(
+                fp8_gemv_fn,
+                scr.down_out_ptr,
+                layer.mlp.down_proj.offset_bytes,
+                layer.mlp.down_proj.blockscale_ptr.unwrap_or(0),
+                scr.silu_mid_ptr,
+                stream_raw,
+            )?;
+        }
+        // (cublaslt only used for outside lm_head now; the
+        // blockwise path is the looped m=1 GEMV above.)
+        let _ = cublaslt;
+
+        // (5) h_residual += down_out (F16 + F16 → F16).
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut dst = scr.h_residual_ptr;
+            let mut src = scr.down_out_ptr;
+            let mut n_arg: i32 = hidden;
+            let args = [
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                (&mut n_arg) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let grid_x: u32 = ((hidden as u32) + 255) / 256;
+            let rc = cuLaunchKernel(
+                ker.fn_vector_add_f16.raw() as CUfunction,
+                grid_x, 1, 1, 256, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 vector_add_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Free function — extract the per-layer
+/// post_attention_layernorm pointer. The layer enum lives in
+/// rvllm-loader so we can't impl methods on it from here
+/// (orphan rule); pattern-match inline instead.
+#[cfg(feature = "cuda")]
+fn post_attn_ln_ptr(attn: &rvllm_loader::qwen35_weights::Qwen35LayerAttn) -> u64 {
+    use rvllm_loader::qwen35_weights::Qwen35LayerAttn;
+    match attn {
+        Qwen35LayerAttn::Linear(l) => l.post_attention_layernorm.offset_bytes,
+        Qwen35LayerAttn::Full(f) => f.post_attention_layernorm.offset_bytes,
     }
 }
 

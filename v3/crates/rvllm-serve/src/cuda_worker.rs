@@ -122,15 +122,27 @@ pub async fn spawn_cuda_worker(
                      meaningless until Phase 2c-B. See \
                      QWEN35_BRINGUP_PLAN.md."
                 );
+                let qwen35_fwd_mode = std::env::var("RVLLM_QWEN35_FWD")
+                    .ok().unwrap_or_else(|| "outside".to_string());
+                tracing::info!("qwen35 forward mode: {qwen35_fwd_mode}");
                 while let Some(req) = req_rx.blocking_recv() {
-                    // Phase 2c-A smoke: route each request through
-                    // forward_outside_only_smoke with the last prompt
-                    // token. Emits ONE Token event per request (the
-                    // post-forward argmax) so the operator can probe
-                    // the pipeline end-to-end via /v1/chat/completions
-                    // while transformer layers are pending.
+                    // Phase 2c-A / 2c-B-A smoke. Env-selected:
+                    //   outside (default) — embed → norm → lm_head → argmax,
+                    //                       skipping all 64 layers.
+                    //   dense_mlp         — embed → dense_mlp(0) →
+                    //                       norm → lm_head → argmax,
+                    //                       still skipping attn + 63 other
+                    //                       layers.
+                    // Both emit one Token + Done event so the operator
+                    // can probe each path via /v1/chat/completions.
                     let last_tok = req.prompt_ids.last().copied().unwrap_or(1);
-                    match unsafe { bringup.forward_outside_only_smoke(last_tok) } {
+                    let result = match qwen35_fwd_mode.as_str() {
+                        "dense_mlp" => unsafe {
+                            bringup.forward_one_dense_mlp_smoke(last_tok)
+                        },
+                        _ => unsafe { bringup.forward_outside_only_smoke(last_tok) },
+                    };
+                    match result {
                         Ok(predicted) => {
                             let _ = req.events_tx.send(GenerateEvent::Token {
                                 id: predicted,
