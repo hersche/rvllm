@@ -818,6 +818,7 @@ pub async fn spawn_cuda_worker(
                                 vision_failed = true;
                                 break;
                             }
+                            let vit_t0 = std::time::Instant::now();
                             match qwen.forward_qwen_vision(&item.bytes) {
                                 Ok(out) => {
                                     if out.num_tokens != item.num_tokens {
@@ -830,10 +831,12 @@ pub async fn spawn_cuda_worker(
                                         vision_failed = true;
                                         break;
                                     }
+                                    let vit_ms = vit_t0.elapsed().as_secs_f64() * 1000.0;
                                     tracing::info!(
                                         idx = i,
                                         tokens = out.num_tokens,
                                         hidden = out.hidden_dim,
+                                        vit_ms = format!("{vit_ms:.1}"),
                                         "vision: ViT forward done"
                                     );
                                     vision_outputs.push(out);
