@@ -5295,52 +5295,49 @@ impl Qwen36Bringup {
         let q_region = self.arena.region("qwen36_plb_q", n * qk_bytes_per_token, 16)?;
         let k_region = self.arena.region("qwen36_plb_k", n * qk_bytes_per_token, 16)?;
         let v_region = self.arena.region("qwen36_plb_v", n * v_bytes_per_token,  16)?;
-        for t in 0..num_tokens {
-            #[cfg(feature = "cuda")]
-            unsafe {
-                use cudarc::driver::sys::*;
-                let conv_t = conv_out_region.device_ptr()
-                    + (t as u64) * (qkv_n as u64) * 2;
-                let q_t = q_region.device_ptr() + (t as u64) * (qk_bytes_per_token as u64);
-                let k_t = k_region.device_ptr() + (t as u64) * (qk_bytes_per_token as u64);
-                let v_t = v_region.device_ptr() + (t as u64) * (v_bytes_per_token  as u64);
-                let mut q_out = q_t;
-                let mut k_out = k_t;
-                let mut v_out = v_t;
-                let mut conv_p = conv_t;
-                let mut vus_i: i32 = vus as i32;
-                let mut hkd_i: i32 = hkd as i32;
-                let mut hvd_i: i32 = hvd as i32;
-                let mut kd_i:  i32 = key_dim as i32;
-                let mut nvh:   i32 = num_v_heads as i32;
-                let mut vpk:   i32 = v_per_k as i32;
-                let args = [
-                    (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut k_out) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut v_out) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut conv_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut hkd_i) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut kd_i)  as *mut i32 as *mut core::ffi::c_void,
-                    (&mut nvh)   as *mut i32 as *mut core::ffi::c_void,
-                    (&mut vpk)   as *mut i32 as *mut core::ffi::c_void,
-                ];
-                let block: u32 = (hkd.max(hvd)) as u32;
-                let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_qwen_linear_silu_l2_gqa_f16.raw() as CUfunction,
-                    vus as u32, 1, 1, block, 1, 1, 0,
-                    self.stream.raw() as CUstream,
-                    args.as_ptr() as *mut *mut core::ffi::c_void,
-                    core::ptr::null_mut(),
-                );
-                if rc != CUresult::CUDA_SUCCESS {
-                    return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 linear_attn_batched silu_l2_gqa",
-                        rvllm_core::CudaErrorKind::LaunchFailed,
-                        rvllm_core::CudaCtx::setup(),
-                    ));
-                }
+        // Single batched launch over (vus, num_tokens) — replaces
+        // the per-token host loop. Kernel folds `blockIdx.y *
+        // per_token_stride` into its pointer math; base pointers
+        // are the start of the [N, …] buffers.
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut q_out = q_region.device_ptr();
+            let mut k_out = k_region.device_ptr();
+            let mut v_out = v_region.device_ptr();
+            let mut conv_p = conv_out_region.device_ptr();
+            let mut vus_i: i32 = vus as i32;
+            let mut hkd_i: i32 = hkd as i32;
+            let mut hvd_i: i32 = hvd as i32;
+            let mut kd_i:  i32 = key_dim as i32;
+            let mut nvh:   i32 = num_v_heads as i32;
+            let mut vpk:   i32 = v_per_k as i32;
+            let args = [
+                (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut conv_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hkd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut kd_i)  as *mut i32 as *mut core::ffi::c_void,
+                (&mut nvh)   as *mut i32 as *mut core::ffi::c_void,
+                (&mut vpk)   as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = (hkd.max(hvd)) as u32;
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_qwen_linear_silu_l2_gqa_f16.raw() as CUfunction,
+                vus as u32, num_tokens as u32, 1, block, 1, 1, 0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 linear_attn_batched silu_l2_gqa",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
             }
         }
 
@@ -5348,49 +5345,45 @@ impl Qwen36Bringup {
         // [num_tokens, vus] f32 each.
         let alpha_region = self.arena.region("qwen36_plb_alpha", n * vus * 4, 16)?;
         let beta_region  = self.arena.region("qwen36_plb_beta",  n * vus * 4, 16)?;
-        for t in 0..num_tokens {
-            #[cfg(feature = "cuda")]
-            unsafe {
-                use cudarc::driver::sys::*;
-                let in_t = normed_region.device_ptr()
-                    + (t as u64) * (hidden as u64) * 2;
-                let a_out_t = alpha_region.device_ptr() + (t as u64) * (vus as u64) * 4;
-                let b_out_t = beta_region.device_ptr()  + (t as u64) * (vus as u64) * 4;
-                let mut a_out = a_out_t;
-                let mut b_out = b_out_t;
-                let mut a_w_p = la.in_proj_a.offset_bytes;
-                let mut b_w_p = la.in_proj_b.offset_bytes;
-                let mut a_log_p = la.a_log.offset_bytes;
-                let mut dt_bias_p = la.dt_bias.offset_bytes;
-                let mut in_p = in_t;
-                let mut vus_i: i32 = vus as i32;
-                let mut h_i: i32 = h as i32;
-                let args = [
-                    (&mut a_out) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut b_out) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut a_w_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut b_w_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut a_log_p)  as *mut u64 as *mut core::ffi::c_void,
-                    (&mut dt_bias_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut in_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut h_i) as *mut i32 as *mut core::ffi::c_void,
-                ];
-                let block: u32 = 256u32.min(h as u32).max(1);
-                let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_qwen_linear_alpha_beta_f16.raw() as CUfunction,
-                    vus as u32, 1, 1, block, 1, 1, 0,
-                    self.stream.raw() as CUstream,
-                    args.as_ptr() as *mut *mut core::ffi::c_void,
-                    core::ptr::null_mut(),
-                );
-                if rc != CUresult::CUDA_SUCCESS {
-                    return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 linear_attn_batched alpha_beta",
-                        rvllm_core::CudaErrorKind::LaunchFailed,
-                        rvllm_core::CudaCtx::setup(),
-                    ));
-                }
+        // Single batched launch (vus, num_tokens). Kernel folds
+        // per-token offsets into input / alpha_out / beta_out.
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut a_out = alpha_region.device_ptr();
+            let mut b_out = beta_region.device_ptr();
+            let mut a_w_p = la.in_proj_a.offset_bytes;
+            let mut b_w_p = la.in_proj_b.offset_bytes;
+            let mut a_log_p = la.a_log.offset_bytes;
+            let mut dt_bias_p = la.dt_bias.offset_bytes;
+            let mut in_p = normed_region.device_ptr();
+            let mut vus_i: i32 = vus as i32;
+            let mut h_i: i32 = h as i32;
+            let args = [
+                (&mut a_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut b_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut a_w_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut b_w_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut a_log_p)  as *mut u64 as *mut core::ffi::c_void,
+                (&mut dt_bias_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut in_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut h_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256u32.min(h as u32).max(1);
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_qwen_linear_alpha_beta_f16.raw() as CUfunction,
+                vus as u32, num_tokens as u32, 1, block, 1, 1, 0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 linear_attn_batched alpha_beta",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
             }
         }
 
@@ -5463,47 +5456,40 @@ impl Qwen36Bringup {
         // slices.
         let gated_region = self.arena.region(
             "qwen36_plb_gated", n * vus * hvd * 2, 16)?;
-        for t in 0..num_tokens {
-            #[cfg(feature = "cuda")]
-            unsafe {
-                use cudarc::driver::sys::*;
-                let g_t = gated_region.device_ptr()
-                    + (t as u64) * (vus as u64) * (hvd as u64) * 2;
-                let r_t = readout_region.device_ptr()
-                    + (t as u64) * (v_bytes_per_token as u64);
-                let z_t = z_region.device_ptr()
-                    + (t as u64) * (z_n as u64) * 2;
-                let mut g_out = g_t;
-                let mut r_in  = r_t;
-                let mut z_in  = z_t;
-                let mut gamma_p = la.norm.offset_bytes;
-                let mut vus_i: i32 = vus as i32;
-                let mut hvd_i: i32 = hvd as i32;
-                let mut eps_f: f32 = 1e-6;
-                let args = [
-                    (&mut g_out) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut r_in)  as *mut u64 as *mut core::ffi::c_void,
-                    (&mut z_in)  as *mut u64 as *mut core::ffi::c_void,
-                    (&mut gamma_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut eps_f) as *mut f32 as *mut core::ffi::c_void,
-                ];
-                let block: u32 = hvd as u32;
-                let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_qwen_linear_rmsnorm_gated_f16.raw() as CUfunction,
-                    vus as u32, 1, 1, block, 1, 1, 0,
-                    self.stream.raw() as CUstream,
-                    args.as_ptr() as *mut *mut core::ffi::c_void,
-                    core::ptr::null_mut(),
-                );
-                if rc != CUresult::CUDA_SUCCESS {
-                    return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 linear_attn_batched rmsnorm_gated",
-                        rvllm_core::CudaErrorKind::LaunchFailed,
-                        rvllm_core::CudaCtx::setup(),
-                    ));
-                }
+        // Single batched launch (vus, num_tokens).
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut g_out = gated_region.device_ptr();
+            let mut r_in  = readout_region.device_ptr();
+            let mut z_in  = z_region.device_ptr();
+            let mut gamma_p = la.norm.offset_bytes;
+            let mut vus_i: i32 = vus as i32;
+            let mut hvd_i: i32 = hvd as i32;
+            let mut eps_f: f32 = 1e-6;
+            let args = [
+                (&mut g_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut r_in)  as *mut u64 as *mut core::ffi::c_void,
+                (&mut z_in)  as *mut u64 as *mut core::ffi::c_void,
+                (&mut gamma_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut eps_f) as *mut f32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = hvd as u32;
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_qwen_linear_rmsnorm_gated_f16.raw() as CUfunction,
+                vus as u32, num_tokens as u32, 1, block, 1, 1, 0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 linear_attn_batched rmsnorm_gated",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
             }
         }
 

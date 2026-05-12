@@ -23,9 +23,13 @@
 // the host pipeline produced.
 //
 // Launch:
-//   Grid:  (vus, 1, 1)               — one block per output element
+//   Grid:  (vus, num_tokens, 1)      — one block per (v-output, token)
 //   Block: (block_size, 1, 1)         — power-of-two dot-product width
 //   Shared: block_size * sizeof(float)
+//
+// Per-token offsets (codex review #3, 2026-05-12): `alpha_out`,
+// `beta_out`, `input` are per-token; `in_proj_a/b`, `a_log`,
+// `dt_bias` are static layer weights. `blockIdx.y` selects token.
 //
 // Constraint: `hidden % 1 == 0`; the kernel handles the trailing
 // remainder via a strided loop (no alignment requirement).
@@ -68,12 +72,17 @@ qwen_linear_alpha_beta_f16_kernel(
     int hidden
 ) {
     const int v   = blockIdx.x;
+    const int t   = blockIdx.y;
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
     if (v >= vus) return;
 
     const __half* a_row = in_proj_a + (long long)v * hidden;
     const __half* b_row = in_proj_b + (long long)v * hidden;
+    // Per-token input + output offsets.
+    const __half* input_t = input + (long long)t * hidden;
+    float*        alpha_t = alpha_out + (long long)t * vus;
+    float*        beta_t  = beta_out  + (long long)t * vus;
 
     __shared__ float smem_a[WARPS_MAX];
     __shared__ float smem_b[WARPS_MAX];
@@ -82,7 +91,7 @@ qwen_linear_alpha_beta_f16_kernel(
     float local_a = 0.0f;
     float local_b = 0.0f;
     for (int k = tid; k < hidden; k += stride) {
-        float xk = __half2float(input[k]);
+        float xk = __half2float(input_t[k]);
         local_a += __half2float(a_row[k]) * xk;
         local_b += __half2float(b_row[k]) * xk;
     }
@@ -97,7 +106,7 @@ qwen_linear_alpha_beta_f16_kernel(
         // numerically-stable softplus
         float sp = (x > 20.0f) ? x : log1pf(expf(x));
         float g  = -expf(al) * sp;
-        alpha_out[v] = expf(g);
-        beta_out[v]  = 1.0f / (1.0f + expf(-b_acc));
+        alpha_t[v] = expf(g);
+        beta_t[v]  = 1.0f / (1.0f + expf(-b_acc));
     }
 }

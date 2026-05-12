@@ -23,9 +23,16 @@
 // with one launch (Phase 4b-prep iter6).
 //
 // Launch:
-//   Grid:  (vus, 1, 1)              — one block per v-head.
+//   Grid:  (vus, num_tokens, 1)     — one block per (v-head, token).
 //   Block: (max(hkd, hvd), 1, 1)    — Qwen 3.6 has hkd == hvd == 128.
 //   Shared: WARPS_MAX * sizeof(float) (for warp-amax reductions)
+//
+// Per-token offsets (codex review #3, 2026-05-12): `conv_out`,
+// `q_exp_out`, `k_exp_out`, `v_pack_out` are all per-token buffers.
+// `blockIdx.y` selects the token and the kernel folds the
+// per-token stride into the pointer math. Decode-time callers
+// keep launching with grid.y=1, behaviour identical to the prior
+// per-token launch loop.
 
 #include <cuda_fp16.h>
 
@@ -69,14 +76,26 @@ qwen_linear_silu_l2_gqa_f16_kernel(
     int v_per_k         // = num_v_heads / num_k_heads
 ) {
     const int v   = blockIdx.x;
+    const int t   = blockIdx.y;   // token index in [0, num_tokens)
     const int tid = threadIdx.x;
     if (v >= vus) return;
 
+    // Per-token input stride: conv_dim = 2*key_dim + value_dim.
+    // We re-derive value_dim as num_v_heads * hvd locally so the
+    // signature stays stable.
+    const long long conv_dim = (long long)(2 * key_dim) + (long long)num_v_heads * hvd;
+    const long long conv_t_off = (long long)t * conv_dim;
+
+    // Per-token output strides into [num_tokens, vus, *].
+    const long long q_t_off = (long long)t * (long long)vus * hkd;
+    const long long k_t_off = (long long)t * (long long)vus * hkd;
+    const long long v_t_off = (long long)t * (long long)vus * hvd;
+
     // Map this v-head to its parent k-head.
     const int kh = v / v_per_k;
-    const int q_base = kh * hkd;
-    const int k_base = key_dim + kh * hkd;
-    const int v_base = 2 * key_dim + v * hvd;
+    const long long q_base = conv_t_off + kh * hkd;
+    const long long k_base = conv_t_off + key_dim + kh * hkd;
+    const long long v_base = conv_t_off + 2 * key_dim + (long long)v * hvd;
 
     __shared__ float smem_q[WARPS_MAX];
     __shared__ float smem_k[WARPS_MAX];
@@ -104,16 +123,16 @@ qwen_linear_silu_l2_gqa_f16_kernel(
 
     if (tid < hkd) {
         // Write Q and K (L2-normalised) into the v-head's row of
-        // q_exp / k_exp. GQA expansion happens by virtue of every
-        // v-head in the same k-group reading the SAME q_base / k_base
-        // and writing into ITS OWN v-head row.
-        q_exp_out[(long long)v * hkd + tid] = __float2half(q_val / q_norm);
-        k_exp_out[(long long)v * hkd + tid] = __float2half(k_val / k_norm);
+        // q_exp / k_exp at the per-token slab. GQA expansion happens
+        // by virtue of every v-head in the same k-group reading the
+        // SAME q_base / k_base and writing into ITS OWN v-head row.
+        q_exp_out[q_t_off + (long long)v * hkd + tid] = __float2half(q_val / q_norm);
+        k_exp_out[k_t_off + (long long)v * hkd + tid] = __float2half(k_val / k_norm);
     }
 
     // --- V silu (no norm, just per-v-head pack) ---
     if (tid < hvd) {
         float vv = silu_f(__half2float(conv_out[v_base + tid]));
-        v_pack_out[(long long)v * hvd + tid] = __float2half(vv);
+        v_pack_out[v_t_off + (long long)v * hvd + tid] = __float2half(vv);
     }
 }

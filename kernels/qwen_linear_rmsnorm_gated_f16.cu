@@ -25,9 +25,14 @@
 //   silu(z)   = z / (1 + exp(-z))
 //
 // Launch:
-//   Grid:  (vus, 1, 1)             — one block per v-head
+//   Grid:  (vus, num_tokens, 1)    — one block per (v-head, token)
 //   Block: (hvd, 1, 1)              — one thread per element
 //   Shared: WARPS_MAX * sizeof(float)
+//
+// Per-token offsets (codex review #3, 2026-05-12): gated_out,
+// readout, z_logits are all [num_tokens, vus, hvd]; gamma is a
+// static layer weight shared across tokens. blockIdx.y selects
+// the token.
 
 #include <cuda_fp16.h>
 
@@ -64,13 +69,15 @@ qwen_linear_rmsnorm_gated_f16_kernel(
     float eps
 ) {
     const int v   = blockIdx.x;
+    const int t   = blockIdx.y;
     const int tid = threadIdx.x;
     if (v >= vus || tid >= hvd) return;
 
     __shared__ float smem[WARPS_MAX];
     __shared__ float rms_b;
 
-    const long long base = (long long)v * hvd;
+    // Per-token offset into the [num_tokens, vus, hvd] buffers.
+    const long long base = (long long)t * vus * hvd + (long long)v * hvd;
 
     // Pass 1: sumsq.
     float r = __half2float(readout[base + tid]);

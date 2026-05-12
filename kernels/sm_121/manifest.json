@@ -557,19 +557,19 @@
       "sha256": "f7a7c2613b5fc5c72cd6dfee7b74d087a4845dbb00912846fbb137e94a60908e"
     },
     "qwen_linear_alpha_beta_f16": {
-      "bytes": 13625,
+      "bytes": 13939,
       "path": "qwen_linear_alpha_beta_f16.ptx",
-      "sha256": "c75d5da720e7d2645294c4be8f971c73f9f7ebbf0238e93f004ffa19b824b4a1"
+      "sha256": "240244dcd6e4ee6ec906ee28aedf86a71be7b4fff7889e138566dad2c1cb95db"
     },
     "qwen_linear_rmsnorm_gated_f16": {
-      "bytes": 5433,
+      "bytes": 5555,
       "path": "qwen_linear_rmsnorm_gated_f16.ptx",
-      "sha256": "d0645233c979f41e3e386de115ced0aed163912cc492a1cdea38ba9104590623"
+      "sha256": "c9e26c297477cb28a63b218fe727e7c841336042e87f37113315346753c837be"
     },
     "qwen_linear_silu_l2_gqa_f16": {
-      "bytes": 9630,
+      "bytes": 10188,
       "path": "qwen_linear_silu_l2_gqa_f16.ptx",
-      "sha256": "bde94c9f772cee97ab0443f947d7712727b37f386ea45ab75d198b51d882bbc7"
+      "sha256": "0e841e9a6c35c219851e5e35d6a2e339f28754e78b44f115c3f507ce52c62d06"
     },
     "repetition_penalty": {
       "bytes": 4570,
@@ -832,5 +832,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "14e16ab"
+  "revision": "7c6063a"
 }
