@@ -2334,6 +2334,197 @@ impl Qwen35Bringup {
         Ok(())
     }
 
+    /// Phase #1-d: layer-major batched prefill driver.
+    ///
+    /// One call processes all N prompt tokens through the 64-layer
+    /// transformer stack — layer-major (each layer in turn over the
+    /// full [N, hidden] buffer), not token-major. Returns the
+    /// predicted next token (the lm_head argmax of the LAST prompt
+    /// position's hidden state).
+    ///
+    /// Steps:
+    ///   1. Allocate [N, hidden] h_residual + per-request small
+    ///      device buffers (positions[N] i32, ctx_len[1] i32,
+    ///      token_ids[N] i32).
+    ///   2. HtoD positions = [0, 1, …, N-1], ctx_len = N,
+    ///      token_ids = prompt_ids.
+    ///   3. Batched embed: EmbeddingGatherLaunch at num_tokens=N
+    ///      → fills [N, hidden].
+    ///   4. Vision splices via DtoD over the right rows.
+    ///   5. For li in 0..num_hidden_layers:
+    ///        match arch.layer_types[li]:
+    ///          Linear → apply_linear_attn_layer_batched
+    ///          Full   → apply_full_attn_layer_batched
+    ///        apply_dense_mlp_layer_batched
+    ///   6. DtoD last row of h_residual into scr.h_residual_ptr
+    ///      so the existing forward_finalize_argmax pipeline can
+    ///      finish lm_head + argmax untouched.
+    ///   7. Return forward_finalize_argmax()'s predicted token.
+    ///
+    /// Caller is responsible for restoring the arena to the
+    /// checkpoint after this returns — same contract as the
+    /// per-token forward_all_layers_with_splice path.
+    pub unsafe fn forward_qwen35_prefill_batched<'a>(
+        &self,
+        prompt_ids: &[u32],
+        splices: &'a [(usize, &'a [u8])],
+    ) -> Result<u32> {
+        let n_prompt = prompt_ids.len();
+        if n_prompt == 0 {
+            return Err(corrupt(
+                self.paths.model_dir.clone(),
+                "forward_qwen35_prefill_batched: empty prompt".into()));
+        }
+        let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_qwen35_prefill_batched: scratch absent".into()))?;
+        let ker = self.outside_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_qwen35_prefill_batched: outside_kernels absent".into()))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_qwen35_prefill_batched: stream absent".into()))?;
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_qwen35_prefill_batched: arena absent".into()))?;
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_qwen35_prefill_batched: model absent".into()))?;
+        let arch = &self.arch;
+        let hidden = arch.base.hidden_size as u32;
+        let vocab = arch.base.vocab_size as u32;
+        let row_bytes = (hidden as usize) * 2;
+        let stream_raw = stream.raw() as u64;
+        let num_tokens = n_prompt as u32;
+
+        // (1) Allocate batched buffers.
+        let h_residual_buf = arena.region(
+            "qwen35_lmp_h_residual", n_prompt * row_bytes, 16)?.device_ptr();
+        let positions_dev = arena.region(
+            "qwen35_lmp_positions", n_prompt * 4, 16)?.device_ptr();
+        let ctx_len_dev = arena.region(
+            "qwen35_lmp_ctx_len", 4, 4)?.device_ptr();
+        let token_ids_dev = arena.region(
+            "qwen35_lmp_token_ids", n_prompt * 4, 16)?.device_ptr();
+
+        // (2) Build + HtoD the small per-request scalars.
+        let mut positions_host: Vec<u8> = Vec::with_capacity(n_prompt * 4);
+        for i in 0..(n_prompt as i32) {
+            positions_host.extend_from_slice(&i.to_le_bytes());
+        }
+        let mut token_ids_host: Vec<u8> = Vec::with_capacity(n_prompt * 4);
+        for &t in prompt_ids {
+            token_ids_host.extend_from_slice(&(t as i32).to_le_bytes());
+        }
+        let ctx_len_bytes: [u8; 4] = (n_prompt as i32).to_le_bytes();
+        {
+            use cudarc::driver::sys::*;
+            for (dst, src, n) in [
+                (positions_dev, positions_host.as_ptr(), positions_host.len()),
+                (token_ids_dev, token_ids_host.as_ptr(), token_ids_host.len()),
+                (ctx_len_dev,   ctx_len_bytes.as_ptr(),  4usize),
+            ] {
+                let rc = cuMemcpyHtoDAsync_v2(
+                    dst as CUdeviceptr, src as *const _, n,
+                    stream_raw as CUstream);
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 prefill HtoD per-request scalars",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup()));
+                }
+            }
+        }
+
+        // (3) Batched embed: gather num_tokens rows.
+        rvllm_fused::EmbeddingGatherLaunch {
+            num_tokens, hidden, vocab,
+        }.launch(
+            ker.fn_embedding_gather_f16,
+            h_residual_buf,
+            model.outside.embed_tokens.offset_bytes,
+            token_ids_dev,
+            stream_raw,
+        )?;
+
+        // (4) Vision splices: DtoD per-slot over the [N, hidden]
+        //     buffer. Each splice is (token_start, &[u8] of
+        //     num_rows * row_bytes).
+        for (start, data) in splices {
+            if data.len() % row_bytes != 0 {
+                return Err(corrupt(
+                    self.paths.model_dir.clone(),
+                    format!("forward_qwen35_prefill_batched: splice has \
+                             {} bytes, not a multiple of row_bytes={row_bytes}",
+                            data.len())));
+            }
+            let n_rows = data.len() / row_bytes;
+            if start + n_rows > n_prompt {
+                return Err(corrupt(
+                    self.paths.model_dir.clone(),
+                    format!("forward_qwen35_prefill_batched: splice {start}+{n_rows} \
+                             past prompt_len={n_prompt}")));
+            }
+            use cudarc::driver::sys::*;
+            let dst = h_residual_buf + ((*start) as u64) * (row_bytes as u64);
+            let rc = cuMemcpyHtoDAsync_v2(
+                dst as CUdeviceptr, data.as_ptr() as *const _, data.len(),
+                stream_raw as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 prefill vision splice HtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (5) Layer-major dispatch.
+        for (li, ty) in arch.base.layer_types.iter().enumerate() {
+            match ty {
+                rvllm_loader::LayerAttnType::Linear => {
+                    self.apply_linear_attn_layer_batched(li, num_tokens, h_residual_buf)?;
+                }
+                rvllm_loader::LayerAttnType::Full => {
+                    self.apply_full_attn_layer_batched(
+                        li, num_tokens,
+                        /* start_position */ 0,
+                        h_residual_buf,
+                        positions_dev,
+                        ctx_len_dev,
+                    )?;
+                }
+                other => {
+                    return Err(corrupt(
+                        self.paths.model_dir.clone(),
+                        format!("forward_qwen35_prefill_batched: layer {li} has \
+                                 unsupported attn type {other:?}")));
+                }
+            }
+            self.apply_dense_mlp_layer_batched(li, num_tokens, h_residual_buf)?;
+        }
+
+        // (6) Move last row of h_residual into the single-row
+        //     scratch so forward_finalize_argmax can run lm_head
+        //     unchanged. Last row offset = (n_prompt-1) * row_bytes.
+        {
+            use cudarc::driver::sys::*;
+            let last_src = h_residual_buf + ((n_prompt - 1) as u64) * (row_bytes as u64);
+            let rc = cuMemcpyDtoDAsync_v2(
+                scr.h_residual_ptr, last_src, row_bytes,
+                stream_raw as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 prefill DtoD last-row → scratch",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (7) Final norm + lm_head + argmax — reuses the existing
+        //     single-row finisher.
+        self.forward_finalize_argmax()
+    }
+
     /// Phase 3-a-v: borrow bundle for the shared Qwen-VL ViT
     /// forward path. Mirrors `Qwen36Bringup::vision_deps`; the
     /// free fn that consumes it lives in
@@ -3743,25 +3934,36 @@ impl Qwen35Bringup {
         }
 
         let ck = arena.checkpoint();
-
-        // Prefill: walk every prompt token; KV slot = its position.
-        // Pass the per-token splice (None for plain text tokens).
-        // Phase 4-a: skip the final-norm + lm_head + argmax + DtoH
-        // on every prefill token except the last (we only need the
-        // argmax of the LAST prompt token to seed decode). For a
-        // 30-token prompt that's 29 saved lm_head GEMMs +
-        // 29 fences + 29 DtoHs.
+        let _ = splice_map; // map is only consumed by the per-token path
         let prompt_len = prompt_ids.len() as u32;
-        let last_idx = prompt_ids.len() - 1;
+
+        // Phase #1-e: env-gated layer-major batched prefill.
+        // RVLLM_QWEN35_BATCHED_PREFILL=1 → one call into the
+        // batched driver replaces the N forward_layers_only loops.
+        // Default OFF (per-token, byte-stable canary path) until
+        // this gets a runtime correctness sign-off.
+        let batched_prefill = std::env::var("RVLLM_QWEN35_BATCHED_PREFILL")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
         let mut last_predicted: u32 = 0;
-        for (p, &tok) in prompt_ids.iter().enumerate() {
-            if p < last_idx {
-                self.forward_layers_only(tok, p as u32, splice_map[p])?;
-            } else {
-                last_predicted = self.forward_all_layers_with_splice(
-                    tok, p as u32, splice_map[p])?;
-            }
+        if batched_prefill {
+            last_predicted = self.forward_qwen35_prefill_batched(
+                prompt_ids, vision_splices)?;
             arena.restore(ck);
+        } else {
+            // Per-token path (Phase 4-a). Skip lm_head on every
+            // prefill token except the last to save the GEMM +
+            // fence + DtoH cost.
+            let last_idx = prompt_ids.len() - 1;
+            for (p, &tok) in prompt_ids.iter().enumerate() {
+                if p < last_idx {
+                    self.forward_layers_only(tok, p as u32, splice_map[p])?;
+                } else {
+                    last_predicted = self.forward_all_layers_with_splice(
+                        tok, p as u32, splice_map[p])?;
+                }
+                arena.restore(ck);
+            }
         }
 
         // Decode. `last_predicted` is the prefill's lm_head argmax
