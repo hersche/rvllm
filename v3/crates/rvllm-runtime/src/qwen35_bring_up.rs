@@ -1767,6 +1767,22 @@ impl Qwen35Bringup {
         })
     }
 
+    /// Phase 3-a-iii: Qwen-VL ViT forward for Qwen 3.5.
+    ///
+    /// Thin wrapper around `crate::qwen_vision_forward::forward_qwen_vision`
+    /// — the same shared free fn that powers Qwen 3.6 vision.
+    /// Drives the 27-block ViT + PatchMerger over a single image
+    /// (PNG/JPEG/WebP) and returns the f16 embeddings ready for
+    /// splice into the text-side hidden buffer after the embed
+    /// gather (Phase 4 / Phase 3-a-vi).
+    pub fn forward_qwen_vision(
+        &self,
+        image_bytes: &[u8],
+    ) -> Result<crate::qwen36_bring_up::VisionForwardOutput> {
+        let deps = self.vision_deps()?;
+        crate::qwen_vision_forward::forward_qwen_vision(&deps, image_bytes)
+    }
+
     /// Phase 2c-C-b: linear-attn (Gated DeltaNet) forward block.
     ///
     /// Port of qwen36::apply_layer_linear_attn for the Qwen 3.5
