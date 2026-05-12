@@ -72,6 +72,20 @@ pub struct Qwen35KvCache {
     pub n_kv_heads: usize,
     pub head_dim: usize,
     pub per_layer_bytes: usize,
+    /// Persistent identity-permutation block_tables, shape
+    /// `[max_pos]` i32, value `i` at index `i`. Allocated +
+    /// filled once at bring-up. With `block_size=1` this is the
+    /// straight identity mapping the FA-2 paged kernel expects;
+    /// the only thing that changes per decode/prefill step is
+    /// `context_lens` below. Was rebuilt on the host every step
+    /// per full-attn layer (Codex review #2, 2026-05-12) —
+    /// O(T²) host work + HtoD bandwidth for nothing.
+    pub block_tables_ptr: u64,
+    /// Persistent device i32 [1] holding the current
+    /// `context_len`. Written per step from the host; the FA-2
+    /// kernel reads it. Small enough that an HtoD here costs
+    /// less than the kernel launch following it.
+    pub context_lens_ptr: u64,
 }
 
 /// Per-linear-attn-layer SSM state. Layout: one contiguous region
@@ -377,6 +391,23 @@ impl Qwen35Bringup {
                     next_full += 1;
                 }
             }
+            // Persistent identity block_tables [max_pos] i32:
+            // table[i] = i. With block_size=1 this is the straight
+            // identity mapping FA-2 paged-attn expects; per-step
+            // only `context_lens` (a single i32) needs to change.
+            let bt_bytes = kv_max_pos * 4;
+            let bt_region = arena.region(
+                "qwen35_fattn_block_tables_persistent", bt_bytes, 16)?;
+            let mut bt_host: Vec<u8> = Vec::with_capacity(bt_bytes);
+            for i in 0..(kv_max_pos as i32) {
+                bt_host.extend_from_slice(&i.to_le_bytes());
+            }
+            unsafe { bt_region.copy_from_host(&bt_host)?; }
+            let cl_region = arena.region(
+                "qwen35_fattn_context_lens_persistent", 4, 4)?;
+            // Zero-init; first step overwrites with the real value.
+            zero_region(cl_region.device_ptr(), 4)?;
+
             let kv_cache = Qwen35KvCache {
                 layers: kv_layers,
                 layer_idx_to_full_idx,
@@ -384,6 +415,8 @@ impl Qwen35Bringup {
                 n_kv_heads,
                 head_dim,
                 per_layer_bytes: per_layer_kv_bytes,
+                block_tables_ptr: bt_region.device_ptr(),
+                context_lens_ptr: cl_region.device_ptr(),
             };
             eprintln!(
                 "[qwen35] KV cache: {} full-attn layers × \
@@ -1585,26 +1618,36 @@ impl Qwen35Bringup {
         }
 
         // (8) flash_attention_2_decode_f16io: single-token decode
-        // attention against the KV cache. The cache layout is
+        // attention against the KV cache. Cache layout is
         //   [max_pos, num_kv_heads, head_dim] f16
-        // which matches the FA-2 paged-attn assumption when we treat
-        //   block_size = 1, num_blocks = max_pos,
-        //   block_tables = identity [0, 1, ..., position],
-        //   context_lens = [position+1]   (decode step at `position`)
+        // which matches FA-2's paged-attn assumption when we treat
+        //   block_size       = 1
+        //   num_blocks       = max_pos
+        //   block_tables     = identity [0..max_pos]   (PERSISTENT)
+        //   context_lens     = [position+1]            (HtoD here)
+        //
+        // The block_tables buffer is allocated + identity-filled
+        // exactly once at bring-up (see Qwen35KvCache); per step we
+        // only need to write the current `context_len` to
+        // `kv_cache.context_lens_ptr`. This kills the O(T²) host
+        // arithmetic + per-FA-layer arena alloc that was happening
+        // before (Codex review #2, 2026-05-12).
         let context_len = (position + 1) as i32;
-        let bt_bytes = (context_len as usize) * 4;
-        let bt_region = arena.region(
-            "qwen35_fattn_block_tables", bt_bytes.max(4), 16)?;
-        let cl_region = arena.region(
-            "qwen35_fattn_context_lens", 4, 16)?;
-        let mut bt_host: Vec<u8> = Vec::with_capacity(bt_bytes);
-        for i in 0..(context_len as i32) {
-            bt_host.extend_from_slice(&i.to_le_bytes());
-        }
-        let cl_bytes: [u8; 4] = context_len.to_le_bytes();
+        let bt_ptr = kv_cache.block_tables_ptr;
+        let cl_ptr = kv_cache.context_lens_ptr;
         unsafe {
-            bt_region.copy_from_host(&bt_host)?;
-            cl_region.copy_from_host(&cl_bytes)?;
+            use cudarc::driver::sys::*;
+            let bytes = context_len.to_le_bytes();
+            let rc = cuMemcpyHtoDAsync_v2(
+                cl_ptr as CUdeviceptr,
+                bytes.as_ptr() as *const _, 4,
+                stream_raw as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 fattn context_lens HtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
         }
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
         const FA2_THREADS: i32 = 128;
@@ -1631,14 +1674,17 @@ impl Qwen35Bringup {
             let mut query = scr.q_out_ptr;
             let mut key_cache = layer_kv.k_ptr;
             let mut value_cache = layer_kv.v_ptr;
-            let mut block_tables = bt_region.device_ptr();
-            let mut context_lens = cl_region.device_ptr();
+            let mut block_tables = bt_ptr;
+            let mut context_lens = cl_ptr;
             let mut scale_arg = scale;
             let mut nh = n_q_heads;
             let mut nkvh = n_kv_heads;
             let mut hd = head_dim;
             let mut bs: i32 = 1;
-            let mut mbps: i32 = context_len;
+            // mbps = the number of identity slots the kernel may
+            // walk per seq. The block_tables buffer has max_pos
+            // entries; safe upper bound regardless of position.
+            let mut mbps: i32 = kv_cache.max_pos as i32;
             let mut window: i32 = -1;
             let args = [
                 (&mut output) as *mut u64 as *mut core::ffi::c_void,
