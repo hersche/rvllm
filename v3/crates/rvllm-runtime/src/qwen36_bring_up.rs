@@ -8053,59 +8053,54 @@ impl Qwen36Bringup {
         }
 
         // Phase 3c-pad (Codex review #4-B): CUTLASS-with-M-pad
-        // for 2 ≤ m < 128. Gated off behind
-        // `RVLLM_QWEN36_FP8_PAD_DEBUG=1` for further debugging.
+        // for 2 ≤ m < 128. **ABANDONED** — kept gated off
+        // for archival reference; the path is structurally
+        // unsuitable for sm_121 + this checkpoint, not a fixable
+        // bug. Toggle `RVLLM_QWEN36_FP8_PAD_DEBUG=1` to enable
+        // and `RVLLM_QWEN36_FP8_PAD_DIFF=1` to log per-row diff
+        // stats vs the looped-GEMV reference (used during the
+        // 2026-05-13 root-cause pass).
         //
-        // Status after three debug passes:
+        // Root cause (confirmed by side-by-side diff):
         //
-        //   1) Zero-pad rows m..127  → wrong output
-        //      ("Königslutter am Elm" on ball.png).
-        //   2) Replicate row 0       → same wrong output.
-        //   3) Pad-debug env-gate + diverse-input bisect
-        //      (2026-05-13):
-        //        Qwen 3.6 / plain text 24-tok "Zähle von 1 bis 5"
-        //          → "1, 2, 3, 4, 5." (CORRECT)
-        //        Qwen 3.6 / vision 83-tok ball.png
-        //          → "Königslutter am Elm …" (still WRONG)
+        // `Fp8GemvF16InLaunch` (production sm_121 path) reads
+        // **f16 activation × fp8 weight** — no activation
+        // quantization. The CUTLASS SM120 blockwise FP8 GEMM
+        // does **fp8 act × fp8 weight** after a per-token amax
+        // quantize — additional per-row quantization noise.
         //
-        // Crucial new finding: the CUTLASS-pad path produces
-        // **correct** output for plain-text prefill at M < 128
-        // but wrong output for vision prefill at the same path.
-        // Both runs are the same dispatcher with the same
-        // padding strategy; only the row contents differ.
+        // Measured diff at the first M<128 dispatch (m=5,
+        // n=8192, k=2048) on a vision request:
+        //   overall_max  = 0.25
+        //   mean_per_row = 0.155
+        // On a layer output of magnitude ~2 that's 10–15%
+        // relative error per element. The model is robust to
+        // this noise on plain text (greedy decode survives
+        // small perturbations) but vision-spliced inputs
+        // drift semantically — ball.png deterministically
+        // hallucinated "Königslutter am Elm".
         //
-        // The earlier "per-row vs per-chunk scale" hypothesis
-        // was incorrect — reading
-        // kernels/cutlass_fp8_gemm_blockscale_sm120.cu shows
-        // `prep_sfa` is a straight per-row copy
-        // (`sfa[row + k_block * m] = a_scale[row]`) with no
-        // reduction, and `SFVecSizeM=1` is genuinely per-row.
-        // Plain text working through the same code path
-        // confirms the per-row math is consistent.
+        // The m≥128 native path on sm_121 has the SAME
+        // numerics — but `BLOCKWISE_STATE` caches `NoAlgo`
+        // after the first call (cuBLASLt has no kernel for
+        // sm_121) so m≥128 also falls through to looped
+        // GEMV in production. The CUTLASS SM120 .so is built
+        // and present, just never invoked on sm_121 — the f16
+        // activation path is the production reference for
+        // every M on this arch.
         //
-        // Likely cause is content-dependent: ViT splice rows
-        // have amax magnitudes very different from surrounding
-        // text rows, which probably hits an FP8 dynamic-range
-        // edge case inside the SM120 GEMM that plain-text
-        // amaxes don't exercise. Next debug pass wants to
-        // instrument: dump pad_out[0..16] vs the looped-GEMV
-        // reference on the SAME inputs at the first
-        // dispatch where M < 128, capture per-row amax
-        // distribution, and compare. Possible fixes once the
-        // mechanism is pinned:
+        // Right fix: the row-batched FP8 GEMV (Codex #4-B
+        // alternative — already shipped at commit 31131b1).
+        // Preserves f16 activation precision, batches the
+        // launch overhead across the row dimension, and is
+        // numerically identical to the m=1 reference on
+        // EVERY input.
         //
-        //   * Cap per-row amax to a layer-wide envelope so
-        //     ViT rows don't dominate fp8 dynamic range.
-        //   * Quantize ViT splice rows separately + project
-        //     them through a different scale (heavy).
-        //   * Write the row-batched FP8 GEMV alt path
-        //     (already shipped in #4-B as the production
-        //     fallback) and stop trying to make CUTLASS-pad
-        //     work — same launch-overhead win, no
-        //     content-dependence.
-        //
-        // Production stays on the Codex #4-A capability-cached
-        // → row-batched GEMV path (#4-B alt that works).
+        // The CUTLASS-pad scaffold + DIFF instrumentation
+        // stay in tree so a future GB10 driver release that
+        // adds a true cuBLASLt sm_121 blockwise kernel (or a
+        // CUTLASS path that preserves f16 activations) can
+        // re-evaluate quickly.
         let pad_debug = std::env::var("RVLLM_QWEN36_FP8_PAD_DEBUG")
             .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
         #[cfg(feature = "cuda")]
@@ -8218,6 +8213,105 @@ impl Qwen36Bringup {
                         PAD_M as i32, n as i32, k as i32,
                         ws.device_ptr(), ws_n, stream,
                     )?;
+                }
+                // Optional diff instrumentation: RVLLM_QWEN36_FP8_PAD_DIFF=1
+                // runs the looped-GEMV reference on the same input
+                // and compares pad_out[0..M] against ref_out[0..M],
+                // dumping per-row max-abs-diff + a few row samples
+                // to the journal. Fires only on the first M < 128
+                // dispatch per process so it doesn't flood logs.
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static DIFF_DONE: AtomicBool = AtomicBool::new(false);
+                let diff_on = std::env::var("RVLLM_QWEN36_FP8_PAD_DIFF")
+                    .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+                if diff_on && !DIFF_DONE.swap(true, Ordering::Relaxed) {
+                    let ref_bytes = (m as usize) * (n as usize) * 2;
+                    let ref_region = self.arena.region(
+                        "qwen36_proj_pad_ref", ref_bytes, 16)?;
+                    rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                        m, n, k,
+                    }.launch(
+                        kernel_gemv,
+                        ref_region.device_ptr(),
+                        weight_fp8,
+                        b_blockscale,
+                        input_f16,
+                        stream,
+                    )?;
+                    self.stream.fence()?;
+                    let mut pad_host = vec![0u16; (m as usize) * (n as usize)];
+                    let mut ref_host = vec![0u16; (m as usize) * (n as usize)];
+                    use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(
+                        pad_host.as_mut_ptr() as *mut _,
+                        pad_out.device_ptr(), ref_bytes);
+                    let _ = cuMemcpyDtoH_v2(
+                        ref_host.as_mut_ptr() as *mut _,
+                        ref_region.device_ptr(), ref_bytes);
+                    let f16_to_f32 = |x: u16| -> f32 {
+                        let sign = ((x >> 15) & 1) as u32;
+                        let exp  = ((x >> 10) & 0x1f) as i32;
+                        let mant = (x & 0x3ff) as u32;
+                        if exp == 0 {
+                            if mant == 0 { return if sign == 1 { -0.0 } else { 0.0 }; }
+                            // subnormal
+                            let f = mant as f32 / 1024.0;
+                            return (if sign == 1 { -1.0 } else { 1.0 }) * f * (2.0f32).powi(-14);
+                        }
+                        if exp == 0x1f {
+                            return if mant == 0 {
+                                if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY }
+                            } else { f32::NAN };
+                        }
+                        let f = 1.0 + (mant as f32 / 1024.0);
+                        (if sign == 1 { -1.0 } else { 1.0 }) * f * (2.0f32).powi(exp - 15)
+                    };
+                    let mut max_per_row: Vec<f32> = Vec::with_capacity(m as usize);
+                    for r in 0..(m as usize) {
+                        let mut max_abs = 0.0f32;
+                        for c in 0..(n as usize) {
+                            let p = f16_to_f32(pad_host[r * (n as usize) + c]);
+                            let q = f16_to_f32(ref_host[r * (n as usize) + c]);
+                            let d = (p - q).abs();
+                            if d > max_abs { max_abs = d; }
+                        }
+                        max_per_row.push(max_abs);
+                    }
+                    let overall_max = max_per_row.iter().fold(0.0f32, |a, &b| a.max(b));
+                    let mean_per_row: f32 = max_per_row.iter().sum::<f32>() / (m as f32);
+                    tracing::warn!(
+                        m, n, k, overall_max, mean_per_row,
+                        "fp8_proj_pad_diff: first M<128 dispatch, per-row max-abs-diff stats"
+                    );
+                    // Sample dump: rows 0, m-1, plus rows with the
+                    // largest diffs so we can see whether the bad
+                    // rows cluster.
+                    let mut ranked: Vec<(usize, f32)> = max_per_row.iter()
+                        .copied().enumerate().collect();
+                    ranked.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
+                    let worst_rows: Vec<usize> = ranked.iter().take(4).map(|&(r,_)| r).collect();
+                    let dump_rows: Vec<usize> = {
+                        let mut v: Vec<usize> = vec![0, (m as usize)-1];
+                        for r in worst_rows { if !v.contains(&r) { v.push(r); } }
+                        v
+                    };
+                    for r in dump_rows {
+                        let p0 = f16_to_f32(pad_host[r * (n as usize) + 0]);
+                        let p1 = f16_to_f32(pad_host[r * (n as usize) + 1]);
+                        let p2 = f16_to_f32(pad_host[r * (n as usize) + 2]);
+                        let p3 = f16_to_f32(pad_host[r * (n as usize) + 3]);
+                        let q0 = f16_to_f32(ref_host[r * (n as usize) + 0]);
+                        let q1 = f16_to_f32(ref_host[r * (n as usize) + 1]);
+                        let q2 = f16_to_f32(ref_host[r * (n as usize) + 2]);
+                        let q3 = f16_to_f32(ref_host[r * (n as usize) + 3]);
+                        let max_abs = max_per_row[r];
+                        tracing::warn!(
+                            row = r, max_abs,
+                            pad_first4 = format!("[{:.4} {:.4} {:.4} {:.4}]", p0,p1,p2,p3),
+                            ref_first4 = format!("[{:.4} {:.4} {:.4} {:.4}]", q0,q1,q2,q3),
+                            "fp8_proj_pad_diff: row sample"
+                        );
+                    }
                 }
                 // DtoD the first M rows of pad_out into out_f16.
                 unsafe {
