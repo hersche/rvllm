@@ -185,10 +185,22 @@ pub async fn spawn_cuda_worker(
                                       vision_outputs[s.vision_item_idx].data.as_slice()))
                             .collect();
 
+                        let stop_ids: std::collections::HashSet<u32> =
+                            req.stop_token_ids.iter().copied().collect();
+                        let stopped_on_eos = std::cell::Cell::new(false);
                         let result = unsafe {
                             bringup.generate_session_with_vision(
                                 &prompt_ids, max_new, &splices,
                                 |tok_id, pos| {
+                                    // EOS check: if this token is a
+                                    // stop token, emit nothing and
+                                    // signal short-circuit. The Done
+                                    // event below will carry
+                                    // FinishReason::Stop.
+                                    if stop_ids.contains(&tok_id) {
+                                        stopped_on_eos.set(true);
+                                        return false;
+                                    }
                                     events_tx.send(GenerateEvent::Token {
                                         id: tok_id, position: pos,
                                     }).is_ok()
@@ -197,9 +209,23 @@ pub async fn spawn_cuda_worker(
                         };
                         match result {
                             Ok(emitted) => {
+                                let finish = if stopped_on_eos.get() {
+                                    FinishReason::Stop
+                                } else {
+                                    FinishReason::Length
+                                };
+                                // When stop_on_eos fires the loop
+                                // counts the EOS slot toward emitted
+                                // but doesn't actually send it as a
+                                // Token event — subtract it so the
+                                // usage/completion_tokens matches the
+                                // events the client received.
+                                let user_emitted = if stopped_on_eos.get() {
+                                    emitted.saturating_sub(1)
+                                } else { emitted };
                                 let _ = req.events_tx.send(GenerateEvent::Done {
-                                    finish: FinishReason::Length,
-                                    completion_tokens: emitted,
+                                    finish,
+                                    completion_tokens: user_emitted,
                                     prompt_tokens: prompt_len,
                                 });
                             }

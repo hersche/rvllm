@@ -2740,21 +2740,38 @@ impl Qwen35Bringup {
             arena.restore(ck);
         }
 
-        // Decode: feed `last_predicted` at position = prompt_len,
-        // then its successor at prompt_len+1, etc. No splice on
-        // decode — generated tokens are text-only.
+        // Decode. `last_predicted` is the prefill's lm_head argmax
+        // at position N-1 — i.e. the first generated token at
+        // absolute position prompt_len. Emit it FIRST, then feed it
+        // back at position prompt_len to produce the SECOND token,
+        // and so on.
+        //
+        // The previous version was off-by-one: it ran one full
+        // forward step before any emission, so the first answer
+        // token (which the prefill had already computed for free)
+        // was thrown away and the user saw the second answer token
+        // first. That bug was visible as "Bild zeigt …" instead of
+        // "Das Bild zeigt …" on Qwen 3.5 27B dense (2026-05-12).
+        let mut current = last_predicted;
         let mut emitted: u32 = 0;
         for step in 0..max_new_tokens {
             let pos = prompt_len + step;
-            let tok = last_predicted;
-            let predicted = self.forward_all_layers_smoke(tok, pos)?;
-            arena.restore(ck);
-            let cont = on_token(predicted, pos + 1);
-            emitted += 1;
-            last_predicted = predicted;
-            if !cont {
+            // Emit `current` (the token at position `pos`). The
+            // callback returns `false` to request a short-circuit
+            // (EOS, cancellation, etc.).
+            if !on_token(current, pos) {
+                emitted += 1;
                 break;
             }
+            emitted += 1;
+            if emitted >= max_new_tokens {
+                break;
+            }
+            // Compute next: feed `current` at `pos`, lm_head's
+            // argmax of position `pos` predicts the token at
+            // position `pos + 1`.
+            current = self.forward_all_layers_smoke(current, pos)?;
+            arena.restore(ck);
         }
         Ok(emitted)
     }
