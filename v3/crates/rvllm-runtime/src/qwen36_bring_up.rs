@@ -8255,27 +8255,27 @@ impl Qwen36Bringup {
         use std::sync::atomic::{AtomicI8, Ordering};
         static BLOCKWISE_STATE: AtomicI8 = AtomicI8::new(0);
         let state = BLOCKWISE_STATE.load(Ordering::Relaxed);
-        let run_looped_gemv = || -> Result<()> {
-            let row_bytes_in = (k as u64) * 2;
-            let row_bytes_out = (n as u64) * 2;
-            for row in 0..(m as u64) {
-                let row_in = input_f16 + row * row_bytes_in;
-                let row_out = out_f16 + row * row_bytes_out;
-                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m: 1, n, k }.launch(
-                    kernel_gemv,
-                    row_out,
-                    weight_fp8,
-                    b_blockscale,
-                    row_in,
-                    stream,
-                )?;
-            }
-            Ok(())
+        // Codex review #4-B (alternative): row-batched FP8 GEMV.
+        // The fp8_gemv kernel itself already supports M-batching
+        // via grid.y; the per-row launch loop was just not using
+        // it. One launch at m=M does the same work as M launches
+        // at m=1, with ~M× lower CPU/driver overhead. Math is
+        // byte-identical — each warp owns the same (m, n) pair
+        // it would in the per-row case.
+        let run_batched_gemv = || -> Result<()> {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n, k }.launch(
+                kernel_gemv,
+                out_f16,
+                weight_fp8,
+                b_blockscale,
+                input_f16,
+                stream,
+            )
         };
         if state == 1 {
             // Cached NoAlgo (sm_121 today). Skip quantise + cuBLASLt
             // try, go straight to looped GEMV.
-            return run_looped_gemv();
+            return run_batched_gemv();
         }
         // state == 0 (Unknown, first call) OR state == 2 (HasAlgo).
         // Both still need the quantised input + a cuBLASLt try.
@@ -8353,7 +8353,7 @@ impl Qwen36Bringup {
                          path for 2 ≤ M < 128 is the next slice."
                     );
                 }
-                run_looped_gemv()
+                run_batched_gemv()
             }
         }
         // Non-cuda build: the entire m≥2 path was cfg-gated out; we
