@@ -288,7 +288,6 @@ pub fn forward_qwen_vision(
         ));
     }
     }
-    deps.stream.fence()?;
 
     // Stage dump: post pos_embed (before any block).
     if let Ok(path) = std::env::var("RVLLM_QWEN36_VIT_POSEMB_DUMP") {
@@ -436,7 +435,6 @@ pub fn forward_qwen_vision(
             ));
         }
         }
-        deps.stream.fence()?;
 
         // Block 0 dump: norm1 output (= input to QKV proj).
         if blk_idx == 0 {
@@ -490,7 +488,6 @@ pub fn forward_qwen_vision(
                 );
             }
         }
-        deps.stream.fence()?;
 
         // ─ Apply 2D rotary to Q, K. ─
         for &qk_ptr in &[q_buf.device_ptr(), k_buf.device_ptr()] {
@@ -528,7 +525,6 @@ pub fn forward_qwen_vision(
             }
             }
         }
-        deps.stream.fence()?;
 
         // Block 0: dump Q + K post-rotary (full [N, hidden] f16).
         if blk_idx == 0 {
@@ -642,7 +638,6 @@ pub fn forward_qwen_vision(
             extract_head(q_h.device_ptr(), q_buf.device_ptr(), h)?;
             extract_head(k_h.device_ptr(), k_buf.device_ptr(), h)?;
             extract_head(v_h.device_ptr(), v_buf.device_ptr(), h)?;
-            deps.stream.fence()?;
 
             // QK^T: [N, head_dim] @ [N, head_dim]^T → [N, N] f32 → cast f16
             // Use cuBLASLt f16_gemm_f32 with N=N, M=N, K=head_dim.
@@ -686,7 +681,6 @@ pub fn forward_qwen_vision(
                 ));
             }
             }
-            deps.stream.fence()?;
 
             // Apply the standard 1/sqrt(head_dim) attention scale
             // to the f16 scores in place before softmax. (Without
@@ -722,7 +716,6 @@ pub fn forward_qwen_vision(
                 ));
             }
             }
-            deps.stream.fence()?;
 
             // Softmax row-wise on scores [N, N]
             #[cfg(feature = "cuda")]
@@ -751,7 +744,6 @@ pub fn forward_qwen_vision(
                 ));
             }
             }
-            deps.stream.fence()?;
 
             // scores @ V: [N, N] @ [N, head_dim] → [N, head_dim].
             // f16_gemm_f32 always computes input @ weight^T, so we
@@ -788,7 +780,6 @@ pub fn forward_qwen_vision(
                 ));
             }
             }
-            deps.stream.fence()?;
             #[cfg(feature = "cuda")]
             unsafe {
                 deps.cublaslt.f16_gemm_f32(
@@ -826,11 +817,9 @@ pub fn forward_qwen_vision(
                 ));
             }
             }
-            deps.stream.fence()?;
 
             // Scatter out_h back into attn_out at offset h*head_dim per row.
             scatter_head(attn_out.device_ptr(), out_h.device_ptr(), h)?;
-            deps.stream.fence()?;
         }
 
         // ─ O proj + residual: hidden += proj(attn_out). ─
@@ -889,7 +878,6 @@ pub fn forward_qwen_vision(
                 ));
             }
         }
-        deps.stream.fence()?;
 
         // Block 0 dump: after attention residual (= input + attn_out).
         if blk_idx == 0 {
@@ -945,7 +933,6 @@ pub fn forward_qwen_vision(
             ));
         }
         }
-        deps.stream.fence()?;
 
         // ─ MLP: fc1 → GELU → fc2 ─
         linear_with_bias(
@@ -984,7 +971,6 @@ pub fn forward_qwen_vision(
             ));
         }
         }
-        deps.stream.fence()?;
         let mlp_out = deps.arena.region("qvis_mlp_out", n_tokens * hidden * 2, 16)?;
         linear_with_bias(
             mlp_buf.device_ptr(),
@@ -1025,7 +1011,6 @@ pub fn forward_qwen_vision(
                 ));
             }
         }
-        deps.stream.fence()?;
 
         // Block 0 sub-step dump (post-attn-residual, post-mlp-residual).
         if blk_idx == 0 {
@@ -1108,7 +1093,6 @@ pub fn forward_qwen_vision(
         ));
     }
     }
-    deps.stream.fence()?;
 
     // (b) Spatial merge: every 4 spatial-neighbour tokens concat
     // into one row of width merger_in=4608. Token order from
@@ -1131,7 +1115,6 @@ pub fn forward_qwen_vision(
             }
         }
     }
-    deps.stream.fence()?;
 
     // (c) merger.linear_fc1 → GELU → linear_fc2.
     let merged_out_fc1 = deps.arena.region("qvis_mfc1", n_merged * merger_in * 2, 16)?;
@@ -1171,7 +1154,6 @@ pub fn forward_qwen_vision(
         ));
     }
     }
-    deps.stream.fence()?;
     let final_region = deps.arena.region("qvis_final", n_merged * out_hidden * 2, 16)?;
     linear_with_bias(
         merged_out_fc1.device_ptr(),
