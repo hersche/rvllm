@@ -657,21 +657,54 @@ pub fn forward_qwen_vision(
                     ));
                 }
             }
-            // (3) softmax_row_f32_to_f16 → scores_buf_all [H, N, N]
-            //     grid = N×H rows of length N each.
+            // (3a) cast scores f32 → f16 (out-of-place) so step (3b)
+            //      can use the same `softmax_row_f16` the per-head
+            //      fallback uses. Matching softmax precision exactly
+            //      is a defensive choice: the f32→f16 fused softmax
+            //      diverged at N=1024 and the f16 in-place softmax
+            //      was the validated path until this rewrite. 1 extra
+            //      launch vs the fused variant; cheap relative to
+            //      the GEMMs.
             unsafe {
                 use cudarc::driver::sys::*;
+                let n_elem = (num_heads * n_tokens * n_tokens) as i32;
                 let mut out = scores_buf_all.device_ptr();
                 let mut input = scores_f32_all.device_ptr();
-                let mut sl = n_tokens as i32;
+                let mut nn = n_elem;
                 let args = [
                     (&mut out) as *mut u64 as *mut core::ffi::c_void,
                     (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+                let rc = cuLaunchKernel(
+                    deps.fn_cast_f32_to_f16.raw() as CUfunction,
+                    grid.0, grid.1, grid.2, block, 1, 1,
+                    0, deps.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen-vit batched cast_f32_to_f16 (scores) launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            // (3b) softmax_row_f16 in place over H×N rows of length N.
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut x = scores_buf_all.device_ptr();
+                let mut sl = n_tokens as i32;
+                let args = [
+                    (&mut x) as *mut u64 as *mut core::ffi::c_void,
                     (&mut sl) as *mut i32 as *mut core::ffi::c_void,
                 ];
                 let block: u32 = (n_tokens as u32).min(1024);
                 let rc = cuLaunchKernel(
-                    deps.fn_softmax_row_f32_to_f16.raw() as CUfunction,
+                    deps.fn_softmax_row_f16.raw() as CUfunction,
                     (n_tokens * num_heads) as u32, 1, 1,
                     block, 1, 1,
                     0, deps.stream.raw() as CUstream,
@@ -680,7 +713,7 @@ pub fn forward_qwen_vision(
                 );
                 if rc != CUresult::CUDA_SUCCESS {
                     return Err(rvllm_core::RvllmError::cuda(
-                        "qwen-vit batched softmax_row_f32_to_f16 launch",
+                        "qwen-vit batched softmax_row_f16 launch",
                         rvllm_core::CudaErrorKind::LaunchFailed,
                         rvllm_core::CudaCtx::setup(),
                     ));
