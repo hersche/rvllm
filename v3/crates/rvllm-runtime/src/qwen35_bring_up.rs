@@ -2379,6 +2379,22 @@ impl Qwen35Bringup {
     pub unsafe fn forward_all_layers_smoke(
         &self, token_id: u32, position: u32,
     ) -> Result<u32> {
+        self.forward_all_layers_with_splice(token_id, position, None)
+    }
+
+    /// Phase 3-b: same as `forward_all_layers_smoke` but when
+    /// `splice_h_residual = Some(bytes)`, the post-embed
+    /// h_residual is overwritten with the supplied `[hidden] f16`
+    /// row instead of looking up `embed_tokens[token_id]`. Used
+    /// for vision splice — `bytes.len()` must equal
+    /// `hidden_size * 2` (one row of the vision-tower output).
+    /// `token_id` is still honoured (HtoD'd) so the linear-attn
+    /// state evolves the same way it would for a non-vision
+    /// step; it just isn't read by the embedding gather.
+    pub unsafe fn forward_all_layers_with_splice(
+        &self, token_id: u32, position: u32,
+        splice_h_residual: Option<&[u8]>,
+    ) -> Result<u32> {
         let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
             "forward_all_layers_smoke: scratch absent".into()))?;
@@ -2427,6 +2443,35 @@ impl Qwen35Bringup {
             scr.token_in_ptr,
             stream_raw,
         )?;
+
+        // (1b) Vision splice: if the caller supplied a pre-computed
+        // h_residual row (Qwen3-VL ViT output for an image token),
+        // overwrite the text-embed result with it. The HtoD above
+        // still ran so the token_id is consistent with anything
+        // that reads `token_in` downstream, but the layer chain
+        // sees the vision row.
+        if let Some(bytes) = splice_h_residual {
+            let want = (hidden as usize) * 2;
+            if bytes.len() != want {
+                return Err(corrupt(
+                    self.paths.model_dir.clone(),
+                    format!("forward_all_layers_with_splice: splice has \
+                             {} bytes but expected {} (hidden*2)",
+                            bytes.len(), want),
+                ));
+            }
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyHtoDAsync_v2(
+                scr.h_residual_ptr as CUdeviceptr,
+                bytes.as_ptr() as *const _, want,
+                stream_raw as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 splice HtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
 
         // (2) Per-layer dispatch: attention block then dense MLP.
         for (li, ty) in arch.base.layer_types.iter().enumerate() {
@@ -2535,6 +2580,27 @@ impl Qwen35Bringup {
         &self,
         prompt_ids: &[u32],
         max_new_tokens: u32,
+        on_token: impl FnMut(u32, u32) -> bool,
+    ) -> Result<u32> {
+        self.generate_session_with_vision(prompt_ids, max_new_tokens, &[], on_token)
+    }
+
+    /// Phase 3-b: same as `generate_session` but accepts vision
+    /// splice tuples `[(token_start, &[u8])]`. Each tuple's bytes
+    /// are `[num_rows, hidden] f16` — i.e. one row per spliced
+    /// prompt position. The function builds a per-prompt-token
+    /// splice map up-front and routes each prefill step through
+    /// `forward_all_layers_with_splice`. The splice does NOT
+    /// affect decode steps; only prefill positions in
+    /// `[token_start, token_start + num_rows)` see vision rows.
+    ///
+    /// Hidden-row size = `arch.base.hidden_size * 2` bytes.
+    /// `data.len() % row_bytes == 0` is asserted at every tuple.
+    pub unsafe fn generate_session_with_vision<'a>(
+        &self,
+        prompt_ids: &[u32],
+        max_new_tokens: u32,
+        vision_splices: &'a [(usize, &'a [u8])],
         mut on_token: impl FnMut(u32, u32) -> bool,
     ) -> Result<u32> {
         if prompt_ids.is_empty() {
@@ -2543,20 +2609,49 @@ impl Qwen35Bringup {
         let arena = self.arena.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
             "generate_session: arena absent".into()))?;
+        let row_bytes = (self.arch.base.hidden_size) * 2;
+
+        // Build per-prompt-token splice map.
+        let mut splice_map: Vec<Option<&[u8]>> = vec![None; prompt_ids.len()];
+        for (start, data) in vision_splices {
+            if data.len() % row_bytes != 0 {
+                return Err(corrupt(
+                    self.paths.model_dir.clone(),
+                    format!("generate_session: vision splice at token_start={start} \
+                             has {} bytes, not a multiple of row_bytes={row_bytes}",
+                            data.len()),
+                ));
+            }
+            let n_rows = data.len() / row_bytes;
+            for k in 0..n_rows {
+                let idx = start + k;
+                if idx >= prompt_ids.len() {
+                    return Err(corrupt(
+                        self.paths.model_dir.clone(),
+                        format!("generate_session: vision splice row {idx} \
+                                 (start={start}+{k}) past prompt_len={}",
+                                prompt_ids.len()),
+                    ));
+                }
+                splice_map[idx] = Some(&data[k * row_bytes .. (k + 1) * row_bytes]);
+            }
+        }
+
         let ck = arena.checkpoint();
 
         // Prefill: walk every prompt token; KV slot = its position.
+        // Pass the per-token splice (None for plain text tokens).
         let prompt_len = prompt_ids.len() as u32;
         let mut last_predicted: u32 = 0;
         for (p, &tok) in prompt_ids.iter().enumerate() {
-            last_predicted = self.forward_all_layers_smoke(tok, p as u32)?;
-            // Free this step's scratch; persistent state above ck
-            // is not touched.
+            last_predicted = self.forward_all_layers_with_splice(
+                tok, p as u32, splice_map[p])?;
             arena.restore(ck);
         }
 
         // Decode: feed `last_predicted` at position = prompt_len,
-        // then its successor at prompt_len+1, etc.
+        // then its successor at prompt_len+1, etc. No splice on
+        // decode — generated tokens are text-only.
         let mut emitted: u32 = 0;
         for step in 0..max_new_tokens {
             let pos = prompt_len + step;

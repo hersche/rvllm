@@ -125,7 +125,12 @@ pub fn forward_qwen_vision(
     let merge: usize = 2;
     let merge_sq = merge * merge;
     let merger_in: usize = hidden * merge_sq; // 4608
-    let out_hidden: usize = 2048;
+    // Phase 3-a-vii: out_hidden is now data-driven from the
+    // merger's fc2 weight row count, so Qwen 3.5 (out=5120) and
+    // Qwen 3.6 (out=2048) share the same forward fn without a
+    // family-specific branch. The fc2 weight is shape
+    // [out_hidden, merger_in].
+    let out_hidden: usize = vision.merger.fc2_w.shape[0];
     let n_merged = n_tokens / merge_sq;
 
     // ── Step 2: upload patches as f16. ──────────────────────────

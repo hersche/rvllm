@@ -169,8 +169,14 @@ async fn main() -> anyhow_compat::Result<()> {
                 .unwrap_or(false)
         }
         ModelFamily::Auto | ModelFamily::Qwen36 | ModelFamily::Gemma4 => true,
-        // Qwen 3.5 Phase 0: vision tower not yet loaded.
-        ModelFamily::Qwen35 => false,
+        // Phase 3-a-vi: Qwen 3.5 now loads the Qwen3-VL ViT
+        // (qwen35_load::load_qwen35_vision) and drives it via
+        // Qwen35Bringup::forward_qwen_vision against the shared
+        // qwen_vision_forward free fn. The dispatch wiring in
+        // cuda_worker (Phase 3-b) lands separately; admission now
+        // accepts image-bearing requests so we don't 400 before
+        // the bring-up gets to fail loudly if anything regresses.
+        ModelFamily::Qwen35 => true,
     };
     let state = AppState {
         config: config.clone(), tokenizer, worker, started_at,

@@ -138,9 +138,56 @@ pub async fn spawn_cuda_worker(
                         let max_new = req.max_new_tokens.max(1);
                         let prompt_len = prompt_ids.len() as u32;
                         let events_tx = req.events_tx.clone();
+
+                        // Phase 3-b: vision pre-pass. Decode each
+                        // image once through the Qwen3-VL ViT and
+                        // accumulate (token_start, vision_bytes)
+                        // tuples for the splice into prefill.
+                        // Mirrors the Qwen 3.6 path below.
+                        let mut vision_outputs: Vec<
+                            rvllm_runtime::qwen36_bring_up::VisionForwardOutput,
+                        > = Vec::with_capacity(req.vision_items.len());
+                        let mut vision_failed = false;
+                        for (i, item) in req.vision_items.iter().enumerate() {
+                            match bringup.forward_qwen_vision(&item.bytes) {
+                                Ok(out) => {
+                                    if out.num_tokens != item.num_tokens {
+                                        let _ = req.events_tx.send(GenerateEvent::Error(
+                                            format!("qwen35 vision: tokens mismatch \
+                                                     (predicted {} got {})",
+                                                    item.num_tokens, out.num_tokens),
+                                        ));
+                                        vision_failed = true;
+                                        break;
+                                    }
+                                    tracing::info!(
+                                        idx = i, tokens = out.num_tokens,
+                                        hidden = out.hidden_dim,
+                                        "qwen35 vision: ViT forward done"
+                                    );
+                                    vision_outputs.push(out);
+                                }
+                                Err(e) => {
+                                    let _ = req.events_tx.send(GenerateEvent::Error(
+                                        format!("qwen35 vision forward: {e:?}"),
+                                    ));
+                                    vision_failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if vision_failed {
+                            continue;
+                        }
+                        let splices: Vec<(usize, &[u8])> = req.vision_slots
+                            .iter()
+                            .map(|s| (s.token_start,
+                                      vision_outputs[s.vision_item_idx].data.as_slice()))
+                            .collect();
+
                         let result = unsafe {
-                            bringup.generate_session(
-                                &prompt_ids, max_new,
+                            bringup.generate_session_with_vision(
+                                &prompt_ids, max_new, &splices,
                                 |tok_id, pos| {
                                     events_tx.send(GenerateEvent::Token {
                                         id: tok_id, position: pos,
