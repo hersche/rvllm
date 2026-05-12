@@ -3859,6 +3859,41 @@ impl Qwen36Bringup {
     ///
     /// Output layout: `[num_merged_tokens, 2048]` f16 (out_hidden_size
     /// == text hidden_size for Qwen 3.6).
+    ///
+    /// Phase 3-a-ii (planned) will move the body into a free fn in
+    /// `crate::qwen_vision_forward` that operates on the borrow
+    /// bundle returned by `vision_deps()`, so the Qwen 3.5 bringup
+    /// can drive the same forward chain without duplicating ~1100
+    /// LOC. The bundle exists already; nothing currently consumes
+    /// it.
+    pub fn vision_deps(&self) -> Result<crate::qwen_vision_forward::QwenVisionDeps<'_>> {
+        let vision = self.model.vision.as_ref().ok_or_else(|| {
+            rvllm_core::RvllmError::cuda(
+                "vision_deps: model.vision not loaded",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+        Ok(crate::qwen_vision_forward::QwenVisionDeps {
+            vision,
+            arena: &self.arena,
+            stream: &self.stream,
+            cublaslt: &self.cublaslt,
+            fn_layernorm_inplace_f16: self.outside_kernels.fn_layernorm_inplace_f16,
+            fn_gelu_tanh_f16: self.outside_kernels.fn_gelu_tanh_f16,
+            fn_softmax_row_f16: self.outside_kernels.fn_softmax_row_f16,
+            fn_vit_rotary_2d_f16: self.outside_kernels.fn_vit_rotary_2d_f16,
+            fn_vit_pos_embed_interp_f16: self.outside_kernels.fn_vit_pos_embed_interp_f16,
+            fn_scale_inplace_f16: self.outside_kernels.fn_scale_inplace_f16,
+            fn_transpose_2d_f16: self.outside_kernels.fn_transpose_2d_f16,
+            fn_add_bias_f16: self.outside_kernels.fn_add_bias_f16,
+            fn_cast_f32_to_f16: self.outside_kernels.fn_cast_f32_to_f16,
+            fn_extract_head_f16: self.outside_kernels.fn_extract_head_f16,
+            fn_scatter_head_f16: self.outside_kernels.fn_scatter_head_f16,
+            fn_vector_add_f16: self.outside_kernels.fn_vector_add_f16,
+        })
+    }
+
     pub fn forward_qwen_vision(
         &self,
         image_bytes: &[u8],

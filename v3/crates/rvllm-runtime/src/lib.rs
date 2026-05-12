@@ -83,6 +83,7 @@ pub mod mistral35_pixtral_rope;
 pub mod mistral35_yarn;
 pub mod qwen36_bring_up;
 pub mod qwen36_layer_exec;
+pub mod qwen_vision_forward;
 pub mod qwen36_load;
 pub mod sched_state;
 pub mod vision_preprocess;
