@@ -209,7 +209,13 @@ pub fn forward_qwen_vision(
             ));
         }
         }
-        deps.stream.fence()?;
+        // Phase-perf 1: no trailing fence. linear_with_bias is
+        // called ~108×/forward (27 ViT blocks × 4 sites: QKV, proj,
+        // fc1, fc2, plus 3 calls outside the loop). All call sites
+        // either chain into the next stream-ordered device launch
+        // or terminate at a synchronous cuMemcpyDtoH_v2 (which
+        // carries its own implicit sync). The previous fence was
+        // pure pipeline-drain overhead.
         Ok(())
     };
 
