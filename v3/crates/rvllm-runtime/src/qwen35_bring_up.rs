@@ -3017,6 +3017,190 @@ impl Qwen35Bringup {
         }
         Ok(())
     }
+
+    /// Phase-#1 building block: batched dense MLP over N tokens.
+    ///
+    /// Runs the same 5-op chain as `apply_dense_mlp_layer` but
+    /// over a `[N, hidden]` residual buffer in one launch each
+    /// (grid.y = N). All three sub-kernels already support
+    /// M-batching natively:
+    ///   * `rmsnorm_inplace_f16_kernel` — grid (num_tokens, 1, 1)
+    ///   * `fp8_gemv_blockwise_wpr_native_f16in_dual_silu_kernel`
+    ///     — grid (ceil(N_out/8), M, 1)
+    ///   * `fp8_gemv_blockwise_wpr_native_f16in_kernel` — same
+    ///   * `vector_add_f16` — element-wise over N*hidden
+    ///
+    /// Scratch (h_work, silu_mid, down_out) is allocated
+    /// per-call via the arena and sized at `num_tokens`. The
+    /// existing single-token `apply_dense_mlp_layer` is
+    /// preserved for the decode path (num_tokens = 1).
+    ///
+    /// Caller passes the `[N, hidden]` h_residual buffer
+    /// directly so this composes with the layer-major prefill
+    /// driver that will live above it.
+    pub unsafe fn apply_dense_mlp_layer_batched(
+        &self,
+        layer_idx: usize,
+        num_tokens: u32,
+        h_residual_buf: u64,
+    ) -> Result<()> {
+        let arch = &self.arch;
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_dense_mlp_layer_batched: model absent".into()))?;
+        let ker = self.outside_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_dense_mlp_layer_batched: outside_kernels absent".into()))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_dense_mlp_layer_batched: stream absent".into()))?;
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_dense_mlp_layer_batched: arena absent".into()))?;
+        let layer = model.layers.get(layer_idx).ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            format!("apply_dense_mlp_layer_batched: layer {layer_idx} out of range")))?;
+        let hidden = arch.base.hidden_size as i32;
+        let intermediate = arch.base.intermediate_size as i32;
+        let eps = arch.base.rms_norm_eps;
+        let stream_raw = stream.raw() as u64;
+        let n = num_tokens as usize;
+        let nh = (n * hidden as usize) * 2;
+        let ni = (n * intermediate as usize) * 2;
+        let h_work_buf  = arena.region("qwen35_bmlp_h_work",  nh, 16)?.device_ptr();
+        let silu_mid_buf = arena.region("qwen35_bmlp_silu",   ni, 16)?.device_ptr();
+        let down_out_buf = arena.region("qwen35_bmlp_down",   nh, 16)?.device_ptr();
+
+        // (1) h_work ← rmsnorm(h_residual, post_attn_layernorm).
+        //     Copy [N, hidden] → h_work then norm with
+        //     grid.x = num_tokens.
+        {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                h_work_buf, h_residual_buf, nh, stream_raw as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35_bmlp dtod h_work",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        {
+            use cudarc::driver::sys::*;
+            let mut hw_ptr = h_work_buf;
+            let mut gamma_ptr = post_attn_ln_ptr(&layer.attn);
+            let mut eps_arg = eps;
+            let mut hd = hidden;
+            let args = [
+                (&mut hw_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gamma_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut eps_arg) as *mut f32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block_dim = (hidden as u32).min(1024);
+            let rc = cuLaunchKernel(
+                ker.fn_rmsnorm_inplace_f16.raw() as CUfunction,
+                num_tokens, 1, 1, block_dim, 1, 1, 32 * 4,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35_bmlp rmsnorm_inplace_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (2) silu_mid ← SiLU(gate(h_work)) * up(h_work)
+        //     grid (ceil(intermediate/8), num_tokens), block 256.
+        {
+            use cudarc::driver::sys::*;
+            let mut out_ptr = silu_mid_buf;
+            let mut wg_ptr = layer.mlp.gate_proj.offset_bytes;
+            let mut wu_ptr = layer.mlp.up_proj.offset_bytes;
+            let mut sg_ptr = layer.mlp.gate_proj.blockscale_ptr.unwrap_or(0);
+            let mut su_ptr = layer.mlp.up_proj.blockscale_ptr.unwrap_or(0);
+            let mut inp_ptr = h_work_buf;
+            let mut m_arg: i32 = num_tokens as i32;
+            let mut n_arg: i32 = intermediate;
+            let mut k_arg: i32 = hidden;
+            let mut ncb: i32 = hidden / 128;
+            let args = [
+                (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut wg_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut wu_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sg_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut su_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut inp_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut m_arg) as *mut i32 as *mut core::ffi::c_void,
+                (&mut n_arg) as *mut i32 as *mut core::ffi::c_void,
+                (&mut k_arg) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let grid_x: u32 = ((intermediate as u32) + 7) / 8;
+            let rc = cuLaunchKernel(
+                ker.fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu.raw() as CUfunction,
+                grid_x, num_tokens, 1, 256, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35_bmlp fp8_gemv_dual_silu launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (3+4) down_proj at M=num_tokens — one launch via the
+        //       row-batched FP8 GEMV (kernel already supports
+        //       grid.y=M; see qwen36 fp8_proj_dispatch fix).
+        let fp8_gemv_fn = ker.fn_fp8_gemv_wpr_native_f16in.ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_dense_mlp_layer_batched: fp8_gemv_wpr_native_f16in unavailable".into()))?;
+        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+            m: num_tokens, n: hidden as u32, k: intermediate as u32,
+        }.launch(
+            fp8_gemv_fn,
+            down_out_buf,
+            layer.mlp.down_proj.offset_bytes,
+            layer.mlp.down_proj.blockscale_ptr.unwrap_or(0),
+            silu_mid_buf,
+            stream_raw,
+        )?;
+
+        // (5) h_residual += down_out elementwise over N*hidden.
+        {
+            use cudarc::driver::sys::*;
+            let n_elem = (num_tokens as i32) * hidden;
+            let mut dst = h_residual_buf;
+            let mut src = down_out_buf;
+            let mut n_arg: i32 = n_elem;
+            let args = [
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                (&mut n_arg) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let grid_x: u32 = ((n_elem as u32) + 255) / 256;
+            let rc = cuLaunchKernel(
+                ker.fn_vector_add_f16.raw() as CUfunction,
+                grid_x, 1, 1, 256, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35_bmlp vector_add_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Free function — extract the per-layer
