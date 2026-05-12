@@ -1,23 +1,17 @@
 //! Shareable Qwen-VL ViT forward path.
 //!
-//! Phase 3-a-i scaffolding for the Qwen 3.5 vision tower bring-up.
+//! Qwen 3.5 27B dense and Qwen 3.6 35B-A3B share the same
+//! Qwen3-VL ViT geometry (27 blocks, hidden=1152, intermediate=4304,
+//! 16 heads × head_dim=72, PatchMerger 2×2). The merger's
+//! `out_hidden` differs per family (Qwen 3.5: 5120, Qwen 3.6: 2048)
+//! and is read at runtime from `vision.merger.fc2_w.shape[0]`
+//! (Phase 3-a-vii), so the same forward fn drives both with no
+//! family-specific branching.
 //!
-//! The Qwen 3.5 27B dense and Qwen 3.6 35B-A3B checkpoints carry
-//! byte-identical Qwen3-VL ViT geometry (27 blocks, hidden=1152,
-//! intermediate=4304, 16 heads × head_dim=72, PatchMerger 2×2 →
-//! out_hidden=2048 — note: out_hidden equals the *Qwen 3.6* text
-//! hidden size, not Qwen 3.5's hidden=5120; the merger is sized
-//! against the tower's intrinsic output, and the splice handles
-//! any down-/up-projection if needed). The same forward kernel
-//! chain works for both.
-//!
-//! Today the implementation still lives inline in
-//! `qwen36_bring_up::Qwen36Bringup::forward_qwen_vision` (~1100 LOC).
-//! This module introduces the **borrow bundle** that lets the
-//! function operate on `(arena, stream, cublaslt, vision-tower,
-//! kernel-handles)` without going through `&Qwen36Bringup`.
-//! Phase 3-a-ii will move the function body itself; Phase 3-a-iii
-//! adds the Qwen 3.5 caller.
+//! Both bringups expose `vision_deps()` to assemble the borrow
+//! bundle below; `forward_qwen_vision(&deps, &bytes)` is the
+//! shared entry point (smoke-validated against Qwen 3.6 on
+//! GB10/sm_121 — "Kreis" on a 256×256 orange-disc PNG).
 //!
 //! ## Why a borrow bundle and not a trait
 //!
@@ -184,7 +178,7 @@ pub fn forward_qwen_vision(
             );
         if rc != CUresult::CUDA_SUCCESS {
             return Err(rvllm_core::RvllmError::cuda(
-                "qwen36 cast_f32_to_f16 launch",
+                "qwen-vit cast_f32_to_f16 launch",
                 rvllm_core::CudaErrorKind::LaunchFailed,
                 rvllm_core::CudaCtx::setup(),
             ));
@@ -209,7 +203,7 @@ pub fn forward_qwen_vision(
             );
         if rc != CUresult::CUDA_SUCCESS {
             return Err(rvllm_core::RvllmError::cuda(
-                "qwen36 add_bias_f16 launch",
+                "qwen-vit add_bias_f16 launch",
                 rvllm_core::CudaErrorKind::LaunchFailed,
                 rvllm_core::CudaCtx::setup(),
             ));
@@ -244,7 +238,7 @@ pub fn forward_qwen_vision(
             let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
         }
         let _ = std::fs::write(&path, &host);
-        eprintln!("[qwen36] vit patch_embed dump: {} bytes ([{},{}]) → {}", bytes, n_tokens, hidden, path);
+        eprintln!("[qwen-vit] vit patch_embed dump: {} bytes ([{},{}]) → {}", bytes, n_tokens, hidden, path);
     }
 
     // ── Step 3.5: add learned absolute pos_embed (bilinear-interp). ─
@@ -282,7 +276,7 @@ pub fn forward_qwen_vision(
         );
     if rc != CUresult::CUDA_SUCCESS {
         return Err(rvllm_core::RvllmError::cuda(
-            "qwen36 vit_pos_embed_interp_f16 launch",
+            "qwen-vit vit_pos_embed_interp_f16 launch",
             rvllm_core::CudaErrorKind::LaunchFailed,
             rvllm_core::CudaCtx::setup(),
         ));
@@ -300,7 +294,7 @@ pub fn forward_qwen_vision(
             let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
         }
         let _ = std::fs::write(&path, &host);
-        eprintln!("[qwen36] vit posemb dump: {} bytes → {}", bytes, path);
+        eprintln!("[qwen-vit] vit posemb dump: {} bytes → {}", bytes, path);
     }
 
     // ── Step 4: build per-token cos/sin tables for 2D rotary. ────
@@ -430,7 +424,7 @@ pub fn forward_qwen_vision(
             );
         if rc != CUresult::CUDA_SUCCESS {
             return Err(rvllm_core::RvllmError::cuda(
-                "qwen36 layernorm_inplace_f16 launch",
+                "qwen-vit layernorm_inplace_f16 launch",
                 rvllm_core::CudaErrorKind::LaunchFailed,
                 rvllm_core::CudaCtx::setup(),
             ));
@@ -521,7 +515,7 @@ pub fn forward_qwen_vision(
                 );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 vit_rotary_2d_f16 launch",
+                    "qwen-vit vit_rotary_2d_f16 launch",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
@@ -680,7 +674,7 @@ pub fn forward_qwen_vision(
                 );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 cast_f32_to_f16 launch",
+                    "qwen-vit cast_f32_to_f16 launch",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
@@ -716,7 +710,7 @@ pub fn forward_qwen_vision(
                 );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 scale_inplace_f16 launch",
+                    "qwen-vit scale_inplace_f16 launch",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
@@ -745,7 +739,7 @@ pub fn forward_qwen_vision(
                 );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 softmax_row_f16 launch",
+                    "qwen-vit softmax_row_f16 launch",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
@@ -782,7 +776,7 @@ pub fn forward_qwen_vision(
                 );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 transpose_2d_f16 launch",
+                    "qwen-vit transpose_2d_f16 launch",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
@@ -820,7 +814,7 @@ pub fn forward_qwen_vision(
                 );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 cast_f32_to_f16 launch",
+                    "qwen-vit cast_f32_to_f16 launch",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
@@ -939,7 +933,7 @@ pub fn forward_qwen_vision(
             );
         if rc != CUresult::CUDA_SUCCESS {
             return Err(rvllm_core::RvllmError::cuda(
-                "qwen36 layernorm_inplace_f16 launch",
+                "qwen-vit layernorm_inplace_f16 launch",
                 rvllm_core::CudaErrorKind::LaunchFailed,
                 rvllm_core::CudaCtx::setup(),
             ));
@@ -978,7 +972,7 @@ pub fn forward_qwen_vision(
             );
         if rc != CUresult::CUDA_SUCCESS {
             return Err(rvllm_core::RvllmError::cuda(
-                "qwen36 gelu_tanh_f16 launch",
+                "qwen-vit gelu_tanh_f16 launch",
                 rvllm_core::CudaErrorKind::LaunchFailed,
                 rvllm_core::CudaCtx::setup(),
             ));
@@ -1053,7 +1047,7 @@ pub fn forward_qwen_vision(
                 }
                 let path = format!("{dir}/blk{blk_idx}.bin");
                 let _ = std::fs::write(&path, &host);
-                eprintln!("[qwen36] vit blk{blk_idx} dump → {path}");
+                eprintln!("[qwen-vit] vit blk{blk_idx} dump → {path}");
             }
         }
     }
@@ -1069,7 +1063,7 @@ pub fn forward_qwen_vision(
         }
         let _ = std::fs::write(&path, &host);
         eprintln!(
-            "[qwen36] pre-merger dump: {} bytes ([{}, {}] f16) → {}",
+            "[qwen-vit] pre-merger dump: {} bytes ([{}, {}] f16) → {}",
             bytes, n_tokens, hidden, path,
         );
     }
@@ -1102,7 +1096,7 @@ pub fn forward_qwen_vision(
         );
     if rc != CUresult::CUDA_SUCCESS {
         return Err(rvllm_core::RvllmError::cuda(
-            "qwen36 layernorm_inplace_f16 launch",
+            "qwen-vit layernorm_inplace_f16 launch",
             rvllm_core::CudaErrorKind::LaunchFailed,
             rvllm_core::CudaCtx::setup(),
         ));
@@ -1165,7 +1159,7 @@ pub fn forward_qwen_vision(
         );
     if rc != CUresult::CUDA_SUCCESS {
         return Err(rvllm_core::RvllmError::cuda(
-            "qwen36 gelu_tanh_f16 launch",
+            "qwen-vit gelu_tanh_f16 launch",
             rvllm_core::CudaErrorKind::LaunchFailed,
             rvllm_core::CudaCtx::setup(),
         ));
