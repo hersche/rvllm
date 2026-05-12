@@ -8052,22 +8052,60 @@ impl Qwen36Bringup {
             }
         }
 
-        // Phase 3b: m≥2 path through cuBLASLt blockwise fp8_gemm.
-        //   1) Per-(token, 128-K-block) f16→fp8 amax-quantise the
-        //      input → scratch `[M, K] fp8` + `[M, ceil(K/128)] f32`
-        //      activation scales (mode VEC128_32F = 4 in cuBLASLt).
-        //   2) `cublaslt.fp8_gemm_blockwise(...)` with the activation
-        //      scales above and the existing `[N/128, K/128]` weight
-        //      blockscale (mode BLK128x128_32F = 5). Both modes set
-        //      explicitly on the matmul descriptor.
-        //   3) f16 output is written directly to `out_f16`.
+        // Phase 3b: m≥2 path. Two sub-paths, gated by a one-time
+        // capability probe (Codex review #4):
         //
-        // The per-K-block input scale + 128×128 weight scale are the
-        // cuBLASLt-native modes that match Qwen's checkpoint layout —
-        // no scale transpose, no lossy reduction to per-channel.
-        let fp8_bytes = (m as usize) * (k as usize); // E4M3 = 1 byte/elem
+        //   * If cuBLASLt's blockwise FP8 algo is available
+        //     (sm_100 / sm_120 Blackwell-server / RTX 5090),
+        //     quantise input → fp8 + per-K-block f32 scale and
+        //     dispatch to cuBLASLt.
+        //   * If it isn't (sm_121 = GB10 — cuBLASLt has no
+        //     blockwise FP8 kernel for that arch today), skip the
+        //     quantise scratch entirely and fall straight through
+        //     to M× Fp8GemvF16InLaunch on the original `input_f16`.
+        //
+        // The previous code unconditionally quantised + tried
+        // cuBLASLt + caught the "no algo" error every call. On
+        // sm_121 that was ~10–30 µs/call of waste in the hot path
+        // (and a Vec<f32>-sized scratch allocation churn) for a
+        // result that always landed in the looped-GEMV branch.
+        //
+        // `BLOCKWISE_STATE` is a process-global atomic with
+        // states {Unknown=0, NoAlgo=1, HasAlgo=2}. The first
+        // dispatch that reaches this branch tries cuBLASLt and
+        // sets the state from the result; every subsequent
+        // dispatch reads the cached state and skips the wasted
+        // work.
+        use std::sync::atomic::{AtomicI8, Ordering};
+        static BLOCKWISE_STATE: AtomicI8 = AtomicI8::new(0);
+        let state = BLOCKWISE_STATE.load(Ordering::Relaxed);
+        let run_looped_gemv = || -> Result<()> {
+            let row_bytes_in = (k as u64) * 2;
+            let row_bytes_out = (n as u64) * 2;
+            for row in 0..(m as u64) {
+                let row_in = input_f16 + row * row_bytes_in;
+                let row_out = out_f16 + row * row_bytes_out;
+                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m: 1, n, k }.launch(
+                    kernel_gemv,
+                    row_out,
+                    weight_fp8,
+                    b_blockscale,
+                    row_in,
+                    stream,
+                )?;
+            }
+            Ok(())
+        };
+        if state == 1 {
+            // Cached NoAlgo (sm_121 today). Skip quantise + cuBLASLt
+            // try, go straight to looped GEMV.
+            return run_looped_gemv();
+        }
+        // state == 0 (Unknown, first call) OR state == 2 (HasAlgo).
+        // Both still need the quantised input + a cuBLASLt try.
+        let fp8_bytes = (m as usize) * (k as usize);
         let k_blocks = (k as usize + 127) / 128;
-        let scale_bytes = (m as usize) * k_blocks * 4; // f32 per (row, K-block)
+        let scale_bytes = (m as usize) * k_blocks * 4;
         let in_fp8 = self
             .arena
             .region("qwen36_proj_in_fp8", fp8_bytes, 16)?;
@@ -8077,7 +8115,6 @@ impl Qwen36Bringup {
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
-            // Quantise launch: grid=(K_blocks, M, 1), block=(128, 1, 1).
             let mut out_fp8_ptr = in_fp8.device_ptr();
             let mut out_scale_ptr = in_scale.device_ptr();
             let mut in_ptr = input_f16;
@@ -8090,9 +8127,9 @@ impl Qwen36Bringup {
             ];
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_fp8_quantize_per_token_f16.raw() as CUfunction,
-                /*grid*/ k_blocks as u32, m, 1,
-                /*block*/ 128, 1, 1,
-                /*shared*/ 0,
+                k_blocks as u32, m, 1,
+                128, 1, 1,
+                0,
                 stream as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -8105,19 +8142,6 @@ impl Qwen36Bringup {
                 ));
             }
         }
-        // First try the cuBLASLt blockwise FP8 path. On
-        // sm_100/sm_120 (Blackwell-server / RTX 5090) this dispatches
-        // to a tensor-core kernel for ≥128×N×K. On sm_121 (GB10
-        // consumer Blackwell) cuBLASLt does NOT ship a blockwise FP8
-        // kernel today — `Algo­GetHeuristic` returns "no algo".
-        //
-        // The fall-back is a looped-m=1 GEMV reference: correct, but
-        // not faster than the existing per-token loop. It lets Phase
-        // 4 wire the dispatcher into the prefill loop without
-        // breaking sm_121 — when CUDA 13.x eventually adds a blockwise
-        // sm_121 kernel, the same call site immediately picks it up.
-        // Phase 3c will plug in the CUTLASS SM120 blockwise GEMM
-        // (already built for Gemma) as the sm_121 fast path.
         #[cfg(feature = "cuda")]
         let blockwise_result = self.cublaslt.fp8_gemm_blockwise(
             in_fp8.device_ptr(),
@@ -8132,42 +8156,28 @@ impl Qwen36Bringup {
         );
         #[cfg(feature = "cuda")]
         match blockwise_result {
-            Ok(()) => return Ok(()),
-            Err(_) => {
-                // Fall back: N×Fp8GemvF16InLaunch at m=1, one row at a
-                // time. We log the no-algo path once per process so
-                // operators see "blockwise no-algo, falling back" rather
-                // than silently paying the per-token cost on every batch.
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static LOGGED: AtomicBool = AtomicBool::new(false);
-                if !LOGGED.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(
-                        "qwen36 fp8_proj_dispatch: cuBLASLt has no blockwise FP8 \
-                         algo for this arch (likely sm_121). Falling back to \
-                         looped m=1 GEMV — correct but not accelerated. \
-                         Phase 3c will plug in CUTLASS SM120."
+            Ok(()) => {
+                if state == 0 {
+                    BLOCKWISE_STATE.store(2, Ordering::Relaxed);
+                    tracing::info!(
+                        "qwen36 fp8_proj_dispatch: cuBLASLt blockwise FP8 \
+                         available on this arch; caching HasAlgo state."
                     );
                 }
-                let row_bytes_in = (k as u64) * 2;
-                let row_bytes_out = (n as u64) * 2;
-                for row in 0..(m as u64) {
-                    let row_in = input_f16 + row * row_bytes_in;
-                    let row_out = out_f16 + row * row_bytes_out;
-                    rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                        m: 1,
-                        n,
-                        k,
-                    }
-                    .launch(
-                        kernel_gemv,
-                        row_out,
-                        weight_fp8,
-                        b_blockscale,
-                        row_in,
-                        stream,
-                    )?;
-                }
                 Ok(())
+            }
+            Err(_) => {
+                if state == 0 {
+                    BLOCKWISE_STATE.store(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        "qwen36 fp8_proj_dispatch: cuBLASLt has no blockwise \
+                         FP8 algo on this arch (sm_121/GB10 expected). Caching \
+                         NoAlgo — future dispatches skip quantise + heuristic \
+                         and go straight to looped GEMV. CUTLASS-pad fast \
+                         path for 2 ≤ M < 128 is the next slice."
+                    );
+                }
+                run_looped_gemv()
             }
         }
         // Non-cuda build: the entire m≥2 path was cfg-gated out; we
