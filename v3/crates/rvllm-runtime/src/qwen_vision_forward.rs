@@ -406,14 +406,31 @@ pub fn forward_qwen_vision(
     let qkv_eps = 1e-6f32;
     let blk_dump_dir = std::env::var("RVLLM_QWEN36_VIT_BLK_DUMP_DIR").ok();
 
-    // Phase-perf 2: optional batched-strided attention path. When
-    // RVLLM_QWEN_VIT_BATCHED_ATTN=1, the per-block 16-head attention
-    // loop is replaced by 7 launches (scale, batched QK^T, fused
-    // softmax-to-f16, transpose V, batched scores@V, cast, scatter
-    // all heads). Scratch is allocated once outside the block loop;
-    // all 27 blocks reuse it. ~3.7k saved launches per ViT forward.
-    let batched_attn_enabled = std::env::var("RVLLM_QWEN_VIT_BATCHED_ATTN")
-        .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+    // Phase-perf 2: per-N gated batched-strided attention.
+    //
+    // Bench-validated on Qwen 3.6 / GB10 / sm_121 (2026-05-12):
+    //   internal N=256  : batched 43 ms vs per-head 52 ms   (−17%)
+    //   internal N=1024 : batched 227 ms vs per-head 189 ms (+20%)
+    //   internal N=4096 : batched 1727 ms vs per-head 1632 ms (+6%)
+    //
+    // The batched path is only a net win at small N. The crossover
+    // sits below N=512; above it the extra cast launch + the
+    // batched-strided cuBLASLt algo at these shapes are slower than
+    // 16 separate non-batched GEMMs.
+    //
+    // Knobs:
+    //   RVLLM_QWEN_VIT_BATCHED_ATTN=0/1  — hard off / hard on
+    //     (overrides per-N gate; default unset → auto)
+    //   RVLLM_QWEN_VIT_BATCHED_MAX_N=<n> — auto-mode threshold
+    //     (default 384; batched used iff n_tokens ≤ this)
+    let max_n_for_batched: usize = std::env::var("RVLLM_QWEN_VIT_BATCHED_MAX_N")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(384);
+    let batched_attn_enabled = match std::env::var("RVLLM_QWEN_VIT_BATCHED_ATTN") {
+        Ok(v) if v == "0" => false,
+        Ok(v) if !v.is_empty() && v != "auto" => true,
+        // unset or "auto" → per-N gate
+        _ => n_tokens <= max_n_for_batched,
+    };
     // For the disabled path we still allocate 1-byte placeholders so
     // we can hand them to the unused branch without runtime cost.
     let scores_f32_all_bytes = if batched_attn_enabled {
@@ -440,10 +457,14 @@ pub fn forward_qwen_vision(
     let out_hmajor = deps.arena.region("qvis_out_hmajor", out_hmajor_bytes, 16)?;
     if batched_attn_enabled {
         eprintln!(
-            "[qwen-vit] batched attention enabled (N={n_tokens}, H={num_heads}, \
-             D={head_dim}); scratch {:.1} MiB",
+            "[qwen-vit] batched attention: N={n_tokens} ≤ MAX={max_n_for_batched}, \
+             H={num_heads} D={head_dim}; scratch {:.1} MiB",
             (scores_f32_all_bytes + scores_buf_all_bytes + v_t_all_bytes
                 + out_f32_all_bytes + out_hmajor_bytes) as f64 / (1024.0 * 1024.0),
+        );
+    } else {
+        eprintln!(
+            "[qwen-vit] per-head attention: N={n_tokens} (batched MAX={max_n_for_batched})",
         );
     }
 
