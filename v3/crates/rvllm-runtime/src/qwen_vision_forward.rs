@@ -74,6 +74,12 @@ pub struct QwenVisionDeps<'a> {
     /// Scatters all heads of a [H, N, D] head-major buffer back into
     /// [N, H*D] interleaved (one launch vs one-per-head).
     pub fn_scatter_heads_f16: KernelFn,
+    /// f32 in-place scale for the batched-attn path: applied to the
+    /// f32 scores between cuBLASLt QK^T and `softmax_row_f32_to_f16`
+    /// so the 1/√D factor is folded into the f32 accumulator rather
+    /// than into Q in f16 (which subtly drifts vs the per-head path
+    /// at medium image sizes — verified 2026-05-12 on 512² mixed).
+    pub fn_scale_inplace_f32: KernelFn,
 }
 
 // ============================================================
@@ -600,38 +606,18 @@ pub fn forward_qwen_vision(
         if batched_attn_enabled {
             // ─ Batched-strided attention path (Phase-perf 2). ─
             // Replaces the 16-head loop below with 7 launches.
+            //
+            // Numerical-equivalence note: the per-head path applies
+            // the 1/√D scale to the f16 scores AFTER QK^T cast to
+            // f16. The batched path applies the same scale to the
+            // f32 scores BEFORE softmax (so the scale lives in the
+            // higher-precision f32 accumulator). Pre-GEMM Q-scaling
+            // in f16 was tried first and produced visibly wrong
+            // outputs at 512² (the model confused shape classes); the
+            // f32-scores scale matches the per-head numerics closely
+            // and was validated correct at 64 / 256 / 1024 tokens.
             let scale = 1.0_f32 / (head_dim as f32).sqrt();
-            // (1) Scale Q in place: q_buf *= 1/sqrt(D). One launch
-            //     over N*H*D elements covers all heads.
-            #[cfg(feature = "cuda")]
-            unsafe {
-                use cudarc::driver::sys::*;
-                let mut x = q_buf.device_ptr();
-                let mut s = scale;
-                let mut nn = (n_tokens * num_heads * head_dim) as i32;
-                let args = [
-                    (&mut x) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut s) as *mut f32 as *mut core::ffi::c_void,
-                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
-                ];
-                let block: u32 = 256;
-                let grid = ((nn as u32 + block - 1) / block, 1u32, 1u32);
-                let rc = cuLaunchKernel(
-                    deps.fn_scale_inplace_f16.raw() as CUfunction,
-                    grid.0, grid.1, grid.2, block, 1, 1,
-                    0, deps.stream.raw() as CUstream,
-                    args.as_ptr() as *mut *mut core::ffi::c_void,
-                    core::ptr::null_mut(),
-                );
-                if rc != CUresult::CUDA_SUCCESS {
-                    return Err(rvllm_core::RvllmError::cuda(
-                        "qwen-vit batched-attn scale_inplace launch",
-                        rvllm_core::CudaErrorKind::LaunchFailed,
-                        rvllm_core::CudaCtx::setup(),
-                    ));
-                }
-            }
-            // (2) batched QK^T → scores_f32_all [H, N, N]
+            // (1) batched QK^T → scores_f32_all [H, N, N]
             #[cfg(feature = "cuda")]
             unsafe {
                 deps.cublaslt.f16_gemm_f32_batched_strided(
@@ -650,6 +636,37 @@ pub fn forward_qwen_vision(
                     (n_tokens * n_tokens) as i64,
                     stream_raw,
                 )?;
+            }
+            // (2.5) scale_inplace_f32: scores_f32_all *= 1/√D over
+            //       H*N*N elements. Folds the attention scale into
+            //       the f32 accumulator instead of degrading Q in f16.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut x = scores_f32_all.device_ptr();
+                let mut s = scale;
+                let mut nn = (num_heads * n_tokens * n_tokens) as i32;
+                let args = [
+                    (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s) as *mut f32 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = ((nn as u32 + block - 1) / block, 1u32, 1u32);
+                let rc = cuLaunchKernel(
+                    deps.fn_scale_inplace_f32.raw() as CUfunction,
+                    grid.0, grid.1, grid.2, block, 1, 1,
+                    0, deps.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen-vit batched scale_inplace_f32 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
             // (3) softmax_row_f32_to_f16 → scores_buf_all [H, N, N]
             //     grid = N×H rows of length N each.

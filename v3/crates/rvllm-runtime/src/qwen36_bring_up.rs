@@ -331,6 +331,8 @@ pub struct Qwen36OutsideKernels {
     pub fn_transpose_heads_v_f16: KernelFn,
     pub scatter_heads_f16_mod: LoadedModule,
     pub fn_scatter_heads_f16: KernelFn,
+    pub scale_inplace_f32_mod: LoadedModule,
+    pub fn_scale_inplace_f32: KernelFn,
 }
 
 /// Pre-converted f32 weight caches for one linear-attention layer.
@@ -732,6 +734,9 @@ impl Qwen36Bringup {
         let scatter_heads_f16_mod = kernels.load_ptx("scatter_heads_f16")?;
         let fn_scatter_heads_f16 = scatter_heads_f16_mod
             .get_function("scatter_heads_f16_kernel")?;
+        let scale_inplace_f32_mod = kernels.load_ptx("scale_inplace_f32")?;
+        let fn_scale_inplace_f32 = scale_inplace_f32_mod
+            .get_function("scale_inplace_f32_kernel")?;
         let outside_kernels = Qwen36OutsideKernels {
             embedding_gather_f16_mod,
             fn_embedding_gather_f16,
@@ -847,6 +852,8 @@ impl Qwen36Bringup {
             fn_transpose_heads_v_f16,
             scatter_heads_f16_mod,
             fn_scatter_heads_f16,
+            scale_inplace_f32_mod,
+            fn_scale_inplace_f32,
         };
         eprintln!(
             "[qwen36] outside kernels resolved: embedding_gather_f16, \
@@ -3920,6 +3927,7 @@ impl Qwen36Bringup {
             fn_softmax_row_f32_to_f16: self.outside_kernels.fn_softmax_row_f32_to_f16,
             fn_transpose_heads_v_f16: self.outside_kernels.fn_transpose_heads_v_f16,
             fn_scatter_heads_f16: self.outside_kernels.fn_scatter_heads_f16,
+            fn_scale_inplace_f32: self.outside_kernels.fn_scale_inplace_f32,
             fn_vector_add_f16: self.outside_kernels.fn_vector_add_f16,
         })
     }

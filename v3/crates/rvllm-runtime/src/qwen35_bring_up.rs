@@ -247,6 +247,8 @@ pub struct Qwen35OutsideKernels {
     pub fn_transpose_heads_v_f16: KernelFn,
     pub scatter_heads_f16_mod: LoadedModule,
     pub fn_scatter_heads_f16: KernelFn,
+    pub scale_inplace_f32_mod: LoadedModule,
+    pub fn_scale_inplace_f32: KernelFn,
 }
 
 /// Phase 2c-A engine handle. Adds outside kernels + cuBLASLt on
@@ -670,6 +672,9 @@ impl Qwen35Bringup {
                 kernels.load_ptx("scatter_heads_f16")?;
             let fn_scatter_heads_f16 = scatter_heads_f16_mod
                 .get_function("scatter_heads_f16_kernel")?;
+            let scale_inplace_f32_mod = kernels.load_ptx("scale_inplace_f32")?;
+            let fn_scale_inplace_f32 = scale_inplace_f32_mod
+                .get_function("scale_inplace_f32_kernel")?;
 
             let outside_kernels = Qwen35OutsideKernels {
                 embedding_gather_f16_mod,
@@ -737,6 +742,8 @@ impl Qwen35Bringup {
                 fn_transpose_heads_v_f16,
                 scatter_heads_f16_mod,
                 fn_scatter_heads_f16,
+                scale_inplace_f32_mod,
+                fn_scale_inplace_f32,
             };
 
             // cuBLASLt for the FP8 lm_head matmul. 32 MiB workspace
@@ -1791,6 +1798,7 @@ impl Qwen35Bringup {
             fn_softmax_row_f32_to_f16: ker.fn_softmax_row_f32_to_f16,
             fn_transpose_heads_v_f16: ker.fn_transpose_heads_v_f16,
             fn_scatter_heads_f16: ker.fn_scatter_heads_f16,
+            fn_scale_inplace_f32: ker.fn_scale_inplace_f32,
             fn_vector_add_f16: ker.fn_vector_add_f16,
         })
     }
