@@ -222,6 +222,19 @@ pub struct Qwen35OutsideKernels {
     pub fn_gated_delta_rule_decode_f16: KernelFn,
     pub qwen_linear_rmsnorm_gated_f16_mod: LoadedModule,
     pub fn_qwen_linear_rmsnorm_gated_f16: KernelFn,
+    // ── Batched-prefill linear-attn (Phase #1-b) ───────────
+    // Batched conv1d state advance: assembles [N+ks-1, conv_dim]
+    // history block from the persistent (ks-1)-row state cache
+    // and the current N-token QKV stripe, then rotates the state
+    // to its tail (ks-1) rows in one launch.
+    pub conv_state_advance_batched_f16_mod: LoadedModule,
+    pub fn_conv_state_advance_batched_f16: KernelFn,
+    // Batched gated-delta-rule kernel — one launch advances the
+    // SSM state across all N tokens internally and writes the
+    // [N, num_v_heads, head_v_dim] readout. Replaces N×
+    // `gated_delta_rule_decode_f16` launches at prefill time.
+    pub gated_delta_rule_prefill_f16_mod: LoadedModule,
+    pub fn_gated_delta_rule_prefill_f16: KernelFn,
     // ── Vector residual add (used after attn + MLP) ────────
     pub f16_plus_f32_inplace_f16_mod: LoadedModule,
     pub fn_f16_plus_f32_inplace_f16: KernelFn,
@@ -648,6 +661,16 @@ impl Qwen35Bringup {
                 kernels.load_ptx("qwen_linear_rmsnorm_gated_f16")?;
             let fn_qwen_linear_rmsnorm_gated_f16 = qwen_linear_rmsnorm_gated_f16_mod
                 .get_function("qwen_linear_rmsnorm_gated_f16_kernel")?;
+            // Phase #1-b: batched-prefill linear-attn support
+            // (ported from qwen36 — same PTX names).
+            let conv_state_advance_batched_f16_mod =
+                kernels.load_ptx("conv_state_advance_batched_f16")?;
+            let fn_conv_state_advance_batched_f16 = conv_state_advance_batched_f16_mod
+                .get_function("conv_state_advance_batched_f16_kernel")?;
+            let gated_delta_rule_prefill_f16_mod =
+                kernels.load_ptx("gated_delta_rule_prefill_f16")?;
+            let fn_gated_delta_rule_prefill_f16 = gated_delta_rule_prefill_f16_mod
+                .get_function("gated_delta_rule_prefill_f16_kernel")?;
 
             // Vector residual.
             let f16_plus_f32_inplace_f16_mod =
@@ -742,6 +765,10 @@ impl Qwen35Bringup {
                 fn_qwen_linear_silu_l2_gqa_f16,
                 gated_delta_rule_decode_f16_mod,
                 fn_gated_delta_rule_decode_f16,
+                conv_state_advance_batched_f16_mod,
+                fn_conv_state_advance_batched_f16,
+                gated_delta_rule_prefill_f16_mod,
+                fn_gated_delta_rule_prefill_f16,
                 qwen_linear_rmsnorm_gated_f16_mod,
                 fn_qwen_linear_rmsnorm_gated_f16,
                 f16_plus_f32_inplace_f16_mod,
@@ -2313,6 +2340,447 @@ impl Qwen35Bringup {
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
                     "qwen35 la residual vector_add_f16",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase #1-b: batched linear-attn (Gated DeltaNet) over N
+    /// tokens. Ported from `Qwen36Bringup::apply_layer_linear_attn_batched`
+    /// with Qwen 3.5 dim numbers (kh=16, vh=48, hkd=hvd=128 →
+    /// key_dim=2048, value_dim=6144, conv_dim=10240). 10-op chain
+    /// identical to per-token; just runs at M=N instead of M=1:
+    ///
+    ///   1) rmsnorm(input_layernorm) on [N, hidden]
+    ///   2) in_proj_qkv batched FP8 GEMV (m=N)
+    ///   3) conv_state_advance_batched_f16 — assembles
+    ///      [N+ks-1, conv_dim] history block + rotates the
+    ///      persistent (ks-1) state to the tail of the chunk
+    ///   3b) causal_conv1d_f16 at seq_len=N
+    ///   4) silu_l2_gqa over (vus, N)
+    ///   5) alpha_beta over (vus, N)
+    ///   6) gated_delta_rule_prefill_f16 — one launch advances
+    ///      the SSM state across all N tokens and writes the
+    ///      [N, vus, hvd] readout
+    ///   7) in_proj_z batched FP8 GEMV (m=N)
+    ///   8) rmsnorm_gated over (vus, N)
+    ///   9) out_proj batched FP8 GEMV (m=N)
+    ///  10) h_residual += out elementwise over N*hidden
+    ///
+    /// Caller passes the [N, hidden] h_residual buffer directly.
+    /// All scratch is per-call via the arena. The persistent
+    /// linear-attn SSM state + conv1d state both advance
+    /// correctly because the batched kernels handle the
+    /// recurrence internally — same correctness contract as
+    /// qwen36's apply_layer_linear_attn_batched.
+    pub unsafe fn apply_linear_attn_layer_batched(
+        &self,
+        layer_idx: usize,
+        num_tokens: u32,
+        h_residual_buf: u64,
+    ) -> Result<()> {
+        if num_tokens == 0 {
+            return Ok(());
+        }
+        if num_tokens == 1 {
+            // Degenerate case: delegate to the per-token path so
+            // we don't accidentally fork numerics between the
+            // batched and per-token kernels for the decode case.
+            // The caller must arrange `scr.h_residual_ptr` to
+            // alias the single-row `h_residual_buf` before
+            // calling — this is enforced by the layer-major
+            // driver above. For now, returning Ok forces the
+            // caller to use the per-token path explicitly.
+            return self.apply_linear_attn_layer(layer_idx);
+        }
+
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer_batched: model absent".into()))?;
+        let ker = self.outside_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer_batched: outside_kernels absent".into()))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer_batched: stream absent".into()))?;
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer_batched: arena absent".into()))?;
+        let la_dims = self.la_dims.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer_batched: la_dims absent".into()))?;
+        let linear_state = self.linear_state.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer_batched: linear_state absent".into()))?;
+        let layer = model.layers.get(layer_idx).ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            format!("apply_linear_attn_layer_batched: layer {layer_idx} out of range")))?;
+        let la = match &layer.attn {
+            rvllm_loader::qwen35_weights::Qwen35LayerAttn::Linear(l) => l,
+            rvllm_loader::qwen35_weights::Qwen35LayerAttn::Full(_) => {
+                return Err(corrupt(
+                    self.paths.model_dir.clone(),
+                    format!("apply_linear_attn_layer_batched: layer {layer_idx} is full-attn"),
+                ));
+            }
+        };
+        let linear_idx = linear_state.layer_idx_to_linear_idx
+            .get(layer_idx).copied().flatten()
+            .ok_or_else(|| corrupt(
+                self.paths.model_dir.clone(),
+                format!("apply_linear_attn_layer_batched: layer {layer_idx} not linear-attn")))?;
+
+        let stream_raw = stream.raw() as u64;
+        let arch = &self.arch;
+        let hidden = arch.base.hidden_size as i32;
+        let hidden_u = hidden as u32;
+        let eps = arch.base.rms_norm_eps;
+        let num_k_heads = la_dims.num_k_heads;
+        let num_v_heads = la_dims.num_v_heads;
+        let head_k_dim = la_dims.head_k_dim;
+        let head_v_dim = la_dims.head_v_dim;
+        let key_dim = la_dims.key_dim;
+        let v_per_k = la_dims.v_per_k;
+        let conv_dim = la_dims.conv_dim;
+        let ks = la_dims.conv_kernel_dim;
+        let n = num_tokens as usize;
+        let h = hidden as usize;
+        let qk_bytes_per_token = num_v_heads * head_k_dim * 2;
+        let v_bytes_per_token  = num_v_heads * head_v_dim * 2;
+        let fp8_gemv_fn = ker.fn_fp8_gemv_wpr_native_f16in.ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer_batched: fp8_gemv_wpr_native_f16in unavailable".into()))?;
+        let _ = num_k_heads;
+
+        // (1) RMSNorm a [N, hidden] copy of the chunk.
+        let normed_bytes = n * h * 2;
+        let normed = arena.region("qwen35_blattn_normed", normed_bytes, 16)?.device_ptr();
+        {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                normed, h_residual_buf, normed_bytes, stream_raw as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35_blattn DtoD normed",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens, hidden: hidden_u, eps,
+        }.launch(
+            ker.fn_rmsnorm_inplace_f16,
+            normed,
+            la.input_layernorm.offset_bytes,
+            stream_raw,
+        )?;
+
+        // (2) in_proj_qkv [N, hidden] → [N, conv_dim].
+        let qkv_n = conv_dim as u32;
+        let qkv_bs = la.in_proj_qkv.blockscale_ptr.ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer_batched: in_proj_qkv blockscale missing".into()))?;
+        let qkv_region = arena.region("qwen35_blattn_qkv", n * conv_dim * 2, 16)?.device_ptr();
+        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+            m: num_tokens, n: qkv_n, k: hidden_u,
+        }.launch(
+            fp8_gemv_fn, qkv_region,
+            la.in_proj_qkv.offset_bytes, qkv_bs, normed, stream_raw,
+        )?;
+
+        // (3) conv1d batched state advance + causal_conv1d.
+        let conv_in_bytes  = (n + (ks - 1)) * conv_dim * 2;
+        let conv_out_bytes = n * conv_dim * 2;
+        let conv_in  = arena.region("qwen35_blattn_cin",  conv_in_bytes, 16)?.device_ptr();
+        let conv_out = arena.region("qwen35_blattn_cout", conv_out_bytes, 16)?.device_ptr();
+        let conv_state_p = linear_state.conv_state_ptr(linear_idx);
+        {
+            use cudarc::driver::sys::*;
+            let mut conv_in_a = conv_in;
+            let mut state = conv_state_p;
+            let mut cur = qkv_region;
+            let mut ts_i: i32 = conv_dim as i32;
+            let mut nt_i: i32 = num_tokens as i32;
+            let args = [
+                (&mut conv_in_a) as *mut u64 as *mut core::ffi::c_void,
+                (&mut state) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cur) as *mut u64 as *mut core::ffi::c_void,
+                (&mut ts_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nt_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((conv_dim as u32 + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                ker.fn_conv_state_advance_batched_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35_blattn conv_state_advance_batched",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        {
+            use cudarc::driver::sys::*;
+            let mut output = conv_out;
+            let mut input = conv_in;
+            let mut weight = la.conv1d.offset_bytes;
+            let mut sl: i32 = num_tokens as i32;
+            let mut ch: i32 = conv_dim as i32;
+            let mut k_arg: i32 = ks as i32;
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                (&mut weight) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sl) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ch) as *mut i32 as *mut core::ffi::c_void,
+                (&mut k_arg) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid_x: u32 = (conv_dim as u32 + block - 1) / block;
+            let rc = cuLaunchKernel(
+                ker.fn_causal_conv1d_f16.raw() as CUfunction,
+                grid_x, num_tokens, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35_blattn causal_conv1d_f16",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (4) silu_l2_gqa over (vus, N).
+        let q_region = arena.region("qwen35_blattn_q", n * qk_bytes_per_token, 16)?.device_ptr();
+        let k_region = arena.region("qwen35_blattn_k", n * qk_bytes_per_token, 16)?.device_ptr();
+        let v_region = arena.region("qwen35_blattn_v", n * v_bytes_per_token,  16)?.device_ptr();
+        {
+            use cudarc::driver::sys::*;
+            let mut q_out = q_region;
+            let mut k_out = k_region;
+            let mut v_out = v_region;
+            let mut conv_p = conv_out;
+            let mut vus_i: i32 = num_v_heads as i32;
+            let mut hkd_i: i32 = head_k_dim as i32;
+            let mut hvd_i: i32 = head_v_dim as i32;
+            let mut kd_i:  i32 = key_dim as i32;
+            let mut nvh:   i32 = num_v_heads as i32;
+            let mut vpk:   i32 = v_per_k as i32;
+            let args = [
+                (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut conv_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hkd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut kd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nvh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut vpk) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = head_k_dim.max(head_v_dim) as u32;
+            let rc = cuLaunchKernel(
+                ker.fn_qwen_linear_silu_l2_gqa_f16.raw() as CUfunction,
+                num_v_heads as u32, num_tokens, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35_blattn silu_l2_gqa",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (5) alpha_beta over (vus, N).
+        let alpha_region = arena.region("qwen35_blattn_alpha", n * num_v_heads * 4, 16)?.device_ptr();
+        let beta_region  = arena.region("qwen35_blattn_beta",  n * num_v_heads * 4, 16)?.device_ptr();
+        {
+            use cudarc::driver::sys::*;
+            let mut a_out = alpha_region;
+            let mut b_out = beta_region;
+            let mut a_w_p = la.in_proj_a.offset_bytes;
+            let mut b_w_p = la.in_proj_b.offset_bytes;
+            let mut a_log_p = la.a_log.offset_bytes;
+            let mut dt_bias_p = la.dt_bias.offset_bytes;
+            let mut in_p = normed;
+            let mut vus_i: i32 = num_v_heads as i32;
+            let mut h_i: i32 = hidden;
+            let args = [
+                (&mut a_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut b_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut a_w_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut b_w_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut a_log_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut dt_bias_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut in_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut h_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256u32.min(hidden_u).max(1);
+            let rc = cuLaunchKernel(
+                ker.fn_qwen_linear_alpha_beta_f16.raw() as CUfunction,
+                num_v_heads as u32, num_tokens, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35_blattn alpha_beta",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (6) gated_delta_rule_prefill — one launch over all N
+        //     tokens; advances SSM state internally.
+        let layer_state_ptr = linear_state.delta_state_ptr(linear_idx);
+        let scale = 1.0_f32 / (head_k_dim as f32).sqrt();
+        let readout_region = arena.region("qwen35_blattn_readout", n * v_bytes_per_token, 16)?.device_ptr();
+        {
+            use cudarc::driver::sys::*;
+            let mut state = layer_state_ptr;
+            let mut q_ptr = q_region;
+            let mut k_ptr = k_region;
+            let mut v_ptr = v_region;
+            let mut a_ptr = alpha_region;
+            let mut b_ptr = beta_region;
+            let mut o_ptr = readout_region;
+            let mut scale_arg = scale;
+            let mut nt_i = num_tokens as i32;
+            let mut nvh_i = num_v_heads as i32;
+            let mut hvd_i = head_v_dim as i32;
+            let mut hkd_i = head_k_dim as i32;
+            let args = [
+                (&mut state) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut a_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut b_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut o_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut scale_arg) as *mut f32 as *mut core::ffi::c_void,
+                (&mut nt_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nvh_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hkd_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let smem: u32 = (2 * head_k_dim as u32 + head_v_dim as u32) * 4;
+            let rc = cuLaunchKernel(
+                ker.fn_gated_delta_rule_prefill_f16.raw() as CUfunction,
+                num_v_heads as u32, 1, 1,
+                head_v_dim as u32, 1, 1, smem,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35_blattn gated_delta_rule_prefill",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (7) in_proj_z batched FP8 GEMV [N, hidden] → [N, value_dim].
+        let z_n = la.in_proj_z.shape[0] as u32;
+        let z_bs = la.in_proj_z.blockscale_ptr.ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer_batched: in_proj_z blockscale missing".into()))?;
+        let z_region = arena.region("qwen35_blattn_z", n * (z_n as usize) * 2, 16)?.device_ptr();
+        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+            m: num_tokens, n: z_n, k: hidden_u,
+        }.launch(
+            fp8_gemv_fn, z_region,
+            la.in_proj_z.offset_bytes, z_bs, normed, stream_raw,
+        )?;
+
+        // (8) rmsnorm_gated over (vus, N).
+        let gated_region = arena.region("qwen35_blattn_gated", n * num_v_heads * head_v_dim * 2, 16)?.device_ptr();
+        {
+            use cudarc::driver::sys::*;
+            let mut g_out = gated_region;
+            let mut r_in = readout_region;
+            let mut z_in = z_region;
+            let mut gamma_p = la.norm.offset_bytes;
+            let mut vus_i: i32 = num_v_heads as i32;
+            let mut hvd_i: i32 = head_v_dim as i32;
+            let mut eps_f: f32 = 1e-6;
+            let args = [
+                (&mut g_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut r_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut z_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gamma_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut eps_f) as *mut f32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_qwen_linear_rmsnorm_gated_f16.raw() as CUfunction,
+                num_v_heads as u32, num_tokens, 1,
+                head_v_dim as u32, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35_blattn rmsnorm_gated",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // (9) out_proj batched FP8 GEMV [N, value_dim] → [N, hidden].
+        let out_n = la.out_proj.shape[0] as u32;
+        let out_k = la.out_proj.shape[1] as u32;
+        let out_bs = la.out_proj.blockscale_ptr.ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "apply_linear_attn_layer_batched: out_proj blockscale missing".into()))?;
+        let out_region = arena.region("qwen35_blattn_out", n * (out_n as usize) * 2, 16)?.device_ptr();
+        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+            m: num_tokens, n: out_n, k: out_k,
+        }.launch(
+            fp8_gemv_fn, out_region,
+            la.out_proj.offset_bytes, out_bs, gated_region, stream_raw,
+        )?;
+
+        // (10) h_residual += out elementwise over N*hidden.
+        {
+            use cudarc::driver::sys::*;
+            let n_elem = (n as i32) * hidden;
+            let mut dst = h_residual_buf;
+            let mut src = out_region;
+            let mut nn: i32 = n_elem;
+            let args = [
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((n_elem as u32) + block - 1) / block;
+            let rc = cuLaunchKernel(
+                ker.fn_vector_add_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35_blattn residual vector_add",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup()));
             }
