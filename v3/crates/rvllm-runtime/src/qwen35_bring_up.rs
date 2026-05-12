@@ -213,6 +213,33 @@ pub struct Qwen35OutsideKernels {
     pub fn_f16_plus_f32_inplace_f16: KernelFn,
     pub vector_add_f16_mod: LoadedModule,
     pub fn_vector_add_f16: KernelFn,
+    // ── Vision (Qwen3-VL ViT, Phase 3-a-v) ─────────────────
+    // 11 modules + 12 kernel handles. cast_fp_mod carries both
+    // cast_f32_to_f16 (used here) and cast_f16_to_f32 (unused,
+    // kept resident so a future vision-debug dump-to-f32 doesn't
+    // need a second load). The vector_add_f16 above is shared
+    // with the text path.
+    pub layernorm_inplace_f16_mod: LoadedModule,
+    pub fn_layernorm_inplace_f16: KernelFn,
+    pub gelu_tanh_f16_mod: LoadedModule,
+    pub fn_gelu_tanh_f16: KernelFn,
+    pub softmax_row_f16_mod: LoadedModule,
+    pub fn_softmax_row_f16: KernelFn,
+    pub vit_rotary_2d_f16_mod: LoadedModule,
+    pub fn_vit_rotary_2d_f16: KernelFn,
+    pub vit_pos_embed_interp_f16_mod: LoadedModule,
+    pub fn_vit_pos_embed_interp_f16: KernelFn,
+    pub scale_inplace_f16_mod: LoadedModule,
+    pub fn_scale_inplace_f16: KernelFn,
+    pub transpose_2d_f16_mod: LoadedModule,
+    pub fn_transpose_2d_f16: KernelFn,
+    pub add_bias_f16_mod: LoadedModule,
+    pub fn_add_bias_f16: KernelFn,
+    pub cast_fp_mod: LoadedModule,
+    pub fn_cast_f32_to_f16: KernelFn,
+    pub extract_head_f16_mod: LoadedModule,
+    pub fn_extract_head_f16: KernelFn,
+    pub fn_scatter_head_f16: KernelFn,
 }
 
 /// Phase 2c-A engine handle. Adds outside kernels + cuBLASLt on
@@ -589,6 +616,42 @@ impl Qwen35Bringup {
             let fn_vector_add_f16 = vector_add_f16_mod
                 .get_function("vector_add_f16_kernel")?;
 
+            // ── Vision kernels (Phase 3-a-v) ────────────────────
+            let layernorm_inplace_f16_mod =
+                kernels.load_ptx("layernorm_inplace_f16")?;
+            let fn_layernorm_inplace_f16 = layernorm_inplace_f16_mod
+                .get_function("layernorm_inplace_f16_kernel")?;
+            let gelu_tanh_f16_mod = kernels.load_ptx("gelu_tanh_f16")?;
+            let fn_gelu_tanh_f16 = gelu_tanh_f16_mod
+                .get_function("gelu_tanh_f16_kernel")?;
+            let softmax_row_f16_mod = kernels.load_ptx("softmax_row_f16")?;
+            let fn_softmax_row_f16 = softmax_row_f16_mod
+                .get_function("softmax_row_f16_kernel")?;
+            let vit_rotary_2d_f16_mod = kernels.load_ptx("vit_rotary_2d_f16")?;
+            let fn_vit_rotary_2d_f16 = vit_rotary_2d_f16_mod
+                .get_function("vit_rotary_2d_f16_kernel")?;
+            let vit_pos_embed_interp_f16_mod =
+                kernels.load_ptx("vit_pos_embed_interp_f16")?;
+            let fn_vit_pos_embed_interp_f16 = vit_pos_embed_interp_f16_mod
+                .get_function("vit_pos_embed_interp_f16_kernel")?;
+            let scale_inplace_f16_mod = kernels.load_ptx("scale_inplace_f16")?;
+            let fn_scale_inplace_f16 = scale_inplace_f16_mod
+                .get_function("scale_inplace_f16_kernel")?;
+            let transpose_2d_f16_mod = kernels.load_ptx("transpose_2d_f16")?;
+            let fn_transpose_2d_f16 = transpose_2d_f16_mod
+                .get_function("transpose_2d_f16_kernel")?;
+            let add_bias_f16_mod = kernels.load_ptx("add_bias_f16")?;
+            let fn_add_bias_f16 = add_bias_f16_mod
+                .get_function("add_bias_f16_kernel")?;
+            let cast_fp_mod = kernels.load_ptx("cast_fp")?;
+            let fn_cast_f32_to_f16 = cast_fp_mod
+                .get_function("cast_f32_to_f16_kernel")?;
+            let extract_head_f16_mod = kernels.load_ptx("extract_head_f16")?;
+            let fn_extract_head_f16 = extract_head_f16_mod
+                .get_function("extract_head_f16_kernel")?;
+            let fn_scatter_head_f16 = extract_head_f16_mod
+                .get_function("scatter_head_f16_kernel")?;
+
             let outside_kernels = Qwen35OutsideKernels {
                 embedding_gather_f16_mod,
                 fn_embedding_gather_f16,
@@ -628,6 +691,27 @@ impl Qwen35Bringup {
                 fn_f16_plus_f32_inplace_f16,
                 vector_add_f16_mod,
                 fn_vector_add_f16,
+                layernorm_inplace_f16_mod,
+                fn_layernorm_inplace_f16,
+                gelu_tanh_f16_mod,
+                fn_gelu_tanh_f16,
+                softmax_row_f16_mod,
+                fn_softmax_row_f16,
+                vit_rotary_2d_f16_mod,
+                fn_vit_rotary_2d_f16,
+                vit_pos_embed_interp_f16_mod,
+                fn_vit_pos_embed_interp_f16,
+                scale_inplace_f16_mod,
+                fn_scale_inplace_f16,
+                transpose_2d_f16_mod,
+                fn_transpose_2d_f16,
+                add_bias_f16_mod,
+                fn_add_bias_f16,
+                cast_fp_mod,
+                fn_cast_f32_to_f16,
+                extract_head_f16_mod,
+                fn_extract_head_f16,
+                fn_scatter_head_f16,
             };
 
             // cuBLASLt for the FP8 lm_head matmul. 32 MiB workspace
@@ -1633,6 +1717,54 @@ impl Qwen35Bringup {
             }
         }
         Ok(())
+    }
+
+    /// Phase 3-a-v: borrow bundle for the shared Qwen-VL ViT
+    /// forward path. Mirrors `Qwen36Bringup::vision_deps`; the
+    /// free fn that consumes it lives in
+    /// `crate::qwen_vision_forward` and is shared between the two
+    /// bringups. Returns a clean error if the vision tower wasn't
+    /// loaded (no `model.visual.*` keys in the checkpoint).
+    pub fn vision_deps(
+        &self,
+    ) -> Result<crate::qwen_vision_forward::QwenVisionDeps<'_>> {
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "vision_deps: model absent".into()))?;
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "vision_deps: arena absent".into()))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "vision_deps: stream absent".into()))?;
+        let cublaslt = self.cublaslt.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "vision_deps: cublaslt absent".into()))?;
+        let ker = self.outside_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "vision_deps: outside_kernels absent".into()))?;
+        let vision = model.vision.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "vision_deps: model.vision not loaded — checkpoint lacks \
+             model.visual.* tensors".into()))?;
+        Ok(crate::qwen_vision_forward::QwenVisionDeps {
+            vision,
+            arena,
+            stream,
+            cublaslt,
+            fn_layernorm_inplace_f16: ker.fn_layernorm_inplace_f16,
+            fn_gelu_tanh_f16: ker.fn_gelu_tanh_f16,
+            fn_softmax_row_f16: ker.fn_softmax_row_f16,
+            fn_vit_rotary_2d_f16: ker.fn_vit_rotary_2d_f16,
+            fn_vit_pos_embed_interp_f16: ker.fn_vit_pos_embed_interp_f16,
+            fn_scale_inplace_f16: ker.fn_scale_inplace_f16,
+            fn_transpose_2d_f16: ker.fn_transpose_2d_f16,
+            fn_add_bias_f16: ker.fn_add_bias_f16,
+            fn_cast_f32_to_f16: ker.fn_cast_f32_to_f16,
+            fn_extract_head_f16: ker.fn_extract_head_f16,
+            fn_scatter_head_f16: ker.fn_scatter_head_f16,
+            fn_vector_add_f16: ker.fn_vector_add_f16,
+        })
     }
 
     /// Phase 2c-C-b: linear-attn (Gated DeltaNet) forward block.
