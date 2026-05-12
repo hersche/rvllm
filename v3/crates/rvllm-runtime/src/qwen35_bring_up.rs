@@ -235,6 +235,17 @@ pub struct Qwen35OutsideKernels {
     // `gated_delta_rule_decode_f16` launches at prefill time.
     pub gated_delta_rule_prefill_f16_mod: LoadedModule,
     pub fn_gated_delta_rule_prefill_f16: KernelFn,
+    // Phase #1-c: batched-prefill full-attn support.
+    // `flash_attention_2_f16kv_kernel` is the prefill-time
+    // FA-2 kernel (f32-Q / f16-KV / f32-O, causal-masked over
+    // num_query_tokens=N). Lives in the same `flash_attention`
+    // PTX module that already supplied the decode-time kernel.
+    pub fn_flash_attention_2_f16kv: KernelFn,
+    // `cast_f16_to_f32_kernel` lives in the same `cast_fp`
+    // module as the already-loaded `fn_cast_f32_to_f16`; this
+    // is the inverse direction needed to sandwich the
+    // f32-IO FA-2 prefill kernel between our f16 GEMVs.
+    pub fn_cast_f16_to_f32: KernelFn,
     // ── Vector residual add (used after attn + MLP) ────────
     pub f16_plus_f32_inplace_f16_mod: LoadedModule,
     pub fn_f16_plus_f32_inplace_f16: KernelFn,
@@ -633,6 +644,8 @@ impl Qwen35Bringup {
             let flash_attention_mod = kernels.load_ptx("flash_attention")?;
             let fn_flash_attention_2_decode_f16io = flash_attention_mod
                 .get_function("flash_attention_2_decode_f16io_kernel")?;
+            let fn_flash_attention_2_f16kv = flash_attention_mod
+                .get_function("flash_attention_2_f16kv_kernel")?;
             let sigmoid_mul_f16_mod = kernels.load_ptx("sigmoid_mul_f16")?;
             let fn_sigmoid_mul_f16 = sigmoid_mul_f16_mod
                 .get_function("sigmoid_mul_f16_kernel")?;
@@ -711,6 +724,8 @@ impl Qwen35Bringup {
             let cast_fp_mod = kernels.load_ptx("cast_fp")?;
             let fn_cast_f32_to_f16 = cast_fp_mod
                 .get_function("cast_f32_to_f16_kernel")?;
+            let fn_cast_f16_to_f32 = cast_fp_mod
+                .get_function("cast_f16_to_f32_kernel")?;
             let extract_head_f16_mod = kernels.load_ptx("extract_head_f16")?;
             let fn_extract_head_f16 = extract_head_f16_mod
                 .get_function("extract_head_f16_kernel")?;
@@ -769,6 +784,8 @@ impl Qwen35Bringup {
                 fn_conv_state_advance_batched_f16,
                 gated_delta_rule_prefill_f16_mod,
                 fn_gated_delta_rule_prefill_f16,
+                fn_flash_attention_2_f16kv,
+                fn_cast_f16_to_f32,
                 qwen_linear_rmsnorm_gated_f16_mod,
                 fn_qwen_linear_rmsnorm_gated_f16,
                 f16_plus_f32_inplace_f16_mod,
