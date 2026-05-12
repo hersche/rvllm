@@ -8053,16 +8053,50 @@ impl Qwen36Bringup {
         }
 
         // Phase 3c-pad (Codex review #4-B): CUTLASS-with-M-pad for
-        // 2 ≤ m < 128. Currently DISABLED — first live test on
-        // Qwen 3.6 / sm_121 produced wrong row outputs (ball.png
-        // vision returned "Königslutter am Elm" instead of the
-        // orange-circle description). The TTFT win is real
-        // (572 → 302 ms for a 51-token prompt) but correctness
-        // failed; the cause is not yet identified — likely a
-        // subtle layout / CUTLASS launch-prep precondition that
-        // the zero-padded rows violate even though the amax
-        // kernel itself handles amax=0 safely. Keep the code in
-        // tree for the next debug pass; gated off by `false &&`.
+        // 2 ≤ m < 128. Currently DISABLED — two attempts failed
+        // for the same structural reason:
+        //
+        //   1) Zero-pad rows m..127:
+        //      → amax kernel writes scale=1.0 (its safe fallback
+        //        for amax=0), CUTLASS prep_sfa max-reduces over
+        //        all 128 rows → chunk scale inflated to 1.0,
+        //        real rows un-quantized at the wrong scale,
+        //        wrong output ("Königslutter am Elm").
+        //   2) Replicate row 0 into rows m..127:
+        //      → all 128 rows have similar amax, chunk scale
+        //        represents the real data well, BUT the real
+        //        rows 1..m-1 were each quantized at THEIR OWN
+        //        scale (different from row 0's), so they
+        //        de-quantize wrong. Same hallucinated output.
+        //
+        // Root cause: `fp8_quantize_per_token_amax_f16` writes
+        // PER-ROW-scaled fp8 values, but CUTLASS prep_sfa
+        // produces a PER-CHUNK scale. The m≥128 path gets away
+        // with this only because real activations in a chunk are
+        // typically similar enough that per-row ≈ chunk scale.
+        // Injecting padded rows breaks that assumption no matter
+        // what they contain.
+        //
+        // Fixes that would work but are non-trivial:
+        //
+        //   * Switch to a CHUNK-LEVEL quantize kernel that uses
+        //     ONE scale per 128-row chunk (matches CUTLASS
+        //     prep_sfa semantics exactly). The real M rows
+        //     would then be quantized identically to the m≥128
+        //     case at M=128.
+        //   * Write a dedicated row-batched FP8 GEMV kernel
+        //     (the user's alternative suggestion) — keeps
+        //     per-row scaling, just amortizes launch overhead
+        //     across the row dimension.
+        //
+        // Either is its own debug + bench session. Keeping the
+        // scaffold in tree for that pass; production stays on
+        // the cached cuBLASLt-no-algo → looped-GEMV path
+        // (Codex #4-A) which is correct and faster than the
+        // previous quantise+heuristic-every-call.
+        // Disabled by `false &&`. See block-leading comment for the
+        // numerical root cause (per-row vs per-chunk scale
+        // mismatch). Keeping the scaffold in tree.
         #[cfg(feature = "cuda")]
         if false && m >= 2 && m < 128 {
             if let CutlassBackend::SoSm120(ref lib) = self.cutlass {
@@ -8071,28 +8105,45 @@ impl Qwen36Bringup {
                 let pad_out_bytes = (PAD_M as usize) * (n as usize) * 2;
                 let pad_in  = self.arena.region("qwen36_proj_pad_in_f16",  pad_in_bytes,  16)?;
                 let pad_out = self.arena.region("qwen36_proj_pad_out_f16", pad_out_bytes, 16)?;
-                // Zero the padded input slab, then DtoD M rows in.
+                // Build pad_in as: real m rows from input_f16, then
+                // replicate row 0 into rows m..PAD_M-1. Replicating
+                // (rather than zero-padding) gives all 128 rows a
+                // similar per-token amax, so the CUTLASS prep_sfa
+                // chunk-level reduction picks a scale that
+                // represents the real data — not artificially
+                // inflated by amax=0 fallback rows (the cause of the
+                // wrong output in the prior commit).
                 unsafe {
                     use cudarc::driver::sys::*;
-                    let rc = cuMemsetD8_v2(pad_in.device_ptr(), 0, pad_in_bytes);
-                    if rc != CUresult::CUDA_SUCCESS {
-                        return Err(rvllm_core::RvllmError::cuda(
-                            "qwen36 fp8_proj_dispatch: pad-in cuMemsetD8",
-                            rvllm_core::CudaErrorKind::Other,
-                            rvllm_core::CudaCtx::setup(),
-                        ));
-                    }
-                    let m_rows_bytes = (m as usize) * (k as usize) * 2;
+                    let row_bytes = (k as usize) * 2;
+                    // (a) DtoD M real rows starting at row 0.
+                    let m_rows_bytes = (m as usize) * row_bytes;
                     let rc = cuMemcpyDtoDAsync_v2(
                         pad_in.device_ptr(), input_f16,
                         m_rows_bytes, stream as CUstream,
                     );
                     if rc != CUresult::CUDA_SUCCESS {
                         return Err(rvllm_core::RvllmError::cuda(
-                            "qwen36 fp8_proj_dispatch: pad-in DtoD",
+                            "qwen36 fp8_proj_dispatch: pad-in DtoD (real rows)",
                             rvllm_core::CudaErrorKind::MemcpyFailed,
                             rvllm_core::CudaCtx::setup(),
                         ));
+                    }
+                    // (b) Replicate row 0 into rows m..PAD_M-1
+                    //     (PAD_M-m small DtoD copies).
+                    for r in (m as u64)..(PAD_M as u64) {
+                        let dst = pad_in.device_ptr() + r * (row_bytes as u64);
+                        let rc = cuMemcpyDtoDAsync_v2(
+                            dst, input_f16, row_bytes,
+                            stream as CUstream,
+                        );
+                        if rc != CUresult::CUDA_SUCCESS {
+                            return Err(rvllm_core::RvllmError::cuda(
+                                "qwen36 fp8_proj_dispatch: pad-in row-0 replication",
+                                rvllm_core::CudaErrorKind::MemcpyFailed,
+                                rvllm_core::CudaCtx::setup(),
+                            ));
+                        }
                     }
                 }
                 // Per-token amax-quantise the padded input.
