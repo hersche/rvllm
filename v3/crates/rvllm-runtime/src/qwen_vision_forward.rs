@@ -163,7 +163,6 @@ pub fn forward_qwen_vision(
                             n: usize,
                             k: usize|
      -> Result<()> {
-        #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             deps.cublaslt.f16_gemm_f32(
@@ -253,7 +252,6 @@ pub fn forward_qwen_vision(
     if let Ok(path) = std::env::var("RVLLM_QWEN36_VIT_PATCH_EMBED_DUMP") {
         let bytes = n_tokens * hidden * 2;
         let mut host = vec![0u8; bytes];
-        #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
@@ -267,7 +265,6 @@ pub fn forward_qwen_vision(
     // table is `[2304, 1152]` (num_grid_per_side²); we interpolate it
     // to `[grid_h * grid_w, 1152]` and add to hidden_region in place.
     const QWEN_VIT_NUM_GRID: i32 = 48; // sqrt(num_position_embeddings=2304)
-    #[cfg(feature = "cuda")]
     unsafe {
         use cudarc::driver::sys::*;
         let mut hs = hidden_region.device_ptr();
@@ -308,7 +305,6 @@ pub fn forward_qwen_vision(
     if let Ok(path) = std::env::var("RVLLM_QWEN36_VIT_POSEMB_DUMP") {
         let bytes = n_tokens * hidden * 2;
         let mut host = vec![0u8; bytes];
-        #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
@@ -454,7 +450,6 @@ pub fn forward_qwen_vision(
     for (blk_idx, blk) in vision.blocks.iter().enumerate() {
         // ─ pre-attn LayerNorm on a copy ─
         let normed = deps.arena.region("qvis_normed", n_tokens * hidden * 2, 16)?;
-        #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let _ = cuMemcpyDtoDAsync_v2(
@@ -498,7 +493,6 @@ pub fn forward_qwen_vision(
             if let Some(dir) = blk_dump_dir.as_deref() {
                 let bytes = n_tokens * hidden * 2;
                 let mut host = vec![0u8; bytes];
-                #[cfg(feature = "cuda")]
                 unsafe {
                     use cudarc::driver::sys::*;
                     let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, normed.device_ptr(), bytes);
@@ -519,7 +513,6 @@ pub fn forward_qwen_vision(
 
         // ─ Split QKV → Q, K, V (each [N, 1152]). HF lays them out
         //   as [N, 3*hidden] = (Q[N,hidden], K[N,hidden], V[N,hidden]). ─
-        #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let row_bytes = (hidden * 2) as u64;
@@ -548,7 +541,6 @@ pub fn forward_qwen_vision(
 
         // ─ Apply 2D rotary to Q, K. ─
         for &qk_ptr in &[q_buf.device_ptr(), k_buf.device_ptr()] {
-            #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut x = qk_ptr;
@@ -590,7 +582,6 @@ pub fn forward_qwen_vision(
                 let mut q_host = vec![0u8; bytes];
                 let mut k_host = vec![0u8; bytes];
                 let mut v_host = vec![0u8; bytes];
-                #[cfg(feature = "cuda")]
                 unsafe {
                     use cudarc::driver::sys::*;
                     let _ = cuMemcpyDtoH_v2(q_host.as_mut_ptr() as *mut _, q_buf.device_ptr(), bytes);
@@ -618,7 +609,6 @@ pub fn forward_qwen_vision(
             // and was validated correct at 64 / 256 / 1024 tokens.
             let scale = 1.0_f32 / (head_dim as f32).sqrt();
             // (1) batched QK^T → scores_f32_all [H, N, N]
-            #[cfg(feature = "cuda")]
             unsafe {
                 deps.cublaslt.f16_gemm_f32_batched_strided(
                     q_buf.device_ptr(),
@@ -640,7 +630,6 @@ pub fn forward_qwen_vision(
             // (2.5) scale_inplace_f32: scores_f32_all *= 1/√D over
             //       H*N*N elements. Folds the attention scale into
             //       the f32 accumulator instead of degrading Q in f16.
-            #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut x = scores_f32_all.device_ptr();
@@ -670,7 +659,6 @@ pub fn forward_qwen_vision(
             }
             // (3) softmax_row_f32_to_f16 → scores_buf_all [H, N, N]
             //     grid = N×H rows of length N each.
-            #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut out = scores_buf_all.device_ptr();
@@ -700,7 +688,6 @@ pub fn forward_qwen_vision(
             }
             // (4) transpose V from interleaved [N, H*D] to head-major
             //     [H, D, N] for the second batched GEMM.
-            #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut out = v_t_all.device_ptr();
@@ -732,7 +719,6 @@ pub fn forward_qwen_vision(
                 }
             }
             // (5) batched scores @ V_T → out_f32_all [H, N, D] f32
-            #[cfg(feature = "cuda")]
             unsafe {
                 deps.cublaslt.f16_gemm_f32_batched_strided(
                     scores_buf_all.device_ptr(),
@@ -752,7 +738,6 @@ pub fn forward_qwen_vision(
                 )?;
             }
             // (6) cast f32 → f16: out_hmajor [H, N, D]
-            #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let n_elem = (num_heads * n_tokens * head_dim) as i32;
@@ -782,7 +767,6 @@ pub fn forward_qwen_vision(
                 }
             }
             // (7) scatter [H, N, D] → attn_out [N, H*D]
-            #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut out = attn_out.device_ptr();
@@ -836,7 +820,6 @@ pub fn forward_qwen_vision(
         // launches per image at N=196) with a single kernel
         // launch per (head, direction). Codex review #C round 3.
         let extract_head = |dst: u64, src: u64, head_idx: usize| -> Result<()> {
-            #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut o = dst;
@@ -870,7 +853,6 @@ pub fn forward_qwen_vision(
             Ok(())
         };
         let scatter_head = |dst: u64, src: u64, head_idx: usize| -> Result<()> {
-            #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut o = dst;
@@ -910,7 +892,6 @@ pub fn forward_qwen_vision(
 
             // QK^T: [N, head_dim] @ [N, head_dim]^T → [N, N] f32 → cast f16
             // Use cuBLASLt f16_gemm_f32 with N=N, M=N, K=head_dim.
-            #[cfg(feature = "cuda")]
             unsafe {
                 deps.cublaslt.f16_gemm_f32(
                     q_h.device_ptr(), k_h.device_ptr(),
@@ -956,7 +937,6 @@ pub fn forward_qwen_vision(
             // this, softmax becomes degenerate — one token wins
             // ~all attention — and patches stop mixing, which
             // produces image-content-blind ViT output.)
-            #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut x = scores_buf.device_ptr();
@@ -987,7 +967,6 @@ pub fn forward_qwen_vision(
             }
 
             // Softmax row-wise on scores [N, N]
-            #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut x = scores_buf.device_ptr();
@@ -1018,7 +997,6 @@ pub fn forward_qwen_vision(
             // f16_gemm_f32 always computes input @ weight^T, so we
             // need V transposed [head_dim, N] for the call to give
             // sum_j scores[r,j] * V[j,c] (instead of scores @ V^T).
-            #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut out_p = v_h_t.device_ptr();
@@ -1049,7 +1027,6 @@ pub fn forward_qwen_vision(
                 ));
             }
             }
-            #[cfg(feature = "cuda")]
             unsafe {
                 deps.cublaslt.f16_gemm_f32(
                     scores_buf.device_ptr(), v_h_t.device_ptr(),
@@ -1098,7 +1075,6 @@ pub fn forward_qwen_vision(
             if let Some(dir) = blk_dump_dir.as_deref() {
                 let bytes = n_tokens * hidden * 2;
                 let mut host = vec![0u8; bytes];
-                #[cfg(feature = "cuda")]
                 unsafe {
                     use cudarc::driver::sys::*;
                     let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, attn_out.device_ptr(), bytes);
@@ -1118,7 +1094,6 @@ pub fn forward_qwen_vision(
         // Residual: hidden += proj_out via GPU vector_add_f16
         // (replaces the earlier DtoH-add-HtoD round-trip per
         // block — Codex review #3 round 4 follow-up).
-        #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let n_elem = (n_tokens * hidden) as i32;
@@ -1154,7 +1129,6 @@ pub fn forward_qwen_vision(
             if let Some(dir) = blk_dump_dir.as_deref() {
                 let bytes = n_tokens * hidden * 2;
                 let mut host = vec![0u8; bytes];
-                #[cfg(feature = "cuda")]
                 unsafe {
                     use cudarc::driver::sys::*;
                     let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
@@ -1165,7 +1139,6 @@ pub fn forward_qwen_vision(
 
         // ─ pre-MLP LayerNorm (norm2) on a copy ─
         let normed2 = deps.arena.region("qvis_normed2", n_tokens * hidden * 2, 16)?;
-        #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let _ = cuMemcpyDtoDAsync_v2(
@@ -1213,7 +1186,6 @@ pub fn forward_qwen_vision(
             f32_scratch.device_ptr(),
             n_tokens, intermediate, hidden,
         )?;
-        #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let n_elem = (n_tokens * intermediate) as i32;
@@ -1251,7 +1223,6 @@ pub fn forward_qwen_vision(
             n_tokens, hidden, intermediate,
         )?;
         // Residual: hidden += mlp_out via GPU vector_add_f16.
-        #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let n_elem = (n_tokens * hidden) as i32;
@@ -1287,7 +1258,6 @@ pub fn forward_qwen_vision(
             if let Some(dir) = blk_dump_dir.as_deref() {
                 let bytes = n_tokens * hidden * 2;
                 let mut host = vec![0u8; bytes];
-                #[cfg(feature = "cuda")]
                 unsafe {
                     use cudarc::driver::sys::*;
                     let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
@@ -1301,7 +1271,6 @@ pub fn forward_qwen_vision(
             if blk_idx == 0 || blk_idx == 13 || blk_idx == 26 {
                 let bytes = n_tokens * hidden * 2;
                 let mut host = vec![0u8; bytes];
-                #[cfg(feature = "cuda")]
                 unsafe {
                     use cudarc::driver::sys::*;
                     let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
@@ -1317,7 +1286,6 @@ pub fn forward_qwen_vision(
     if let Ok(path) = std::env::var("RVLLM_QWEN36_VISION_PREMERGER_DUMP") {
         let bytes = n_tokens * hidden * 2;
         let mut host = vec![0u8; bytes];
-        #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
@@ -1331,7 +1299,6 @@ pub fn forward_qwen_vision(
 
     // ── Step 6: PatchMerger. ────────────────────────────────────
     // (a) LayerNorm hidden in-place per-token (gamma/beta are 1152).
-    #[cfg(feature = "cuda")]
     unsafe {
         use cudarc::driver::sys::*;
         let mut x = hidden_region.device_ptr();
@@ -1371,7 +1338,6 @@ pub fn forward_qwen_vision(
     // 2×2 spatial cluster ⇒ direct concat works.
     let merged_bytes = n_merged * merger_in * 2;
     let merged_region = deps.arena.region("qvis_merged", merged_bytes, 16)?;
-    #[cfg(feature = "cuda")]
     unsafe {
         use cudarc::driver::sys::*;
         let row_bytes = (hidden * 2) as u64;
@@ -1396,7 +1362,6 @@ pub fn forward_qwen_vision(
         f32_scratch.device_ptr(),
         n_merged, merger_in, merger_in,
     )?;
-    #[cfg(feature = "cuda")]
     unsafe {
         use cudarc::driver::sys::*;
         let n_elem = (n_merged * merger_in) as i32;
@@ -1443,7 +1408,6 @@ pub fn forward_qwen_vision(
     // meaningless vision output. Propagate the error so the
     // request fails loudly.
     let mut out_bytes = vec![0u8; n_merged * out_hidden * 2];
-    #[cfg(feature = "cuda")]
     unsafe {
         use cudarc::driver::sys::*;
         let r = cuMemcpyDtoH_v2(
