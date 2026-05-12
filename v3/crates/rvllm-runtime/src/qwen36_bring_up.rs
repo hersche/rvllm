@@ -8052,6 +8052,131 @@ impl Qwen36Bringup {
             }
         }
 
+        // Phase 3c-pad (Codex review #4-B): CUTLASS-with-M-pad for
+        // 2 ≤ m < 128. Currently DISABLED — first live test on
+        // Qwen 3.6 / sm_121 produced wrong row outputs (ball.png
+        // vision returned "Königslutter am Elm" instead of the
+        // orange-circle description). The TTFT win is real
+        // (572 → 302 ms for a 51-token prompt) but correctness
+        // failed; the cause is not yet identified — likely a
+        // subtle layout / CUTLASS launch-prep precondition that
+        // the zero-padded rows violate even though the amax
+        // kernel itself handles amax=0 safely. Keep the code in
+        // tree for the next debug pass; gated off by `false &&`.
+        #[cfg(feature = "cuda")]
+        if false && m >= 2 && m < 128 {
+            if let CutlassBackend::SoSm120(ref lib) = self.cutlass {
+                const PAD_M: u32 = 128;
+                let pad_in_bytes  = (PAD_M as usize) * (k as usize) * 2;
+                let pad_out_bytes = (PAD_M as usize) * (n as usize) * 2;
+                let pad_in  = self.arena.region("qwen36_proj_pad_in_f16",  pad_in_bytes,  16)?;
+                let pad_out = self.arena.region("qwen36_proj_pad_out_f16", pad_out_bytes, 16)?;
+                // Zero the padded input slab, then DtoD M rows in.
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let rc = cuMemsetD8_v2(pad_in.device_ptr(), 0, pad_in_bytes);
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 fp8_proj_dispatch: pad-in cuMemsetD8",
+                            rvllm_core::CudaErrorKind::Other,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                    let m_rows_bytes = (m as usize) * (k as usize) * 2;
+                    let rc = cuMemcpyDtoDAsync_v2(
+                        pad_in.device_ptr(), input_f16,
+                        m_rows_bytes, stream as CUstream,
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 fp8_proj_dispatch: pad-in DtoD",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                // Per-token amax-quantise the padded input.
+                let fp8_bytes  = (PAD_M as usize) * (k as usize);
+                let amax_bytes = (PAD_M as usize) * 4;
+                let in_fp8  = self.arena.region("qwen36_proj_pad_in_fp8", fp8_bytes, 16)?;
+                let in_amax = self.arena.region("qwen36_proj_pad_in_amax", amax_bytes, 16)?;
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let block_dim: u32 = (k as u32).min(1024);
+                    let mut o_fp8 = in_fp8.device_ptr();
+                    let mut o_amax = in_amax.device_ptr();
+                    let mut i_ptr = pad_in.device_ptr();
+                    let mut k_i: i32 = k as i32;
+                    let args = [
+                        (&mut o_fp8) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut o_amax) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut i_ptr) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let rc = cuLaunchKernel(
+                        self.outside_kernels.fn_fp8_quantize_per_token_amax_f16.raw() as CUfunction,
+                        PAD_M, 1, 1,
+                        block_dim, 1, 1,
+                        0, stream as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 fp8_proj_dispatch: pad amax-quantise launch",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                // CUTLASS SM120 launch at M=PAD_M.
+                let sfa_n = lib.sfa_bytes(PAD_M as i32, k as i32);
+                let sfb_n = lib.sfb_bytes(n as i32, k as i32);
+                let ws_n  = lib.workspace_size(PAD_M as i32, n as i32, k as i32);
+                if sfa_n == 0 || sfb_n == 0 {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 fp8_proj_dispatch: CUTLASS SM120 pad path \
+                         reported sfa_bytes/sfb_bytes==0",
+                        rvllm_core::CudaErrorKind::Other,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+                let sfa = self.arena.region("qwen36_proj_pad_sfa", sfa_n.max(4), 16)?;
+                let sfb = self.arena.region("qwen36_proj_pad_sfb", sfb_n.max(4), 16)?;
+                let ws  = self.arena.region("qwen36_proj_pad_ws",  ws_n.max(16), 256)?;
+                unsafe {
+                    lib.launch_prep_sfa(in_amax.device_ptr(), sfa.device_ptr(), PAD_M as i32, k as i32, stream)?;
+                    lib.launch_prep_sfb(b_blockscale, sfb.device_ptr(), n as i32, k as i32, stream)?;
+                    lib.launch_fp8_gemm_blockscale(
+                        pad_out.device_ptr(),
+                        in_fp8.device_ptr(),
+                        weight_fp8,
+                        sfa.device_ptr(),
+                        sfb.device_ptr(),
+                        PAD_M as i32, n as i32, k as i32,
+                        ws.device_ptr(), ws_n, stream,
+                    )?;
+                }
+                // DtoD the first M rows of pad_out into out_f16.
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let m_rows_bytes = (m as usize) * (n as usize) * 2;
+                    let rc = cuMemcpyDtoDAsync_v2(
+                        out_f16, pad_out.device_ptr(),
+                        m_rows_bytes, stream as CUstream,
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 fp8_proj_dispatch: pad-out DtoD",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                return Ok(());
+            }
+        }
+
         // Phase 3b: m≥2 path. Two sub-paths, gated by a one-time
         // capability probe (Codex review #4):
         //
