@@ -71,6 +71,9 @@ pub struct QwenVisionDeps<'a> {
     // softmax over H×N rows, 1 transpose V, 1 batched scores @ V).
     pub fn_softmax_row_f32_to_f16: KernelFn,
     pub fn_transpose_heads_v_f16: KernelFn,
+    /// Scatters all heads of a [H, N, D] head-major buffer back into
+    /// [N, H*D] interleaved (one launch vs one-per-head).
+    pub fn_scatter_heads_f16: KernelFn,
 }
 
 // ============================================================
