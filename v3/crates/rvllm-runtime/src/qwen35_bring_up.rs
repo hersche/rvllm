@@ -3200,6 +3200,64 @@ mod tests {
         assert!((arch.rope_theta - 5_000_000.0).abs() < 1e-3);
     }
 
+    /// Phase 2c-C-a regression: the linear-attn dim probe reads the
+    /// canonical Qwen 3.5 27B keys and computes the derived widths.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn la_dims_reads_qwen35_27b_canonical() {
+        let tmp = tempdir();
+        write_config(&tmp, &qwen35_full().replace(
+            "\"attn_output_gate\": true,",
+            "\"attn_output_gate\": true, \
+             \"linear_num_key_heads\": 16, \"linear_num_value_heads\": 48, \
+             \"linear_key_head_dim\": 128, \"linear_value_head_dim\": 128, \
+             \"linear_conv_kernel_dim\": 4,",
+        ));
+        let d = qwen35_la_dims(&tmp);
+        assert_eq!(d.num_k_heads, 16);
+        assert_eq!(d.num_v_heads, 48);
+        assert_eq!(d.head_k_dim, 128);
+        assert_eq!(d.head_v_dim, 128);
+        assert_eq!(d.conv_kernel_dim, 4);
+        assert_eq!(d.key_dim, 16 * 128);
+        assert_eq!(d.value_dim, 48 * 128);
+        assert_eq!(d.conv_dim, 2 * 16 * 128 + 48 * 128); // 10240
+        assert_eq!(d.v_per_k, 3);
+    }
+
+    /// Phase 2c-C-a defaults: when the linear-attn keys are missing
+    /// the probe falls back to the Qwen 3.5 27B canonical values so
+    /// test fixtures don't need to duplicate them.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn la_dims_defaults_to_qwen35_27b() {
+        let tmp = tempdir();
+        write_config(&tmp, qwen35_full());
+        let d = qwen35_la_dims(&tmp);
+        assert_eq!(d.num_k_heads, 16);
+        assert_eq!(d.num_v_heads, 48);
+        assert_eq!(d.head_v_dim, 128);
+        assert_eq!(d.v_per_k, 3);
+        // legacy 2-tuple alias must agree.
+        let (nvh, hvd) = qwen35_linear_dims(&tmp);
+        assert_eq!(nvh, d.num_v_heads);
+        assert_eq!(hvd, d.head_v_dim);
+    }
+
+    /// Phase 3-a defaults: vision config keys propagate onto the
+    /// arch struct (they drive the chat-template image-pad
+    /// expansion + admission predictor).
+    #[test]
+    fn arch_carries_vision_config() {
+        let tmp = tempdir();
+        write_config(&tmp, qwen35_full());
+        let arch = Qwen35Arch::from_dir(&tmp).unwrap().expect("dense qwen35");
+        assert_eq!(arch.vision_hidden_size, Some(1152));
+        assert_eq!(arch.vision_depth, Some(27));
+        assert_eq!(arch.vision_out_hidden_size, Some(5120));
+        assert_eq!(arch.image_token_id, Some(248056));
+    }
+
     #[test]
     fn typed_errors_render_helpful_messages() {
         // Verify the typed error messages still point at the plan
