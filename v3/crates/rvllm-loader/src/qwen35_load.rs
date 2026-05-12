@@ -295,7 +295,89 @@ pub fn load_qwen35_model(
         arena.used() as f64 / (1024.0 * 1024.0 * 1024.0),
     );
 
-    Ok(Qwen35LoadedModel { outside, layers, vision: None })
+    let vision = load_qwen35_vision(&ctx).ok();
+    if vision.is_some() {
+        eprintln!("[qwen35-loader] vision tower loaded \
+                   (27 ViT blocks + PatchMerger)");
+    } else {
+        eprintln!("[qwen35-loader] vision tower SKIPPED \
+                   (no model.visual.* tensors or load failed)");
+    }
+    Ok(Qwen35LoadedModel { outside, layers, vision })
+}
+
+/// Qwen 3.5 vision tower load — byte-identical layout to Qwen 3.6
+/// (`model.visual.*` prefix, 27 ViT blocks, patch_embed, pos_embed,
+/// PatchMerger). Reuses `Qwen36Vision` via the existing struct in
+/// `qwen36_weights`. The only difference vs `qwen36_load`'s sibling
+/// is the arena region-name prefix (`qwen35_vis_*`) so a future
+/// Codex audit can identify which family allocated each region.
+fn load_qwen35_vision(
+    ctx: &LoadCtx,
+) -> Result<crate::qwen36_weights::Qwen36Vision> {
+    use crate::qwen36_weights::{
+        Qwen36PatchMerger, Qwen36Vision, Qwen36VisionBlock,
+        Qwen36VisionPatchEmbed,
+    };
+    let started = std::time::Instant::now();
+    const QWEN35_VISION_PREFIX: &str = "model.visual";
+
+    let pe_w_name = format!("{QWEN35_VISION_PREFIX}.patch_embed.proj.weight");
+    let pe_b_name = format!("{QWEN35_VISION_PREFIX}.patch_embed.proj.bias");
+    let _ = ctx.must_get(&pe_w_name)?;
+    let _ = ctx.must_get(&pe_b_name)?;
+    let (proj_weight, _) = ctx.upload_f16("qwen35_vis_pe_w", &pe_w_name)?;
+    let (proj_bias, _) = ctx.upload_f16("qwen35_vis_pe_b", &pe_b_name)?;
+    let patch_embed = Qwen36VisionPatchEmbed { proj_weight, proj_bias };
+
+    let pos_embed_name = format!("{QWEN35_VISION_PREFIX}.pos_embed.weight");
+    let (pos_embed, _) = ctx.upload_f16("qwen35_vis_pos_embed", &pos_embed_name)?;
+
+    let mut blocks = Vec::with_capacity(27);
+    for i in 0..27 {
+        let p = |s: &str| format!("{QWEN35_VISION_PREFIX}.blocks.{i}.{s}");
+        let (norm1_w, _) = ctx.upload_f16("qwen35_vis_n1w", &p("norm1.weight"))?;
+        let (norm1_b, _) = ctx.upload_f16("qwen35_vis_n1b", &p("norm1.bias"))?;
+        let (qkv_w, _) = ctx.upload_f16("qwen35_vis_qkv_w", &p("attn.qkv.weight"))?;
+        let (qkv_b, _) = ctx.upload_f16("qwen35_vis_qkv_b", &p("attn.qkv.bias"))?;
+        let (proj_w, _) = ctx.upload_f16("qwen35_vis_o_w", &p("attn.proj.weight"))?;
+        let (proj_b, _) = ctx.upload_f16("qwen35_vis_o_b", &p("attn.proj.bias"))?;
+        let (norm2_w, _) = ctx.upload_f16("qwen35_vis_n2w", &p("norm2.weight"))?;
+        let (norm2_b, _) = ctx.upload_f16("qwen35_vis_n2b", &p("norm2.bias"))?;
+        let (fc1_w, _) = ctx.upload_f16("qwen35_vis_fc1w", &p("mlp.linear_fc1.weight"))?;
+        let (fc1_b, _) = ctx.upload_f16("qwen35_vis_fc1b", &p("mlp.linear_fc1.bias"))?;
+        let (fc2_w, _) = ctx.upload_f16("qwen35_vis_fc2w", &p("mlp.linear_fc2.weight"))?;
+        let (fc2_b, _) = ctx.upload_f16("qwen35_vis_fc2b", &p("mlp.linear_fc2.bias"))?;
+        blocks.push(Qwen36VisionBlock {
+            norm1_w, norm1_b, qkv_w, qkv_b, proj_w, proj_b,
+            norm2_w, norm2_b, fc1_w, fc1_b, fc2_w, fc2_b,
+        });
+    }
+
+    let mp = |s: &str| format!("{QWEN35_VISION_PREFIX}.merger.{s}");
+    let (norm_w, _) = ctx.upload_f16("qwen35_vis_mg_nw", &mp("norm.weight"))?;
+    let (norm_b, _) = ctx.upload_f16("qwen35_vis_mg_nb", &mp("norm.bias"))?;
+    let (mfc1_w, _) = ctx.upload_f16("qwen35_vis_mg_fc1w", &mp("linear_fc1.weight"))?;
+    let (mfc1_b, _) = ctx.upload_f16("qwen35_vis_mg_fc1b", &mp("linear_fc1.bias"))?;
+    let (mfc2_w, _) = ctx.upload_f16("qwen35_vis_mg_fc2w", &mp("linear_fc2.weight"))?;
+    let (mfc2_b, _) = ctx.upload_f16("qwen35_vis_mg_fc2b", &mp("linear_fc2.bias"))?;
+    let merger = Qwen36PatchMerger {
+        norm_w, norm_b,
+        fc1_w: mfc1_w, fc1_b: mfc1_b,
+        fc2_w: mfc2_w, fc2_b: mfc2_b,
+    };
+
+    eprintln!(
+        "[qwen35-loader] vision: 27 blocks + patch_embed + merger uploaded \
+         in {:.1}s",
+        started.elapsed().as_secs_f64(),
+    );
+    Ok(Qwen36Vision {
+        patch_embed,
+        pos_embed,
+        blocks,
+        merger,
+    })
 }
 
 fn load_full_attn_layer(ctx: &LoadCtx, layer_idx: usize) -> Result<Qwen35FullAttnLayer> {
