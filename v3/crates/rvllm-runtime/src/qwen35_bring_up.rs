@@ -2437,37 +2437,12 @@ impl Qwen35Bringup {
         let eps = arch.base.rms_norm_eps;
         let stream_raw = stream.raw() as u64;
 
-        // (1) HtoD token + embed.
-        let token_bytes = (token_id as i32).to_le_bytes();
-        {
-            use cudarc::driver::sys::*;
-            let rc = cuMemcpyHtoDAsync_v2(
-                scr.token_in_ptr as CUdeviceptr,
-                token_bytes.as_ptr() as *const _, 4,
-                stream_raw as CUstream);
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen35 all-layers HtoD",
-                    rvllm_core::CudaErrorKind::MemcpyFailed,
-                    rvllm_core::CudaCtx::setup()));
-            }
-        }
-        rvllm_fused::EmbeddingGatherLaunch {
-            num_tokens: 1, hidden, vocab,
-        }.launch(
-            ker.fn_embedding_gather_f16,
-            scr.h_residual_ptr,
-            model.outside.embed_tokens.offset_bytes,
-            scr.token_in_ptr,
-            stream_raw,
-        )?;
-
-        // (1b) Vision splice: if the caller supplied a pre-computed
-        // h_residual row (Qwen3-VL ViT output for an image token),
-        // overwrite the text-embed result with it. The HtoD above
-        // still ran so the token_id is consistent with anything
-        // that reads `token_in` downstream, but the layer chain
-        // sees the vision row.
+        // (1) Source h_residual. Two paths:
+        //   * Vision splice (Some): HtoD the vision-tower row
+        //     directly. Skips token HtoD + embed_gather — neither
+        //     is needed because nothing downstream reads
+        //     `token_in_ptr` after embed.
+        //   * Text (None): HtoD token id, then embed_gather.
         if let Some(bytes) = splice_h_residual {
             let want = (hidden as usize) * 2;
             if bytes.len() != want {
@@ -2489,6 +2464,30 @@ impl Qwen35Bringup {
                     rvllm_core::CudaErrorKind::MemcpyFailed,
                     rvllm_core::CudaCtx::setup()));
             }
+        } else {
+            let token_bytes = (token_id as i32).to_le_bytes();
+            {
+                use cudarc::driver::sys::*;
+                let rc = cuMemcpyHtoDAsync_v2(
+                    scr.token_in_ptr as CUdeviceptr,
+                    token_bytes.as_ptr() as *const _, 4,
+                    stream_raw as CUstream);
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 all-layers HtoD",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup()));
+                }
+            }
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens: 1, hidden, vocab,
+            }.launch(
+                ker.fn_embedding_gather_f16,
+                scr.h_residual_ptr,
+                model.outside.embed_tokens.offset_bytes,
+                scr.token_in_ptr,
+                stream_raw,
+            )?;
         }
 
         // (2) Per-layer dispatch: attention block then dense MLP.
