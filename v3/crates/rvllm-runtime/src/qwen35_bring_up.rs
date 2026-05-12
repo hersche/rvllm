@@ -2395,6 +2395,24 @@ impl Qwen35Bringup {
         &self, token_id: u32, position: u32,
         splice_h_residual: Option<&[u8]>,
     ) -> Result<u32> {
+        self.forward_layers_only(token_id, position, splice_h_residual)?;
+        self.forward_finalize_argmax()
+    }
+
+    /// Phase 4-a: prefill-step variant — runs embed (or splice)
+    /// + the 64-layer loop only. Skips final-norm + lm_head GEMM
+    /// + argmax + the host-side DtoH/fence. KV cache + linear-attn
+    /// state advance the same way they do in the full smoke path,
+    /// so the next call sees the correct context.
+    ///
+    /// Used by `generate_session_with_vision` for every prefill
+    /// step except the last (which needs the argmax to seed
+    /// decode). Saves ~lm_head_gemm + 1 fence + 1 DtoH per
+    /// prefill token at the cost of one extra method boundary.
+    pub unsafe fn forward_layers_only(
+        &self, token_id: u32, position: u32,
+        splice_h_residual: Option<&[u8]>,
+    ) -> Result<()> {
         let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
             "forward_all_layers_smoke: scratch absent".into()))?;
@@ -2493,8 +2511,40 @@ impl Qwen35Bringup {
             }
             self.apply_dense_mlp_layer(li)?;
         }
+        Ok(())
+    }
 
-        // (3) Final RMSNorm + FP8 quantize.
+    /// Phase 4-a: finalize the current `h_residual` into a single
+    /// predicted token. Runs final RMSNorm + FP8 quantize +
+    /// cuBLASLt FP8 GEMM (lm_head) + argmax + DtoH the scalar
+    /// token id back to the host. Used both by the
+    /// final prefill step (to seed decode) and every decode
+    /// step.
+    pub unsafe fn forward_finalize_argmax(&self) -> Result<u32> {
+        let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_finalize_argmax: scratch absent".into()))?;
+        let ker = self.outside_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_finalize_argmax: outside_kernels absent".into()))?;
+        let cublaslt = self.cublaslt.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_finalize_argmax: cublaslt absent".into()))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_finalize_argmax: stream absent".into()))?;
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_finalize_argmax: arena absent".into()))?;
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_finalize_argmax: model absent".into()))?;
+        let arch = &self.arch;
+        let hidden = arch.base.hidden_size as u32;
+        let vocab = arch.base.vocab_size as u32;
+        let eps = arch.base.rms_norm_eps;
+        let stream_raw = stream.raw() as u64;
+
         let hidden_fp8_region = arena.region(
             "qwen35_all_hidden_fp8", hidden as usize, 16)?;
         let hidden_scale_region = arena.region(
@@ -2509,8 +2559,6 @@ impl Qwen35Bringup {
             model.outside.final_norm.offset_bytes,
             stream_raw,
         )?;
-
-        // (4) cuBLASLt fp8_gemm logits.
         cublaslt.fp8_gemm(
             hidden_fp8_region.device_ptr(),
             model.outside.lm_head_fp8.offset_bytes,
@@ -2520,8 +2568,6 @@ impl Qwen35Bringup {
             model.outside.lm_head_fp8.scale_ptr,
             stream_raw,
         )?;
-
-        // (5) argmax + DtoH.
         {
             use cudarc::driver::sys::*;
             let block_dim: u32 = vocab.min(1024);
@@ -2542,7 +2588,7 @@ impl Qwen35Bringup {
             );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "qwen35 all-layers argmax",
+                    "qwen35 finalize argmax",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup()));
             }
@@ -2556,7 +2602,7 @@ impl Qwen35Bringup {
                 scr.token_out_ptr as CUdeviceptr, 4);
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "qwen35 all-layers DtoH",
+                    "qwen35 finalize DtoH",
                     rvllm_core::CudaErrorKind::MemcpyFailed,
                     rvllm_core::CudaCtx::setup()));
             }
@@ -2641,11 +2687,21 @@ impl Qwen35Bringup {
 
         // Prefill: walk every prompt token; KV slot = its position.
         // Pass the per-token splice (None for plain text tokens).
+        // Phase 4-a: skip the final-norm + lm_head + argmax + DtoH
+        // on every prefill token except the last (we only need the
+        // argmax of the LAST prompt token to seed decode). For a
+        // 30-token prompt that's 29 saved lm_head GEMMs +
+        // 29 fences + 29 DtoHs.
         let prompt_len = prompt_ids.len() as u32;
+        let last_idx = prompt_ids.len() - 1;
         let mut last_predicted: u32 = 0;
         for (p, &tok) in prompt_ids.iter().enumerate() {
-            last_predicted = self.forward_all_layers_with_splice(
-                tok, p as u32, splice_map[p])?;
+            if p < last_idx {
+                self.forward_layers_only(tok, p as u32, splice_map[p])?;
+            } else {
+                last_predicted = self.forward_all_layers_with_splice(
+                    tok, p as u32, splice_map[p])?;
+            }
             arena.restore(ck);
         }
 
