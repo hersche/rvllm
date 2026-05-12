@@ -321,6 +321,14 @@ pub struct Qwen36OutsideKernels {
     pub extract_head_f16_mod: LoadedModule,
     pub fn_extract_head_f16: KernelFn,
     pub fn_scatter_head_f16: KernelFn,
+    /// Phase-perf 2: batched ViT attention. `softmax_row_f32_to_f16`
+    /// fuses scale+softmax over H×N rows; `transpose_heads_v_f16`
+    /// rearranges V from [N, H*D] interleaved to [H, D, N] head-major
+    /// for the second batched GEMM.
+    pub softmax_row_f32_to_f16_mod: LoadedModule,
+    pub fn_softmax_row_f32_to_f16: KernelFn,
+    pub transpose_heads_v_f16_mod: LoadedModule,
+    pub fn_transpose_heads_v_f16: KernelFn,
 }
 
 /// Pre-converted f32 weight caches for one linear-attention layer.
@@ -711,6 +719,14 @@ impl Qwen36Bringup {
             extract_head_f16_mod.get_function("extract_head_f16_kernel")?;
         let fn_scatter_head_f16 =
             extract_head_f16_mod.get_function("scatter_head_f16_kernel")?;
+        let softmax_row_f32_to_f16_mod =
+            kernels.load_ptx("softmax_row_f32_to_f16")?;
+        let fn_softmax_row_f32_to_f16 = softmax_row_f32_to_f16_mod
+            .get_function("softmax_row_f32_to_f16_kernel")?;
+        let transpose_heads_v_f16_mod =
+            kernels.load_ptx("transpose_heads_v_f16")?;
+        let fn_transpose_heads_v_f16 = transpose_heads_v_f16_mod
+            .get_function("transpose_heads_v_f16_kernel")?;
         let outside_kernels = Qwen36OutsideKernels {
             embedding_gather_f16_mod,
             fn_embedding_gather_f16,
@@ -820,6 +836,10 @@ impl Qwen36Bringup {
             extract_head_f16_mod,
             fn_extract_head_f16,
             fn_scatter_head_f16,
+            softmax_row_f32_to_f16_mod,
+            fn_softmax_row_f32_to_f16,
+            transpose_heads_v_f16_mod,
+            fn_transpose_heads_v_f16,
         };
         eprintln!(
             "[qwen36] outside kernels resolved: embedding_gather_f16, \
@@ -3890,6 +3910,8 @@ impl Qwen36Bringup {
             fn_cast_f32_to_f16: self.outside_kernels.fn_cast_f32_to_f16,
             fn_extract_head_f16: self.outside_kernels.fn_extract_head_f16,
             fn_scatter_head_f16: self.outside_kernels.fn_scatter_head_f16,
+            fn_softmax_row_f32_to_f16: self.outside_kernels.fn_softmax_row_f32_to_f16,
+            fn_transpose_heads_v_f16: self.outside_kernels.fn_transpose_heads_v_f16,
             fn_vector_add_f16: self.outside_kernels.fn_vector_add_f16,
         })
     }

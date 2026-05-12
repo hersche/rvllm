@@ -65,6 +65,12 @@ pub struct QwenVisionDeps<'a> {
     pub fn_extract_head_f16: KernelFn,
     pub fn_scatter_head_f16: KernelFn,
     pub fn_vector_add_f16: KernelFn,
+    // Phase-perf 2: batched-strided attention path (parity with the
+    // Gemma 4 vision tower). Replaces a 16-head loop with a constant
+    // number of launches per ViT block (1 batched QK^T GEMM, 1 fused
+    // softmax over H×N rows, 1 transpose V, 1 batched scores @ V).
+    pub fn_softmax_row_f32_to_f16: KernelFn,
+    pub fn_transpose_heads_v_f16: KernelFn,
 }
 
 // ============================================================
