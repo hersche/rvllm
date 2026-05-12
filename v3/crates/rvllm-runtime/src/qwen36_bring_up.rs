@@ -8052,53 +8052,64 @@ impl Qwen36Bringup {
             }
         }
 
-        // Phase 3c-pad (Codex review #4-B): CUTLASS-with-M-pad for
-        // 2 ≤ m < 128. Currently DISABLED — two attempts failed
-        // for the same structural reason:
+        // Phase 3c-pad (Codex review #4-B): CUTLASS-with-M-pad
+        // for 2 ≤ m < 128. Gated off behind
+        // `RVLLM_QWEN36_FP8_PAD_DEBUG=1` for further debugging.
         //
-        //   1) Zero-pad rows m..127:
-        //      → amax kernel writes scale=1.0 (its safe fallback
-        //        for amax=0), CUTLASS prep_sfa max-reduces over
-        //        all 128 rows → chunk scale inflated to 1.0,
-        //        real rows un-quantized at the wrong scale,
-        //        wrong output ("Königslutter am Elm").
-        //   2) Replicate row 0 into rows m..127:
-        //      → all 128 rows have similar amax, chunk scale
-        //        represents the real data well, BUT the real
-        //        rows 1..m-1 were each quantized at THEIR OWN
-        //        scale (different from row 0's), so they
-        //        de-quantize wrong. Same hallucinated output.
+        // Status after three debug passes:
         //
-        // Root cause: `fp8_quantize_per_token_amax_f16` writes
-        // PER-ROW-scaled fp8 values, but CUTLASS prep_sfa
-        // produces a PER-CHUNK scale. The m≥128 path gets away
-        // with this only because real activations in a chunk are
-        // typically similar enough that per-row ≈ chunk scale.
-        // Injecting padded rows breaks that assumption no matter
-        // what they contain.
+        //   1) Zero-pad rows m..127  → wrong output
+        //      ("Königslutter am Elm" on ball.png).
+        //   2) Replicate row 0       → same wrong output.
+        //   3) Pad-debug env-gate + diverse-input bisect
+        //      (2026-05-13):
+        //        Qwen 3.6 / plain text 24-tok "Zähle von 1 bis 5"
+        //          → "1, 2, 3, 4, 5." (CORRECT)
+        //        Qwen 3.6 / vision 83-tok ball.png
+        //          → "Königslutter am Elm …" (still WRONG)
         //
-        // Fixes that would work but are non-trivial:
+        // Crucial new finding: the CUTLASS-pad path produces
+        // **correct** output for plain-text prefill at M < 128
+        // but wrong output for vision prefill at the same path.
+        // Both runs are the same dispatcher with the same
+        // padding strategy; only the row contents differ.
         //
-        //   * Switch to a CHUNK-LEVEL quantize kernel that uses
-        //     ONE scale per 128-row chunk (matches CUTLASS
-        //     prep_sfa semantics exactly). The real M rows
-        //     would then be quantized identically to the m≥128
-        //     case at M=128.
-        //   * Write a dedicated row-batched FP8 GEMV kernel
-        //     (the user's alternative suggestion) — keeps
-        //     per-row scaling, just amortizes launch overhead
-        //     across the row dimension.
+        // The earlier "per-row vs per-chunk scale" hypothesis
+        // was incorrect — reading
+        // kernels/cutlass_fp8_gemm_blockscale_sm120.cu shows
+        // `prep_sfa` is a straight per-row copy
+        // (`sfa[row + k_block * m] = a_scale[row]`) with no
+        // reduction, and `SFVecSizeM=1` is genuinely per-row.
+        // Plain text working through the same code path
+        // confirms the per-row math is consistent.
         //
-        // Either is its own debug + bench session. Keeping the
-        // scaffold in tree for that pass; production stays on
-        // the cached cuBLASLt-no-algo → looped-GEMV path
-        // (Codex #4-A) which is correct and faster than the
-        // previous quantise+heuristic-every-call.
-        // Disabled by `false &&`. See block-leading comment for the
-        // numerical root cause (per-row vs per-chunk scale
-        // mismatch). Keeping the scaffold in tree.
+        // Likely cause is content-dependent: ViT splice rows
+        // have amax magnitudes very different from surrounding
+        // text rows, which probably hits an FP8 dynamic-range
+        // edge case inside the SM120 GEMM that plain-text
+        // amaxes don't exercise. Next debug pass wants to
+        // instrument: dump pad_out[0..16] vs the looped-GEMV
+        // reference on the SAME inputs at the first
+        // dispatch where M < 128, capture per-row amax
+        // distribution, and compare. Possible fixes once the
+        // mechanism is pinned:
+        //
+        //   * Cap per-row amax to a layer-wide envelope so
+        //     ViT rows don't dominate fp8 dynamic range.
+        //   * Quantize ViT splice rows separately + project
+        //     them through a different scale (heavy).
+        //   * Write the row-batched FP8 GEMV alt path
+        //     (already shipped in #4-B as the production
+        //     fallback) and stop trying to make CUTLASS-pad
+        //     work — same launch-overhead win, no
+        //     content-dependence.
+        //
+        // Production stays on the Codex #4-A capability-cached
+        // → row-batched GEMV path (#4-B alt that works).
+        let pad_debug = std::env::var("RVLLM_QWEN36_FP8_PAD_DEBUG")
+            .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
         #[cfg(feature = "cuda")]
-        if false && m >= 2 && m < 128 {
+        if pad_debug && m >= 2 && m < 128 {
             if let CutlassBackend::SoSm120(ref lib) = self.cutlass {
                 const PAD_M: u32 = 128;
                 let pad_in_bytes  = (PAD_M as usize) * (k as usize) * 2;
