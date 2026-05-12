@@ -403,6 +403,48 @@ pub fn forward_qwen_vision(
 
     let qkv_eps = 1e-6f32;
     let blk_dump_dir = std::env::var("RVLLM_QWEN36_VIT_BLK_DUMP_DIR").ok();
+
+    // Phase-perf 2: optional batched-strided attention path. When
+    // RVLLM_QWEN_VIT_BATCHED_ATTN=1, the per-block 16-head attention
+    // loop is replaced by 7 launches (scale, batched QK^T, fused
+    // softmax-to-f16, transpose V, batched scores@V, cast, scatter
+    // all heads). Scratch is allocated once outside the block loop;
+    // all 27 blocks reuse it. ~3.7k saved launches per ViT forward.
+    let batched_attn_enabled = std::env::var("RVLLM_QWEN_VIT_BATCHED_ATTN")
+        .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+    // For the disabled path we still allocate 1-byte placeholders so
+    // we can hand them to the unused branch without runtime cost.
+    let scores_f32_all_bytes = if batched_attn_enabled {
+        num_heads * n_tokens * n_tokens * 4
+    } else { 16 };
+    let scores_buf_all_bytes = if batched_attn_enabled {
+        num_heads * n_tokens * n_tokens * 2
+    } else { 16 };
+    let v_t_all_bytes = if batched_attn_enabled {
+        num_heads * head_dim * n_tokens * 2
+    } else { 16 };
+    let out_f32_all_bytes = if batched_attn_enabled {
+        num_heads * n_tokens * head_dim * 4
+    } else { 16 };
+    let out_hmajor_bytes = if batched_attn_enabled {
+        num_heads * n_tokens * head_dim * 2
+    } else { 16 };
+    let scores_f32_all =
+        deps.arena.region("qvis_scores_f32_all", scores_f32_all_bytes, 16)?;
+    let scores_buf_all =
+        deps.arena.region("qvis_scores_buf_all", scores_buf_all_bytes, 16)?;
+    let v_t_all = deps.arena.region("qvis_v_t_all", v_t_all_bytes, 16)?;
+    let out_f32_all = deps.arena.region("qvis_out_f32_all", out_f32_all_bytes, 16)?;
+    let out_hmajor = deps.arena.region("qvis_out_hmajor", out_hmajor_bytes, 16)?;
+    if batched_attn_enabled {
+        eprintln!(
+            "[qwen-vit] batched attention enabled (N={n_tokens}, H={num_heads}, \
+             D={head_dim}); scratch {:.1} MiB",
+            (scores_f32_all_bytes + scores_buf_all_bytes + v_t_all_bytes
+                + out_f32_all_bytes + out_hmajor_bytes) as f64 / (1024.0 * 1024.0),
+        );
+    }
+
     for (blk_idx, blk) in vision.blocks.iter().enumerate() {
         // ─ pre-attn LayerNorm on a copy ─
         let normed = deps.arena.region("qvis_normed", n_tokens * hidden * 2, 16)?;
@@ -554,6 +596,207 @@ pub fn forward_qwen_vision(
                 let _ = std::fs::write(format!("{dir}/blk0_v.bin"), &v_host);
             }
         }
+
+        if batched_attn_enabled {
+            // ─ Batched-strided attention path (Phase-perf 2). ─
+            // Replaces the 16-head loop below with 7 launches.
+            let scale = 1.0_f32 / (head_dim as f32).sqrt();
+            // (1) Scale Q in place: q_buf *= 1/sqrt(D). One launch
+            //     over N*H*D elements covers all heads.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut x = q_buf.device_ptr();
+                let mut s = scale;
+                let mut nn = (n_tokens * num_heads * head_dim) as i32;
+                let args = [
+                    (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s) as *mut f32 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = ((nn as u32 + block - 1) / block, 1u32, 1u32);
+                let rc = cuLaunchKernel(
+                    deps.fn_scale_inplace_f16.raw() as CUfunction,
+                    grid.0, grid.1, grid.2, block, 1, 1,
+                    0, deps.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen-vit batched-attn scale_inplace launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            // (2) batched QK^T → scores_f32_all [H, N, N]
+            #[cfg(feature = "cuda")]
+            unsafe {
+                deps.cublaslt.f16_gemm_f32_batched_strided(
+                    q_buf.device_ptr(),
+                    k_buf.device_ptr(),
+                    scores_f32_all.device_ptr(),
+                    n_tokens as i32,
+                    n_tokens as i32,
+                    head_dim as i32,
+                    num_heads as i32,
+                    (num_heads * head_dim) as i32,
+                    (num_heads * head_dim) as i32,
+                    n_tokens as i32,
+                    head_dim as i64,
+                    head_dim as i64,
+                    (n_tokens * n_tokens) as i64,
+                    stream_raw,
+                )?;
+            }
+            // (3) softmax_row_f32_to_f16 → scores_buf_all [H, N, N]
+            //     grid = N×H rows of length N each.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut out = scores_buf_all.device_ptr();
+                let mut input = scores_f32_all.device_ptr();
+                let mut sl = n_tokens as i32;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut sl) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = (n_tokens as u32).min(1024);
+                let rc = cuLaunchKernel(
+                    deps.fn_softmax_row_f32_to_f16.raw() as CUfunction,
+                    (n_tokens * num_heads) as u32, 1, 1,
+                    block, 1, 1,
+                    0, deps.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen-vit batched softmax_row_f32_to_f16 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            // (4) transpose V from interleaved [N, H*D] to head-major
+            //     [H, D, N] for the second batched GEMM.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut out = v_t_all.device_ptr();
+                let mut in_p = v_buf.device_ptr();
+                let mut nh = num_heads as i32;
+                let mut hd = head_dim as i32;
+                let mut nt = n_tokens as i32;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut in_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let rc = cuLaunchKernel(
+                    deps.fn_transpose_heads_v_f16.raw() as CUfunction,
+                    n_tokens as u32, num_heads as u32, 1,
+                    head_dim as u32, 1, 1,
+                    0, deps.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen-vit batched transpose_heads_v_f16 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            // (5) batched scores @ V_T → out_f32_all [H, N, D] f32
+            #[cfg(feature = "cuda")]
+            unsafe {
+                deps.cublaslt.f16_gemm_f32_batched_strided(
+                    scores_buf_all.device_ptr(),
+                    v_t_all.device_ptr(),
+                    out_f32_all.device_ptr(),
+                    n_tokens as i32,
+                    head_dim as i32,
+                    n_tokens as i32,
+                    num_heads as i32,
+                    n_tokens as i32,
+                    n_tokens as i32,
+                    head_dim as i32,
+                    (n_tokens * n_tokens) as i64,
+                    (head_dim * n_tokens) as i64,
+                    (n_tokens * head_dim) as i64,
+                    stream_raw,
+                )?;
+            }
+            // (6) cast f32 → f16: out_hmajor [H, N, D]
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let n_elem = (num_heads * n_tokens * head_dim) as i32;
+                let mut out = out_hmajor.device_ptr();
+                let mut input = out_f32_all.device_ptr();
+                let mut nn = n_elem;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+                let rc = cuLaunchKernel(
+                    deps.fn_cast_f32_to_f16.raw() as CUfunction,
+                    grid.0, grid.1, grid.2, block, 1, 1,
+                    0, deps.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen-vit batched cast_f32_to_f16 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            // (7) scatter [H, N, D] → attn_out [N, H*D]
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut out = attn_out.device_ptr();
+                let mut in_p = out_hmajor.device_ptr();
+                let mut nh = num_heads as i32;
+                let mut hd = head_dim as i32;
+                let mut nt = n_tokens as i32;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut in_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let rc = cuLaunchKernel(
+                    deps.fn_scatter_heads_f16.raw() as CUfunction,
+                    n_tokens as u32, num_heads as u32, 1,
+                    head_dim as u32, 1, 1,
+                    0, deps.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen-vit batched scatter_heads_f16 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+        } else {
 
         // ─ Per-head attention: QK^T → softmax → @V. ─
         // Q, K, V layout is [N, num_heads*head_dim] = [N, 1152]
@@ -830,6 +1073,7 @@ pub fn forward_qwen_vision(
             // Scatter out_h back into attn_out at offset h*head_dim per row.
             scatter_head(attn_out.device_ptr(), out_h.device_ptr(), h)?;
         }
+        }  // end else (per-head fallback path)
 
         // ─ O proj + residual: hidden += proj(attn_out). ─
         // Block 0 dump: attn output pre-O-proj.
