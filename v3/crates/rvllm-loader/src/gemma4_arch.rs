@@ -47,6 +47,11 @@ pub struct Gemma4Arch {
     pub layer_types: Vec<Gemma4LayerType>,
     pub weight_prefix: String,
     pub tie_word_embeddings: bool,
+    /// E4B-it adds this field: the final `num_kv_shared_layers` layers
+    /// reuse K/V from the most recent earlier full-attention layer
+    /// rather than computing their own. `None` on 31B (legacy /
+    /// per-layer compute). Plumbed through to layer_exec in A4.
+    pub num_kv_shared_layers: Option<u32>,
 }
 
 impl Gemma4Arch {
@@ -130,6 +135,23 @@ impl Gemma4Arch {
             .unwrap_or(true);
 
         let layer_types = Self::parse_layer_types(tc, num_hidden_layers);
+        if layer_types.len() != num_hidden_layers {
+            return Err(RvllmError::Loader {
+                err: LoaderError::Corrupt {
+                    detail: format!(
+                        "Gemma4 layer_types length {} != num_hidden_layers {}",
+                        layer_types.len(),
+                        num_hidden_layers
+                    ),
+                },
+                ctx: LoaderCtx {
+                    path: p.clone(),
+                    tensor: None,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let num_kv_shared_layers = tc["num_kv_shared_layers"].as_u64().map(|n| n as u32);
         let weight_prefix = Self::detect_weight_prefix(dir);
 
         if num_attention_heads == 0 || hidden_size == 0 || num_hidden_layers == 0 {
@@ -165,6 +187,7 @@ impl Gemma4Arch {
             layer_types,
             weight_prefix,
             tie_word_embeddings,
+            num_kv_shared_layers,
         })
     }
 
@@ -322,8 +345,56 @@ mod tests {
             layer_types: vec![Gemma4LayerType::SlidingAttention; 6],
             weight_prefix: "model".into(),
             tie_word_embeddings: true,
+            num_kv_shared_layers: None,
         };
         assert_eq!(arch.rotary_dim_for_layer(0), 256);
+    }
+
+    #[test]
+    fn e4b_layer_types_parsed() {
+        // E4B-it has 42 layers; full_attention at positions
+        // 5, 11, 17, 23, 29, 35, 41 (every 6th + last); rest sliding.
+        let mut lt = vec!["sliding_attention"; 42];
+        for &i in &[5usize, 11, 17, 23, 29, 35, 41] {
+            lt[i] = "full_attention";
+        }
+        let v = serde_json::json!({ "layer_types": lt });
+        let types = Gemma4Arch::parse_layer_types(&v, 42);
+        assert_eq!(types.len(), 42);
+        for i in 0..42 {
+            let want_full = matches!(i, 5 | 11 | 17 | 23 | 29 | 35 | 41);
+            let got_full = types[i] == Gemma4LayerType::GlobalAttention;
+            assert_eq!(got_full, want_full, "layer {i}");
+        }
+    }
+
+    #[test]
+    fn num_kv_shared_layers_none_on_legacy_31b() {
+        // 31B config has no `num_kv_shared_layers` field; parser must
+        // leave it as None so 31B path stays bit-identical.
+        let arch = Gemma4Arch {
+            num_hidden_layers: 60,
+            hidden_size: 5376,
+            num_attention_heads: 32,
+            head_dim_sliding: 256,
+            head_dim_global: 512,
+            num_kv_heads_sliding: 16,
+            num_kv_heads_global: 4,
+            intermediate_size: 21504,
+            vocab_size: 262144,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 262144,
+            sliding_window_size: 1024,
+            rope_theta_sliding: 10000.0,
+            rope_theta_global: 1000000.0,
+            partial_rotary_factor_global: 0.25,
+            logit_softcap: 30.0,
+            layer_types: vec![Gemma4LayerType::SlidingAttention; 60],
+            weight_prefix: "model".into(),
+            tie_word_embeddings: true,
+            num_kv_shared_layers: None,
+        };
+        assert!(arch.num_kv_shared_layers.is_none());
     }
 
     #[test]
@@ -348,6 +419,7 @@ mod tests {
             layer_types: vec![Gemma4LayerType::GlobalAttention; 6],
             weight_prefix: "model".into(),
             tie_word_embeddings: true,
+            num_kv_shared_layers: None,
         };
         // 512 * 0.25 = 128
         assert_eq!(arch.rotary_dim_for_layer(0), 128);
