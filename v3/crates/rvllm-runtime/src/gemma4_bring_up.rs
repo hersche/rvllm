@@ -1939,7 +1939,15 @@ impl Gemma4Bringup {
             .unwrap(),
         };
 
+        // E4B PLE state for the bench dispatch site. Currently
+        // unwired (run_bench has no fn_embed parameter nor embedding
+        // gather — synthetic input residual). Left at (0, 0) so the
+        // dims branch below behaves like 31B (PLE inactive). When
+        // bench grows real embed integration this becomes the same
+        // per-iteration Cell pattern run_ppl uses.
+        let ple_state: std::cell::Cell<(u64, u32)> = std::cell::Cell::new((0u64, 0u32));
         let one_step = || -> rvllm_core::Result<()> {
+            let (ple_base, ple_stride_elems) = ple_state.get();
             for (layer_idx, layer) in self.model.layers.iter().enumerate() {
                 let lt = arch.layer_types[layer_idx];
                 let hd = arch.head_dim_for_layer(layer_idx) as u32;
@@ -2074,8 +2082,21 @@ impl Gemma4Bringup {
                         .post_per_layer_input_norm
                         .as_ref()
                         .map_or(0, |w| w.offset_bytes),
-                    ple_per_layer_input: 0,
-                    ple_per_layer_stride_elems: 0,
+                    // E4B PLE: per-layer slice into the per-token
+                    // precompute buffer (set by enclosing per-token
+                    // driver before one_step). Mirrors the chunked-
+                    // prefill and decode-step sites. 0/0 when the
+                    // driver hasn't wired PLE (e.g. run_bench's
+                    // synthetic-input path) — layer_exec then
+                    // short-circuits the PLE injection.
+                    ple_per_layer_input: if ple_base != 0 {
+                        ple_base + (layer_idx as u64)
+                            * (arch.hidden_size_per_layer_input.unwrap_or(0) as u64)
+                            * 2
+                    } else {
+                        0
+                    },
+                    ple_per_layer_stride_elems: ple_stride_elems,
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -2501,7 +2522,13 @@ impl Gemma4Bringup {
         };
 
         let step_counter = std::cell::Cell::new(0u32);
+        // E4B PLE state: (ple_base, ple_stride_elems) refreshed per token
+        // by `ppl_forward` below right after the embedding gather. one_step
+        // reads it lazily so every layer's dims pick up the per-token
+        // precompute. (0, 0) when PLE inactive (31B path).
+        let ple_state: std::cell::Cell<(u64, u32)> = std::cell::Cell::new((0u64, 0u32));
         let one_step = || -> Result<()> {
+            let (ple_base, ple_stride_elems) = ple_state.get();
             for (layer_idx, layer) in self.model.layers.iter().enumerate() {
                 if layer_idx >= max_layers {
                     break;
@@ -2631,8 +2658,21 @@ impl Gemma4Bringup {
                         .post_per_layer_input_norm
                         .as_ref()
                         .map_or(0, |w| w.offset_bytes),
-                    ple_per_layer_input: 0,
-                    ple_per_layer_stride_elems: 0,
+                    // E4B PLE: per-layer slice into the per-token
+                    // precompute buffer (set by enclosing per-token
+                    // driver before one_step). Mirrors the chunked-
+                    // prefill and decode-step sites. 0/0 when the
+                    // driver hasn't wired PLE (e.g. run_bench's
+                    // synthetic-input path) — layer_exec then
+                    // short-circuits the PLE injection.
+                    ple_per_layer_input: if ple_base != 0 {
+                        ple_base + (layer_idx as u64)
+                            * (arch.hidden_size_per_layer_input.unwrap_or(0) as u64)
+                            * 2
+                    } else {
+                        0
+                    },
+                    ple_per_layer_stride_elems: ple_stride_elems,
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -2868,15 +2908,38 @@ impl Gemma4Bringup {
         let mut total_nll: f64 = 0.0;
         let mut n_evaluated: usize = 0;
 
+        // E4B PLE precompute is per-token: it depends on inputs_embeds
+        // (the post-gather residual) and feeds each decoder layer's
+        // per-layer-input slot. Wire it into the same closure that
+        // runs embed + layer chain. The graph-capture path below can't
+        // host arena.region() allocations safely, so force eager mode
+        // whenever PLE is active.
+        let e4b_ple_enabled = std::env::var("RVLLM_E4B_PLE")
+            .map_or(false, |v| v == "1")
+            && self.model.ple.is_some();
         // Build a graph-capturable forward: embed + all layers + lm_head.
         // No debug probes (they break capture).
         let ppl_forward = || -> Result<()> {
             rvllm_fused::EmbeddingGatherLaunch { num_tokens: 1, hidden, vocab }
                 .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes, token_ids_region.device_ptr(), stream)?;
+            if e4b_ple_enabled {
+                let (base, stride) = unsafe {
+                    self.precompute_ple(
+                        residual_ptr,
+                        token_ids_region.device_ptr(),
+                        1u32,
+                        fn_embed,
+                        &kernels,
+                        stream as u64,
+                    )?
+                };
+                ple_state.set((base, stride));
+            }
             one_step()
         };
 
-        let use_graph = std::env::var("RVLLM_NO_GRAPH").ok().as_deref() != Some("1");
+        let use_graph = !e4b_ple_enabled
+            && std::env::var("RVLLM_NO_GRAPH").ok().as_deref() != Some("1");
         let ppl_graph = if use_graph {
             // Dry run to populate KV cache slot 0
             let tok_i32 = [token_ids[0] as i32];
