@@ -26,6 +26,32 @@ pub enum Gemma4LayerType {
     GlobalAttention,
 }
 
+/// Gemma 4 vision tower (SigLIP-style ViT) geometry.
+///
+/// 31B (current production):
+///   hidden=1152, layers=27, heads=16, head_dim=72,
+///   intermediate=4304, patch=16, pool_k=3, pos=10240,
+///   standardize=true
+/// E4B-it (new):
+///   hidden=768, layers=16, heads=12, head_dim=64,
+///   intermediate=3072, patch=16, pool_k=3, pos=10240,
+///   standardize=false  (no `std_bias` / `std_scale` tensors;
+///                       encoder→projection bridge skips the
+///                       standardize span).
+#[derive(Clone, Debug)]
+pub struct Gemma4VisionConfig {
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub patch_size: usize,
+    pub pooling_kernel_size: usize,
+    pub position_embedding_size: usize,
+    pub rms_norm_eps: f32,
+    pub standardize: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Gemma4Arch {
     pub num_hidden_layers: usize,
@@ -52,6 +78,11 @@ pub struct Gemma4Arch {
     /// rather than computing their own. `None` on 31B (legacy /
     /// per-layer compute). Plumbed through to layer_exec in A4.
     pub num_kv_shared_layers: Option<u32>,
+    /// Parsed `vision_config` block. `None` for text-only checkpoints
+    /// (no vision tower on disk). Required reading once vision-bearing
+    /// requests are re-enabled — A4b promotes the forward path's
+    /// hardcoded 31B constants to read from this struct.
+    pub vision_config: Option<Gemma4VisionConfig>,
 }
 
 impl Gemma4Arch {
@@ -152,6 +183,7 @@ impl Gemma4Arch {
             });
         }
         let num_kv_shared_layers = tc["num_kv_shared_layers"].as_u64().map(|n| n as u32);
+        let vision_config = Self::parse_vision_config(&v);
         let weight_prefix = Self::detect_weight_prefix(dir);
 
         if num_attention_heads == 0 || hidden_size == 0 || num_hidden_layers == 0 {
@@ -188,6 +220,7 @@ impl Gemma4Arch {
             weight_prefix,
             tie_word_embeddings,
             num_kv_shared_layers,
+            vision_config,
         })
     }
 
@@ -211,6 +244,27 @@ impl Gemma4Arch {
                 }
             })
             .collect()
+    }
+
+    fn parse_vision_config(v: &serde_json::Value) -> Option<Gemma4VisionConfig> {
+        let vc = v.get("vision_config")?;
+        // `hidden_size` is mandatory; without it we can't trust the
+        // block. 31B and E4B both ship it.
+        let hidden_size = vc.get("hidden_size")?.as_u64()? as usize;
+        Some(Gemma4VisionConfig {
+            hidden_size,
+            num_hidden_layers: vc["num_hidden_layers"].as_u64().unwrap_or(27) as usize,
+            num_attention_heads: vc["num_attention_heads"].as_u64().unwrap_or(16) as usize,
+            head_dim: vc["head_dim"].as_u64().unwrap_or(72) as usize,
+            intermediate_size: vc["intermediate_size"].as_u64().unwrap_or(4304) as usize,
+            patch_size: vc["patch_size"].as_u64().unwrap_or(16) as usize,
+            pooling_kernel_size: vc["pooling_kernel_size"].as_u64().unwrap_or(3) as usize,
+            position_embedding_size: vc["position_embedding_size"].as_u64().unwrap_or(10240) as usize,
+            rms_norm_eps: vc["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
+            // E4B sets `standardize=false` explicitly. 31B has no key
+            // (defaults to true — std_bias/std_scale tensors exist).
+            standardize: vc["standardize"].as_bool().unwrap_or(true),
+        })
     }
 
     fn detect_weight_prefix(dir: &Path) -> String {
@@ -346,6 +400,7 @@ mod tests {
             weight_prefix: "model".into(),
             tie_word_embeddings: true,
             num_kv_shared_layers: None,
+            vision_config: None,
         };
         assert_eq!(arch.rotary_dim_for_layer(0), 256);
     }
@@ -393,8 +448,47 @@ mod tests {
             weight_prefix: "model".into(),
             tie_word_embeddings: true,
             num_kv_shared_layers: None,
+            vision_config: None,
         };
         assert!(arch.num_kv_shared_layers.is_none());
+    }
+
+    #[test]
+    fn e4b_vision_config_parsed() {
+        let v = serde_json::json!({
+            "text_config": { "num_hidden_layers": 42, "hidden_size": 2560,
+                             "num_attention_heads": 8, "intermediate_size": 10240,
+                             "layer_types": vec!["sliding_attention"; 42] },
+            "vision_config": {
+                "hidden_size": 768, "num_hidden_layers": 16,
+                "num_attention_heads": 12, "head_dim": 64,
+                "intermediate_size": 3072, "patch_size": 16,
+                "pooling_kernel_size": 3, "position_embedding_size": 10240,
+                "rms_norm_eps": 1e-6, "standardize": false
+            }
+        });
+        let vc = Gemma4Arch::parse_vision_config(&v).expect("E4B vision_config");
+        assert_eq!(vc.hidden_size, 768);
+        assert_eq!(vc.num_hidden_layers, 16);
+        assert_eq!(vc.num_attention_heads, 12);
+        assert_eq!(vc.head_dim, 64);
+        assert_eq!(vc.intermediate_size, 3072);
+        assert!(!vc.standardize);
+    }
+
+    #[test]
+    fn vision_config_31b_defaults_standardize_true() {
+        // 31B has no explicit `standardize` key — must default to true
+        // so std_bias / std_scale stay required for the existing path.
+        let v = serde_json::json!({
+            "vision_config": { "hidden_size": 1152 }
+        });
+        let vc = Gemma4Arch::parse_vision_config(&v).expect("31B vision_config");
+        assert_eq!(vc.hidden_size, 1152);
+        assert!(vc.standardize);
+        // Defaults for unspecified 31B-typical values:
+        assert_eq!(vc.num_hidden_layers, 27);
+        assert_eq!(vc.num_attention_heads, 16);
     }
 
     #[test]
@@ -420,6 +514,7 @@ mod tests {
             weight_prefix: "model".into(),
             tie_word_embeddings: true,
             num_kv_shared_layers: None,
+            vision_config: None,
         };
         // 512 * 0.25 = 128
         assert_eq!(arch.rotary_dim_for_layer(0), 128);
