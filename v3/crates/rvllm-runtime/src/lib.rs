@@ -87,6 +87,8 @@ pub mod qwen_vision_forward;
 pub mod qwen36_load;
 pub mod sched_state;
 pub mod vision_preprocess;
+// B1 (Gemma 4 E4B native audio): mel-spectrogram extractor.
+pub mod audio_preprocess;
 pub mod scheduler;
 
 /// Re-export the Mistral 3.5 loader-side modules so downstream

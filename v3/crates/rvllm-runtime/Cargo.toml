@@ -81,4 +81,7 @@ half = { workspace = true }
 # parsing without pulling the multi-GiB payload into RAM.
 memmap2 = "0.9"
 image = { workspace = true }
+# B1 (Gemma 4 E4B audio): pure-Rust mel-spectrogram extractor in
+# `audio_preprocess::MelExtractor`. CPU-only; no GPU dep.
+rustfft = { workspace = true }
 cudarc = { version = "0.19", features = ["driver", "cuda-version-from-build-system"], optional = true }

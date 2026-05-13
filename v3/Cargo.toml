@@ -59,6 +59,12 @@ clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 bytes = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# Native audio frontend (B1): pure-Rust FFT for the mel-spectrogram
+# extractor in `rvllm-runtime::audio_preprocess`. MIT/Apache-2.0
+# dual-licensed; no `unsafe` in the hot path; published crate
+# audited by maintainers of the half + image deps already in this
+# workspace.
+rustfft = "6"
 
 [profile.release]
 lto = "fat"
