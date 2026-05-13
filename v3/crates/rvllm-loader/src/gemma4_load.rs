@@ -616,7 +616,17 @@ pub fn load_gemma4_model(
     // pre-scaled by sqrt(hidden_size) above.
     let ple = if let Some(ple_dim) = arch.hidden_size_per_layer_input {
         use crate::gemma4_weights::Gemma4Ple;
-        let scale_ple = (ple_dim as f32).sqrt();
+        // Bake BOTH scales into the lookup table and the post-norm γ
+        // so the runtime precompute reduces to: lookup + rmsnorm(context).
+        // Math:
+        //   HF: out = ((lookup × √D) + norm(W·embeds × scale_proj) × γ) × scale_input
+        //   RMSNorm is scale-invariant (eps tiny vs typical input
+        //   magnitudes) so scale_proj inside it is a no-op.
+        //   Rewriting: out = lookup × √D × scale_input
+        //              + norm(W·embeds) × γ × scale_input
+        //   ⇒ bake (√D × scale_input) into the lookup weights,
+        //   bake (scale_input) into γ, leave the GEMM unscaled.
+        let scale_ple = (ple_dim as f32).sqrt() * arch.per_layer_input_scale;
         let etpl = {
             let name = format!("{prefix}.embed_tokens_per_layer.weight");
             let (si, e) = must_get(&name)?;
@@ -637,14 +647,30 @@ pub fn load_gemma4_model(
             "ple_model_projection",
             &format!("{prefix}.per_layer_model_projection.weight"),
         )?;
-        let plnorm = upload_f16_norm(
-            "ple_projection_norm",
-            &format!("{prefix}.per_layer_projection_norm.weight"),
-        )?;
+        // Bake `per_layer_input_scale` into γ at upload time.
+        let plnorm = {
+            let name = format!("{prefix}.per_layer_projection_norm.weight");
+            let (si, e) = must_get(&name)?;
+            let mut buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+            let scale = arch.per_layer_input_scale;
+            let n = buf.len() / 2;
+            for i in 0..n {
+                let bits = u16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]);
+                let v = f16::from_bits(bits).to_f32() * scale;
+                let out = f16::from_f32(v).to_le_bytes();
+                buf[2 * i] = out[0];
+                buf[2 * i + 1] = out[1];
+            }
+            let r = arena.region("ple_projection_norm", buf.len(), 16)?;
+            unsafe { r.copy_from_host(&buf)? };
+            F16Weight { offset_bytes: r.device_ptr(), shape: e.shape.clone() }
+        };
         eprintln!(
-            "[gemma4-loader] PLE loaded: ple_dim={ple_dim}, vocab={}, num_layers={}",
+            "[gemma4-loader] PLE loaded: ple_dim={ple_dim}, vocab={}, num_layers={}, \
+             scales baked (×{scale_ple:.5} on lookup, ×{:.5} on γ)",
             etpl.shape[0],
-            arch.num_hidden_layers
+            arch.num_hidden_layers,
+            arch.per_layer_input_scale,
         );
         Some(Gemma4Ple {
             embed_tokens_per_layer: etpl,

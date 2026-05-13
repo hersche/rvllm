@@ -5511,6 +5511,153 @@ impl Gemma4Bringup {
         Ok(output_ids)
     }
 
+    /// E4B Per-Layer Embeddings precompute (stage 3b2).
+    ///
+    /// Computes `per_layer_inputs[T, num_layers * ple_dim]` from
+    /// `token_ids` and the post-gather embeddings, once per
+    /// request/chunk. Returns `(base_ptr, row_stride_elems)`:
+    ///   - `base_ptr` points at the precomputed `[T, num_layers, ple_dim]`
+    ///     row-major f16 buffer.
+    ///   - `row_stride_elems` = `num_layers * ple_dim`. Per-layer slice
+    ///     for layer L lives at `base_ptr + L * ple_dim * 2`.
+    ///
+    /// Returns `(0, 0)` when PLE is inactive (31B/AWQ → caller skips
+    /// the per-layer injection block).
+    ///
+    /// Math (HF Gemma4TextModel.{get,project}_per_layer_inputs):
+    ///   lookup  = embed_tokens_per_layer[token_ids]   # × sqrt(D) × scale_in baked
+    ///   context = inputs_embeds @ plmp.T              # raw GEMM (scale eaten by norm)
+    ///   context = f32→f16
+    ///   context = rmsnorm(context, γ)                 # γ × scale_in baked
+    ///   per_layer_inputs = lookup + context
+    ///
+    /// scale_in = `arch.per_layer_input_scale` (= 1/√2 default).
+    /// Both load-time scale bakes happen in gemma4_load.rs PLE block.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn precompute_ple(
+        &self,
+        inputs_embeds_ptr: u64,
+        token_ids_ptr: u64,
+        num_tokens: u32,
+        fn_embed: rvllm_kernels::KernelFn,
+        kernels: &Gemma4LayerKernels,
+        stream: u64,
+    ) -> Result<(u64, u32)> {
+        let Some(ple) = self.model.ple.as_ref() else {
+            return Ok((0, 0));
+        };
+        let Some(ple_dim) = self.arch.hidden_size_per_layer_input else {
+            return Ok((0, 0));
+        };
+        let num_layers = self.arch.num_hidden_layers;
+        let total_dim = (num_layers * ple_dim) as u32; // 10752 on E4B
+        let hidden = self.arch.hidden_size as u32;
+        let vocab = self.arch.vocab_size as u32;
+
+        // Allocate scratch. Both regions are auto-restored at request
+        // end via the existing arena checkpoint mechanism.
+        let bytes_f16 = (num_tokens as usize) * (total_dim as usize) * 2;
+        let bytes_f32 = (num_tokens as usize) * (total_dim as usize) * 4;
+        let per_layer_inputs = self
+            .arena
+            .region("ple_per_layer_inputs", bytes_f16, 16)?;
+        let ctx_f32 = self.arena.region("ple_ctx_f32", bytes_f32, 16)?;
+
+        // Step 1: lookup the per-layer token-identity embedding.
+        // Scale (× √D × scale_in) is already baked in at load time;
+        // EmbeddingGather just copies the row.
+        rvllm_fused::EmbeddingGatherLaunch {
+            num_tokens,
+            hidden: total_dim,
+            vocab,
+        }
+        .launch(
+            fn_embed,
+            per_layer_inputs.device_ptr(),
+            ple.embed_tokens_per_layer.offset_bytes,
+            token_ids_ptr,
+            stream,
+        )?;
+
+        // Step 2: context-aware projection. inputs_embeds [T, hidden]
+        // × per_layer_model_projection.T [hidden, total_dim]
+        // → ctx_f32 [T, total_dim] f32. RMSNorm later scrubs the
+        // `per_layer_model_projection_scale` so we skip it.
+        self.cublaslt.f16_gemm_f32(
+            inputs_embeds_ptr,
+            ple.per_layer_model_projection.offset_bytes,
+            ctx_f32.device_ptr(),
+            num_tokens as i32,
+            total_dim as i32,
+            hidden as i32,
+            stream,
+        )?;
+
+        // Step 3: narrow f32 → f16 in-place onto the front half of
+        // ctx_f32. After this, `ctx_f32.device_ptr()` is the f16
+        // buffer of `num_tokens * total_dim * 2` bytes.
+        let n_total = num_tokens * total_dim;
+        rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: n_total }.launch(
+            kernels.f32_to_f16_sat,
+            ctx_f32.device_ptr(),
+            ctx_f32.device_ptr(),
+            stream,
+        )?;
+
+        // Step 4: RMSNorm over the ple_dim axis with the SHARED γ
+        // (shape [ple_dim] broadcasts across all `T * num_layers`
+        // slices). γ has `× per_layer_input_scale` baked in.
+        rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: num_tokens * (num_layers as u32),
+            hidden: ple_dim as u32,
+            eps: self.arch.rms_norm_eps,
+        }
+        .launch(
+            kernels.fused_rmsnorm,
+            ctx_f32.device_ptr(),
+            ple.per_layer_projection_norm.offset_bytes,
+            stream,
+        )?;
+
+        // Step 5: per_layer_inputs += ctx_f16 (elementwise on the
+        // packed [T * num_layers * ple_dim] flat buffer).
+        // Use the vector_add_f16 kernel directly.
+        let n = n_total as i32;
+        let mut dst = per_layer_inputs.device_ptr();
+        let mut src = ctx_f32.device_ptr();
+        let mut nn = n;
+        let args = [
+            (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+            (&mut src) as *mut u64 as *mut core::ffi::c_void,
+            (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        let block: u32 = 256;
+        let grid = ((n as u32 + block - 1) / block, 1u32, 1u32);
+        let rc = cudarc::driver::sys::cuLaunchKernel(
+            self.fused.fn_vector_add.raw() as cudarc::driver::sys::CUfunction,
+            grid.0,
+            grid.1,
+            grid.2,
+            block,
+            1,
+            1,
+            0,
+            stream as cudarc::driver::sys::CUstream,
+            args.as_ptr() as *mut *mut core::ffi::c_void,
+            core::ptr::null_mut(),
+        );
+        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "ple: vector_add launch failed",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+
+        Ok((per_layer_inputs.device_ptr(), total_dim))
+    }
+
     pub fn layer_kernels(&self) -> Result<Gemma4LayerKernels> {
         // (helper defined just above) — see assert_rope_kernels_match
         // NVFP4 RoPE kernel handle — `None` on branches without the
