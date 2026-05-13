@@ -3785,6 +3785,33 @@ impl Gemma4Bringup {
             rvllm_fused::EmbeddingGatherLaunch { num_tokens: 1, hidden, vocab }
                 .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes,
                     token_ids_region.device_ptr(), stream)?;
+
+            // E4B PLE precompute for the decoded token. Mirrors the
+            // chunked-prefill PLE precompute at line ~4338: every E4B
+            // decoder layer reads a per-(token, layer) input slice and
+            // injects it into the residual after the attention block.
+            // Without this, the decode path diverges from prefill at
+            // every layer (per-layer cosine drift starting at L0). PLE
+            // depends on inputs_embeds, so it must run AFTER the
+            // embedding gather above and BEFORE the optional bf16 widen
+            // (precompute_ple expects f16 inputs_embeds).
+            let ple_enabled = std::env::var("RVLLM_E4B_PLE")
+                .map_or(false, |v| v == "1");
+            let (ple_base, ple_stride_elems) = if ple_enabled {
+                unsafe {
+                    self.precompute_ple(
+                        residual_ptr,
+                        token_ids_region.device_ptr(),
+                        1u32,
+                        fn_embed,
+                        &kernels,
+                        stream as u64,
+                    )?
+                }
+            } else {
+                (0u64, 0u32)
+            };
+
             // Cycle 54 Stage 1: BF16 residual chain entry. Embedding
             // gather writes f16; widen to bf16 in-place so subsequent
             // layers operate on bf16 storage.
@@ -3894,8 +3921,18 @@ impl Gemma4Bringup {
                         .post_per_layer_input_norm
                         .as_ref()
                         .map_or(0, |w| w.offset_bytes),
-                    ple_per_layer_input: 0,
-                    ple_per_layer_stride_elems: 0,
+                    // E4B PLE: per-layer slice into the precompute buffer
+                    // computed once per decode step in decode_forward above.
+                    // Layout matches the chunked-prefill site at ~line 4502:
+                    // base + L * ple_dim * 2.
+                    ple_per_layer_input: if ple_base != 0 {
+                        ple_base + (layer_idx as u64)
+                            * (arch.hidden_size_per_layer_input.unwrap_or(0) as u64)
+                            * 2
+                    } else {
+                        0
+                    },
+                    ple_per_layer_stride_elems: ple_stride_elems,
                 };
                 let k_out = q_base + (q_dim as u64) * 2;
                 let v_out = k_out + (kv_dim as u64) * 2;
@@ -4012,6 +4049,24 @@ impl Gemma4Bringup {
                     &self.cublaslt, &self.cutlass, &self.sliding_attention, &self.global_attention,
                     residual_ptr, stream,
                 )?;
+                // E4B decode-step drill-down: when RVLLM_E4B_DECODE_DUMP_DIR
+                // is set, dump the post-layer residual at this decode step
+                // for every layer. Filenames carry the actual layer_idx +
+                // step so prefill / decode / multiple steps don't collide.
+                // Cost: D2H of `hidden * 2` bytes per layer, gated entirely
+                // by env presence — zero overhead when unset.
+                #[cfg(feature = "cuda")]
+                if let Ok(dump_dir) = std::env::var("RVLLM_E4B_DECODE_DUMP_DIR") {
+                    use cudarc::driver::sys::*;
+                    cuStreamSynchronize(stream as CUstream);
+                    let nbytes = (hidden as usize) * 2;
+                    let mut buf = vec![0u8; nbytes];
+                    cuMemcpyDtoH_v2(buf.as_mut_ptr() as *mut _, residual_ptr, nbytes);
+                    let path = std::path::Path::new(&dump_dir)
+                        .join(format!("e4b_decode_step{}_layer{}_output.bin", step, layer_idx));
+                    std::fs::create_dir_all(&dump_dir).ok();
+                    let _ = std::fs::write(&path, &buf);
+                }
             }
             Ok(())
         };
