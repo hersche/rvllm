@@ -128,9 +128,12 @@ pub struct Gemma4Vision {
     pub patch_embedder_input_proj: F16Weight, // [1152, 768]
     pub patch_embedder_pos_table: F16Weight,  // [2, 10240, 1152]
     pub blocks: Vec<Gemma4VisionBlock>,
-    pub std_bias: F16Weight,                   // [1152]
-    pub std_scale: F16Weight,                  // [1152]
-    pub embed_vision_projection: F16Weight,    // [5376, 1152]
+    /// `[hidden]`. Present iff `vision_config.standardize=true`
+    /// (31B); `None` on E4B-it which sets standardize=false and
+    /// omits these tensors entirely.
+    pub std_bias: Option<F16Weight>,
+    pub std_scale: Option<F16Weight>,
+    pub embed_vision_projection: F16Weight,    // [out_hidden, hidden]
 }
 
 #[derive(Debug)]

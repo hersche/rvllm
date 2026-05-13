@@ -582,7 +582,9 @@ pub fn load_gemma4_model(
 
     // Gemma 4 vision tower (SigLIP-style ViT). Optional: only loaded
     // if `model.vision_tower.*` tensors exist in the checkpoint.
-    let vision = load_gemma_vision(arena, &must_get, &bytes_of, model_dir).ok();
+    let vision = load_gemma_vision(
+        arena, &must_get, &bytes_of, model_dir, arch.vision_config.as_ref(),
+    ).ok();
     if vision.is_some() {
         eprintln!("[gemma4-loader] vision tower loaded (27 SigLIP-style blocks + patch_embedder + multimodal projector)");
     } else {
@@ -609,12 +611,18 @@ fn load_gemma_vision<'a, F1, F2>(
     must_get: &F1,
     bytes_of: &F2,
     model_dir: &std::path::Path,
+    vision_cfg: Option<&crate::gemma4_arch::Gemma4VisionConfig>,
 ) -> Result<crate::gemma4_weights::Gemma4Vision>
 where
     F1: Fn(&str) -> Result<(usize, TensorEntry)>,
     F2: Fn(usize, &TensorEntry) -> &'a [u8],
 {
     use crate::gemma4_weights::{Gemma4Vision, Gemma4VisionBlock};
+    // A4c: vision_config drives block count + standardize behavior.
+    // Defaults match the 31B layout so callers passing None (pre-A4a
+    // codepaths / legacy fixtures) get bit-identical behavior.
+    let num_blocks: usize = vision_cfg.map(|c| c.num_hidden_layers).unwrap_or(27);
+    let standardize: bool = vision_cfg.map(|c| c.standardize).unwrap_or(true);
 
     let upload = |name: &'static str, hf_name: &str| -> Result<F16Weight> {
         let (si, e) = must_get(hf_name)?;
@@ -666,15 +674,21 @@ where
         "g4v_pe_pos",
         "model.vision_tower.patch_embedder.position_embedding_table",
     )?;
-    let std_bias = upload("g4v_std_bias", "model.vision_tower.std_bias")?;
-    let std_scale = upload("g4v_std_scale", "model.vision_tower.std_scale")?;
+    let (std_bias, std_scale) = if standardize {
+        (
+            Some(upload("g4v_std_bias", "model.vision_tower.std_bias")?),
+            Some(upload("g4v_std_scale", "model.vision_tower.std_scale")?),
+        )
+    } else {
+        (None, None)
+    };
     let embed_vision_projection = upload(
         "g4v_embed_proj",
         "model.embed_vision.embedding_projection.weight",
     )?;
 
-    let mut blocks = Vec::with_capacity(27);
-    for i in 0..27 {
+    let mut blocks = Vec::with_capacity(num_blocks);
+    for i in 0..num_blocks {
         let p = |s: &str| format!("model.vision_tower.encoder.layers.{i}.{s}");
         // NB: in this FP8-block dump the vision norm gammas are already
         // pre-shifted (i.e. the stored value IS `1 + gamma_centered`),
@@ -716,8 +730,10 @@ where
     }
 
     eprintln!(
-        "[gemma4-loader] vision: 27 blocks + patch_embedder + std_scale/bias \
+        "[gemma4-loader] vision: {} blocks + patch_embedder{} \
          + embed_vision_projection in {:.1}s",
+        num_blocks,
+        if standardize { " + std_scale/bias" } else { " (no standardize)" },
         started.elapsed().as_secs_f64(),
     );
     Ok(Gemma4Vision {

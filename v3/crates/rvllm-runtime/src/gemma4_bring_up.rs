@@ -6643,8 +6643,23 @@ impl Gemma4Bringup {
         unsafe {
             let mut out = pooled_region.device_ptr();
             let mut x = pooled_region_f32.device_ptr();
-            let mut bias = vision.std_bias.offset_bytes;
-            let mut scale = vision.std_scale.offset_bytes;
+            // A4c: std_bias/std_scale are Optional. 31B has them; E4B
+            // (vision_config.standardize=false) does not. The full
+            // standardize-skip path lands later (needs a plain
+            // f32→f16 narrow kernel); for now panic with a clear
+            // message — E4B vision is admission-gated by
+            // RVLLM_VISION_MAX_IMAGES=0, so this is unreachable in
+            // any deployed profile.
+            let std_bias = vision
+                .std_bias
+                .as_ref()
+                .expect("vision standardize requested but std_bias missing — set RVLLM_VISION_MAX_IMAGES=0 in profile until A4d lands the standardize-skip path");
+            let std_scale = vision
+                .std_scale
+                .as_ref()
+                .expect("vision standardize requested but std_scale missing");
+            let mut bias = std_bias.offset_bytes;
+            let mut scale = std_scale.offset_bytes;
             let mut hd = HIDDEN as i32;
             let args = [
                 (&mut out) as *mut u64 as *mut core::ffi::c_void,
