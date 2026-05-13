@@ -557,6 +557,25 @@ pub fn load_gemma4_model(
 
         let layer_scalar = upload_f16("layer_scalar", &ln("layer_scalar"))?;
 
+        // E4B Per-Layer Embeddings (PLE) per-layer triple. Only present
+        // on E4B-it checkpoints. Each layer has its own
+        // per_layer_input_gate + per_layer_projection +
+        // post_per_layer_input_norm. Runtime applies them as an
+        // additional residual contribution at the end of the layer
+        // forward (HF Gemma4TextDecoderLayer.forward tail).
+        let (per_layer_input_gate, per_layer_projection, post_per_layer_input_norm) =
+            if arch.hidden_size_per_layer_input.is_some() {
+                let gate = upload_f16("ple_gate", &ln("per_layer_input_gate.weight"))?;
+                let proj = upload_f16("ple_proj", &ln("per_layer_projection.weight"))?;
+                let ln_w = upload_f16_norm(
+                    "ple_post_ln",
+                    &ln("post_per_layer_input_norm.weight"),
+                )?;
+                (Some(gate), Some(proj), Some(ln_w))
+            } else {
+                (None, None, None)
+            };
+
         if l < 2 {
             eprintln!(
                 "[loader] layer {l} FP8: qkv_scale={:.6e} o={:.6e} gate_up={:.6e} down={:.6e}",
@@ -580,12 +599,61 @@ pub fn load_gemma4_model(
             q_norm,
             k_norm,
             layer_scalar,
+            per_layer_input_gate,
+            per_layer_projection,
+            post_per_layer_input_norm,
             // Cycle 46 step 5c: AWQ load path is wired in cycle 47.
             // For now every checkpoint falls through the FP8 cascade
             // and `Gemma4AwqLayerPtrs` defaults all-zero in bring-up.
             awq: None,
         });
     }
+
+    // E4B PLE global side. Loaded once per model (token-identity
+    // table + global context projection + RMSNorm γ). Pre-scaled at
+    // upload time so the runtime lookup needs no separate sqrt(ple_dim)
+    // launch — same pattern as the main embed_tokens.weight which is
+    // pre-scaled by sqrt(hidden_size) above.
+    let ple = if let Some(ple_dim) = arch.hidden_size_per_layer_input {
+        use crate::gemma4_weights::Gemma4Ple;
+        let scale_ple = (ple_dim as f32).sqrt();
+        let etpl = {
+            let name = format!("{prefix}.embed_tokens_per_layer.weight");
+            let (si, e) = must_get(&name)?;
+            let mut buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+            let n = buf.len() / 2;
+            for i in 0..n {
+                let bits = u16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]);
+                let v = f16::from_bits(bits).to_f32() * scale_ple;
+                let out = f16::from_f32(v).to_le_bytes();
+                buf[2 * i] = out[0];
+                buf[2 * i + 1] = out[1];
+            }
+            let r = arena.region("ple_embed_tokens", buf.len(), 16)?;
+            unsafe { r.copy_from_host(&buf)? };
+            F16Weight { offset_bytes: r.device_ptr(), shape: e.shape.clone() }
+        };
+        let plmp = upload_f16(
+            "ple_model_projection",
+            &format!("{prefix}.per_layer_model_projection.weight"),
+        )?;
+        let plnorm = upload_f16_norm(
+            "ple_projection_norm",
+            &format!("{prefix}.per_layer_projection_norm.weight"),
+        )?;
+        eprintln!(
+            "[gemma4-loader] PLE loaded: ple_dim={ple_dim}, vocab={}, num_layers={}",
+            etpl.shape[0],
+            arch.num_hidden_layers
+        );
+        Some(Gemma4Ple {
+            embed_tokens_per_layer: etpl,
+            per_layer_model_projection: plmp,
+            per_layer_projection_norm: plnorm,
+        })
+    } else {
+        None
+    };
 
     // Gemma 4 vision tower (SigLIP-style ViT). Optional: only loaded
     // if `model.vision_tower.*` tensors exist in the checkpoint.
@@ -612,6 +680,7 @@ pub fn load_gemma4_model(
         rope_sin_global,
         layers,
         vision,
+        ple,
         num_kv_shared_layers: arch.num_kv_shared_layers,
     })
 }
@@ -1642,6 +1711,9 @@ fn load_gemma4_awq_model_inner(
             q_norm,
             k_norm,
             layer_scalar,
+            per_layer_input_gate: None,
+            per_layer_projection: None,
+            post_per_layer_input_norm: None,
             awq: Some(awq_layer),
         });
     }
@@ -1665,6 +1737,9 @@ fn load_gemma4_awq_model_inner(
         // checkpoints; vision is FP16/BF16 in the standard fp8-block
         // checkpoint and currently unused on the AWQ path.
         vision: None,
+        // E4B Per-Layer Embeddings are not present in AWQ checkpoints
+        // (31B-AWQ only — PLE is E4B-specific).
+        ple: None,
         num_kv_shared_layers: arch.num_kv_shared_layers,
     })
 }

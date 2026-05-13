@@ -83,6 +83,23 @@ pub struct Gemma4Arch {
     /// requests are re-enabled — A4b promotes the forward path's
     /// hardcoded 31B constants to read from this struct.
     pub vision_config: Option<Gemma4VisionConfig>,
+    /// E4B Per-Layer Embedding (PLE) dimension. `Some(256)` on E4B-it;
+    /// `None` on 31B (no PLE pathway on disk). When `Some`, the loader
+    /// uploads `embed_tokens_per_layer`, `per_layer_model_projection`,
+    /// `per_layer_projection_norm`, plus per-layer
+    /// `per_layer_input_gate` / `per_layer_projection` /
+    /// `post_per_layer_input_norm` and the runtime injects an
+    /// additional residual contribution at the end of each layer's
+    /// forward (HF `Gemma4TextDecoderLayer.forward`).
+    pub hidden_size_per_layer_input: Option<usize>,
+    /// Scale applied after the linear projection of `inputs_embeds`
+    /// onto per-layer space. HF Gemma 4 uses `1/sqrt(hidden_size)`
+    /// when the config field is unset. Stored as f32 so the kernel
+    /// can baked it in or applied separately.
+    pub per_layer_model_projection_scale: f32,
+    /// Scale applied to the combined `(context + token_identity)`
+    /// per-layer-input. HF default = `1/sqrt(2)`.
+    pub per_layer_input_scale: f32,
 }
 
 impl Gemma4Arch {
@@ -191,6 +208,23 @@ impl Gemma4Arch {
             });
         }
         let num_kv_shared_layers = tc["num_kv_shared_layers"].as_u64().map(|n| n as u32);
+        // E4B Per-Layer Embeddings (PLE). When the text_config has
+        // `hidden_size_per_layer_input`, the checkpoint ships PLE
+        // tensors that the runtime must consume at the end of each
+        // layer's forward; missing them produces "numerically-stable,
+        // semantically-off" output (token salad with healthy logit
+        // margins). HF default scales: per_layer_model_projection_scale
+        // = 1/sqrt(hidden_size); per_layer_input_scale = 1/sqrt(2).
+        let hidden_size_per_layer_input =
+            tc["hidden_size_per_layer_input"].as_u64().map(|n| n as usize);
+        let per_layer_model_projection_scale = tc["per_layer_model_projection_scale"]
+            .as_f64()
+            .map(|x| x as f32)
+            .unwrap_or_else(|| 1.0 / (hidden_size as f32).sqrt());
+        let per_layer_input_scale = tc["per_layer_input_scale"]
+            .as_f64()
+            .map(|x| x as f32)
+            .unwrap_or_else(|| 1.0 / (2.0f32).sqrt());
         let vision_config = Self::parse_vision_config(&v);
         let weight_prefix = Self::detect_weight_prefix(dir);
 
@@ -229,6 +263,9 @@ impl Gemma4Arch {
             tie_word_embeddings,
             num_kv_shared_layers,
             vision_config,
+            hidden_size_per_layer_input,
+            per_layer_model_projection_scale,
+            per_layer_input_scale,
         })
     }
 
@@ -443,6 +480,9 @@ mod tests {
             tie_word_embeddings: true,
             num_kv_shared_layers: None,
             vision_config: None,
+            hidden_size_per_layer_input: None,
+            per_layer_model_projection_scale: 0.0,
+            per_layer_input_scale: 0.0,
         };
         assert_eq!(arch.rotary_dim_for_layer(0), 256);
     }
@@ -491,6 +531,9 @@ mod tests {
             tie_word_embeddings: true,
             num_kv_shared_layers: None,
             vision_config: None,
+            hidden_size_per_layer_input: None,
+            per_layer_model_projection_scale: 0.0,
+            per_layer_input_scale: 0.0,
         };
         assert!(arch.num_kv_shared_layers.is_none());
     }
@@ -623,6 +666,9 @@ mod tests {
             tie_word_embeddings: true,
             num_kv_shared_layers: None,
             vision_config: None,
+            hidden_size_per_layer_input: None,
+            per_layer_model_projection_scale: 0.0,
+            per_layer_input_scale: 0.0,
         };
         // 512 * 0.25 = 128
         assert_eq!(arch.rotary_dim_for_layer(0), 128);

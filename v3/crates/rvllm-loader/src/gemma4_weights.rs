@@ -60,6 +60,13 @@ pub struct Gemma4LayerWeights {
     pub q_norm: F16Weight,
     pub k_norm: F16Weight,
     pub layer_scalar: F16Weight,
+    /// E4B Per-Layer Embeddings (PLE). `None` on 31B; `Some` on E4B.
+    /// Used by the runtime to compute the additional residual
+    /// contribution at the end of each layer's forward (HF
+    /// `Gemma4TextDecoderLayer.forward`).
+    pub per_layer_input_gate: Option<F16Weight>, // [ple_dim, hidden]
+    pub per_layer_projection: Option<F16Weight>, // [hidden, ple_dim]
+    pub post_per_layer_input_norm: Option<F16Weight>, // [hidden]
     /// Cycle 46 step 5c: optional AWQ INT4 W4A16 weights for this layer.
     /// `None` = FP8 path stays in charge for every linear in the layer
     /// (no behavior change for non-AWQ checkpoints). `Some` = the seven
@@ -91,11 +98,59 @@ pub struct Gemma4LoadedModel {
     /// Vision tower (SigLIP-style ViT) for Gemma 4 multimodal.
     /// `None` for text-only checkpoints.
     pub vision: Option<Gemma4Vision>,
+    /// E4B Per-Layer Embeddings (PLE) global side. `None` on 31B;
+    /// `Some` on E4B-it. Combined with the per-layer triple on each
+    /// `Gemma4LayerWeights` to inject an additive residual at the
+    /// end of every layer's forward.
+    pub ple: Option<Gemma4Ple>,
     /// Echoed from `Gemma4Arch::num_kv_shared_layers`. `None` on 31B;
     /// `Some(18)` on E4B-it. Bring-up reads this to alias the trailing
     /// sliding layers' K/V onto the most recent full-attention layer's
     /// KV slot (A4 lands the physical aliasing — A2 only plumbs).
     pub num_kv_shared_layers: Option<u32>,
+}
+
+// ─── Per-Layer Embeddings (E4B-it) ────────────────────────────────────
+//
+// Gemma 4 E4B introduces a secondary signal pathway that
+// rvllm needs to honour for coherent output. The math is documented
+// upstream in HF `Gemma4TextModel.get_per_layer_inputs` +
+// `project_per_layer_inputs` + the tail of
+// `Gemma4TextDecoderLayer.forward`. Geometry on E4B:
+//
+//   ple_dim = 256
+//   num_hidden_layers = 42
+//   hidden_size = 2560
+//
+//   embed_tokens_per_layer       [vocab, num_layers * ple_dim]
+//                                = [262144, 10752]
+//   per_layer_model_projection   [num_layers * ple_dim, hidden_size]
+//                                = [10752, 2560]
+//   per_layer_projection_norm    [num_layers * ple_dim] = [10752]
+//
+//   (per layer) per_layer_input_gate.weight   [ple_dim, hidden]
+//   (per layer) per_layer_projection.weight   [hidden,  ple_dim]
+//   (per layer) post_per_layer_input_norm     [hidden]
+//
+// Scales:
+//   embed_tokens_per_layer is a ScaledWordEmbedding → output is
+//   `lookup × sqrt(ple_dim)`. Bake at upload time (same pattern as
+//   the main embed_tokens.weight pre-scale).
+//   per_layer_model_projection_scale defaults to `1/sqrt(hidden_size)`.
+//   per_layer_input_scale defaults to `1/sqrt(2)`.
+//
+#[derive(Debug)]
+pub struct Gemma4Ple {
+    /// `[vocab, num_layers * ple_dim]`; sqrt(ple_dim) pre-scaled at
+    /// upload time so the runtime lookup is a plain gather.
+    pub embed_tokens_per_layer: F16Weight,
+    /// `[num_layers * ple_dim, hidden_size]`. The runtime multiplies
+    /// the linear output by `arch.per_layer_model_projection_scale`.
+    pub per_layer_model_projection: F16Weight,
+    /// `[num_layers * ple_dim]`. RMSNorm γ applied after the
+    /// projection (per-layer slice; reshape view applies per
+    /// `(layer, ple_dim)`).
+    pub per_layer_projection_norm: F16Weight,
 }
 
 // ─── Vision (Gemma 4 SigLIP-style ViT) ────────────────────────────────
