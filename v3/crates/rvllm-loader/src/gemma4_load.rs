@@ -132,14 +132,11 @@ pub fn load_gemma4_model(
         })
     };
 
-    // Stub: was a `+1` norm-gamma shift gated by pure-bf16 detection.
-    // First-light smoke 2026-05-13 showed E4B logits saturating the
-    // softcap (amax==amin==30.0) with the bake applied — i.e. E4B's
-    // gammas are NOT centered-at-0 / NOT needing the +1 shift the way
-    // 31B's vision gammas do. Reverted to plain upload_f16; the
-    // residual-explosion problem lives elsewhere (likely the FP8
-    // tied-embed-quantize path corrupting lm_head logits, or the
-    // f16-only weight dispatch missing a layer).
+    // E4B uses raw upload — first-light A/B showed +1 bake HURTS
+    // quality (margin 1.99 → 0.465 with the down_proj NaN already
+    // fixed). E4B-it's gammas are STORED pre-shifted (same as 31B),
+    // contrary to my earlier hypothesis. Stub alias keeps the
+    // call-site readable.
     let upload_f16_norm = upload_f16;
 
     let embed_name = format!("{prefix}.embed_tokens.weight");
