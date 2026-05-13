@@ -39,6 +39,16 @@ base64 = "0.22"
 image = { workspace = true }
 url = "2"
 
+# Audio fetch + decode + resample (B2 of the E4B audio plan).
+# All codec features OFF by default; we explicitly enable WAV (no
+# external deps), MP3, FLAC, OGG, AAC (ADTS), and ISO MP4 containers
+# — the formats most audio_url payloads ship as. Heavier codecs
+# (Opus + dav1d-style video) stay off to keep the dep graph small.
+symphonia = { version = "0.5", default-features = false, features = [
+    "wav", "pcm", "mp3", "flac", "ogg", "vorbis", "aac", "isomp4",
+] }
+rubato = "0.16"
+
 # Serde
 serde = { workspace = true }
 serde_json = { workspace = true }

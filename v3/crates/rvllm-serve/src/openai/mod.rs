@@ -13,6 +13,7 @@ pub mod handlers;
 pub mod models;
 pub mod types;
 pub mod vision_fetch;
+pub mod audio_fetch;
 
 /// Default temperature when the client omits it. OpenAI's documented
 /// default is 1.0 (stochastic), but on rvllm-serve that triggers a
