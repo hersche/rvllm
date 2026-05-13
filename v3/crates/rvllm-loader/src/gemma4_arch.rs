@@ -215,8 +215,14 @@ impl Gemma4Arch {
         // semantically-off" output (token salad with healthy logit
         // margins). HF default scales: per_layer_model_projection_scale
         // = 1/sqrt(hidden_size); per_layer_input_scale = 1/sqrt(2).
-        let hidden_size_per_layer_input =
-            tc["hidden_size_per_layer_input"].as_u64().map(|n| n as usize);
+        // Defensive: HF has at least one E4B-adjacent config with
+        // `hidden_size_per_layer_input: 0`, meaning the PLE pathway
+        // is disabled. Treat `Some(0)` as `None` so the loader
+        // doesn't try to upload non-existent tensors.
+        let hidden_size_per_layer_input = tc["hidden_size_per_layer_input"]
+            .as_u64()
+            .map(|n| n as usize)
+            .filter(|&n| n > 0);
         let per_layer_model_projection_scale = tc["per_layer_model_projection_scale"]
             .as_f64()
             .map(|x| x as f32)

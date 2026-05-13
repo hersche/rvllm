@@ -332,9 +332,9 @@
       "sha256": "7ef67202273a14e07ffb454b1be482f4cb3aba8a334b99fad7a83c16ca0aa828"
     },
     "gelu_tanh_mul_dual_f16": {
-      "bytes": 8971,
+      "bytes": 9437,
       "path": "gelu_tanh_mul_dual_f16.ptx",
-      "sha256": "70e856540e4a5bc2c5ad22d2cab911a8bab1130af59e8f41952bb5708946e93e"
+      "sha256": "e884d03f4d6f541a04cdc11a6a2b8896a9f1f66bdb1af6243edccdfb1db81909"
     },
     "gelu_tanh_mul_f16": {
       "bytes": 2397,
@@ -837,5 +837,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "ff404cb"
+  "revision": "5e0cf63"
 }

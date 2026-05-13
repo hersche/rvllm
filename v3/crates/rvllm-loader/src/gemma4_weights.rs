@@ -147,9 +147,13 @@ pub struct Gemma4Ple {
     /// `[num_layers * ple_dim, hidden_size]`. The runtime multiplies
     /// the linear output by `arch.per_layer_model_projection_scale`.
     pub per_layer_model_projection: F16Weight,
-    /// `[num_layers * ple_dim]`. RMSNorm γ applied after the
-    /// projection (per-layer slice; reshape view applies per
-    /// `(layer, ple_dim)`).
+    /// `[ple_dim]` — SHARED across all `num_hidden_layers` layers.
+    /// HF instantiates as `Gemma4RMSNorm(hidden_size_per_layer_input)`
+    /// then applies after reshape to `[T, num_layers, ple_dim]`,
+    /// broadcasting over the layer axis. One rmsnorm launch on a
+    /// `[T * num_layers, ple_dim]` view with this γ vector is the
+    /// correct precompute primitive — not 42 separate sliced
+    /// launches.
     pub per_layer_projection_norm: F16Weight,
 }
 

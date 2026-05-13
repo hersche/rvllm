@@ -2064,6 +2064,7 @@ impl Gemma4Bringup {
                         .as_ref()
                         .map_or(0, |w| w.offset_bytes),
                     ple_per_layer_input: 0,
+                    ple_per_layer_stride_elems: 0,
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -2609,6 +2610,7 @@ impl Gemma4Bringup {
                         .as_ref()
                         .map_or(0, |w| w.offset_bytes),
                     ple_per_layer_input: 0,
+                    ple_per_layer_stride_elems: 0,
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -3860,6 +3862,7 @@ impl Gemma4Bringup {
                         .as_ref()
                         .map_or(0, |w| w.offset_bytes),
                     ple_per_layer_input: 0,
+                    ple_per_layer_stride_elems: 0,
                 };
                 let k_out = q_base + (q_dim as u64) * 2;
                 let v_out = k_out + (kv_dim as u64) * 2;
@@ -4407,6 +4410,7 @@ impl Gemma4Bringup {
                         .as_ref()
                         .map_or(0, |w| w.offset_bytes),
                     ple_per_layer_input: 0,
+                    ple_per_layer_stride_elems: 0,
                 };
                 // Row-major [num_tokens, q_dim+2*kv_dim]: k_out / v_out
                 // point at row 0's K / V sub-slice. The rmsnorm kernel

@@ -522,10 +522,15 @@ pub struct Gemma4LayerWeightPtrs {
     pub ple_post_input_norm_gamma: u64, // [hidden] f16 (+1 pre-shifted)
     /// Base pointer into the per-request precomputed
     /// `per_layer_inputs` arena slice for THIS layer.
-    /// Shape: `[num_tokens, ple_dim]` f16 row-major, stride =
-    /// ple_dim * 2 bytes.
     /// `0` when PLE inactive (31B).
     pub ple_per_layer_input: u64,
+    /// Row stride (in ELEMENTS, not bytes) the
+    /// `gelu_tanh_mul_dual_f16` kernel uses to walk per_layer_inputs.
+    /// `0` (default) = packed stride = ple_dim. For the natural
+    /// token-major precompute layout `[T, num_layers, ple_dim]`,
+    /// bring-up sets this to `num_layers * ple_dim` so the kernel
+    /// reads `base + token * stride + i` for token t, element i.
+    pub ple_per_layer_stride_elems: u32,
 }
 
 /// Per-layer AWQ device pointer set. All-zero `*_packed` = AWQ
@@ -2921,17 +2926,31 @@ pub unsafe fn gemma4_forward_phase(
         )?;
         // Step 3: GELU(tanh)(gate) × per_layer_inputs[L] →
         // overwrites gate buffer in-place.
+        //
+        // `per_li_row_stride_elems` lets the kernel read the
+        // per-layer slice from a token-major `[T, num_layers, ple_dim]`
+        // precompute buffer without a transpose: bring-up passes
+        // `weights.ple_per_layer_input = base + L * ple_dim * 2` plus
+        // stride = num_layers * ple_dim. With `ple_per_layer_stride=0`
+        // (default, decode T=1 or pre-transposed `[L, T, ple_dim]`)
+        // we fall back to the packed stride = ple_dim.
         #[cfg(feature = "cuda")]
         unsafe {
             let mut out = scratch.gate_up_out;
             let mut a = scratch.gate_up_out;
             let mut b = weights.ple_per_layer_input;
             let mut pd = ple_dim as i32;
+            let mut stride_elems = if weights.ple_per_layer_stride_elems > 0 {
+                weights.ple_per_layer_stride_elems as i32
+            } else {
+                ple_dim as i32
+            };
             let args = [
                 (&mut out) as *mut u64 as *mut core::ffi::c_void,
                 (&mut a) as *mut u64 as *mut core::ffi::c_void,
                 (&mut b) as *mut u64 as *mut core::ffi::c_void,
                 (&mut pd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut stride_elems) as *mut i32 as *mut core::ffi::c_void,
             ];
             let block = (ple_dim.min(1024), 1, 1);
             let grid = (dims.num_tokens, 1, 1);

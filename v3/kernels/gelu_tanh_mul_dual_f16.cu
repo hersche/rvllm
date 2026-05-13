@@ -10,9 +10,17 @@
 //   gated    = GELU(tanh)(gate) * per_li                # this kernel
 //
 // Layout:
-//   Both input buffers are row-major `[num_tokens, ple_dim]` f16.
-//   The output buffer is row-major `[num_tokens, ple_dim]` f16.
-//   No interleaving / concatenation — distinct device pointers.
+//   - output: row-major `[num_tokens, ple_dim]` f16, stride = ple_dim.
+//   - gate:   row-major `[num_tokens, ple_dim]` f16, stride = ple_dim.
+//   - per_li: `[num_tokens, ple_dim]` f16 with caller-provided ROW
+//             STRIDE in ELEMENTS (not bytes). For the natural
+//             token-major `[T, num_layers, ple_dim]` precompute
+//             layout, the per-layer slice at layer L has base
+//             `base + L * ple_dim` and row stride
+//             `num_layers * ple_dim`. The kernel reads
+//             `per_li[row * per_li_row_stride_elems + i]`.
+//             Pass `per_li_row_stride_elems = ple_dim` for the
+//             packed `[T, ple_dim]` case (no transpose).
 //
 // Launch:
 //   Grid:  (num_tokens, 1, 1)
@@ -26,20 +34,22 @@ gelu_tanh_mul_dual_f16_kernel(
     __half* __restrict__ output,
     const __half* __restrict__ gate,
     const __half* __restrict__ per_li,
-    int ple_dim
+    int ple_dim,
+    int per_li_row_stride_elems
 ) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
-    const long long off = (long long)row * ple_dim;
+    const long long out_off  = (long long)row * ple_dim;
+    const long long peli_off = (long long)row * per_li_row_stride_elems;
 
     for (int i = tid; i < ple_dim; i += stride) {
-        float g = __half2float(gate[off + i]);
-        float p = __half2float(per_li[off + i]);
+        float g = __half2float(gate[out_off + i]);
+        float p = __half2float(per_li[peli_off + i]);
         // GELU(tanh) approximation, same as fused_gelu_mul_f16.
         float g3 = g * g * g;
         float inner = 0.7978845608f * (g + 0.044715f * g3);
         float gelu = 0.5f * g * (1.0f + tanhf(inner));
-        output[off + i] = __float2half(gelu * p);
+        output[out_off + i] = __float2half(gelu * p);
     }
 }
