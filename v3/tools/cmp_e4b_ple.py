@@ -94,6 +94,12 @@ def infer_last_dim(name: str) -> int:
     # value; user can override --last-dim for global-layer dumps.
     if "_qkv" in name:
         return 3072
+    # Per-head sub-step buffers: q-side num_h*head_dim=8*256=2048,
+    # k-side num_kv_h*head_dim=2*256=512, attn_out same as q_normed.
+    if "_q_normed" in name or "_attn_out" in name:
+        return 2048
+    if "_k_normed" in name:
+        return 512
     # RoPE tables: [max_pos, rotary_dim/2] — sliding=128, global=64 (partial 0.25)
     if "rope_" in name and "_sliding" in name:
         return 128

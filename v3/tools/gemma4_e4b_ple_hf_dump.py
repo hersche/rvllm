@@ -152,34 +152,39 @@ def patch_decoder_layer(layer: g4.Gemma4TextDecoderLayer, layer_idx: int,
         # scratch.q_out f16 buffer after Bf16ToF16SatLaunch.
         sa = layer.self_attn
         q_full = sa.q_proj(hs)
-        k_full = sa.k_proj(hs)
-        v_full = sa.v_proj(hs)
-        qkv = torch.cat([q_full, k_full, v_full], dim=-1)
-        write_f16(out_dir / f"e4b_layer{layer_idx}_qkv.bin", qkv[0])
-        # Per-head q_norm / k_norm in HF Gemma4Attention. Reshape Q
-        # and K to [B, S, num_heads, head_dim] then apply the
-        # head_dim-shape γ broadcast. Write flat [S, num_heads*head_dim]
-        # to match rvllm's contiguous q_normed / k_normed layout.
+        # KV-shared layers (last `num_kv_shared_layers` layers, default
+        # 18 for E4B) reuse the previous non-shared layer's K/V and do
+        # not have their own k_proj / v_proj. Skip K/V replay for those
+        # layers; still dump Q-side and the residual chain.
+        is_kv_shared = bool(getattr(sa, "is_kv_shared_layer", False))
+        if not is_kv_shared:
+            k_full = sa.k_proj(hs)
+            v_full = sa.v_proj(hs)
+            qkv = torch.cat([q_full, k_full, v_full], dim=-1)
+            write_f16(out_dir / f"e4b_layer{layer_idx}_qkv.bin", qkv[0])
         b, s, _ = q_full.shape
         num_h = sa.config.num_attention_heads
         num_kvh = sa.config.num_key_value_heads
         head_dim = sa.head_dim if hasattr(sa, "head_dim") else (q_full.shape[-1] // num_h)
         q_reshaped = q_full.view(b, s, num_h, head_dim)
-        k_reshaped = k_full.view(b, s, num_kvh, head_dim)
         q_normed = sa.q_norm(q_reshaped)
-        k_normed = sa.k_norm(k_reshaped)
         write_f16(
             out_dir / f"e4b_layer{layer_idx}_q_normed.bin",
             q_normed[0].reshape(s, num_h * head_dim),
         )
-        write_f16(
-            out_dir / f"e4b_layer{layer_idx}_k_normed.bin",
-            k_normed[0].reshape(s, num_kvh * head_dim),
-        )
+        if not is_kv_shared:
+            k_reshaped = k_full.view(b, s, num_kvh, head_dim)
+            k_normed = sa.k_norm(k_reshaped)
+            write_f16(
+                out_dir / f"e4b_layer{layer_idx}_k_normed.bin",
+                k_normed[0].reshape(s, num_kvh * head_dim),
+            )
         # Manually replay HF's attention math up to (but not
         # including) o_proj, so we can dump attn_out and compare
         # against rvllm's scratch.attn_out [T, q_dim] f16.
         try:
+            if is_kv_shared:
+                raise RuntimeError("kv-shared layer: skipping attn_out replay")
             import math as _math
             from transformers.models.gemma4.modeling_gemma4 import (
                 apply_rotary_pos_emb,
