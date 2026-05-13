@@ -2777,12 +2777,22 @@ pub unsafe fn gemma4_forward_phase(
         // residual stream — the down_f16 path silently ate the entire
         // FFN block (and its layer_scalar). Mirrors the awq / fp8
         // branches above and below.
+        // E4B PLE: when the PLE block fires below, IT will apply
+        // layer_scalar (matching HF's "scalar after PLE add" order).
+        // Suppress here to avoid double-application. For 31B (PLE
+        // inactive) the post-MLP write keeps the layer_scalar — its
+        // "end-of-layer" semantics — bit-identical to before.
+        let mlp_layer_scalar_ptr = if weights.ple_per_layer_input != 0 {
+            0
+        } else {
+            weights.layer_scalar_ptr
+        };
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
         }.launch(
             norm_add_residual_f16in_kernel, scratch.gemm_f32_tmp,
             weights.post_ff_norm_gamma, residual,
-            weights.layer_scalar_ptr, stream,
+            mlp_layer_scalar_ptr, stream,
         )?;
     } else if let (true, Some(fn_gemv)) = (
         weights.down_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
@@ -2985,10 +2995,13 @@ pub unsafe fn gemma4_forward_phase(
             scratch.gemm_f32_tmp,
             stream,
         )?;
-        // Step 6: RMSNorm(proj) × γ + residual → residual.
-        // FusedNormAddResidualF16In wants f16 input → output via
-        // `out = norm(x) × γ × layer_scalar + residual`. We pass
-        // layer_scalar_ptr=0 so the kernel skips that multiply.
+        // Step 6: RMSNorm(proj) × γ + residual → residual, then × layer_scalar.
+        // Actual kernel math: `res = (res + norm(input) × γ) × ls`.
+        // The MLP residual write above suppressed its layer_scalar
+        // when PLE fires, so this is where the scalar lands — matching
+        // HF's "residual_post_ple = (residual_post_mlp + ple) ×
+        // layer_scalar" order. For 31B PLE is inactive, this whole
+        // block doesn't run, and MLP keeps the scalar (bit-identical).
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
@@ -2999,7 +3012,7 @@ pub unsafe fn gemma4_forward_phase(
             scratch.gemm_f32_tmp,
             weights.ple_post_input_norm_gamma,
             residual,
-            0,
+            weights.layer_scalar_ptr,
             stream,
         )?;
     }
