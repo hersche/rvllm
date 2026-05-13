@@ -132,6 +132,16 @@ pub fn load_gemma4_model(
         })
     };
 
+    // Stub: was a `+1` norm-gamma shift gated by pure-bf16 detection.
+    // First-light smoke 2026-05-13 showed E4B logits saturating the
+    // softcap (amax==amin==30.0) with the bake applied — i.e. E4B's
+    // gammas are NOT centered-at-0 / NOT needing the +1 shift the way
+    // 31B's vision gammas do. Reverted to plain upload_f16; the
+    // residual-explosion problem lives elsewhere (likely the FP8
+    // tied-embed-quantize path corrupting lm_head logits, or the
+    // f16-only weight dispatch missing a layer).
+    let upload_f16_norm = upload_f16;
+
     let embed_name = format!("{prefix}.embed_tokens.weight");
     // Gemma models scale embeddings by sqrt(hidden_size) after lookup.
     // Pre-scale at load time so the embedding_gather kernel doesn't need modification.
@@ -165,7 +175,7 @@ pub fn load_gemma4_model(
     };
 
     let norm_name = format!("{prefix}.norm.weight");
-    let final_norm = upload_f16("final_norm", &norm_name)?;
+    let final_norm = upload_f16_norm("final_norm", &norm_name)?;
 
     // Detect pre-quantized FP8 weights (e.g. RedHatAI/gemma-4-31B-it-FP8-Dynamic).
     // These have F8_E4M3 linear weights + per-channel BF16 weight_scale tensors.
@@ -537,16 +547,16 @@ pub fn load_gemma4_model(
         };
 
         let input_layernorm =
-            upload_f16("input_ln", &ln("input_layernorm.weight"))?;
+            upload_f16_norm("input_ln", &ln("input_layernorm.weight"))?;
         let post_attention_layernorm =
-            upload_f16("post_attn_ln", &ln("post_attention_layernorm.weight"))?;
+            upload_f16_norm("post_attn_ln", &ln("post_attention_layernorm.weight"))?;
         let pre_feedforward_layernorm =
-            upload_f16("pre_ff_ln", &ln("pre_feedforward_layernorm.weight"))?;
+            upload_f16_norm("pre_ff_ln", &ln("pre_feedforward_layernorm.weight"))?;
         let post_feedforward_layernorm =
-            upload_f16("post_ff_ln", &ln("post_feedforward_layernorm.weight"))?;
+            upload_f16_norm("post_ff_ln", &ln("post_feedforward_layernorm.weight"))?;
 
-        let q_norm = upload_f16("q_norm", &ln("self_attn.q_norm.weight"))?;
-        let k_norm = upload_f16("k_norm", &ln("self_attn.k_norm.weight"))?;
+        let q_norm = upload_f16_norm("q_norm", &ln("self_attn.q_norm.weight"))?;
+        let k_norm = upload_f16_norm("k_norm", &ln("self_attn.k_norm.weight"))?;
 
         let layer_scalar = upload_f16("layer_scalar", &ln("layer_scalar"))?;
 

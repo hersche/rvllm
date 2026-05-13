@@ -123,9 +123,22 @@ impl KvDtype {
     ///
     /// `f16_only` short-circuits to F16 — used by the bench path
     /// when the caller explicitly asks for f16 regardless of env.
+    /// 2026-05-13: an *explicit* `RVLLM_F16_KV=0` (or `RVLLM_FP8_KV=1`)
+    /// in the profile still wins over the short-circuit so that
+    /// pure-bf16 E4B-it (which needs F16_ONLY weight loading) can run
+    /// on sm_121's FP8 KV decode kernel — F16 KV is rejected by
+    /// `Fa2Ptx::paged_decode` for head_dim>256 (Gemma 4 global =
+    /// head_dim 512), and bf16 weight + FP8 KV is the supported pair.
     #[must_use]
     pub fn from_env(f16_only: bool) -> Self {
         if f16_only {
+            // Explicit operator override survives the short-circuit.
+            if crate::gemma4_bring_up::parse_truthy_env("RVLLM_FP8_KV").unwrap_or(false) {
+                return KvDtype::Fp8;
+            }
+            if crate::gemma4_bring_up::parse_truthy_env("RVLLM_F16_KV") == Some(false) {
+                return KvDtype::Fp8;
+            }
             return KvDtype::F16;
         }
         if crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_KV").unwrap_or(false) {

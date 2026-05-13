@@ -135,10 +135,18 @@ impl Gemma4Arch {
         let num_kv_heads_sliding = tc["num_key_value_heads"]
             .as_u64()
             .unwrap_or(num_attention_heads as u64) as usize;
+        // 31B has a dedicated `num_global_key_value_heads: 4` field
+        // (separate from the sliding count of 16). E4B has only the
+        // uniform `num_key_value_heads: 2` — both sliding AND global
+        // layers use the same KV-head count. Fall back to the
+        // sliding (=primary) value when the global override is
+        // absent rather than a hardcoded 4, which silently
+        // misallocates the global QKV concat on E4B and produces
+        // garbled token output (smoke 2026-05-13).
         let num_kv_heads_global = tc["num_global_key_value_heads"]
             .as_u64()
             .or_else(|| tc["num_key_value_heads_global"].as_u64())
-            .unwrap_or(4) as usize;
+            .unwrap_or(num_kv_heads_sliding as u64) as usize;
 
         // RoPE parameters -- nested per-type in Gemma 4
         let rope = &tc["rope_parameters"];
@@ -523,6 +531,46 @@ mod tests {
         // Defaults for unspecified 31B-typical values:
         assert_eq!(vc.num_hidden_layers, 27);
         assert_eq!(vc.num_attention_heads, 16);
+    }
+
+    #[test]
+    fn e4b_global_kv_heads_inherit_from_sliding_when_absent() {
+        // E4B-it config has `num_key_value_heads: 2` and no
+        // `num_global_key_value_heads`. The global KV-head count
+        // must inherit 2, not silently default to 31B's 4 — that
+        // earlier default misallocated the global-layer QKV concat
+        // and produced garbled token output (2026-05-13 smoke).
+        use std::path::PathBuf;
+        let tmp = std::env::temp_dir().join("rvllm_e4b_global_kv_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg_path = tmp.join("config.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{
+              "text_config": {
+                "num_hidden_layers": 6,
+                "hidden_size": 2560,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "global_head_dim": 512,
+                "intermediate_size": 10240,
+                "sliding_window": 512,
+                "layer_types": ["sliding_attention","sliding_attention","sliding_attention",
+                                "sliding_attention","sliding_attention","full_attention"],
+                "vocab_size": 262144,
+                "rms_norm_eps": 1e-6
+              }
+            }"#,
+        )
+        .unwrap();
+        let arch = Gemma4Arch::from_dir(&PathBuf::from(&tmp)).expect("parse");
+        assert_eq!(arch.num_kv_heads_sliding, 2);
+        assert_eq!(
+            arch.num_kv_heads_global, 2,
+            "E4B global KV must inherit num_key_value_heads, not default to 4"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
