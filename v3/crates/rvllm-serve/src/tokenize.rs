@@ -268,6 +268,11 @@ impl TokenizerHandle {
                                     "image": image_url.url,
                                     "image_url": { "url": image_url.url }
                                 })),
+                                // B3a: Audio is typed but the chat
+                                // template doesn't render it as text;
+                                // skip here. B4 will splice the
+                                // audio-soft-token run separately.
+                                ChatContentPart::Audio { .. } => None,
                                 ChatContentPart::Other { .. } => None,
                             })
                             .collect();

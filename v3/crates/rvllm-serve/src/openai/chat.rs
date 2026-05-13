@@ -251,6 +251,13 @@ impl ChatContent {
             ChatContent::Parts(parts) => parts.iter().find_map(|p| match p {
                 ChatContentPart::Text { .. } => None,
                 ChatContentPart::Image { .. } => None,
+                // Audio is type-level recognised (B3a) but not
+                // admission-flipped yet — keep the unsupported-part
+                // validator returning "audio_url" so requests carrying
+                // audio still 400 cleanly. The admission flip (B3b)
+                // will iterate `audio_urls()` before this validator
+                // when RVLLM_E4B_AUDIO=1.
+                ChatContentPart::Audio { .. } => Some("audio_url"),
                 ChatContentPart::Other { kind } => Some(kind.as_str()),
             }),
         }
@@ -277,6 +284,19 @@ impl ChatContent {
         };
         parts.iter().filter_map(|p| match p {
             ChatContentPart::Image { image_url } => Some(image_url),
+            _ => None,
+        })
+    }
+
+    /// Iterate all `audio_url` parts in document order. Used by the
+    /// future B3b admission flip (gated by `RVLLM_E4B_AUDIO=1`).
+    pub fn audio_urls(&self) -> impl Iterator<Item = &AudioUrl> {
+        let parts: &[ChatContentPart] = match self {
+            ChatContent::Text(_) => &[],
+            ChatContent::Parts(parts) => parts,
+        };
+        parts.iter().filter_map(|p| match p {
+            ChatContentPart::Audio { audio_url } => Some(audio_url),
             _ => None,
         })
     }
@@ -321,6 +341,14 @@ pub enum ChatContentPart {
     Text { text: String },
     /// `{"type":"image_url","image_url":{"url":"data:..."|"https://..."}}`.
     Image { image_url: ImageUrl },
+    /// `{"type":"audio_url","audio_url":{"url":"data:audio/...|https://...}}`.
+    /// Recognised type-level since B3a so the audio admission pipeline
+    /// (handlers.rs) can iterate `audio_urls()`. The default
+    /// `first_unsupported_part_type` validator still returns
+    /// `Some("audio_url")` for this variant, so requests carrying
+    /// audio_url parts continue to receive a clean 400 unless the
+    /// admission gate is explicitly flipped on (RVLLM_E4B_AUDIO=1).
+    Audio { audio_url: AudioUrl },
     /// `{"type":"<anything>", ...}` — kind captured for validation.
     Other { kind: String },
 }
@@ -331,6 +359,18 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+/// `audio_url` field of an `audio_url` content part. Parallel to
+/// `ImageUrl`; carries either a `data:audio/...` URI or an http(s)
+/// URL. `format` (e.g. "wav" / "mp3" / "flac") is the
+/// OpenAI-realtime-API hint when present; the decoder also sniffs
+/// the magic bytes.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AudioUrl {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 impl serde::Serialize for ChatContentPart {
@@ -347,6 +387,12 @@ impl serde::Serialize for ChatContentPart {
                 let mut m = s.serialize_map(Some(2))?;
                 m.serialize_entry("type", "image_url")?;
                 m.serialize_entry("image_url", image_url)?;
+                m.end()
+            }
+            ChatContentPart::Audio { audio_url } => {
+                let mut m = s.serialize_map(Some(2))?;
+                m.serialize_entry("type", "audio_url")?;
+                m.serialize_entry("audio_url", audio_url)?;
                 m.end()
             }
             ChatContentPart::Other { kind } => {
@@ -383,6 +429,14 @@ impl<'de> Deserialize<'de> for ChatContentPart {
                 let image_url: ImageUrl =
                     serde_json::from_value(img.clone()).map_err(serde::de::Error::custom)?;
                 Ok(ChatContentPart::Image { image_url })
+            }
+            "audio_url" => {
+                let aud = v.get("audio_url").ok_or_else(|| {
+                    serde::de::Error::custom("audio_url part missing `audio_url`")
+                })?;
+                let audio_url: AudioUrl =
+                    serde_json::from_value(aud.clone()).map_err(serde::de::Error::custom)?;
+                Ok(ChatContentPart::Audio { audio_url })
             }
             other => Ok(ChatContentPart::Other { kind: other.to_string() }),
         }
@@ -587,6 +641,31 @@ mod tests {
             .expect("content")
             .first_unsupported_part_type();
         assert_eq!(bad, Some("audio_url"));
+    }
+
+    #[test]
+    fn audio_url_part_is_typed_but_still_rejected_by_default() {
+        // B3a: audio_url no longer falls into ChatContentPart::Other.
+        // It now parses into a typed Audio variant carrying AudioUrl.
+        // first_unsupported_part_type still returns Some("audio_url")
+        // so admission-side rejection stays in place until B3b flips
+        // the gate.
+        let body = r#"{
+            "model":"m",
+            "messages":[{
+                "role":"user",
+                "content":[{"type":"audio_url","audio_url":{"url":"http://example/x.wav","format":"wav"}}]
+            }]
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(body).expect("parse");
+        let content = req.messages[0].content.as_ref().expect("content");
+        // Iterator surfaces the typed variant.
+        let urls: Vec<&AudioUrl> = content.audio_urls().collect();
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "http://example/x.wav");
+        assert_eq!(urls[0].format.as_deref(), Some("wav"));
+        // Validator still rejects.
+        assert_eq!(content.first_unsupported_part_type(), Some("audio_url"));
     }
 
     #[test]
