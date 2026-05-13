@@ -5589,6 +5589,40 @@ impl Gemma4Bringup {
         let hidden = self.arch.hidden_size as u32;
         let vocab = self.arch.vocab_size as u32;
 
+        // Diff-against-HF dump hook. When RVLLM_E4B_PLE_DUMP_DIR is set,
+        // each precompute step writes its f16 output to the same
+        // filename layout that v3/tools/gemma4_e4b_ple_hf_dump.py
+        // produces, for row-cosine comparison via
+        // v3/tools/cmp_e4b_ple.py.
+        let dump_dir = std::env::var("RVLLM_E4B_PLE_DUMP_DIR").ok();
+        let dump = |name: &str, ptr: u64, n_bytes: usize| -> Result<()> {
+            if let Some(ref dir) = dump_dir {
+                cudarc::driver::sys::cuStreamSynchronize(stream as cudarc::driver::sys::CUstream);
+                let mut buf = vec![0u8; n_bytes];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut _,
+                    ptr,
+                    n_bytes,
+                );
+                let path = std::path::Path::new(dir).join(name);
+                std::fs::create_dir_all(dir).ok();
+                std::fs::write(&path, &buf).map_err(|e| rvllm_core::RvllmError::cuda(
+                    "ple-dump: write failed",
+                    rvllm_core::CudaErrorKind::Other,
+                    rvllm_core::CudaCtx::setup(),
+                ))?;
+                eprintln!("[ple-dump] {} ({} bytes)", path.display(), n_bytes);
+            }
+            Ok(())
+        };
+
+        // Dump inputs_embeds for HF parity.
+        dump(
+            "e4b_inputs_embeds.bin",
+            inputs_embeds_ptr,
+            (num_tokens as usize) * (hidden as usize) * 2,
+        )?;
+
         // Allocate scratch. Both regions are auto-restored at request
         // end via the existing arena checkpoint mechanism.
         let bytes_f16 = (num_tokens as usize) * (total_dim as usize) * 2;
@@ -5612,6 +5646,11 @@ impl Gemma4Bringup {
             ple.embed_tokens_per_layer.offset_bytes,
             token_ids_ptr,
             stream,
+        )?;
+        dump(
+            "e4b_ple_lookup.bin",
+            per_layer_inputs.device_ptr(),
+            (num_tokens as usize) * (total_dim as usize) * 2,
         )?;
 
         // Step 2: context-aware projection. inputs_embeds [T, hidden]
@@ -5638,6 +5677,11 @@ impl Gemma4Bringup {
             ctx_f32.device_ptr(),
             stream,
         )?;
+        dump(
+            "e4b_ple_context_pre_norm.bin",
+            ctx_f32.device_ptr(),
+            (n_total as usize) * 2,
+        )?;
 
         // Step 4: RMSNorm over the ple_dim axis with the SHARED γ
         // (shape [ple_dim] broadcasts across all `T * num_layers`
@@ -5652,6 +5696,11 @@ impl Gemma4Bringup {
             ctx_f32.device_ptr(),
             ple.per_layer_projection_norm.offset_bytes,
             stream,
+        )?;
+        dump(
+            "e4b_ple_context_post_norm.bin",
+            ctx_f32.device_ptr(),
+            (n_total as usize) * 2,
         )?;
 
         // Step 5: per_layer_inputs += ctx_f16 (elementwise on the
@@ -5688,6 +5737,11 @@ impl Gemma4Bringup {
                 rvllm_core::CudaCtx::setup(),
             ));
         }
+        dump(
+            "e4b_per_layer_inputs.bin",
+            per_layer_inputs.device_ptr(),
+            (n_total as usize) * 2,
+        )?;
 
         Ok((per_layer_inputs.device_ptr(), total_dim))
     }
