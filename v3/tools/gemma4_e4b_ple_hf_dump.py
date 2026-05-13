@@ -129,12 +129,11 @@ def patch_decoder_layer(layer: g4.Gemma4TextDecoderLayer, layer_idx: int,
     def hooked_forward(
         hidden_states,
         per_layer_input=None,
-        position_embeddings_global=None,
-        position_embeddings_local=None,
+        shared_kv_states=None,
+        position_embeddings=None,
         attention_mask=None,
         position_ids=None,
         past_key_values=None,
-        cache_position=None,
         **kwargs,
     ):
         # Residual at start of layer.
@@ -145,19 +144,15 @@ def patch_decoder_layer(layer: g4.Gemma4TextDecoderLayer, layer_idx: int,
         # ── Attention residual sum (no scalar yet) ──
         residual = hidden_states
         hs = layer.input_layernorm(hidden_states)
-        # Pick the appropriate position embeddings for this layer's
-        # attention type. HF passes BOTH global and local to forward.
-        attn_kwargs = dict(
+        hs, _ = layer.self_attn(
+            hidden_states=hs,
+            position_embeddings=position_embeddings,
             attention_mask=attention_mask,
+            shared_kv_states=shared_kv_states,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            cache_position=cache_position,
+            **kwargs,
         )
-        if layer.attention_type == "sliding_attention":
-            attn_kwargs["position_embeddings"] = position_embeddings_local
-        else:
-            attn_kwargs["position_embeddings"] = position_embeddings_global
-        hs, _ = layer.self_attn(hs, **attn_kwargs)
         hs = layer.post_attention_layernorm(hs)
         hs = residual + hs
         write_f16(out_dir / f"e4b_layer{layer_idx}_after_attn_add.bin", hs[0])
@@ -165,6 +160,8 @@ def patch_decoder_layer(layer: g4.Gemma4TextDecoderLayer, layer_idx: int,
         residual = hs
         hs = layer.pre_feedforward_layernorm(hs)
         hs = layer.mlp(hs)
+        # E4B has enable_moe_block=False — single MLP path. Don't
+        # bother dumping the MoE branch.
         hs = layer.post_feedforward_layernorm(hs)
         hs = residual + hs
         write_f16(out_dir / f"e4b_layer{layer_idx}_after_mlp_add.bin", hs[0])
@@ -179,7 +176,7 @@ def patch_decoder_layer(layer: g4.Gemma4TextDecoderLayer, layer_idx: int,
             hs = residual + hs
             write_f16(out_dir / f"e4b_layer{layer_idx}_after_ple_add.bin", hs[0])
         # ── Final layer_scalar ──
-        hs = layer.layer_scalar * hs
+        hs = hs * layer.layer_scalar
         write_f16(out_dir / f"e4b_layer{layer_idx}_output.bin", hs[0])
         return hs
 
