@@ -747,6 +747,30 @@ pub struct VisionSlot {
     pub vision_row_offset: usize,
 }
 
+/// Audio splice slot. Parallel to `VisionSlot` but for an
+/// `audio_url` content part on E4B.
+///
+/// Populated in B4 (tokenize.rs renderer): each `audio_url` part
+/// emits ONE slot covering the soft-token run between the
+/// `boa_token_id` / `eoa_token_id` boundaries. `num_tokens`
+/// equals the encoder's per-item soft-token count
+/// (`MelExtractor::num_soft_tokens(n_samples)`).
+///
+/// The cuda-worker side (B6/B7) reads the slot and overwrites
+/// `hidden_region[slot.token_start .. slot.token_start + slot.num_tokens]`
+/// with the audio-tower output for `audio_items[slot.audio_item_idx]`.
+///
+/// Currently a type-level stub: B3 wires admission but no chat
+/// template yet emits `boa + soft*N + eoa`, so the slot list is
+/// empty across the request lifetime. The downstream worker
+/// short-circuits when this list is empty.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioSlot {
+    pub token_start: usize,
+    pub num_tokens: usize,
+    pub audio_item_idx: usize,
+}
+
 fn extract_token_str(cfg: &serde_json::Value, key: &str) -> Option<String> {
     match cfg.get(key)? {
         serde_json::Value::String(s) => Some(s.clone()),

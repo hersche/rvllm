@@ -41,6 +41,20 @@ pub struct GenerateRequest {
     /// `hidden_region[slot.token_start .. slot.token_start + slot.num_tokens]`
     /// with the vision-tower output for `vision_items[slot.vision_item_idx]`.
     pub vision_slots: Vec<crate::tokenize::VisionSlot>,
+    /// Audio attachments (one per `audio_url` content part). Empty
+    /// for text/vision-only requests. Populated by
+    /// `openai::handlers::collect_audio_items` when
+    /// RVLLM_E4B_AUDIO=1 is set. The cuda-worker side reads f32
+    /// mono PCM directly here and runs the native E4B audio tower
+    /// (B6/B7) to splice the encoder output into the post-embed
+    /// residual the same way vision does.
+    pub audio_items: Vec<AudioItem>,
+    /// Per-audio (token_start, num_tokens) splice slots in
+    /// `prompt_ids`, aligned to `audio_items` by index. The
+    /// tokenizer-side B4 work populates this; until then the field
+    /// stays empty and the cuda-worker's audio splice short-
+    /// circuits to no-op.
+    pub audio_slots: Vec<crate::tokenize::AudioSlot>,
     /// Admission permit "owned" by this request for as long as the
     /// worker is processing it. The handler passes a clone of its
     /// `Arc<OwnedSemaphorePermit>` here; the permit is released
@@ -53,6 +67,37 @@ pub struct GenerateRequest {
     /// requests then passed admission, did the expensive
     /// preprocessing, and bounced on a `try_send` "queue full".
     pub _admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+/// One audio clip attached to a chat request. Built by
+/// `openai::handlers::collect_audio_items` from an `audio_url`
+/// content part: fetched, decoded, downmixed to mono, and
+/// resampled to 16 kHz so the cuda-worker can hand the f32 PCM
+/// straight to the mel frontend without re-blocking on tokio.
+///
+/// `num_soft_tokens` is the chat-template placeholder count; the
+/// actual splice position is recorded in the renderer's
+/// `audio_slots` (mirrors `vision_slots` for images).
+pub struct AudioItem {
+    /// f32 mono PCM at 16 kHz. Length is bounded by
+    /// `RVLLM_AUDIO_MAX_SECONDS × 16000` and was already capped
+    /// inside `openai::audio_fetch::fetch_audio`.
+    pub samples_16k_mono: Vec<f32>,
+    /// Wall-clock length of the source after resample (post-cap).
+    /// Carried for transcription metadata only.
+    pub duration_seconds: f32,
+    /// Number of placeholder tokens this audio takes in
+    /// `prompt_ids` — `boa` + `audio_soft_token * N` + `eoa`,
+    /// where N is the encoder's per-item soft-token count
+    /// (derived from `MelConfig::audio_ms_per_token` and the
+    /// audio length, capped at `audio_seq_length`).
+    pub num_tokens: usize,
+    /// Soft-token-only count (excludes the `boa`/`eoa` boundaries).
+    /// Equals the number of rows the encoder will splice into
+    /// the prefill residual.
+    pub num_soft_tokens: usize,
+    /// Index of the chat-message that carried this audio; logged.
+    pub msg_idx: usize,
 }
 
 /// One image attached to a chat request.
@@ -299,6 +344,8 @@ mod tests {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 vision_items: Vec::new(),
                 vision_slots: Vec::new(),
+                audio_items: Vec::new(),
+                audio_slots: Vec::new(),
                 _admission: None,
             })
             .await
@@ -342,6 +389,8 @@ mod tests {
                 cancelled: cancel.clone(),
                 vision_items: Vec::new(),
                 vision_slots: Vec::new(),
+                audio_items: Vec::new(),
+                audio_slots: Vec::new(),
                 _admission: None,
             })
             .await

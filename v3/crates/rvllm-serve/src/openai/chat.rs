@@ -246,18 +246,24 @@ impl ChatContent {
     /// 400 cleanly on `image_url` etc. Returns `None` for plain-string
     /// content or all-text parts.
     pub fn first_unsupported_part_type(&self) -> Option<&str> {
+        // B3 audio admission flip: when RVLLM_E4B_AUDIO=1, audio_url
+        // parts are accepted at the type-validator boundary and the
+        // request continues into `collect_audio_items` for the actual
+        // fetch + decode + 16 kHz mono resample. With the flag unset
+        // the part is still "unsupported" (clean 400 with `audio_url`
+        // as the unsupported type) so non-E4B builds — or operators
+        // who haven't opted in — keep getting a clear error message.
+        let audio_admitted = std::env::var("RVLLM_E4B_AUDIO")
+            .map(|s| s == "1")
+            .unwrap_or(false);
         match self {
             ChatContent::Text(_) => None,
             ChatContent::Parts(parts) => parts.iter().find_map(|p| match p {
                 ChatContentPart::Text { .. } => None,
                 ChatContentPart::Image { .. } => None,
-                // Audio is type-level recognised (B3a) but not
-                // admission-flipped yet — keep the unsupported-part
-                // validator returning "audio_url" so requests carrying
-                // audio still 400 cleanly. The admission flip (B3b)
-                // will iterate `audio_urls()` before this validator
-                // when RVLLM_E4B_AUDIO=1.
-                ChatContentPart::Audio { .. } => Some("audio_url"),
+                ChatContentPart::Audio { .. } => {
+                    if audio_admitted { None } else { Some("audio_url") }
+                }
                 ChatContentPart::Other { kind } => Some(kind.as_str()),
             }),
         }

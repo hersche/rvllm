@@ -664,6 +664,58 @@ pub async fn chat_completions(
             }
         }
     };
+    // B3 audio admission: when RVLLM_E4B_AUDIO=1 and the request
+    // carries `audio_url` parts, fetch + decode + resample each to
+    // 16 kHz mono f32 inside the same deadline that wraps the
+    // vision fetch above. The chat-template renderer (B4) does
+    // not yet expand audio soft-token runs, so `audio_slots`
+    // stays empty and the cuda-worker side splice is a no-op —
+    // this commit only proves the admission + fetch wire works.
+    let audio_items: Vec<crate::worker::AudioItem> = {
+        let audio_admitted = std::env::var("RVLLM_E4B_AUDIO")
+            .map(|s| s == "1")
+            .unwrap_or(false);
+        let has_audio_parts = req
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_ref())
+            .any(|c| c.audio_urls().next().is_some());
+        if !audio_admitted || !has_audio_parts {
+            Vec::new()
+        } else {
+            let messages = req.messages.clone();
+            let fetch_cancel = Arc::new(AtomicBool::new(false));
+            let fetch_cancel_inner = fetch_cancel.clone();
+            let admission_keepalive = _admission.clone();
+            let fetch_fut = tokio::task::spawn_blocking(move || {
+                let _admission = admission_keepalive;
+                collect_audio_items(&messages, &fetch_cancel_inner)
+            });
+            match tokio::time::timeout_at(request_deadline, fetch_fut).await {
+                Ok(joined) => joined.map_err(|e| {
+                    ApiError::Internal(format!("audio fetch joined: {e}"))
+                })??,
+                Err(_) => {
+                    fetch_cancel.store(true, Ordering::Relaxed);
+                    return Err(ApiError::invalid_param(
+                        "audio fetch exceeded request_timeout — the \
+                         client audio URL(s) did not resolve in time",
+                        "messages",
+                        "audio_fetch_timeout",
+                    ));
+                }
+            }
+        }
+    };
+    if !audio_items.is_empty() {
+        tracing::info!(
+            num_audio_items = audio_items.len(),
+            total_audio_soft_tokens =
+                audio_items.iter().map(|a| a.num_soft_tokens).sum::<usize>(),
+            "audio admission complete"
+        );
+    }
+
     // Run template render on the blocking pool and bound it by the
     // same deadline. Render is normally <1 ms but on a maximally
     // large body it can become non-trivial; without this timeout
@@ -761,6 +813,10 @@ pub async fn chat_completions(
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
         vision_items,
         vision_slots,
+        audio_items,
+        // B4 will populate `audio_slots` from the renderer; until
+        // then the worker-side splice short-circuits on empty.
+        audio_slots: Vec::new(),
         events_tx,
         cancelled: cancelled.clone(),
         // Hand the worker a clone of the admission permit so the
@@ -1855,6 +1911,8 @@ pub async fn completions(
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
         vision_items: Vec::new(),
         vision_slots: Vec::new(),
+        audio_items: Vec::new(),
+        audio_slots: Vec::new(),
         events_tx,
         cancelled: cancelled.clone(),
         _admission: Some(_admission.clone()),
@@ -2566,6 +2624,144 @@ fn collect_vision_items(
                 num_soft_tokens,
                 merged_h,
                 merged_w,
+            });
+        }
+    }
+    Ok(items)
+}
+
+/// Walk the chat messages, fetch + decode + resample every
+/// `audio_url` content part, and predict per-item soft-token
+/// counts via the same E4B `MelExtractor` the cuda-worker will
+/// use downstream. Mirrors `collect_vision_items` byte-for-byte
+/// at the structural level — caps, cancellation, document order.
+///
+/// Caps (all configurable via env):
+///   - `RVLLM_AUDIO_MAX_ITEMS`         total parts in one request   (default 4)
+///   - `RVLLM_AUDIO_MAX_TOTAL_TOKENS`  aggregate predicted soft     (default 4096)
+///   - `RVLLM_AUDIO_MAX_SECONDS`       per-item duration             (default 30)
+///   - `RVLLM_AUDIO_MAX_BYTES`         per-item raw bytes            (default 32 MiB)
+///
+/// Returns `Vec<crate::worker::AudioItem>` in document order
+/// — the chat-template renderer later interleaves
+/// `boa + audio_soft_token*N + eoa` runs at each item's position
+/// (B4 work). Until B4 lands the slot vector stays empty and the
+/// worker-side splice is a no-op, but the audio bytes are still
+/// fetched + the diagnostic logging fires so operators can
+/// shake out fetch/decode bugs without the encoder forward
+/// being green.
+fn collect_audio_items(
+    messages: &[crate::openai::chat::ChatMessage],
+    cancelled: &Arc<AtomicBool>,
+) -> ApiResult<Vec<crate::worker::AudioItem>> {
+    use crate::openai::audio_fetch::{fetch_audio, AudioError};
+
+    let max_items: usize = std::env::var("RVLLM_AUDIO_MAX_ITEMS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let max_total_tokens: usize = std::env::var("RVLLM_AUDIO_MAX_TOTAL_TOKENS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
+
+    // Cheap preflight: count parts before any network I/O.
+    let total_audio_parts: usize = messages
+        .iter()
+        .filter_map(|m| m.content.as_ref())
+        .map(|c| c.audio_urls().count())
+        .sum();
+    if total_audio_parts == 0 {
+        return Ok(Vec::new());
+    }
+    if total_audio_parts > max_items {
+        return Err(ApiError::invalid_param(
+            format!(
+                "request has {total_audio_parts} audio_url parts; server cap \
+                 RVLLM_AUDIO_MAX_ITEMS={max_items}"
+            ),
+            "messages",
+            "too_many_audio_items",
+        ));
+    }
+
+    // Build a one-shot `MelExtractor` so soft-token prediction
+    // matches the cuda-worker's encoder cadence exactly. Reading
+    // the on-disk processor_config.json once per request is
+    // cheap; the extractor itself is light to construct.
+    let mel_cfg = match std::fs::read("/home/r00t/gemma4-e4b/processor_config.json") {
+        Ok(bytes) => rvllm_runtime::audio_preprocess::MelConfig::from_processor_config(&bytes)
+            .unwrap_or(rvllm_runtime::audio_preprocess::MelConfig::gemma4_e4b()),
+        Err(_) => rvllm_runtime::audio_preprocess::MelConfig::gemma4_e4b(),
+    };
+    let extractor = rvllm_runtime::audio_preprocess::MelExtractor::new(mel_cfg);
+
+    let mut items = Vec::with_capacity(total_audio_parts);
+    let mut total_tokens: usize = 0;
+    for (mi, m) in messages.iter().enumerate() {
+        let Some(content) = m.content.as_ref() else { continue };
+        for au in content.audio_urls() {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(ApiError::invalid_param(
+                    "audio fetch cancelled (request deadline or client disconnect)",
+                    "messages",
+                    "audio_fetch_cancelled",
+                ));
+            }
+            let item = fetch_audio(&au.url, au.format.as_deref(), cancelled).map_err(|e| match e {
+                AudioError::FetchTimeout => ApiError::invalid_param(
+                    format!("messages[{mi}].audio_url fetch timeout"),
+                    "messages",
+                    "audio_fetch_timeout",
+                ),
+                AudioError::TooLarge(g, m) => ApiError::invalid_param(
+                    format!("messages[{mi}].audio_url too large ({g}/{m} bytes)"),
+                    "messages",
+                    "audio_too_large",
+                ),
+                AudioError::FormatUnsupported(s) => ApiError::invalid_param(
+                    format!("messages[{mi}].audio_url format not supported: {s}"),
+                    "messages",
+                    "audio_format_unsupported",
+                ),
+                AudioError::Cancelled => ApiError::invalid_param(
+                    format!("messages[{mi}].audio_url cancelled"),
+                    "messages",
+                    "audio_fetch_cancelled",
+                ),
+                other => ApiError::invalid_param(
+                    format!("messages[{mi}].audio_url failed: {other}"),
+                    "messages",
+                    "audio_fetch_failed",
+                ),
+            })?;
+
+            let num_soft_tokens = extractor.num_soft_tokens(item.num_samples());
+            // Chat-template length per item: boa + N soft + eoa = N + 2.
+            // B4 will materialize this in the renderer; for B3 the count
+            // is what the per-request token-budget cap reasons about.
+            let num_tokens = num_soft_tokens.saturating_add(2);
+            total_tokens = total_tokens.saturating_add(num_tokens);
+            if total_tokens > max_total_tokens {
+                return Err(ApiError::invalid_param(
+                    format!(
+                        "aggregate predicted audio tokens {total_tokens} \
+                         exceeds cap RVLLM_AUDIO_MAX_TOTAL_TOKENS={max_total_tokens}"
+                    ),
+                    "messages",
+                    "audio_total_tokens_too_large",
+                ));
+            }
+            tracing::info!(
+                msg_idx = mi,
+                duration_s = item.duration_seconds,
+                num_samples = item.num_samples(),
+                num_soft_tokens,
+                num_tokens,
+                "audio: item fetched + tokens predicted"
+            );
+            items.push(crate::worker::AudioItem {
+                samples_16k_mono: item.samples_16k_mono,
+                duration_seconds: item.duration_seconds,
+                num_tokens,
+                num_soft_tokens,
+                msg_idx: mi,
             });
         }
     }
