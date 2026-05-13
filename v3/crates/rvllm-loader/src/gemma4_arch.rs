@@ -268,22 +268,56 @@ impl Gemma4Arch {
     }
 
     fn detect_weight_prefix(dir: &Path) -> String {
+        // Sharded layout — peek at the index.
         let idx_path = dir.join("model.safetensors.index.json");
         if let Ok(bytes) = std::fs::read(&idx_path) {
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 if let Some(map) = v["weight_map"].as_object() {
-                    for key in map.keys() {
-                        if key.starts_with("model.language_model.") {
-                            return "model.language_model".to_string();
-                        }
-                        if key.starts_with("language_model.") {
-                            return "language_model".to_string();
-                        }
-                    }
+                    return Self::pick_prefix_from_keys(map.keys().map(|s| s.as_str()));
                 }
             }
         }
+        // Single-file layout (e.g. E4B-it ships one model.safetensors,
+        // no index). Read the safetensors header directly.
+        let single = dir.join("model.safetensors");
+        if let Some(prefix) = Self::peek_safetensors_prefix(&single) {
+            return prefix;
+        }
         "model".to_string()
+    }
+
+    fn pick_prefix_from_keys<'a, I: Iterator<Item = &'a str>>(keys: I) -> String {
+        for k in keys {
+            if k.starts_with("model.language_model.") {
+                return "model.language_model".to_string();
+            }
+            if k.starts_with("language_model.") {
+                return "language_model".to_string();
+            }
+        }
+        "model".to_string()
+    }
+
+    /// Reads just the JSON header of a safetensors file (the first
+    /// `u64-LE` byte-length + that many UTF-8 bytes) and runs the
+    /// prefix picker over its keys. `None` on any I/O / parse error
+    /// so the caller can fall back to the literal "model" default.
+    fn peek_safetensors_prefix(path: &Path) -> Option<String> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut len_bytes = [0u8; 8];
+        f.read_exact(&mut len_bytes).ok()?;
+        let n = u64::from_le_bytes(len_bytes);
+        if n == 0 || n > 64 * 1024 * 1024 {
+            return None;
+        }
+        let mut header = vec![0u8; n as usize];
+        f.read_exact(&mut header).ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&header).ok()?;
+        let obj = v.as_object()?;
+        Some(Self::pick_prefix_from_keys(
+            obj.keys().filter(|k| *k != "__metadata__").map(|s| s.as_str()),
+        ))
     }
 
     pub fn head_dim_for_layer(&self, layer_idx: usize) -> usize {
@@ -489,6 +523,32 @@ mod tests {
         // Defaults for unspecified 31B-typical values:
         assert_eq!(vc.num_hidden_layers, 27);
         assert_eq!(vc.num_attention_heads, 16);
+    }
+
+    #[test]
+    fn pick_prefix_from_keys_recognises_language_model() {
+        let keys = vec![
+            "model.embed_tokens.weight",
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+        ];
+        assert_eq!(
+            Gemma4Arch::pick_prefix_from_keys(keys.iter().copied()),
+            "model.language_model"
+        );
+
+        let keys2 = vec!["language_model.layers.0.foo.weight"];
+        assert_eq!(
+            Gemma4Arch::pick_prefix_from_keys(keys2.iter().copied()),
+            "language_model"
+        );
+
+        // No language_model key → bare "model" default (matches 31B
+        // fp8-block layout where weights live under model.layers.*).
+        let keys3 = vec!["model.layers.0.foo.weight", "model.norm.weight"];
+        assert_eq!(
+            Gemma4Arch::pick_prefix_from_keys(keys3.iter().copied()),
+            "model"
+        );
     }
 
     #[test]

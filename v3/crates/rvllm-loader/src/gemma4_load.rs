@@ -585,8 +585,11 @@ pub fn load_gemma4_model(
     let vision = load_gemma_vision(
         arena, &must_get, &bytes_of, model_dir, arch.vision_config.as_ref(),
     ).ok();
-    if vision.is_some() {
-        eprintln!("[gemma4-loader] vision tower loaded (27 SigLIP-style blocks + patch_embedder + multimodal projector)");
+    if let Some(v) = vision.as_ref() {
+        eprintln!(
+            "[gemma4-loader] vision tower loaded ({} SigLIP-style blocks + patch_embedder + multimodal projector)",
+            v.blocks.len()
+        );
     } else {
         eprintln!("[gemma4-loader] vision tower SKIPPED (no model.vision_tower.* tensors)");
     }
