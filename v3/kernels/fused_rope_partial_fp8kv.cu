@@ -17,6 +17,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cstdio>
 
 // FP8 E4M3 max magnitude (7-bit grid, symmetric).
 #define FP8_E4M3_MAX 448.0f
@@ -120,6 +121,23 @@ __global__ void fused_rope_partial_fp8kv_kernel(
             q_scale = *q_scale_ptr;
         }
         float q_inv = 1.0f / q_scale;
+#ifdef RVLLM_ROPE_DEBUG_DUMP  // probe is OFF by default after the tokenization bug was localized
+        // Codex25 probe: dump pre-FP8 q_lo_val/q_hi_val/cos/sin/q for
+        // (token=1, head=1, tid=0..7) to localize the rope mismatch.
+        if (token_idx == 1 && head_idx == 1 && tid < 8) {
+            float cos_dbg = (tid < half_rotary)
+                ? __half2float(cos_table[pos * half_rotary + tid]) : 0.0f;
+            float sin_dbg = (tid < half_rotary)
+                ? __half2float(sin_table[pos * half_rotary + tid]) : 0.0f;
+            float qn_lo = __half2float(q_in[q_base + tid]);
+            float qn_hi = __half2float(q_in[q_base + tid + half_head]);
+            printf("[rope-dbg] pos=%d tid=%d  q_in_lo=%.5f q_in_hi=%.5f  "
+                   "cos=%.5f sin=%.5f  q_lo_val=%.5f q_hi_val=%.5f  "
+                   "q_scale=%.6f q_amax(rdblk)=%.5f\n",
+                   pos, tid, qn_lo, qn_hi, cos_dbg, sin_dbg,
+                   q_lo_val, q_hi_val, q_scale, q_scale * FP8_E4M3_MAX);
+        }
+#endif
         q_fp8_out[q_base + tid]             = __nv_fp8_e4m3(q_lo_val * q_inv);
         q_fp8_out[q_base + tid + half_head] = __nv_fp8_e4m3(q_hi_val * q_inv);
     }
