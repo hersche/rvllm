@@ -274,6 +274,8 @@ fn cached_env_state() -> &'static KvDtypeEnvState {
 pub struct Gemma4LayerDims {
     pub num_tokens: u32,
     pub hidden: u32,
+    /// E4B PLE inner dimension. `0` when PLE inactive (31B).
+    pub ple_dim: u32,
     pub num_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
@@ -512,6 +514,18 @@ pub struct Gemma4LayerWeightPtrs {
     /// gate/up are similarly split into (gate, up). The down + o
     /// projections stay 1-launch.
     pub awq: Gemma4AwqLayerPtrs,
+    /// E4B Per-Layer Embeddings (PLE) per-layer device pointers.
+    /// All zero → PLE inactive (31B path). Set together as a triple
+    /// when arch reports `hidden_size_per_layer_input.is_some()`.
+    pub ple_input_gate: u64,          // [ple_dim, hidden] f16
+    pub ple_projection: u64,          // [hidden, ple_dim] f16
+    pub ple_post_input_norm_gamma: u64, // [hidden] f16 (+1 pre-shifted)
+    /// Base pointer into the per-request precomputed
+    /// `per_layer_inputs` arena slice for THIS layer.
+    /// Shape: `[num_tokens, ple_dim]` f16 row-major, stride =
+    /// ple_dim * 2 bytes.
+    /// `0` when PLE inactive (31B).
+    pub ple_per_layer_input: u64,
 }
 
 /// Per-layer AWQ device pointer set. All-zero `*_packed` = AWQ
@@ -762,6 +776,10 @@ pub struct Gemma4LayerKernels {
     /// Same launch ABI; only the dtype interpretation of gate_up
     /// input + output flips f16 → bf16.
     pub fused_gelu_mul_bf16: KernelFn,
+    /// E4B PLE: GELU(tanh)(gate) × per_layer_input on two
+    /// separate device pointers. See
+    /// kernels/gelu_tanh_mul_dual_f16.cu.
+    pub gelu_tanh_mul_dual_f16: KernelFn,
     pub fused_rope_partial_f16kv: KernelFn,
     pub fused_norm_add_residual: KernelFn,
     pub fused_norm_add_residual_f16: KernelFn,

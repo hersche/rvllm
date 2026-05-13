@@ -415,6 +415,9 @@ pub struct Gemma4FusedModules {
     pub fused_gelu_mul_f16_mod: LoadedModule,
     /// Cycle 55 step 6 (Phase B): bf16 sibling of fused_gelu_mul_f16.
     pub fused_gelu_mul_bf16_mod: LoadedModule,
+    /// E4B Per-Layer Embeddings (PLE) GELU(gate)·per_layer_input
+    /// reading from two separate pointers (not gate||up concat).
+    pub gelu_tanh_mul_dual_f16_mod: LoadedModule,
     pub fused_rope_partial_f16kv_mod: LoadedModule,
     pub fused_norm_add_residual_mod: LoadedModule,
     // Cycle 53+ Stage 1: BF16 residual chain modules.
@@ -467,6 +470,9 @@ pub struct Gemma4FusedModules {
     pub fn_fused_gelu_mul_f16: KernelFn,
     /// Cycle 55 step 6: bf16 sibling of fn_fused_gelu_mul_f16.
     pub fn_fused_gelu_mul_bf16: KernelFn,
+    /// E4B PLE: GELU(tanh)(gate) * per_layer_input on TWO separate
+    /// pointers (not gate||up concat). See kernels/gelu_tanh_mul_dual_f16.cu.
+    pub fn_gelu_tanh_mul_dual_f16: KernelFn,
     pub fn_fused_rope_partial_f16kv: KernelFn,
     pub fn_fused_norm_add_residual: KernelFn,
     pub fn_fused_norm_add_residual_f16: KernelFn,
@@ -1951,6 +1957,7 @@ impl Gemma4Bringup {
                     head_dim: hd,
                     rotary_dim: arch.rotary_dim_for_layer(layer_idx) as u32,
                     intermediate: inter,
+                    ple_dim: arch.hidden_size_per_layer_input.unwrap_or(0) as u32,
                     block_size,
                     max_blocks_per_seq: layer_blocks,
                     num_blocks_total: layer_blocks,
@@ -2039,6 +2046,24 @@ impl Gemma4Bringup {
                     gate_up_blockscale: layer.gate_up.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
                     down_blockscale: layer.down_proj.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
                     awq: awq_layer_ptrs(layer.awq.as_ref()),
+                    // E4B PLE plumbing. Pointers from the loaded per-layer
+                    // tensors (`None` → 0 on 31B/AWQ). `ple_per_layer_input`
+                    // is populated by the per-request PLE precompute (Stage
+                    // 3b); 0 here means PLE inactive for this forward
+                    // dispatch — layer_exec then skips the PLE injection.
+                    ple_input_gate: layer
+                        .per_layer_input_gate
+                        .as_ref()
+                        .map_or(0, |w| w.offset_bytes),
+                    ple_projection: layer
+                        .per_layer_projection
+                        .as_ref()
+                        .map_or(0, |w| w.offset_bytes),
+                    ple_post_input_norm_gamma: layer
+                        .post_per_layer_input_norm
+                        .as_ref()
+                        .map_or(0, |w| w.offset_bytes),
+                    ple_per_layer_input: 0,
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -2484,6 +2509,7 @@ impl Gemma4Bringup {
                     head_dim: hd,
                     rotary_dim: arch.rotary_dim_for_layer(layer_idx) as u32,
                     intermediate: inter,
+                    ple_dim: arch.hidden_size_per_layer_input.unwrap_or(0) as u32,
                     block_size,
                     max_blocks_per_seq: layer_blocks,
                     num_blocks_total: layer_blocks,
@@ -2565,6 +2591,24 @@ impl Gemma4Bringup {
                     gate_up_blockscale: layer.gate_up.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
                     down_blockscale: layer.down_proj.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
                     awq: awq_layer_ptrs(layer.awq.as_ref()),
+                    // E4B PLE plumbing. Pointers from the loaded per-layer
+                    // tensors (`None` → 0 on 31B/AWQ). `ple_per_layer_input`
+                    // is populated by the per-request PLE precompute (Stage
+                    // 3b); 0 here means PLE inactive for this forward
+                    // dispatch — layer_exec then skips the PLE injection.
+                    ple_input_gate: layer
+                        .per_layer_input_gate
+                        .as_ref()
+                        .map_or(0, |w| w.offset_bytes),
+                    ple_projection: layer
+                        .per_layer_projection
+                        .as_ref()
+                        .map_or(0, |w| w.offset_bytes),
+                    ple_post_input_norm_gamma: layer
+                        .post_per_layer_input_norm
+                        .as_ref()
+                        .map_or(0, |w| w.offset_bytes),
+                    ple_per_layer_input: 0,
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -3757,7 +3801,9 @@ impl Gemma4Bringup {
                     num_tokens: 1, hidden,
                     num_heads: arch.num_attention_heads as u32, num_kv_heads: nkvh, head_dim: hd,
                     rotary_dim: arch.rotary_dim_for_layer(layer_idx) as u32,
-                    intermediate: inter, block_size,
+                    intermediate: inter,
+                    ple_dim: arch.hidden_size_per_layer_input.unwrap_or(0) as u32,
+                    block_size,
                     max_blocks_per_seq: layer_blocks, num_blocks_total: layer_blocks,
                     attn_scale: 1.0, rms_eps: arch.rms_norm_eps,
                     layer_type: lt, sliding_window: arch.sliding_window_size as u32,
@@ -3796,6 +3842,24 @@ impl Gemma4Bringup {
                     gate_up_blockscale: layer.gate_up.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
                     down_blockscale: layer.down_proj.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
                     awq: awq_layer_ptrs(layer.awq.as_ref()),
+                    // E4B PLE plumbing. Pointers from the loaded per-layer
+                    // tensors (`None` → 0 on 31B/AWQ). `ple_per_layer_input`
+                    // is populated by the per-request PLE precompute (Stage
+                    // 3b); 0 here means PLE inactive for this forward
+                    // dispatch — layer_exec then skips the PLE injection.
+                    ple_input_gate: layer
+                        .per_layer_input_gate
+                        .as_ref()
+                        .map_or(0, |w| w.offset_bytes),
+                    ple_projection: layer
+                        .per_layer_projection
+                        .as_ref()
+                        .map_or(0, |w| w.offset_bytes),
+                    ple_post_input_norm_gamma: layer
+                        .post_per_layer_input_norm
+                        .as_ref()
+                        .map_or(0, |w| w.offset_bytes),
+                    ple_per_layer_input: 0,
                 };
                 let k_out = q_base + (q_dim as u64) * 2;
                 let v_out = k_out + (kv_dim as u64) * 2;
@@ -4284,7 +4348,9 @@ impl Gemma4Bringup {
                     num_tokens: new_q, hidden,
                     num_heads: arch.num_attention_heads as u32, num_kv_heads: nkvh, head_dim: hd,
                     rotary_dim: arch.rotary_dim_for_layer(layer_idx) as u32,
-                    intermediate: inter, block_size,
+                    intermediate: inter,
+                    ple_dim: arch.hidden_size_per_layer_input.unwrap_or(0) as u32,
+                    block_size,
                     max_blocks_per_seq: layer_blocks, num_blocks_total: layer_blocks,
                     attn_scale: 1.0, rms_eps: arch.rms_norm_eps,
                     layer_type: lt, sliding_window: arch.sliding_window_size as u32,
@@ -4323,6 +4389,24 @@ impl Gemma4Bringup {
                     gate_up_blockscale: layer.gate_up.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
                     down_blockscale: layer.down_proj.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
                     awq: awq_layer_ptrs(layer.awq.as_ref()),
+                    // E4B PLE plumbing. Pointers from the loaded per-layer
+                    // tensors (`None` → 0 on 31B/AWQ). `ple_per_layer_input`
+                    // is populated by the per-request PLE precompute (Stage
+                    // 3b); 0 here means PLE inactive for this forward
+                    // dispatch — layer_exec then skips the PLE injection.
+                    ple_input_gate: layer
+                        .per_layer_input_gate
+                        .as_ref()
+                        .map_or(0, |w| w.offset_bytes),
+                    ple_projection: layer
+                        .per_layer_projection
+                        .as_ref()
+                        .map_or(0, |w| w.offset_bytes),
+                    ple_post_input_norm_gamma: layer
+                        .post_per_layer_input_norm
+                        .as_ref()
+                        .map_or(0, |w| w.offset_bytes),
+                    ple_per_layer_input: 0,
                 };
                 // Row-major [num_tokens, q_dim+2*kv_dim]: k_out / v_out
                 // point at row 0's K / V sub-slice. The rmsnorm kernel
@@ -5502,6 +5586,7 @@ impl Gemma4Bringup {
             scale_rows_f32_ratio: self.fused.fn_scale_rows_f32_ratio,
             fused_gelu_mul_f16: self.fused.fn_fused_gelu_mul_f16,
             fused_gelu_mul_bf16: self.fused.fn_fused_gelu_mul_bf16,
+            gelu_tanh_mul_dual_f16: self.fused.fn_gelu_tanh_mul_dual_f16,
             fused_rope_partial_f16kv: self.fused.fn_fused_rope_partial_f16kv,
             fused_norm_add_residual: self.fused.fn_fused_norm_add_residual,
             fused_norm_add_residual_f16: self.fused.fn_fused_norm_add_residual_f16,
@@ -6835,6 +6920,9 @@ fn load_gemma4_fused(
     let fn_fused_gelu_mul_f16 = fused_gelu_mul_f16_mod.get_function("fused_gelu_mul_f16_kernel")?;
     let fused_gelu_mul_bf16_mod = loader.load_ptx("fused_gelu_mul_bf16")?;
     let fn_fused_gelu_mul_bf16 = fused_gelu_mul_bf16_mod.get_function("fused_gelu_mul_bf16_kernel")?;
+    let gelu_tanh_mul_dual_f16_mod = loader.load_ptx("gelu_tanh_mul_dual_f16")?;
+    let fn_gelu_tanh_mul_dual_f16 =
+        gelu_tanh_mul_dual_f16_mod.get_function("gelu_tanh_mul_dual_f16_kernel")?;
 
     let fused_rope_partial_f16kv_mod = loader.load_ptx("fused_rope_partial_f16kv")?;
     let fn_fused_rope_partial_f16kv =
@@ -6985,6 +7073,7 @@ fn load_gemma4_fused(
         scale_rows_f32_ratio_mod,
         fused_gelu_mul_f16_mod,
         fused_gelu_mul_bf16_mod,
+        gelu_tanh_mul_dual_f16_mod,
         fused_rope_partial_f16kv_mod,
         fused_norm_add_residual_mod,
         // Cycle 53+ Stage 1: BF16 residual chain.
@@ -7021,6 +7110,7 @@ fn load_gemma4_fused(
         fn_scale_rows_f32_ratio,
         fn_fused_gelu_mul_f16,
         fn_fused_gelu_mul_bf16,
+        fn_gelu_tanh_mul_dual_f16,
         fn_fused_rope_partial_f16kv,
         fn_fused_norm_add_residual,
         fn_fused_norm_add_residual_f16,
