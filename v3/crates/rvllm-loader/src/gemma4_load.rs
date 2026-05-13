@@ -176,7 +176,22 @@ pub fn load_gemma4_model(
     if fp8_prequant {
         eprintln!("[loader] Gemma 4 FP8 pre-quantized mode: uploading weights directly with cuBLASLt per-channel scales");
     } else {
-        eprintln!("[loader] Gemma 4 BF16 mode: CPU-quantizing to FP8 at load time");
+        // E4B-it ships native bf16 with no `*_scale` tensors; the
+        // 31B BF16 checkpoint pairs bf16 weights with `*_scale`
+        // tensors (used by upload_fp8 / cuBLASLt). Pure-bf16 is
+        // F16_ONLY-friendly: tensor_to_f16_bytes handles bf16→f16
+        // natively, and the FP8 path's CPU quantize is wasted CPU.
+        let any_scale = tensors
+            .keys()
+            .any(|k| k.ends_with(".weight_scale") || k.ends_with(".weight_scale_inv"));
+        if !any_scale {
+            eprintln!(
+                "[loader] Gemma 4 pure-bf16 layout (no weight_scale tensors); \
+                 expect RVLLM_F16_ONLY=1 in profile to skip FP8 round-trip"
+            );
+        } else {
+            eprintln!("[loader] Gemma 4 BF16 mode: CPU-quantizing to FP8 at load time");
+        }
     }
 
     let lm_head_fp8 = if let Some((si, e)) = get_tensor("lm_head.weight") {
@@ -585,6 +600,7 @@ pub fn load_gemma4_model(
         rope_sin_global,
         layers,
         vision,
+        num_kv_shared_layers: arch.num_kv_shared_layers,
     })
 }
 
@@ -1623,6 +1639,7 @@ fn load_gemma4_awq_model_inner(
         // checkpoints; vision is FP16/BF16 in the standard fp8-block
         // checkpoint and currently unused on the AWQ path.
         vision: None,
+        num_kv_shared_layers: arch.num_kv_shared_layers,
     })
 }
 

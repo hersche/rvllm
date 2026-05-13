@@ -91,6 +91,11 @@ pub struct Gemma4LoadedModel {
     /// Vision tower (SigLIP-style ViT) for Gemma 4 multimodal.
     /// `None` for text-only checkpoints.
     pub vision: Option<Gemma4Vision>,
+    /// Echoed from `Gemma4Arch::num_kv_shared_layers`. `None` on 31B;
+    /// `Some(18)` on E4B-it. Bring-up reads this to alias the trailing
+    /// sliding layers' K/V onto the most recent full-attention layer's
+    /// KV slot (A4 lands the physical aliasing — A2 only plumbs).
+    pub num_kv_shared_layers: Option<u32>,
 }
 
 // ─── Vision (Gemma 4 SigLIP-style ViT) ────────────────────────────────
