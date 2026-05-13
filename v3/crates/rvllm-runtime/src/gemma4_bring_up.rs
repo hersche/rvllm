@@ -6635,53 +6635,79 @@ impl Gemma4Bringup {
         self.stream.fence()?;
 
 
-        // ── Step 6: Standardize — (f32 - bias_f16) * scale_f16, output f16. ─
-        // The std_scale weights are <1.0 in this checkpoint (designed
-        // to bring the post-pool magnitudes back into a normalised
-        // range), so multiplying narrows everything safely into f16.
+        // ── Step 6: Standardize OR plain narrow ──────────────────────
+        // 31B: (f32 - std_bias_f16) * std_scale_f16 → f16 via the
+        //      vit_standardize_f32_to_f16 kernel. std_scale weights
+        //      are <1.0 here so the multiply tames the post-pool
+        //      magnitudes back into f16 range.
+        // E4B (vision_config.standardize=false): no std_bias /
+        //      std_scale tensors on disk. The pooler-bridge f32 path
+        //      already produces values close to f16 range (no
+        //      sqrt(hidden) inflation that 31B needs to undo), so a
+        //      plain f32→f16 cast is the correct fallback.
         #[cfg(feature = "cuda")]
-        unsafe {
-            let mut out = pooled_region.device_ptr();
-            let mut x = pooled_region_f32.device_ptr();
-            // A4c: std_bias/std_scale are Optional. 31B has them; E4B
-            // (vision_config.standardize=false) does not. The full
-            // standardize-skip path lands later (needs a plain
-            // f32→f16 narrow kernel); for now panic with a clear
-            // message — E4B vision is admission-gated by
-            // RVLLM_VISION_MAX_IMAGES=0, so this is unreachable in
-            // any deployed profile.
-            let std_bias = vision
-                .std_bias
-                .as_ref()
-                .expect("vision standardize requested but std_bias missing — set RVLLM_VISION_MAX_IMAGES=0 in profile until A4d lands the standardize-skip path");
-            let std_scale = vision
-                .std_scale
-                .as_ref()
-                .expect("vision standardize requested but std_scale missing");
-            let mut bias = std_bias.offset_bytes;
-            let mut scale = std_scale.offset_bytes;
-            let mut hd = HIDDEN as i32;
-            let args = [
-                (&mut out) as *mut u64 as *mut core::ffi::c_void,
-                (&mut x) as *mut u64 as *mut core::ffi::c_void,
-                (&mut bias) as *mut u64 as *mut core::ffi::c_void,
-                (&mut scale) as *mut u64 as *mut core::ffi::c_void,
-                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let rc = cuLaunchKernel(
-                self.fused.fn_vit_standardize_f32_to_f16.raw() as CUfunction,
-                n_pooled as u32, 1, 1,
-                256, 1, 1,
-                0, self.stream.raw() as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "vision: vit_standardize_f32_to_f16 launch failed",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
+        if let (Some(std_bias), Some(std_scale)) =
+            (vision.std_bias.as_ref(), vision.std_scale.as_ref())
+        {
+            unsafe {
+                let mut out = pooled_region.device_ptr();
+                let mut x = pooled_region_f32.device_ptr();
+                let mut bias = std_bias.offset_bytes;
+                let mut scale = std_scale.offset_bytes;
+                let mut hd = HIDDEN as i32;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut bias) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut scale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let rc = cuLaunchKernel(
+                    self.fused.fn_vit_standardize_f32_to_f16.raw() as CUfunction,
+                    n_pooled as u32, 1, 1,
+                    256, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "vision: vit_standardize_f32_to_f16 launch failed",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+        } else {
+            // E4B path: plain f32 → f16 narrow over n_pooled * HIDDEN.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let n = (n_pooled * HIDDEN) as i32;
+                let mut out = pooled_region.device_ptr();
+                let mut input = pooled_region_f32.device_ptr();
+                let mut nn = n;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = ((n as u32 + block - 1) / block, 1u32, 1u32);
+                let rc = cuLaunchKernel(
+                    self.fused.fn_cast_f32_to_f16.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "vision: cast_f32_to_f16 launch failed (standardize-skip)",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
         }
         self.stream.fence()?;
