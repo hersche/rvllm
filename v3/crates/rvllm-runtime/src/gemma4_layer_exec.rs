@@ -133,6 +133,15 @@ impl KvDtype {
     pub fn from_env(f16_only: bool) -> Self {
         if f16_only {
             // Explicit operator override survives the short-circuit.
+            // 2026-05-14: extended to honor RVLLM_NVFP4_KV=1 alongside
+            // RVLLM_FP8_KV=1 so E4B-it (which must keep RVLLM_F16_ONLY=1
+            // for its pure-bf16 weight ingest) can also opt into NVFP4
+            // KV — the production decode path now wires both FP8 and
+            // NVFP4 K/V correctly (kv-share aliasing + PLE precompute
+            // are dtype-agnostic).
+            if crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_KV").unwrap_or(false) {
+                return KvDtype::Nvfp4;
+            }
             if crate::gemma4_bring_up::parse_truthy_env("RVLLM_FP8_KV").unwrap_or(false) {
                 return KvDtype::Fp8;
             }
