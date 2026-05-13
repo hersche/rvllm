@@ -5622,6 +5622,33 @@ impl Gemma4Bringup {
             inputs_embeds_ptr,
             (num_tokens as usize) * (hidden as usize) * 2,
         )?;
+        // One-shot dump of cos/sin RoPE tables (used by HF parity
+        // for layer-by-layer RoPE replay). Tables are model-global
+        // — write once when PLE precompute first fires.
+        let max_pos = self.arch.max_position_embeddings;
+        // Buffer layout: [max_pos, rotary_dim/2] f16 (no cat-doubling).
+        let half_sl = self.arch.head_dim_sliding / 2; // sliding = full rotation
+        let half_gl = self.arch.rotary_dim_global() / 2; // partial 0.25 → 64
+        dump(
+            "e4b_rope_cos_sliding.bin",
+            self.model.rope_cos_sliding.offset_bytes,
+            max_pos * half_sl * 2,
+        )?;
+        dump(
+            "e4b_rope_sin_sliding.bin",
+            self.model.rope_sin_sliding.offset_bytes,
+            max_pos * half_sl * 2,
+        )?;
+        dump(
+            "e4b_rope_cos_global.bin",
+            self.model.rope_cos_global.offset_bytes,
+            max_pos * half_gl * 2,
+        )?;
+        dump(
+            "e4b_rope_sin_global.bin",
+            self.model.rope_sin_global.offset_bytes,
+            max_pos * half_gl * 2,
+        )?;
 
         // Allocate scratch. Both regions are auto-restored at request
         // end via the existing arena checkpoint mechanism.

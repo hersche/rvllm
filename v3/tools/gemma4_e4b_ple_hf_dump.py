@@ -302,6 +302,37 @@ def main():
           f"hidden_size={text_model.config.hidden_size}, "
           f"ple_dim={getattr(text_model, 'hidden_size_per_layer_input', None)}")
 
+    # Dump full RoPE cos/sin tables for sliding + global variants.
+    # rvllm writes [max_pos, head_dim] f16 row-major; HF's
+    # Gemma4RotaryEmbedding.forward returns (cos, sin) shaped
+    # [batch, seq_len, head_dim]; call with position_ids = arange
+    # to materialize the full table.
+    try:
+        max_pos = int(text_model.config.max_position_embeddings)
+        head_dim_sliding = int(getattr(text_model.config, "head_dim", 256))
+        rotary_sliding = getattr(text_model, "rotary_emb_local", None) or getattr(text_model, "rotary_emb", None)
+        rotary_global = getattr(text_model, "rotary_emb", None)
+        pos_ids = torch.arange(0, max_pos, device=args.device).unsqueeze(0)
+        dummy_x = torch.zeros(1, 1, device=args.device, dtype=dtype_map[args.dtype])
+        # rvllm stores [max_pos, head_dim/2] (single-copy, no
+        # cat-doubling). HF returns [batch, seq, head_dim] with
+        # `cat((freqs, freqs), dim=-1)` so the first `half` columns
+        # are the canonical freqs. Slice to match rvllm.
+        if rotary_sliding is not None:
+            cos_s, sin_s = rotary_sliding(dummy_x, pos_ids)
+            half_s = cos_s.shape[-1] // 2
+            write_f16(out / "e4b_rope_cos_sliding.bin", cos_s[0, :, :half_s].to(torch.float16))
+            write_f16(out / "e4b_rope_sin_sliding.bin", sin_s[0, :, :half_s].to(torch.float16))
+            print(f"  dumped sliding cos/sin: shape={tuple(cos_s.shape)} half={half_s}")
+        if rotary_global is not None and rotary_global is not rotary_sliding:
+            cos_g, sin_g = rotary_global(dummy_x, pos_ids)
+            half_g = cos_g.shape[-1] // 2
+            write_f16(out / "e4b_rope_cos_global.bin", cos_g[0, :, :half_g].to(torch.float16))
+            write_f16(out / "e4b_rope_sin_global.bin", sin_g[0, :, :half_g].to(torch.float16))
+            print(f"  dumped global cos/sin: shape={tuple(cos_g.shape)} half={half_g}")
+    except Exception as e:
+        print(f"  WARN: rope table dump skipped: {e}")
+
     # Plain text encoder hooks.
     patch_text_model(text_model, out)
     for L in dump_layers:

@@ -88,6 +88,17 @@ def infer_last_dim(name: str) -> int:
     # Lookup / pre-norm files: full per-layer stride
     if "_ple_lookup" in name or "_ple_context_pre" in name or "_ple_context_pre_norm" in name:
         return 256  # diff per-ple-slice for finer locality
+    # QKV concat: row = [Q | K | V], q_dim + 2*kv_dim = 8*256 + 2*2*256 = 3072
+    # on E4B sliding (q_dim=2048, kv_dim=512). Use 3072 for sliding,
+    # 6144 for global (q_dim=4096, kv_dim=1024). Default the sliding
+    # value; user can override --last-dim for global-layer dumps.
+    if "_qkv" in name:
+        return 3072
+    # RoPE tables: [max_pos, rotary_dim/2] — sliding=128, global=64 (partial 0.25)
+    if "rope_" in name and "_sliding" in name:
+        return 128
+    if "rope_" in name and "_global" in name:
+        return 64
     # All hidden-size sub-step files
     return 2560
 
