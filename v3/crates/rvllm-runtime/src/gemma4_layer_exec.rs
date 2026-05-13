@@ -2875,6 +2875,116 @@ pub unsafe fn gemma4_forward_phase(
         }
     }
 
+    // ── E4B Per-Layer Embeddings (PLE) injection ──────────────────
+    //
+    // HF Gemma4TextDecoderLayer.forward tail (E4B only):
+    //
+    //   residual_in = hidden_states
+    //   gate        = per_layer_input_gate @ hidden_states      [T, ple_dim]
+    //   gated       = GELU(tanh)(gate) × per_layer_inputs[L]    [T, ple_dim]
+    //   proj        = per_layer_projection @ gated              [T, hidden]
+    //   proj        = post_per_layer_input_norm(proj)
+    //   hidden      = residual_in + proj
+    //
+    // Skips entirely when `ple_per_layer_input == 0` (31B / AWQ:
+    // weights pointers are all 0; stage 3b sets the per-layer
+    // input pointer once per request after PLE precompute).
+    #[cfg(feature = "cuda")]
+    if weights.ple_per_layer_input != 0
+        && weights.ple_input_gate != 0
+        && weights.ple_projection != 0
+        && dims.ple_dim != 0
+    {
+        let ple_dim = dims.ple_dim;
+        // Step 1: gate = residual @ per_layer_input_gate.T → f32 in
+        // gemm_f32_tmp (size T*ple_dim*4 bytes, well under capacity).
+        cublaslt.f16_gemm_f32(
+            residual,
+            weights.ple_input_gate,
+            scratch.gemm_f32_tmp,
+            dims.num_tokens as i32,
+            ple_dim as i32,
+            dims.hidden as i32,
+            stream,
+        )?;
+        // Step 2: narrow f32 → f16 in-place onto the head of
+        // gate_up_out scratch (T*ple_dim*2 bytes; gate_up_out is
+        // sized 2*intermediate*T so easily fits).
+        gemma4_launcher::Bf16ToF16SatLaunch {
+            n: dims.num_tokens * ple_dim,
+        }
+        .launch(
+            kernels.f32_to_f16_sat,
+            scratch.gate_up_out,
+            scratch.gemm_f32_tmp,
+            stream,
+        )?;
+        // Step 3: GELU(tanh)(gate) × per_layer_inputs[L] →
+        // overwrites gate buffer in-place.
+        #[cfg(feature = "cuda")]
+        unsafe {
+            let mut out = scratch.gate_up_out;
+            let mut a = scratch.gate_up_out;
+            let mut b = weights.ple_per_layer_input;
+            let mut pd = ple_dim as i32;
+            let args = [
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut a) as *mut u64 as *mut core::ffi::c_void,
+                (&mut b) as *mut u64 as *mut core::ffi::c_void,
+                (&mut pd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block = (ple_dim.min(1024), 1, 1);
+            let grid = (dims.num_tokens, 1, 1);
+            rvllm_fused::launch_raw(
+                kernels.gelu_tanh_mul_dual_f16,
+                grid,
+                block,
+                0,
+                stream,
+                &args,
+            )?;
+        }
+        // Step 4: proj = gated @ per_layer_projection.T → f32 in
+        // gemm_f32_tmp.
+        cublaslt.f16_gemm_f32(
+            scratch.gate_up_out,
+            weights.ple_projection,
+            scratch.gemm_f32_tmp,
+            dims.num_tokens as i32,
+            dims.hidden as i32,
+            ple_dim as i32,
+            stream,
+        )?;
+        // Step 5: narrow f32 → f16 in-place on gemm_f32_tmp prefix
+        // (T*hidden*2 bytes ≤ T*hidden*4).
+        gemma4_launcher::Bf16ToF16SatLaunch {
+            n: dims.num_tokens * dims.hidden,
+        }
+        .launch(
+            kernels.f32_to_f16_sat,
+            scratch.gemm_f32_tmp,
+            scratch.gemm_f32_tmp,
+            stream,
+        )?;
+        // Step 6: RMSNorm(proj) × γ + residual → residual.
+        // FusedNormAddResidualF16In wants f16 input → output via
+        // `out = norm(x) × γ × layer_scalar + residual`. We pass
+        // layer_scalar_ptr=0 so the kernel skips that multiply.
+        gemma4_launcher::FusedNormAddResidualF16InLaunch {
+            num_tokens: dims.num_tokens,
+            hidden: dims.hidden,
+            eps: dims.rms_eps,
+        }
+        .launch(
+            norm_add_residual_f16in_kernel,
+            scratch.gemm_f32_tmp,
+            weights.ple_post_input_norm_gamma,
+            residual,
+            0,
+            stream,
+        )?;
+    }
+
     #[cfg(feature = "cuda")]
     probe!("after_step14_residual", residual, dims.hidden);
 
