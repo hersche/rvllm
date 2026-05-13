@@ -889,6 +889,22 @@ pub unsafe fn gemma4_forward_phase(
     stream: u64,
     phase: Gemma4Phase,
 ) -> Result<()> {
+    // One-time kv-dispatch trace (drill-down probe): print once per
+    // process so we can confirm which KV path Gemma 4 E4B actually
+    // takes under a given profile. Strictly diagnostic; cost is one
+    // atomic CAS per layer launch in production until it fires once.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[kv-dispatch] first layer: kv_dtype={:?} phase={:?} \
+                 num_heads={} num_kv_heads={} head_dim={} num_tokens={}",
+                dims.kv_dtype, phase, dims.num_heads, dims.num_kv_heads,
+                dims.head_dim, dims.num_tokens
+            );
+        }
+    }
     // Route O / gate_up / down through the f16-in GEMV fast path when
     // `num_tokens <= FAST_PATH_M_MAX`. That kernel is a per-row GEMV
     // (grid.y = M, each block reloads the weight tile) and preserves
@@ -1024,6 +1040,32 @@ pub unsafe fn gemma4_forward_phase(
                 let _ = std::fs::write(&path, &buf);
                 eprintln!(
                     "[ple-dump] L{} {} ({} bytes)",
+                    ple_dump_layer, $suffix, nbytes
+                );
+            }
+        };
+    }
+    /// Raw byte dump (no f16 multiplier). For FP8 (1 B/elem) or
+    /// f32 (4 B/elem) buffers — caller passes the total byte count.
+    #[cfg(feature = "cuda")]
+    macro_rules! ple_dump_raw {
+        ($suffix:expr, $ptr:expr, $nbytes:expr) => {
+            if ple_dump_layer >= 0 {
+                cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                let nbytes = $nbytes as usize;
+                let mut buf = vec![0u8; nbytes];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut _,
+                    $ptr,
+                    nbytes,
+                );
+                let dir = std::env::var("RVLLM_E4B_PLE_DUMP_DIR").unwrap();
+                let path = std::path::Path::new(&dir)
+                    .join(format!("e4b_layer{}_{}.bin", ple_dump_layer, $suffix));
+                std::fs::create_dir_all(&dir).ok();
+                let _ = std::fs::write(&path, &buf);
+                eprintln!(
+                    "[ple-dump] L{} {} ({} bytes raw)",
                     ple_dump_layer, $suffix, nbytes
                 );
             }
@@ -1674,6 +1716,16 @@ pub unsafe fn gemma4_forward_phase(
                 KvDtype::Fp8 => {
                     // FP8 path with F-series per-slot scale signature.
                     rope_fp8kv(dims, kernels, scratch, meta, stream)?;
+                    // Post-RoPE Q FP8 + scale dump (codex24 probe).
+                    {
+                        let q_fp8_bytes = (dims.num_tokens as usize)
+                            * (dims.num_heads as usize)
+                            * (dims.head_dim as usize);
+                        let q_scale_bytes = (dims.num_tokens as usize)
+                            * (dims.num_heads as usize) * 4;
+                        ple_dump_raw!("q_fp8_post_rope", scratch.q_fp8, q_fp8_bytes);
+                        ple_dump_raw!("q_scale_post_rope", scratch.q_scale_cache, q_scale_bytes);
+                    }
                     let decode = PagedDecodeFp8Launcher::new(attention);
                     decode.launch(
                         decode_params,
@@ -1707,6 +1759,18 @@ pub unsafe fn gemma4_forward_phase(
                     }
                     // === END NVFP4 SHADOW DIAGNOSTIC ===
                     rope_nvfp4kv(dims, kernels, scratch, meta, stream)?;
+                    // Post-RoPE Q FP8 + scale dump (codex24 probe).
+                    // NVFP4 path also quantizes Q to FP8 with per-(token,head)
+                    // scale into scratch.q_fp8 / scratch.q_scale_cache.
+                    {
+                        let q_fp8_bytes = (dims.num_tokens as usize)
+                            * (dims.num_heads as usize)
+                            * (dims.head_dim as usize);
+                        let q_scale_bytes = (dims.num_tokens as usize)
+                            * (dims.num_heads as usize) * 4;
+                        ple_dump_raw!("q_fp8_post_rope", scratch.q_fp8, q_fp8_bytes);
+                        ple_dump_raw!("q_scale_post_rope", scratch.q_scale_cache, q_scale_bytes);
+                    }
                     let decode = rvllm_attention::PagedDecodeNvfp4Launcher::new(attention);
 
                     // Split-KV decode (paged_attention_v2-style) —
@@ -1911,6 +1975,16 @@ pub unsafe fn gemma4_forward_phase(
                 }
                 // === END NVFP4 SHADOW DIAGNOSTIC ===
                 rope_nvfp4kv(dims, kernels, scratch, meta, stream)?;
+                // Post-RoPE Q dump (codex24 probe, NVFP4 prefill arm).
+                {
+                    let q_fp8_bytes = (dims.num_tokens as usize)
+                        * (dims.num_heads as usize)
+                        * (dims.head_dim as usize);
+                    let q_scale_bytes = (dims.num_tokens as usize)
+                        * (dims.num_heads as usize) * 4;
+                    ple_dump_raw!("q_fp8_post_rope", scratch.q_fp8, q_fp8_bytes);
+                    ple_dump_raw!("q_scale_post_rope", scratch.q_scale_cache, q_scale_bytes);
+                }
                 let prefill_params = rvllm_attention::PagedPrefillParams {
                     num_tokens: dims.num_tokens,
                     // Forwarded from the scheduler-supplied
@@ -2069,6 +2143,20 @@ pub unsafe fn gemma4_forward_phase(
             // kernel on sm_121). F-series unified-or-fallback structure:
             // Prefill always uses FP8 KV path (no F16 prefill kernel).
             rope_fp8kv(dims, kernels, scratch, meta, stream)?;
+
+            // Post-RoPE Q/K dumps (codex24 probe): dequantize q_fp8 ×
+            // q_scale_cache offline and compare to HF q_rot/k_rot to
+            // separate "Q-FP8 representation wrong" from "softmax/PV wrong".
+            #[cfg(feature = "cuda")]
+            {
+                let q_fp8_bytes = (dims.num_tokens as usize)
+                    * (dims.num_heads as usize)
+                    * (dims.head_dim as usize); // u8/elem
+                let q_scale_bytes =
+                    (dims.num_tokens as usize) * (dims.num_heads as usize) * 4; // f32/elem
+                ple_dump_raw!("q_fp8_post_rope", scratch.q_fp8, q_fp8_bytes);
+                ple_dump_raw!("q_scale_post_rope", scratch.q_scale_cache, q_scale_bytes);
+            }
 
             // --- Unified multi-Q prefill fast path (sm_121) -----------
             // `flash_attention_2_prefill_fp8kv_unified_kernel` handles
