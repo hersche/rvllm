@@ -4273,6 +4273,29 @@ impl Gemma4Bringup {
                     }
                 }
 
+                // E4B PLE precompute (stage 3b2b). Must run BEFORE the
+                // bf16 widen below since the GEMM in the helper expects
+                // f16 inputs_embeds. Gated by RVLLM_E4B_PLE=1 until the
+                // wiring is verified across all dispatch sites; default
+                // off keeps the existing token-salad behavior so the
+                // smoke baseline doesn't regress unexpectedly while
+                // 3b2b lands.
+                let ple_enabled = std::env::var("RVLLM_E4B_PLE")
+                    .map_or(false, |v| v == "1");
+                let (ple_base, ple_stride_elems) = if ple_enabled {
+                    unsafe {
+                        self.precompute_ple(
+                            residual_ptr,
+                            token_ids_region.device_ptr(),
+                            chunk_q as u32,
+                            fn_embed,
+                            &kernels,
+                            stream as u64,
+                        )?
+                    }
+                } else {
+                    (0u64, 0u32)
+                };
                 // Cycle 54 Stage 1: widen embedding-gather output (f16)
                 // to bf16 in-place so the chunked-prefill residual chain
                 // operates on bf16 between layers.
@@ -4409,8 +4432,19 @@ impl Gemma4Bringup {
                         .post_per_layer_input_norm
                         .as_ref()
                         .map_or(0, |w| w.offset_bytes),
-                    ple_per_layer_input: 0,
-                    ple_per_layer_stride_elems: 0,
+                    // Per-layer slice into the [T, num_layers, ple_dim]
+                    // precompute buffer. Base + L*ple_dim*2 walks the
+                    // contiguous-in-D, strided-in-T layout that
+                    // gelu_tanh_mul_dual_f16 expects via
+                    // per_li_row_stride_elems = ple_stride_elems.
+                    ple_per_layer_input: if ple_base != 0 {
+                        ple_base + (layer_idx as u64)
+                            * (arch.hidden_size_per_layer_input.unwrap_or(0) as u64)
+                            * 2
+                    } else {
+                        0
+                    },
+                    ple_per_layer_stride_elems: ple_stride_elems,
                 };
                 // Row-major [num_tokens, q_dim+2*kv_dim]: k_out / v_out
                 // point at row 0's K / V sub-slice. The rmsnorm kernel
