@@ -49,6 +49,30 @@ pub struct MelConfig {
     pub mel_floor: f32,
     pub preemphasis: f32,
     pub input_scale_factor: f32,
+    /// Output-side cadence: each audio soft-token represents this
+    /// many milliseconds of input audio. 40 ms on E4B.
+    pub audio_ms_per_token: u32,
+    /// Hard cap on soft tokens admitted per audio item; encoder
+    /// won't emit more than this. 750 = 30 s of audio at 40 ms /
+    /// token on E4B.
+    pub audio_seq_length: u32,
+}
+
+/// Gemma 4 special token IDs for audio admission + splice. Used by
+/// B3 (HTTP admission) and B4 (tokenize.rs `is_audio_token` +
+/// soft-token-run expansion). Reading these from config.json is
+/// trivial but they're stable for Gemma 4 — pinned here so the
+/// admission rejector + the splice scanner agree on the same
+/// values without re-plumbing per-request.
+pub mod gemma4_audio_tokens {
+    /// Soft-token placeholder. Tokenize replaces each occurrence
+    /// in the rendered chat with a run of `num_soft_tokens(audio)`
+    /// copies, marking the splice slot.
+    pub const AUDIO_TOKEN: u32 = 258_881;
+    /// Beginning-of-audio boundary token (boa_token_id).
+    pub const BOA_TOKEN: u32 = 256_000;
+    /// End-of-audio boundary token (eoa_token_id).
+    pub const EOA_TOKEN: u32 = 258_883;
 }
 
 impl MelConfig {
@@ -69,6 +93,8 @@ impl MelConfig {
             mel_floor: 0.001,
             preemphasis: 0.0,
             input_scale_factor: 1.0,
+            audio_ms_per_token: 40,
+            audio_seq_length: 750,
         }
     }
 
@@ -95,6 +121,16 @@ impl MelConfig {
                 .get("input_scale_factor")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(1.0) as f32,
+            // audio_ms_per_token + audio_seq_length live at the top
+            // of processor_config, not inside feature_extractor.
+            audio_ms_per_token: v
+                .get("audio_ms_per_token")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(40) as u32,
+            audio_seq_length: v
+                .get("audio_seq_length")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(750) as u32,
         })
     }
 }
@@ -134,6 +170,21 @@ impl MelExtractor {
         } else {
             (n_samples - self.cfg.frame_length) / self.cfg.hop_length + 1
         }
+    }
+
+    /// How many audio-soft tokens this audio will splice into the
+    /// rendered chat. Derived from `audio_ms_per_token` directly
+    /// (not from `num_frames`) — the encoder applies its own
+    /// subsampling to land on this cadence regardless of mel-frame
+    /// stride. Clamped to `audio_seq_length`.
+    ///
+    /// E4B: 40 ms / token, 750 max → up to 30 s of audio.
+    pub fn num_soft_tokens(&self, n_samples: usize) -> usize {
+        let cfg = &self.cfg;
+        let samples_per_token =
+            (cfg.sampling_rate as u64 * cfg.audio_ms_per_token as u64 / 1000) as usize;
+        let raw = (n_samples + samples_per_token - 1) / samples_per_token; // ceil
+        raw.min(cfg.audio_seq_length as usize)
     }
 
     /// Compute `[T, n_mels]` log-mel spectrogram as f32 row-major.
@@ -324,6 +375,38 @@ mod tests {
         // Below frame_length → no frames.
         assert_eq!(extr.num_frames(100), 0);
         assert_eq!(extr.num_frames(320), 1);
+    }
+
+    #[test]
+    fn num_soft_tokens_matches_40ms_cadence() {
+        let extr = MelExtractor::new(MelConfig::gemma4_e4b());
+        // 1 s @ 16 kHz = 16000 samples; 40 ms/token = 640 samples/token
+        // → ceil(16000/640) = 25 soft tokens.
+        assert_eq!(extr.num_soft_tokens(16_000), 25);
+        // 30 s = 480000 samples → 750 (== cap).
+        assert_eq!(extr.num_soft_tokens(480_000), 750);
+        // 60 s of input is still clamped to 750.
+        assert_eq!(extr.num_soft_tokens(960_000), 750);
+        // 0 samples → 0 tokens (ceil(0/640) = 0).
+        assert_eq!(extr.num_soft_tokens(0), 0);
+    }
+
+    #[test]
+    fn audio_token_constants_are_e4b_values() {
+        // Cross-check against /home/r00t/gemma4-e4b/config.json:
+        // audio_token_id=258881, boa_token_id=256000, eoa_token_id=258883.
+        assert_eq!(gemma4_audio_tokens::AUDIO_TOKEN, 258_881);
+        assert_eq!(gemma4_audio_tokens::BOA_TOKEN, 256_000);
+        assert_eq!(gemma4_audio_tokens::EOA_TOKEN, 258_883);
+    }
+
+    #[test]
+    fn config_picks_up_audio_seq_length_from_real_json() {
+        let path = "/home/r00t/gemma4-e4b/processor_config.json";
+        let Ok(bytes) = std::fs::read(path) else { return; };
+        let cfg = MelConfig::from_processor_config(&bytes).unwrap();
+        assert_eq!(cfg.audio_ms_per_token, 40);
+        assert_eq!(cfg.audio_seq_length, 750);
     }
 
     #[test]
