@@ -1969,6 +1969,7 @@ impl Gemma4Bringup {
                     f16_kv: kv_dtype_per_layer[layer_idx].is_f16(),
                     kv_dtype: kv_dtype_per_layer[layer_idx],
                     bf16_residual: bf16_residual_enabled(),
+                    kv_share_source_layer: arch.kv_share_source_layer(layer_idx).map(|s| s as u32),
                     current_max_context_len: None,
                 };
 
@@ -1987,11 +1988,21 @@ impl Gemma4Bringup {
                     crate::gemma4_layer_exec::KvDtype::Fp8 => layer_kv_elems,
                     crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_kv_elems / 2,
                 };
-                let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[layer_idx];
+                // E4B kv-share: when this layer aliases an earlier source
+                // (Gemma 4 num_kv_shared_layers tail), the attention
+                // launchers must read K/V from the SOURCE layer's region.
+                // Pointing layer_kv_base at the source while passing
+                // dims.kv_share_source_layer=Some(_) suppresses rope's
+                // K/V writes (see fused_rope_partial_*kv.cu nullptr guard)
+                // so the source layer's K/V cache is never clobbered.
+                let kv_idx = arch.kv_share_source_layer(layer_idx).unwrap_or(layer_idx);
+                let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[kv_idx];
                 // FP8 path (F-series): per-slot f32 K/V scales, always
                 // allocated in `kv_scale_cache` (kv_scale_total_bytes=0 on F16).
+                // kv-share-aware (mirrors layer_kv_base above): for shared
+                // layers, the scale arena base also maps to the source layer.
                 let layer_kv_scale_base =
-                    kv_scale_cache.device_ptr() + kv_scale_layer_offsets[layer_idx];
+                    kv_scale_cache.device_ptr() + kv_scale_layer_offsets[kv_idx];
                 let layer_kv_scale_slots_half =
                     (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
                 // NVFP4 path: K gets the first half of the layer's scale
@@ -2522,6 +2533,7 @@ impl Gemma4Bringup {
                     f16_kv: kv_dtype_per_layer[layer_idx].is_f16(),
                     kv_dtype: kv_dtype_per_layer[layer_idx],
                     bf16_residual: bf16_residual_enabled(),
+                    kv_share_source_layer: arch.kv_share_source_layer(layer_idx).map(|s| s as u32),
                     current_max_context_len: None,
                 };
 
@@ -2540,9 +2552,19 @@ impl Gemma4Bringup {
                     crate::gemma4_layer_exec::KvDtype::Fp8 => layer_kv_elems,
                     crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_kv_elems / 2,
                 };
-                let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[layer_idx];
+                // E4B kv-share: when this layer aliases an earlier source
+                // (Gemma 4 num_kv_shared_layers tail), the attention
+                // launchers must read K/V from the SOURCE layer's region.
+                // Pointing layer_kv_base at the source while passing
+                // dims.kv_share_source_layer=Some(_) suppresses rope's
+                // K/V writes (see fused_rope_partial_*kv.cu nullptr guard)
+                // so the source layer's K/V cache is never clobbered.
+                let kv_idx = arch.kv_share_source_layer(layer_idx).unwrap_or(layer_idx);
+                let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[kv_idx];
+                // kv-share-aware (mirrors layer_kv_base above): for shared
+                // layers, the scale arena base also maps to the source layer.
                 let layer_kv_scale_base =
-                    kv_scale_cache.device_ptr() + kv_scale_layer_offsets[layer_idx];
+                    kv_scale_cache.device_ptr() + kv_scale_layer_offsets[kv_idx];
                 let layer_kv_scale_slots_half =
                     (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
                 let (k_cache_scale, v_cache_scale) = if layer_kv_dtype
@@ -3780,9 +3802,19 @@ impl Gemma4Bringup {
                 let kv_dim = nkvh * hd;
                 let layer_blocks = if lt == Gemma4LayerType::GlobalAttention { num_blocks_total } else { sliding_blocks };
                 let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
-                let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[layer_idx];
+                // E4B kv-share: when this layer aliases an earlier source
+                // (Gemma 4 num_kv_shared_layers tail), the attention
+                // launchers must read K/V from the SOURCE layer's region.
+                // Pointing layer_kv_base at the source while passing
+                // dims.kv_share_source_layer=Some(_) suppresses rope's
+                // K/V writes (see fused_rope_partial_*kv.cu nullptr guard)
+                // so the source layer's K/V cache is never clobbered.
+                let kv_idx = arch.kv_share_source_layer(layer_idx).unwrap_or(layer_idx);
+                let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[kv_idx];
+                // kv-share-aware (mirrors layer_kv_base above): for shared
+                // layers, the scale arena base also maps to the source layer.
                 let layer_kv_scale_base =
-                    kv_scale_cache.device_ptr() + kv_scale_layer_offsets[layer_idx];
+                    kv_scale_cache.device_ptr() + kv_scale_layer_offsets[kv_idx];
                 let layer_kv_scale_slots_half =
                     (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
                 // Per-layer dtype: hybrid mode swaps global layers to FP8,
@@ -3812,6 +3844,7 @@ impl Gemma4Bringup {
                     f16_kv: kv_dtype.is_f16(),
                     kv_dtype,
                     bf16_residual: bf16_residual_enabled(),
+                    kv_share_source_layer: arch.kv_share_source_layer(layer_idx).map(|s| s as u32),
                     // Decode step knows its own ctx CPU-side — `ctx = [step + 1]`
                     // was computed at line ~1843. Pass it so the split-KV
                     // dispatch gates on the current ctx length instead of
@@ -4347,9 +4380,19 @@ impl Gemma4Bringup {
                 let kv_dim = nkvh * hd;
                 let layer_blocks = if lt == Gemma4LayerType::GlobalAttention { num_blocks_total } else { sliding_blocks };
                 let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
-                let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[layer_idx];
+                // E4B kv-share: when this layer aliases an earlier source
+                // (Gemma 4 num_kv_shared_layers tail), the attention
+                // launchers must read K/V from the SOURCE layer's region.
+                // Pointing layer_kv_base at the source while passing
+                // dims.kv_share_source_layer=Some(_) suppresses rope's
+                // K/V writes (see fused_rope_partial_*kv.cu nullptr guard)
+                // so the source layer's K/V cache is never clobbered.
+                let kv_idx = arch.kv_share_source_layer(layer_idx).unwrap_or(layer_idx);
+                let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[kv_idx];
+                // kv-share-aware (mirrors layer_kv_base above): for shared
+                // layers, the scale arena base also maps to the source layer.
                 let layer_kv_scale_base =
-                    kv_scale_cache.device_ptr() + kv_scale_layer_offsets[layer_idx];
+                    kv_scale_cache.device_ptr() + kv_scale_layer_offsets[kv_idx];
                 let layer_kv_scale_slots_half =
                     (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
                 // Per-layer dtype: hybrid swaps global to FP8 (sliding stays env default).
@@ -4383,6 +4426,7 @@ impl Gemma4Bringup {
                     f16_kv: false, // prefill uses FP8 KV (no F16 prefill kernel)
                     kv_dtype: prefill_kv_dtype,
                     bf16_residual: bf16_residual_enabled(),
+                    kv_share_source_layer: arch.kv_share_source_layer(layer_idx).map(|s| s as u32),
                     // Codex17-1: batch-prefill writes context_lens=chunk_end_abs and
                     // the unified-prefill kernel uses it to index block_tables. Pass
                     // it to the validator so OOB reads on long prompts/chunks past

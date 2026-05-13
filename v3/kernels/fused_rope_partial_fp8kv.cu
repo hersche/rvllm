@@ -143,6 +143,16 @@ __global__ void fused_rope_partial_fp8kv_kernel(
     }
 
     // =============== K / V head (per-slot-per-head scale) ===============
+    // E4B kv-share fast-path: when the layer reuses K/V from an
+    // earlier source layer (Gemma 4 num_kv_shared_layers), the host
+    // passes key_cache=value_cache=nullptr so this section is a
+    // complete no-op. Q above still rotates / quantizes for THIS
+    // layer; attention later reads K/V from the source layer's cache
+    // (host-side scratch.k_cache / v_cache point at the source layer's
+    // KV region).
+    if (key_cache == nullptr || value_cache == nullptr) {
+        return;
+    }
     if (head_idx < num_kv_heads) {
         int k_base = (token_idx * num_kv_heads + head_idx) * head_dim;
         int v_base = (token_idx * num_kv_heads + head_idx) * head_dim;

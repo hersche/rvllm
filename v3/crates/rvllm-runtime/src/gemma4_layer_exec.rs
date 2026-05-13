@@ -309,6 +309,17 @@ pub struct Gemma4LayerDims {
     /// residual values from saturating/underflowing across 60 layers.
     /// Matches vLLM's bf16-activation production setup.
     pub bf16_residual: bool,
+    /// E4B kv-share: when `Some(src)`, this layer reuses K/V from
+    /// layer `src` instead of computing its own. Layer_exec then:
+    ///   1. passes `key_cache=value_cache=0` (plus null scale caches)
+    ///      to the RoPE kernel so K/V writes are skipped (Q still
+    ///      rotates / quantizes for THIS layer);
+    ///   2. trusts the caller to have set scratch.k_cache /
+    ///      scratch.v_cache / scratch.k_scale_cache /
+    ///      scratch.v_scale_cache to the SOURCE layer's KV region so
+    ///      the attention launcher reads the right K/V.
+    /// `None` for non-shared layers and for the entire 31B model.
+    pub kv_share_source_layer: Option<u32>,
 }
 
 impl Gemma4LayerDims {
@@ -3666,6 +3677,17 @@ unsafe fn rope_fp8kv(
     } else {
         kernels.fused_rope_partial_fp8kv
     };
+    // E4B kv-share: pass null K/V cache + scale pointers when this
+    // layer aliases an earlier source. The kernel detects the null
+    // and returns before the K/V section, but still rotates +
+    // quantizes Q for this layer (each Q is layer-specific even when
+    // K/V are reused).
+    let share = dims.kv_share_source_layer.is_some();
+    let (k_cache, v_cache, k_scale_cache, v_scale_cache) = if share {
+        (0, 0, 0, 0)
+    } else {
+        (scratch.k_cache, scratch.v_cache, scratch.k_scale_cache, scratch.v_scale_cache)
+    };
     gemma4_launcher::FusedRopePartialFp8KvLaunch {
         num_tokens: dims.num_tokens,
         num_heads: dims.num_heads,
@@ -3679,10 +3701,10 @@ unsafe fn rope_fp8kv(
         scratch.k_normed,
         scratch.v_normed,
         scratch.q_fp8,
-        scratch.k_cache,
-        scratch.v_cache,
-        scratch.k_scale_cache,
-        scratch.v_scale_cache,
+        k_cache,
+        v_cache,
+        k_scale_cache,
+        v_scale_cache,
         scratch.q_scale_cache,
         meta.cos,
         meta.sin,
@@ -3748,6 +3770,13 @@ unsafe fn rope_nvfp4kv(
             bt: std::backtrace::Backtrace::capture(),
         }
     })?;
+    // E4B kv-share: short-circuit the K/V cache write for layers that
+    // reuse an earlier source layer's cache. The kernel's
+    // (key_cache == nullptr || value_cache == nullptr) early-out (see
+    // fused_rope_partial_nvfp4kv.cu) handles the device side; here we
+    // still need Q rotation + per-(token,head) Q scale, so we run the
+    // same launcher with the K/V pointers + scale arenas zeroed.
+    let kv_share = dims.kv_share_source_layer.is_some();
     // Pre-launch null-pointer guard for the NVFP4 K/V scale arenas.
     // The attention launchers downstream (`launch` / `launch_split`)
     // already require_nonnull these, but rope_nvfp4kv runs FIRST and
@@ -3755,8 +3784,9 @@ unsafe fn rope_nvfp4kv(
     // dtype/scratch wiring was misconfigured. NULL deref here is at
     // best a clean segfault and at worst (if the page happens to be
     // mapped) silent corruption of an unrelated arena slot. Catch
-    // before the kernel touches device memory.
-    if scratch.k_cache_scale == 0 || scratch.v_cache_scale == 0 {
+    // before the kernel touches device memory. Skipped for shared
+    // layers — by design they pass nullptr to suppress K/V writes.
+    if !kv_share && (scratch.k_cache_scale == 0 || scratch.v_cache_scale == 0) {
         return Err(rvllm_core::RvllmError::Attention {
             err: rvllm_core::AttentionError::FeatureNotAvailable {
                 backend: "Fa2Ptx",
@@ -3783,10 +3813,10 @@ unsafe fn rope_nvfp4kv(
     // end-to-end PPL blow-up came from (71 FP8 → 6.4M NVFP4).
     let mut v_in = scratch.v_normed;
     let mut q_out = scratch.q_fp8;
-    let mut k_packed = scratch.k_cache;
-    let mut v_packed = scratch.v_cache;
-    let mut k_scale = scratch.k_cache_scale;
-    let mut v_scale = scratch.v_cache_scale;
+    let mut k_packed = if kv_share { 0 } else { scratch.k_cache };
+    let mut v_packed = if kv_share { 0 } else { scratch.v_cache };
+    let mut k_scale = if kv_share { 0 } else { scratch.k_cache_scale };
+    let mut v_scale = if kv_share { 0 } else { scratch.v_cache_scale };
     let mut cos = meta.cos;
     let mut sin = meta.sin;
     let mut positions = meta.positions;
