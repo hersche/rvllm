@@ -132,11 +132,12 @@ pub fn load_gemma4_model(
         })
     };
 
-    // E4B uses raw upload — first-light A/B showed +1 bake HURTS
-    // quality (margin 1.99 → 0.465 with the down_proj NaN already
-    // fixed). E4B-it's gammas are STORED pre-shifted (same as 31B),
-    // contrary to my earlier hypothesis. Stub alias keeps the
-    // call-site readable.
+    // Gemma4RMSNorm.forward is `normed × weight` (NO +1). Verified
+    // 2026-05-13 against HF transformers/models/gemma4/modeling_gemma4.py.
+    // (Gemma 3 used `(1+weight)`; Gemma 4 dropped it.) So γ goes
+    // raw to the kernel for both 31B and E4B. Negative γ values
+    // on E4B (e.g. pre_feedforward_layernorm min=-2.75) are
+    // intentional / handled correctly by direct multiply.
     let upload_f16_norm = upload_f16;
 
     let embed_name = format!("{prefix}.embed_tokens.weight");
@@ -647,7 +648,9 @@ pub fn load_gemma4_model(
             "ple_model_projection",
             &format!("{prefix}.per_layer_model_projection.weight"),
         )?;
-        // Bake `per_layer_input_scale` into γ at upload time.
+        // Bake `× per_layer_input_scale` (1/√2) into γ at upload
+        // time. Gemma4RMSNorm has NO +1 (Gemma 4 dropped it), so the
+        // bake is just the scalar multiply.
         let plnorm = {
             let name = format!("{prefix}.per_layer_projection_norm.weight");
             let (si, e) = must_get(&name)?;

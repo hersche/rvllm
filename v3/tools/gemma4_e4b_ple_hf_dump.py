@@ -144,6 +144,18 @@ def patch_decoder_layer(layer: g4.Gemma4TextDecoderLayer, layer_idx: int,
         # ── Attention residual sum (no scalar yet) ──
         residual = hidden_states
         hs = layer.input_layernorm(hidden_states)
+        # HF input_ln checkpoint: matches rvllm's scratch.delta_f16
+        # state right after RmsnormInplaceLaunch.
+        write_f16(out_dir / f"e4b_layer{layer_idx}_input_ln.bin", hs[0])
+        # HF qkv checkpoint: post-Q/K/V projection, layout concat
+        # [Q (q_dim) | K (kv_dim) | V (kv_dim)] to match rvllm's
+        # scratch.q_out f16 buffer after Bf16ToF16SatLaunch.
+        sa = layer.self_attn
+        q_full = sa.q_proj(hs)
+        k_full = sa.k_proj(hs)
+        v_full = sa.v_proj(hs)
+        qkv = torch.cat([q_full, k_full, v_full], dim=-1)
+        write_f16(out_dir / f"e4b_layer{layer_idx}_qkv.bin", qkv[0])
         hs, _ = layer.self_attn(
             hidden_states=hs,
             position_embeddings=position_embeddings,

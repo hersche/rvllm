@@ -1029,6 +1029,32 @@ pub unsafe fn gemma4_forward_phase(
             }
         };
     }
+    /// Dump a per-token f16 buffer of `D` elements/token at the
+    /// device pointer `ptr` to `e4b_layer{L}_{suffix}.bin`.
+    #[cfg(feature = "cuda")]
+    macro_rules! ple_dump_subbuf {
+        ($suffix:expr, $ptr:expr, $per_token_elems:expr) => {
+            if ple_dump_layer >= 0 {
+                cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                let nbytes = (dims.num_tokens as usize) * ($per_token_elems as usize) * 2;
+                let mut buf = vec![0u8; nbytes];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut _,
+                    $ptr,
+                    nbytes,
+                );
+                let dir = std::env::var("RVLLM_E4B_PLE_DUMP_DIR").unwrap();
+                let path = std::path::Path::new(&dir)
+                    .join(format!("e4b_layer{}_{}.bin", ple_dump_layer, $suffix));
+                std::fs::create_dir_all(&dir).ok();
+                let _ = std::fs::write(&path, &buf);
+                eprintln!(
+                    "[ple-dump] L{} {} ({} bytes)",
+                    ple_dump_layer, $suffix, nbytes
+                );
+            }
+        };
+    }
     // 1. input_layernorm -> FP8 quant
     // Sm121 fast path for QKV writes f16 into delta_f16 via its
     // own rmsnorm — `scratch.hidden_fp8`/`hidden_scale` go unused. Skip
@@ -1332,6 +1358,10 @@ pub unsafe fn gemma4_forward_phase(
             weights.attn_norm_gamma,
             stream,
         )?;
+        // HF input_ln checkpoint: post-RMSNorm input to the QKV GEMM.
+        #[cfg(feature = "cuda")]
+        ple_dump_subbuf!("input_ln", scratch.delta_f16, dims.hidden);
+
         cublaslt.f16_gemm_f32(
             scratch.delta_f16,
             weights.qkv_f16,
@@ -1386,6 +1416,10 @@ pub unsafe fn gemma4_forward_phase(
             scratch.gemm_f32_tmp,
             stream,
         )?;
+        // HF qkv checkpoint: post-QKV-GEMM narrowed to f16. Layout
+        // is concat [Q (q_dim) | K (kv_dim) | V (kv_dim)] per token.
+        #[cfg(feature = "cuda")]
+        ple_dump_subbuf!("qkv", scratch.q_out, qkv_rows);
     } else if let Some(fn_gemv) = if weights.qkv_blockscale != 0 && dims.num_tokens == 1 {
         // Blockscale gate: `Fp8GemvF16InLaunch` reads a 2-D
         // `[N/128, K/128]` tensor. Only enable it when the loader has
