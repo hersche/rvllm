@@ -156,6 +156,62 @@ def patch_decoder_layer(layer: g4.Gemma4TextDecoderLayer, layer_idx: int,
         v_full = sa.v_proj(hs)
         qkv = torch.cat([q_full, k_full, v_full], dim=-1)
         write_f16(out_dir / f"e4b_layer{layer_idx}_qkv.bin", qkv[0])
+        # Per-head q_norm / k_norm in HF Gemma4Attention. Reshape Q
+        # and K to [B, S, num_heads, head_dim] then apply the
+        # head_dim-shape γ broadcast. Write flat [S, num_heads*head_dim]
+        # to match rvllm's contiguous q_normed / k_normed layout.
+        b, s, _ = q_full.shape
+        num_h = sa.config.num_attention_heads
+        num_kvh = sa.config.num_key_value_heads
+        head_dim = sa.head_dim if hasattr(sa, "head_dim") else (q_full.shape[-1] // num_h)
+        q_reshaped = q_full.view(b, s, num_h, head_dim)
+        k_reshaped = k_full.view(b, s, num_kvh, head_dim)
+        q_normed = sa.q_norm(q_reshaped)
+        k_normed = sa.k_norm(k_reshaped)
+        write_f16(
+            out_dir / f"e4b_layer{layer_idx}_q_normed.bin",
+            q_normed[0].reshape(s, num_h * head_dim),
+        )
+        write_f16(
+            out_dir / f"e4b_layer{layer_idx}_k_normed.bin",
+            k_normed[0].reshape(s, num_kvh * head_dim),
+        )
+        # Manually replay HF's attention math up to (but not
+        # including) o_proj, so we can dump attn_out and compare
+        # against rvllm's scratch.attn_out [T, q_dim] f16.
+        try:
+            import math as _math
+            from transformers.models.gemma4.modeling_gemma4 import (
+                apply_rotary_pos_emb,
+            )
+            cos, sin = position_embeddings
+            # This transformers version's apply_rotary_pos_emb takes
+            # ONE tensor at a time: f(x, cos, sin, unsqueeze_dim=1).
+            # Our q_normed/k_normed are [B, S, H, D]; HF expects
+            # [B, H, S, D] for RoPE with unsqueeze_dim=1.
+            q_for_rope = q_normed.transpose(1, 2)  # [B, H, S, D]
+            k_for_rope = k_normed.transpose(1, 2)  # [B, Hkv, S, D]
+            q_rot = apply_rotary_pos_emb(q_for_rope, cos, sin)
+            k_rot = apply_rotary_pos_emb(k_for_rope, cos, sin)
+            # GQA expand: repeat each KV head num_h/num_kvh times.
+            n_rep = num_h // num_kvh
+            if n_rep > 1:
+                k_rot_exp = k_rot.repeat_interleave(n_rep, dim=1)
+                v_exp = v_full.view(b, s, num_kvh, head_dim).transpose(1, 2).repeat_interleave(n_rep, dim=1)
+            else:
+                k_rot_exp = k_rot
+                v_exp = v_full.view(b, s, num_kvh, head_dim).transpose(1, 2)
+            scale = 1.0 / _math.sqrt(head_dim)
+            # Causal attention: [B, H, S, D] @ [B, H, D, S]
+            scores = torch.einsum("bhsd,bhtd->bhst", q_rot.float(), k_rot_exp.float()) * scale
+            mask = torch.triu(torch.ones(s, s, device=scores.device, dtype=torch.bool), diagonal=1)
+            scores = scores.masked_fill(mask, float("-inf"))
+            probs = torch.softmax(scores, dim=-1)
+            attn = torch.einsum("bhst,bhtd->bhsd", probs, v_exp.float())
+            attn = attn.transpose(1, 2).contiguous().view(b, s, num_h * head_dim).to(q_normed.dtype)
+            write_f16(out_dir / f"e4b_layer{layer_idx}_attn_out.bin", attn[0])
+        except Exception as _e:
+            print(f"  attn_out manual replay failed: {_e}")
         hs, _ = layer.self_attn(
             hidden_states=hs,
             position_embeddings=position_embeddings,
@@ -165,6 +221,14 @@ def patch_decoder_layer(layer: g4.Gemma4TextDecoderLayer, layer_idx: int,
             past_key_values=past_key_values,
             **kwargs,
         )
+        # rvllm's scratch.attn_out is the attention output BEFORE
+        # o_proj. HF's self_attn returns post-o_proj output, so we
+        # need to back it out. attn_pre_o = self_attn output ×
+        # o_proj.weight.pinv()? Easier: re-run via the attention
+        # sub-modules. For first localization, write only the
+        # post-o_proj output (= what HF returns) — rvllm's "attn_out"
+        # is BEFORE o_proj; comparing requires HF re-execution that's
+        # non-trivial. Skip until we have a stronger reason.
         hs = layer.post_attention_layernorm(hs)
         hs = residual + hs
         write_f16(out_dir / f"e4b_layer{layer_idx}_after_attn_add.bin", hs[0])

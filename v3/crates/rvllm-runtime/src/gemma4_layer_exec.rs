@@ -1624,6 +1624,10 @@ pub unsafe fn gemma4_forward_phase(
     #[cfg(feature = "cuda")]
     probe!("step3_q_norm", scratch.q_normed, dims.hidden);
     #[cfg(feature = "cuda")]
+    ple_dump_subbuf!("q_normed", scratch.q_normed, q_dim);
+    #[cfg(feature = "cuda")]
+    ple_dump_subbuf!("k_normed", scratch.k_normed, dims.num_kv_heads * dims.head_dim);
+    #[cfg(feature = "cuda")]
     probe!("step3_k_norm", scratch.k_normed, dims.hidden);
 
     // 4-5. RoPE + attention (F16 or FP8 KV cache, decode or prefill)
@@ -2250,6 +2254,8 @@ pub unsafe fn gemma4_forward_phase(
 
     #[cfg(feature = "cuda")]
     probe!("step5_attn_out", scratch.attn_out, q_dim);
+    #[cfg(feature = "cuda")]
+    ple_dump_subbuf!("attn_out", scratch.attn_out, q_dim);
 
     // 6. quantize attn_out -> fp8 per-token (skip when F16 KV + F16 O-proj,
     // or when the Sm121 fast path will read `scratch.attn_out`
