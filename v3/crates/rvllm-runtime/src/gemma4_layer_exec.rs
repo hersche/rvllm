@@ -1269,6 +1269,42 @@ pub unsafe fn gemma4_forward_phase(
             dims.hidden as i32,
             stream,
         )?;
+        // E4B first-light diag: print the QKV GEMM output so we can
+        // localise where NaN appears. Use a thread-local counter so
+        // the print only fires for the first call per request.
+        #[cfg(feature = "cuda")]
+        thread_local! {
+            static PROBE_LAYER: std::cell::Cell<usize> = std::cell::Cell::new(0);
+        }
+        #[cfg(feature = "cuda")]
+        if std::env::var("RVLLM_E4B_PROBE").is_ok() {
+            let l = PROBE_LAYER.with(|c| { let v = c.get(); c.set(v + 1); v });
+            if l < 3 {
+            unsafe {
+                cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                let n_dump = 8usize.min(qkv_rows as usize);
+                let mut buf = vec![0f32; n_dump];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut _,
+                    scratch.gemm_f32_tmp,
+                    (n_dump * 4) as _,
+                );
+                eprintln!(
+                    "[probe-L{l}] QKV gemm_f32_tmp[..{n_dump}] = {:?}",
+                    buf
+                );
+                // Also peek at the rmsnorm input (delta_f16 first 8 f16s).
+                let mut din = vec![0u16; 8];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    din.as_mut_ptr() as *mut _,
+                    scratch.delta_f16,
+                    16,
+                );
+                let din_f: Vec<f32> = din.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect();
+                eprintln!("[probe-L{l}] post-rmsnorm delta_f16[..8] = {:?}", din_f);
+            }
+            }
+        }
         gemma4_launcher::Bf16ToF16SatLaunch {
             n: dims.num_tokens * qkv_rows,
         }
@@ -2692,6 +2728,25 @@ pub unsafe fn gemma4_forward_phase(
             dims.num_tokens as i32,
             dims.hidden as i32,
             dims.intermediate as i32,
+            stream,
+        )?;
+        // E4B first-light fix 2026-05-13: the down_proj GEMM writes
+        // f32 into gemm_f32_tmp, but FusedNormAddResidualF16In below
+        // expects an f16 input. Without this narrow, the kernel
+        // reinterprets f32 bytes as f16 pairs — finite f32 values
+        // become NaN/Inf in f16 view, polluting the residual buffer
+        // at the very first MLP and corrupting every downstream
+        // layer (RVLLM_DBG_LAYER trace showed L0 after_step14_residual
+        // = NaN with finite step10_gate_up_out). Mirrors the QKV path
+        // which does the same f32_to_f16_sat narrow after its GEMM.
+        // Narrow in-place onto the front half of gemm_f32_tmp.
+        gemma4_launcher::Bf16ToF16SatLaunch {
+            n: dims.num_tokens * dims.hidden,
+        }
+        .launch(
+            kernels.f32_to_f16_sat,
+            scratch.gemm_f32_tmp,
+            scratch.gemm_f32_tmp,
             stream,
         )?;
         // Codex35-1: post-FF residual epilog. Earlier this branch
