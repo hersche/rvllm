@@ -192,6 +192,12 @@ def main():
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     ap.add_argument("--dump-layers", default="0,1,5,11,41",
                     help="comma-separated layer indices to dump")
+    ap.add_argument("--prepend-bos", action="store_true", default=True,
+                    help="prepend bos_token_id to match rvllm-serve's "
+                         "/v1/completions tokenization (default ON)")
+    ap.add_argument("--no-prepend-bos", dest="prepend_bos",
+                    action="store_false",
+                    help="don't prepend BOS (matches raw `tok(prompt)`)")
     args = ap.parse_args()
 
     out = Path(args.out_dir)
@@ -225,10 +231,17 @@ def main():
     for L in dump_layers:
         patch_decoder_layer(text_model.layers[L], L, out)
 
-    # Tokenize + forward
-    inputs = tok(args.prompt, return_tensors="pt").to(args.device)
-    print(f"tokenized: shape={tuple(inputs.input_ids.shape)} ids={inputs.input_ids[0].tolist()[:32]}")
-    write_i32(out / "e4b_token_ids.bin", inputs.input_ids[0])
+    # Tokenize + forward. `--prepend-bos` makes the input match
+    # rvllm-serve's /v1/completions which prepends bos_token_id
+    # (=2 on Gemma 4) automatically. With BOS, T=2 for "Hi" so
+    # the per-row diff against rvllm's dump is direct (no offset).
+    raw_ids = tok(args.prompt, return_tensors="pt", add_special_tokens=False).input_ids
+    if args.prepend_bos and tok.bos_token_id is not None:
+        bos = torch.tensor([[tok.bos_token_id]], dtype=raw_ids.dtype)
+        raw_ids = torch.cat([bos, raw_ids], dim=1)
+    inputs = {"input_ids": raw_ids.to(args.device)}
+    print(f"tokenized: shape={tuple(inputs['input_ids'].shape)} ids={inputs['input_ids'][0].tolist()[:32]}")
+    write_i32(out / "e4b_token_ids.bin", inputs["input_ids"][0])
 
     with torch.no_grad():
         out_obj = model(**inputs)

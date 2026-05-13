@@ -982,6 +982,53 @@ pub unsafe fn gemma4_forward_phase(
             }
         };
     }
+
+    // E4B PLE per-layer residual dump for the cmp_e4b_ple.py
+    // diff-against-HF harness. Captures full `[num_tokens, hidden]`
+    // f16 buffers at the 4 HF-canonical checkpoints. Gated by
+    // `RVLLM_E4B_PLE_DUMP_DIR` + per-layer counter; spans the
+    // first `RVLLM_E4B_PLE_DUMP_LAYERS_MAX` exec_layer calls
+    // (default 8 — covers layers 0, 1, 5 on E4B which are the
+    // first per-layer-offset-distinct + first global-attn samples).
+    #[cfg(feature = "cuda")]
+    let ple_dump_layer: i32 = {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static PLE_CTR: AtomicU32 = AtomicU32::new(0);
+        let max_layers: u32 = std::env::var("RVLLM_E4B_PLE_DUMP_LAYERS_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let cnt = PLE_CTR.fetch_add(1, Ordering::Relaxed);
+        if cnt < max_layers && std::env::var("RVLLM_E4B_PLE_DUMP_DIR").is_ok() {
+            cnt as i32
+        } else {
+            -1
+        }
+    };
+    #[cfg(feature = "cuda")]
+    macro_rules! ple_dump_residual {
+        ($suffix:expr) => {
+            if ple_dump_layer >= 0 {
+                cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                let nbytes = (dims.num_tokens as usize) * (dims.hidden as usize) * 2;
+                let mut buf = vec![0u8; nbytes];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut _,
+                    residual,
+                    nbytes,
+                );
+                let dir = std::env::var("RVLLM_E4B_PLE_DUMP_DIR").unwrap();
+                let path = std::path::Path::new(&dir)
+                    .join(format!("e4b_layer{}_{}.bin", ple_dump_layer, $suffix));
+                std::fs::create_dir_all(&dir).ok();
+                let _ = std::fs::write(&path, &buf);
+                eprintln!(
+                    "[ple-dump] L{} {} ({} bytes)",
+                    ple_dump_layer, $suffix, nbytes
+                );
+            }
+        };
+    }
     // 1. input_layernorm -> FP8 quant
     // Sm121 fast path for QKV writes f16 into delta_f16 via its
     // own rmsnorm — `scratch.hidden_fp8`/`hidden_scale` go unused. Skip
@@ -1047,6 +1094,8 @@ pub unsafe fn gemma4_forward_phase(
 
     #[cfg(feature = "cuda")]
     probe!("after_step1_residual", residual, dims.hidden);
+    #[cfg(feature = "cuda")]
+    ple_dump_residual!("residual_in");
     #[cfg(feature = "cuda")]
     probe_f32!("step1_hidden_scale", scratch.hidden_scale);
     #[cfg(feature = "cuda")]
@@ -2369,6 +2418,8 @@ pub unsafe fn gemma4_forward_phase(
 
     #[cfg(feature = "cuda")]
     probe!("after_step8_residual", residual, dims.hidden);
+    #[cfg(feature = "cuda")]
+    ple_dump_residual!("after_attn_add");
 
     // 9. pre_feedforward_layernorm -> FP8 quant
     // Same fast-path skip as step 1: gate_up fast path does its own
@@ -2890,6 +2941,13 @@ pub unsafe fn gemma4_forward_phase(
         }
     }
 
+    // HF after_mlp_add checkpoint — residual after MLP epilog,
+    // BEFORE the PLE injection. With PLE-active layer_scalar
+    // suppression (commit d433c4f), this is layer_scalar-free for
+    // E4B and matches HF's "after_mlp_add" verbatim.
+    #[cfg(feature = "cuda")]
+    ple_dump_residual!("after_mlp_add");
+
     // ── E4B Per-Layer Embeddings (PLE) injection ──────────────────
     //
     // HF Gemma4TextDecoderLayer.forward tail (E4B only):
@@ -3019,6 +3077,13 @@ pub unsafe fn gemma4_forward_phase(
 
     #[cfg(feature = "cuda")]
     probe!("after_step14_residual", residual, dims.hidden);
+    // HF "output" checkpoint — residual after PLE epilog (which
+    // fuses (residual + ple_norm) × layer_scalar). Matches HF
+    // `hidden_states = layer_scalar * hidden_states` at end of
+    // layer. For 31B (PLE inactive) the MLP residual already
+    // applied layer_scalar so this is identical to after_mlp_add.
+    #[cfg(feature = "cuda")]
+    ple_dump_residual!("output");
 
     #[cfg(not(feature = "cuda"))]
     {

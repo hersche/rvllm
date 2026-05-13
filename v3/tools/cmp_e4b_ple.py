@@ -48,20 +48,33 @@ def load_f16(path: Path, total_elems_hint: int | None = None) -> np.ndarray:
     return arr
 
 
-def row_cosine(a: np.ndarray, b: np.ndarray, last_dim: int):
-    """Returns (cos_per_row, max_abs_per_row, n_rows). a,b are
-    flat; reshape internally to (-1, last_dim)."""
-    a2 = a.astype(np.float32).reshape(-1, last_dim)
-    b2 = b.astype(np.float32).reshape(-1, last_dim)
-    if a2.shape != b2.shape:
-        raise ValueError(f"shape mismatch: {a2.shape} vs {b2.shape}")
+def row_cosine(
+    a: np.ndarray,
+    b: np.ndarray,
+    last_dim: int,
+    a_row_off: int = 0,
+    b_row_off: int = 0,
+):
+    """Returns (cos_per_row, max_abs_per_row, n_rows).
+    Reshape a,b to (-1, last_dim), then take the OVERLAP between
+    `a[a_row_off:]` and `b[b_row_off:]` so a BOS-prepended rvllm
+    dump (T=2) can be diffed against a no-BOS HF dump (T=1) by
+    setting a_row_off=1 (rvllm side).
+    """
+    a2 = a.astype(np.float32).reshape(-1, last_dim)[a_row_off:]
+    b2 = b.astype(np.float32).reshape(-1, last_dim)[b_row_off:]
+    n = min(a2.shape[0], b2.shape[0])
+    if n == 0:
+        raise ValueError(f"no overlap rows: a={a2.shape} b={b2.shape}")
+    a2 = a2[:n]
+    b2 = b2[:n]
     dots = (a2 * b2).sum(axis=-1)
     na = np.sqrt((a2 * a2).sum(axis=-1)) + 1e-30
     nb = np.sqrt((b2 * b2).sum(axis=-1)) + 1e-30
     cos = dots / (na * nb)
     diff = np.abs(a2 - b2)
     max_abs = diff.max(axis=-1)
-    return cos, max_abs, a2.shape[0]
+    return cos, max_abs, n
 
 
 def infer_last_dim(name: str) -> int:
@@ -87,6 +100,13 @@ def main():
                     help="override inferred last dim for reshape")
     ap.add_argument("--first-rows", type=int, default=8,
                     help="how many rows to dump in the per-file detail block")
+    ap.add_argument("--rvllm-row-off", type=int, default=0,
+                    help="skip leading rows on the rvllm side")
+    ap.add_argument("--hf-row-off", type=int, default=0,
+                    help="skip leading rows on the HF side. Note: "
+                         "both rvllm and HF dump T=2 when `--prepend-bos` "
+                         "(HF default) so the direct row-0-vs-row-0 diff "
+                         "works out of the box.")
     args = ap.parse_args()
 
     rvllm = args.rvllm_dir
@@ -113,7 +133,11 @@ def main():
         a = load_f16(rvllm / name)
         b = load_f16(hf / name)
         try:
-            cos, ma, nrows = row_cosine(a, b, ld)
+            cos, ma, nrows = row_cosine(
+                a, b, ld,
+                a_row_off=args.rvllm_row_off,
+                b_row_off=args.hf_row_off,
+            )
         except ValueError as e:
             print(f"{name:60s}  SIZE-MISMATCH  rvllm={a.size} hf={b.size}  ({e})")
             summary.append((name, None, None, None, None))
