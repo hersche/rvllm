@@ -385,6 +385,41 @@ impl Gemma4Arch {
         }
     }
 
+    /// Returns true when `layer_idx` is one of the last
+    /// `num_kv_shared_layers` layers — these layers reuse the K/V
+    /// cache of an earlier non-shared layer of the same
+    /// `Gemma4LayerType`. Mirrors HF's `Gemma4TextAttention.is_kv_shared_layer`
+    /// (modeling_gemma4.py: `layer_idx >= first_kv_shared_layer_idx > 0`).
+    pub fn is_kv_shared_layer(&self, layer_idx: usize) -> bool {
+        let shared = self.num_kv_shared_layers.unwrap_or(0) as usize;
+        if shared == 0 {
+            return false;
+        }
+        let first = self.num_hidden_layers.saturating_sub(shared);
+        layer_idx >= first
+    }
+
+    /// For a kv-shared `layer_idx`, returns the index of the
+    /// previous non-shared layer of the same `Gemma4LayerType` whose
+    /// K/V cache this layer aliases. Returns `None` for non-shared
+    /// layers or when no matching predecessor exists.
+    pub fn kv_share_source_layer(&self, layer_idx: usize) -> Option<usize> {
+        if !self.is_kv_shared_layer(layer_idx) {
+            return None;
+        }
+        let shared = self.num_kv_shared_layers.unwrap_or(0) as usize;
+        let first = self.num_hidden_layers.saturating_sub(shared);
+        let target_type = self.layer_types[layer_idx];
+        // Scan the non-shared prefix [0, first) from the back, find
+        // the latest layer matching target_type.
+        for j in (0..first).rev() {
+            if self.layer_types[j] == target_type {
+                return Some(j);
+            }
+        }
+        None
+    }
+
     pub fn rotary_dim_for_layer(&self, layer_idx: usize) -> usize {
         match self.layer_types[layer_idx] {
             // Sliding: full rotation of head_dim_sliding (256)
@@ -509,6 +544,60 @@ mod tests {
             let got_full = types[i] == Gemma4LayerType::GlobalAttention;
             assert_eq!(got_full, want_full, "layer {i}");
         }
+    }
+
+    #[test]
+    fn e4b_kv_share_source_layer_maps_to_last_same_type() {
+        // E4B-it: 42 layers, num_kv_shared_layers=18 → first shared
+        // layer = 24. layer_types pattern: every 6th + last is
+        // global. So layers 24-28 sliding share with layer 22
+        // (last sliding in [0, 24)); layer 29 global shares with
+        // layer 23 (last global in [0, 24)).
+        let mut lt = vec![Gemma4LayerType::SlidingAttention; 42];
+        for &i in &[5usize, 11, 17, 23, 29, 35, 41] {
+            lt[i] = Gemma4LayerType::GlobalAttention;
+        }
+        let arch = Gemma4Arch {
+            num_hidden_layers: 42,
+            hidden_size: 2560,
+            num_attention_heads: 8,
+            head_dim_sliding: 256,
+            head_dim_global: 512,
+            num_kv_heads_sliding: 2,
+            num_kv_heads_global: 2,
+            intermediate_size: 10240,
+            vocab_size: 262144,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 131072,
+            sliding_window_size: 512,
+            rope_theta_sliding: 10000.0,
+            rope_theta_global: 1000000.0,
+            partial_rotary_factor_global: 0.25,
+            logit_softcap: 30.0,
+            layer_types: lt,
+            weight_prefix: "model.language_model".into(),
+            tie_word_embeddings: true,
+            num_kv_shared_layers: Some(18),
+            vision_config: None,
+            hidden_size_per_layer_input: Some(256),
+            per_layer_model_projection_scale: 0.0,
+            per_layer_input_scale: 0.0,
+        };
+        // Non-shared range [0, 24): no source.
+        for i in 0..24 {
+            assert!(!arch.is_kv_shared_layer(i), "layer {i} unexpectedly shared");
+            assert_eq!(arch.kv_share_source_layer(i), None);
+        }
+        // Layer 24 (sliding) → 22 (last sliding before 24).
+        assert!(arch.is_kv_shared_layer(24));
+        assert_eq!(arch.kv_share_source_layer(24), Some(22));
+        // Layer 29 (global) → 23 (last global in [0, 24)).
+        assert!(arch.is_kv_shared_layer(29));
+        assert_eq!(arch.kv_share_source_layer(29), Some(23));
+        // Layer 41 (global) → 23.
+        assert_eq!(arch.kv_share_source_layer(41), Some(23));
+        // Layer 30 (sliding) → 22.
+        assert_eq!(arch.kv_share_source_layer(30), Some(22));
     }
 
     #[test]
