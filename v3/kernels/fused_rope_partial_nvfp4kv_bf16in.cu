@@ -315,6 +315,12 @@ __global__ void fused_rope_partial_nvfp4kv_bf16in_kernel(
     __syncthreads();
     // === END HADAMARD ROTATION ===
 
+    // E4B kv-share fast-path: see fused_rope_partial_fp8kv.cu for the
+    // contract. Host passes key_cache_packed=value_cache_packed=nullptr
+    // for layers that alias an earlier source layer's K/V cache.
+    if (key_cache_packed == nullptr || value_cache_packed == nullptr) {
+        return;
+    }
     // ---- K, V: NVFP4-packed cache write. ----
     if (head_idx < num_kv_heads) {
         const int k_base = (token_idx * num_kv_heads + head_idx) * head_dim;

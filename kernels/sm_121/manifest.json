@@ -277,9 +277,9 @@
       "sha256": "58d6efc0bf14898ae3346087189474e371e065fdb939dd8cf72e9cb9a5ac7e31"
     },
     "fused_rope_partial_fp8kv_bf16in": {
-      "bytes": 15544,
+      "bytes": 15658,
       "path": "fused_rope_partial_fp8kv_bf16in.ptx",
-      "sha256": "6f3339dbc211158da51f5c4fd51011cc96acff18cde6dba54e7f2211ba4e9802"
+      "sha256": "6de6d4e75b01780380fbe71e6392964e7becf19f77a811c8fb1e846feac9be20"
     },
     "fused_rope_partial_nvfp4kv": {
       "bytes": 50990,
@@ -287,9 +287,9 @@
       "sha256": "f55b0e8bbb753505dd1156acc931b48f1c2ff1e48f5a8d15d5ca99529b0b620a"
     },
     "fused_rope_partial_nvfp4kv_bf16in": {
-      "bytes": 51470,
+      "bytes": 51595,
       "path": "fused_rope_partial_nvfp4kv_bf16in.ptx",
-      "sha256": "9204420f0234587cd281e91e1426b56d582d1cb12338d11f050876e783b888ee"
+      "sha256": "7c192c1a1884d1f8ff023279ae09e3125655e475a51184f099b7a61d956e1ed0"
     },
     "fused_rope_qwen_partial_f16kv": {
       "bytes": 7193,
@@ -837,5 +837,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "3954a4e"
+  "revision": "b56a239"
 }
