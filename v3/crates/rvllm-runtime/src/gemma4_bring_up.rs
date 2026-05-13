@@ -5565,15 +5565,34 @@ impl Gemma4Bringup {
             )
         })?;
 
-        const HIDDEN: usize = 1152;
-        const INTERMEDIATE: usize = 4304;
-        const NUM_HEADS: usize = 16;
-        const HEAD_DIM: usize = 72;
-        const NUM_POS: usize = 10240;
-        const POOL_K: usize = 3;
-        const OUT_HIDDEN: usize = 5376;
-        const ROPE_THETA: f32 = 100.0;
-        const RMS_EPS: f32 = 1e-6;
+        // A4b: vision-tower dims now read from arch.vision_config so
+        // E4B-it (h=768, layers=16, heads=12, head_dim=64,
+        // intermediate=3072) can use this same forward path. Every
+        // fallback equals the original 31B `const` value, so the
+        // production 31B path stays bit-identical when vision_config
+        // is absent or matches 31B. ROPE_THETA isn't in the published
+        // vision_config schema today (both 31B and E4B); keep the
+        // hardcoded 100.0 default until rope_parameters parsing lands.
+        #[allow(non_snake_case)]
+        let vc = self.arch.vision_config.as_ref();
+        #[allow(non_snake_case)]
+        let HIDDEN: usize = vc.map(|c| c.hidden_size).unwrap_or(1152);
+        #[allow(non_snake_case)]
+        let INTERMEDIATE: usize = vc.map(|c| c.intermediate_size).unwrap_or(4304);
+        #[allow(non_snake_case)]
+        let NUM_HEADS: usize = vc.map(|c| c.num_attention_heads).unwrap_or(16);
+        #[allow(non_snake_case)]
+        let HEAD_DIM: usize = vc.map(|c| c.head_dim).unwrap_or(72);
+        #[allow(non_snake_case)]
+        let NUM_POS: usize = vc.map(|c| c.position_embedding_size).unwrap_or(10240);
+        #[allow(non_snake_case)]
+        let POOL_K: usize = vc.map(|c| c.pooling_kernel_size).unwrap_or(3);
+        #[allow(non_snake_case)]
+        let OUT_HIDDEN: usize = self.arch.hidden_size; // text-side hidden
+        #[allow(non_snake_case)]
+        let ROPE_THETA: f32 = 100.0;
+        #[allow(non_snake_case)]
+        let RMS_EPS: f32 = vc.map(|c| c.rms_norm_eps).unwrap_or(1e-6);
 
         // Determine n_tokens from preprocess output (count non-padding rows).
         // preprocess_gemma writes per-patch position as (col, row) =
