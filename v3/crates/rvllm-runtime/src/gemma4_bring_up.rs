@@ -4396,9 +4396,31 @@ impl Gemma4Bringup {
                 );
                 let chunk_q = chunk_end_abs - chunk_start_abs;
                 new_q = chunk_q;
-                let tok_ids: Vec<i32> = prompt_ids[
-                    chunk_start_abs as usize .. chunk_end_abs as usize
-                ].iter().map(|&t| t as i32).collect();
+                // HF Gemma4 replaces multimodal placeholder IDs with
+                // pad_token_id (=0 on E4B) before the embedding lookup
+                // and PLE gather; the actual multimodal embeddings get
+                // spliced in afterwards. Without this swap the PLE
+                // path indexes embed_tokens_per_layer at out-of-range
+                // ids (vision 258880, audio 258881) producing garbage
+                // per-layer embeddings that hijack attention and
+                // collapse the response to prompt echo / token storm.
+                // Codex round 9 fix.
+                let chunk_a = chunk_start_abs as usize;
+                let chunk_b = chunk_end_abs as usize;
+                let mut tok_ids: Vec<i32> = prompt_ids[chunk_a..chunk_b]
+                    .iter().map(|&t| t as i32).collect();
+                for (slot_start, emb_bytes) in vision_splice {
+                    let slot_n = emb_bytes.len() / ((hidden as usize) * 2);
+                    let lo = (*slot_start).max(chunk_a);
+                    let hi = (slot_start + slot_n).min(chunk_b);
+                    for i in lo..hi { tok_ids[i - chunk_a] = 0; }
+                }
+                for (slot_start, emb_bytes) in audio_splice {
+                    let slot_n = emb_bytes.len() / ((hidden as usize) * 2);
+                    let lo = (*slot_start).max(chunk_a);
+                    let hi = (slot_start + slot_n).min(chunk_b);
+                    for i in lo..hi { tok_ids[i - chunk_a] = 0; }
+                }
                 token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_ids))?;
                 // Round-19 P1: this readback was a hand-rolled diagnostic
                 // for verifying that `prefix_skip` slid the chunk window
