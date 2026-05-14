@@ -698,6 +698,34 @@ pub fn load_gemma4_model(
         eprintln!("[gemma4-loader] vision tower SKIPPED (no model.vision_tower.* tensors)");
     }
 
+    // E4B audio tower (B5). Optional: only loaded when `audio_config`
+    // is present AND the `model.audio_tower.*` tensors exist. Falls
+    // back to `None` on 31B and any text-only checkpoint.
+    let audio = if arch.audio_config.is_some() {
+        match load_gemma_audio(
+            arena, &must_get, &bytes_of, model_dir,
+            arch.audio_config.as_ref(),
+        ) {
+            Ok(a) => {
+                eprintln!(
+                    "[gemma4-loader] audio tower loaded ({} encoder blocks + \
+                     subsample_conv_projection + output_proj + embed_audio_projection)",
+                    a.blocks.len()
+                );
+                Some(a)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[gemma4-loader] audio tower SKIPPED (audio_config present but \
+                     load failed: {e})"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(Gemma4LoadedModel {
         embedding,
         lm_head_fp8,
@@ -709,6 +737,7 @@ pub fn load_gemma4_model(
         rope_sin_global,
         layers,
         vision,
+        audio,
         ple,
         num_kv_shared_layers: arch.num_kv_shared_layers,
     })
@@ -851,6 +880,165 @@ where
         std_bias,
         std_scale,
         embed_vision_projection,
+    })
+}
+
+// ─── E4B audio tower loader (B5) ─────────────────────────────────────
+//
+// Mirrors `load_gemma_vision` in structure: optional, only fires when
+// the audio_config block AND `model.audio_tower.*` tensors are present.
+// All weights load via the F16_ONLY bf16→f16 path; the four scalar
+// clip statistics per clipped Linear are read as bf16 → f32.
+fn load_gemma_audio<'a, F1, F2>(
+    arena: &HbmArena,
+    must_get: &F1,
+    bytes_of: &F2,
+    model_dir: &std::path::Path,
+    audio_cfg: Option<&crate::gemma4_arch::Gemma4AudioConfig>,
+) -> Result<crate::gemma4_weights::Gemma4Audio>
+where
+    F1: Fn(&str) -> Result<(usize, TensorEntry)>,
+    F2: Fn(usize, &TensorEntry) -> &'a [u8],
+{
+    use crate::gemma4_weights::{
+        ClippedLinearWeight, Gemma4Audio, Gemma4AudioAttention, Gemma4AudioBlock, Gemma4AudioFfn,
+        Gemma4AudioLConv1d, Gemma4AudioSubsample,
+    };
+    let cfg = audio_cfg.ok_or_else(|| RvllmError::Loader {
+        err: LoaderError::Corrupt {
+            detail: "audio_config absent — cannot load audio tower".into(),
+        },
+        ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
+        bt: std::backtrace::Backtrace::capture(),
+    })?;
+    let num_layers = cfg.num_hidden_layers;
+
+    let upload = |region_name: &'static str, hf_name: &str| -> Result<F16Weight> {
+        let (si, e) = must_get(hf_name)?;
+        let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        let region = arena.region(region_name, buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        Ok(F16Weight {
+            offset_bytes: region.device_ptr(),
+            shape: e.shape.clone(),
+        })
+    };
+
+    // Read a bf16 scalar tensor (shape == []) as f32. Tolerates the
+    // `linear_start.input_max` etc. layout: each is a 0-d bf16 scalar
+    // on disk. We assert shape and dtype to fail-fast if the layout
+    // ever changes.
+    let read_bf16_scalar = |hf_name: &str| -> Result<f32> {
+        let (si, e) = must_get(hf_name)?;
+        let raw = bytes_of(si, &e);
+        if raw.len() != 2 {
+            return Err(RvllmError::Loader {
+                err: LoaderError::DtypeMismatch {
+                    tensor: e.name.clone(),
+                    expected: DType::Bf16,
+                    got: e.dtype,
+                },
+                ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: Some(hf_name.into()) },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        // bf16 = top 16 bits of a 32-bit float; pad with zeros for
+        // the mantissa tail to reconstruct the f32.
+        let mut bits = [0u8; 4];
+        bits[2] = raw[0];
+        bits[3] = raw[1];
+        Ok(f32::from_le_bytes(bits))
+    };
+
+    let upload_clipped = |region_prefix: &'static str, hf_prefix: &str| -> Result<ClippedLinearWeight> {
+        let weight = upload(region_prefix, &format!("{hf_prefix}.linear.weight"))?;
+        let input_max = read_bf16_scalar(&format!("{hf_prefix}.input_max"))?;
+        let input_min = read_bf16_scalar(&format!("{hf_prefix}.input_min"))?;
+        let output_max = read_bf16_scalar(&format!("{hf_prefix}.output_max"))?;
+        let output_min = read_bf16_scalar(&format!("{hf_prefix}.output_min"))?;
+        Ok(ClippedLinearWeight { weight, input_max, input_min, output_max, output_min })
+    };
+
+    let t0 = std::time::Instant::now();
+
+    // Top-level subsample + output projection + embed_audio. The
+    // multimodal sub-models live at `model.*` regardless of the text
+    // decoder's `weight_prefix` (which is `model.language_model` on
+    // E4B-it — vision and audio sit ALONGSIDE language_model, not
+    // under it). Hard-code the `model.` prefix here for parity with
+    // load_gemma_vision.
+    let p = |s: &str| format!("model.audio_tower.{s}");
+    let subsample = Gemma4AudioSubsample {
+        input_proj: upload("g4a_sub_input_proj",
+            &p("subsample_conv_projection.input_proj_linear.weight"))?,
+        layer0_conv: upload("g4a_sub_l0_conv",
+            &p("subsample_conv_projection.layer0.conv.weight"))?,
+        layer0_norm: upload("g4a_sub_l0_norm",
+            &p("subsample_conv_projection.layer0.norm.weight"))?,
+        layer1_conv: upload("g4a_sub_l1_conv",
+            &p("subsample_conv_projection.layer1.conv.weight"))?,
+        layer1_norm: upload("g4a_sub_l1_norm",
+            &p("subsample_conv_projection.layer1.norm.weight"))?,
+    };
+    let output_proj_w = upload("g4a_out_proj_w", &p("output_proj.weight"))?;
+    let output_proj_b = upload("g4a_out_proj_b", &p("output_proj.bias"))?;
+    let embed_audio_projection = upload(
+        "g4a_embed_audio_proj",
+        "model.embed_audio.embedding_projection.weight",
+    )?;
+
+    // Per-layer blocks. The HF tree mixes plain LayerNorm gammas with
+    // 4 clipped-linear scalars per Linear; the helper hides the
+    // bookkeeping.
+    let mut blocks = Vec::with_capacity(num_layers);
+    for l in 0..num_layers {
+        let lp = |s: &str| format!("model.audio_tower.layers.{l}.{s}");
+        let block = Gemma4AudioBlock {
+            norm_pre_attn: upload("g4a_norm_pre_attn", &lp("norm_pre_attn.weight"))?,
+            norm_post_attn: upload("g4a_norm_post_attn", &lp("norm_post_attn.weight"))?,
+            norm_out: upload("g4a_norm_out", &lp("norm_out.weight"))?,
+            feed_forward1: Gemma4AudioFfn {
+                pre_norm: upload("g4a_ff1_pre_norm", &lp("feed_forward1.pre_layer_norm.weight"))?,
+                post_norm: upload("g4a_ff1_post_norm", &lp("feed_forward1.post_layer_norm.weight"))?,
+                layer_1: upload_clipped("g4a_ff1_l1", &lp("feed_forward1.ffw_layer_1"))?,
+                layer_2: upload_clipped("g4a_ff1_l2", &lp("feed_forward1.ffw_layer_2"))?,
+            },
+            feed_forward2: Gemma4AudioFfn {
+                pre_norm: upload("g4a_ff2_pre_norm", &lp("feed_forward2.pre_layer_norm.weight"))?,
+                post_norm: upload("g4a_ff2_post_norm", &lp("feed_forward2.post_layer_norm.weight"))?,
+                layer_1: upload_clipped("g4a_ff2_l1", &lp("feed_forward2.ffw_layer_1"))?,
+                layer_2: upload_clipped("g4a_ff2_l2", &lp("feed_forward2.ffw_layer_2"))?,
+            },
+            lconv1d: Gemma4AudioLConv1d {
+                pre_norm: upload("g4a_lconv_pre_norm", &lp("lconv1d.pre_layer_norm.weight"))?,
+                conv_norm: upload("g4a_lconv_conv_norm", &lp("lconv1d.conv_norm.weight"))?,
+                depthwise: upload("g4a_lconv_depthwise", &lp("lconv1d.depthwise_conv1d.weight"))?,
+                linear_start: upload_clipped("g4a_lconv_lin_start", &lp("lconv1d.linear_start"))?,
+                linear_end: upload_clipped("g4a_lconv_lin_end", &lp("lconv1d.linear_end"))?,
+            },
+            self_attn: Gemma4AudioAttention {
+                q: upload_clipped("g4a_attn_q", &lp("self_attn.q_proj"))?,
+                k: upload_clipped("g4a_attn_k", &lp("self_attn.k_proj"))?,
+                v: upload_clipped("g4a_attn_v", &lp("self_attn.v_proj"))?,
+                post: upload_clipped("g4a_attn_post", &lp("self_attn.post"))?,
+                relative_k: upload("g4a_attn_rel_k", &lp("self_attn.relative_k_proj.weight"))?,
+                per_dim_scale: upload("g4a_attn_per_dim", &lp("self_attn.per_dim_scale"))?,
+            },
+        };
+        blocks.push(block);
+    }
+    eprintln!(
+        "[gemma4-loader] audio: {} encoder blocks + subsample_conv_projection \
+         + output_proj + embed_audio_projection in {:.1}s",
+        num_layers,
+        t0.elapsed().as_secs_f32()
+    );
+    Ok(Gemma4Audio {
+        subsample,
+        blocks,
+        output_proj_w,
+        output_proj_b,
+        embed_audio_projection,
     })
 }
 
@@ -1766,6 +1954,8 @@ fn load_gemma4_awq_model_inner(
         // checkpoints; vision is FP16/BF16 in the standard fp8-block
         // checkpoint and currently unused on the AWQ path.
         vision: None,
+        // Audio tower is E4B-only and the AWQ path is 31B-only.
+        audio: None,
         // E4B Per-Layer Embeddings are not present in AWQ checkpoints
         // (31B-AWQ only — PLE is E4B-specific).
         ple: None,

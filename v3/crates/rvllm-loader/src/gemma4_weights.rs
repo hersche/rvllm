@@ -98,6 +98,10 @@ pub struct Gemma4LoadedModel {
     /// Vision tower (SigLIP-style ViT) for Gemma 4 multimodal.
     /// `None` for text-only checkpoints.
     pub vision: Option<Gemma4Vision>,
+    /// E4B audio tower (12-layer encoder + 2-stage Conv2d subsampling
+    /// + output projection). `None` on 31B and any text-only checkpoint
+    /// that lacks the `model.audio_tower.*` tensors.
+    pub audio: Option<Gemma4Audio>,
     /// E4B Per-Layer Embeddings (PLE) global side. `None` on 31B;
     /// `Some` on E4B-it. Combined with the per-layer triple on each
     /// `Gemma4LayerWeights` to inject an additive residual at the
@@ -193,6 +197,136 @@ pub struct Gemma4Vision {
     pub std_bias: Option<F16Weight>,
     pub std_scale: Option<F16Weight>,
     pub embed_vision_projection: F16Weight,    // [out_hidden, hidden]
+}
+
+// ─── E4B audio tower (B5) ────────────────────────────────────────────
+//
+// Geometry per `/home/r00t/gemma4-e4b/config.json::audio_config`:
+//   num_hidden_layers           = 12
+//   hidden_size                 = 1024  (audio-tower internal hidden;
+//                                        NOT text hidden=2560)
+//   num_attention_heads         = 8  → head_dim = 128
+//   conv_kernel_size            = 5  (depthwise causal Conv1d inside
+//                                     each layer's lconv1d block)
+//   subsampling_conv_channels   = [128, 32] (two-stage Conv2d
+//                                            kernel=(3,3) stride=(2,2))
+//   output_proj_dims            = 1536 (audio-tower output width;
+//                                       projected to text hidden by
+//                                       embed_audio.embedding_projection)
+//   use_clipped_linears         = true  (every Linear ships
+//                                        input_max/input_min/output_max
+//                                        /output_min scalar clip stats)
+//
+// Tensor layout on disk (`model.audio_tower.*`):
+//   subsample_conv_projection.input_proj_linear.weight    [1024, 1024]
+//   subsample_conv_projection.layer{0,1}.conv.weight      [128 or 32,
+//                                                          1 or 128, 3, 3]
+//   subsample_conv_projection.layer{0,1}.norm.weight      [128 or 32]
+//   output_proj.weight                                    [1536, 1024]
+//   output_proj.bias                                      [1536]
+//
+//   layers.{L}.norm_pre_attn.weight                       [1024]
+//   layers.{L}.norm_post_attn.weight                      [1024]
+//   layers.{L}.norm_out.weight                            [1024]
+//
+//   layers.{L}.self_attn.{q,k,v}_proj.{linear.weight,
+//                                      input_max, input_min,
+//                                      output_max, output_min}
+//   layers.{L}.self_attn.post.* (same clipped-linear shape)
+//   layers.{L}.self_attn.relative_k_proj.weight           [1024, 1024]
+//   layers.{L}.self_attn.per_dim_scale                    [128]
+//
+//   layers.{L}.feed_forward{1,2}.pre_layer_norm.weight    [1024]
+//   layers.{L}.feed_forward{1,2}.post_layer_norm.weight   [1024]
+//   layers.{L}.feed_forward{1,2}.ffw_layer_{1,2}.*
+//                                                          (clipped linear)
+//
+//   layers.{L}.lconv1d.pre_layer_norm.weight              [1024]
+//   layers.{L}.lconv1d.conv_norm.weight                   [1024]
+//   layers.{L}.lconv1d.depthwise_conv1d.weight            [1024, 1, 5]
+//   layers.{L}.lconv1d.linear_{start,end}.*               (clipped linear)
+//
+//   embed_audio.embedding_projection.weight               [2560, 1536]
+//
+// All on-disk dtypes are bf16 → f16 at upload (same F16_ONLY path
+// the text decoder uses).
+
+/// A Linear weight bundled with its 4 scalar clip statistics
+/// (`use_clipped_linears=true` on E4B). The runtime applies the
+/// clip on input (saturate to [`input_min`, `input_max`]) before
+/// the matmul and on output (saturate to [`output_min`,
+/// `output_max`]) after; see HF Gemma4 `ClippedLinear.forward`.
+/// The scalar clips are stored as f32 (loaded from bf16 at upload
+/// time) so the runtime kernel can apply them with one multiply +
+/// `fmaxf`/`fminf` per element with no per-launch dtype dance.
+#[derive(Debug)]
+pub struct ClippedLinearWeight {
+    pub weight: F16Weight,
+    pub input_max: f32,
+    pub input_min: f32,
+    pub output_max: f32,
+    pub output_min: f32,
+}
+
+#[derive(Debug)]
+pub struct Gemma4AudioFfn {
+    pub pre_norm: F16Weight,
+    pub post_norm: F16Weight,
+    pub layer_1: ClippedLinearWeight,
+    pub layer_2: ClippedLinearWeight,
+}
+
+#[derive(Debug)]
+pub struct Gemma4AudioLConv1d {
+    pub pre_norm: F16Weight,
+    pub conv_norm: F16Weight,
+    pub depthwise: F16Weight,
+    pub linear_start: ClippedLinearWeight,
+    pub linear_end: ClippedLinearWeight,
+}
+
+#[derive(Debug)]
+pub struct Gemma4AudioAttention {
+    pub q: ClippedLinearWeight,
+    pub k: ClippedLinearWeight,
+    pub v: ClippedLinearWeight,
+    pub post: ClippedLinearWeight,
+    pub relative_k: F16Weight,
+    pub per_dim_scale: F16Weight,
+}
+
+#[derive(Debug)]
+pub struct Gemma4AudioBlock {
+    pub norm_pre_attn: F16Weight,
+    pub norm_post_attn: F16Weight,
+    pub norm_out: F16Weight,
+    pub feed_forward1: Gemma4AudioFfn,
+    pub feed_forward2: Gemma4AudioFfn,
+    pub lconv1d: Gemma4AudioLConv1d,
+    pub self_attn: Gemma4AudioAttention,
+}
+
+#[derive(Debug)]
+pub struct Gemma4AudioSubsample {
+    pub input_proj: F16Weight,   // `input_proj_linear.weight`
+    pub layer0_conv: F16Weight,  // 2D Conv kernel=(3,3) stride=(2,2)
+    pub layer0_norm: F16Weight,
+    pub layer1_conv: F16Weight,
+    pub layer1_norm: F16Weight,
+}
+
+#[derive(Debug)]
+pub struct Gemma4Audio {
+    pub subsample: Gemma4AudioSubsample,
+    pub blocks: Vec<Gemma4AudioBlock>,
+    pub output_proj_w: F16Weight, // [output_proj_dims, hidden]
+    pub output_proj_b: F16Weight, // [output_proj_dims]
+    /// `model.embed_audio.embedding_projection.weight` —
+    /// [text_hidden, output_proj_dims] linear from audio-tower
+    /// output to the text decoder hidden width. Applied after the
+    /// audio tower's output_proj when splicing into the prefill
+    /// residual.
+    pub embed_audio_projection: F16Weight,
 }
 
 #[derive(Debug)]

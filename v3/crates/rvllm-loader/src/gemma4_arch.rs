@@ -52,6 +52,47 @@ pub struct Gemma4VisionConfig {
     pub standardize: bool,
 }
 
+/// E4B-it audio tower configuration (B5 of the audio plan). Verified
+/// against `/home/r00t/gemma4-e4b/config.json::audio_config` on
+/// 2026-05-14. Field order mirrors the JSON block so the parser is
+/// a 1:1 mapping. `None` for 31B (no audio tower on disk).
+///
+/// Notable values for E4B:
+///   hidden_size                   = 1024
+///   num_hidden_layers             = 12
+///   num_attention_heads           = 8        (head_dim = hidden / heads = 128)
+///   output_proj_dims              = 1536     (audio_tower output width)
+///   conv_kernel_size              = 5        (causal Conv1d inside each layer's lconv1d block)
+///   subsampling_conv_channels     = [128, 32](two-stage Conv2d kernel=(3,3) stride=(2,2))
+///   attention_chunk_size          = 12
+///   attention_context_left        = 13       (HF subtracts 1 → usable past 12)
+///   attention_context_right       = 0
+///   attention_logit_cap           = 50.0
+///   attention_invalid_logits_value= -1e9
+///   residual_weight               = 0.5
+///   rms_norm_eps                  = 1e-6
+///   hidden_act                    = "silu"
+///   use_clipped_linears           = true     (every Linear has
+///                                            input_max/input_min/output_max/output_min
+///                                            calibration tensors used by B6's clip stage)
+#[derive(Clone, Debug)]
+pub struct Gemma4AudioConfig {
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub output_proj_dims: usize,
+    pub conv_kernel_size: usize,
+    pub subsampling_conv_channels: [usize; 2],
+    pub attention_chunk_size: usize,
+    pub attention_context_left: usize,
+    pub attention_context_right: usize,
+    pub attention_logit_cap: f32,
+    pub attention_invalid_logits_value: f32,
+    pub residual_weight: f32,
+    pub rms_norm_eps: f32,
+    pub use_clipped_linears: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Gemma4Arch {
     pub num_hidden_layers: usize,
@@ -83,6 +124,10 @@ pub struct Gemma4Arch {
     /// requests are re-enabled — A4b promotes the forward path's
     /// hardcoded 31B constants to read from this struct.
     pub vision_config: Option<Gemma4VisionConfig>,
+    /// Parsed `audio_config` block (B5). `None` on 31B. When `Some`,
+    /// the loader uploads `model.audio_tower.*` plus
+    /// `model.embed_audio.embedding_projection.weight`.
+    pub audio_config: Option<Gemma4AudioConfig>,
     /// E4B Per-Layer Embedding (PLE) dimension. `Some(256)` on E4B-it;
     /// `None` on 31B (no PLE pathway on disk). When `Some`, the loader
     /// uploads `embed_tokens_per_layer`, `per_layer_model_projection`,
@@ -232,6 +277,7 @@ impl Gemma4Arch {
             .map(|x| x as f32)
             .unwrap_or_else(|| 1.0 / (2.0f32).sqrt());
         let vision_config = Self::parse_vision_config(&v);
+        let audio_config = Self::parse_audio_config(&v);
         let weight_prefix = Self::detect_weight_prefix(dir);
 
         if num_attention_heads == 0 || hidden_size == 0 || num_hidden_layers == 0 {
@@ -269,6 +315,7 @@ impl Gemma4Arch {
             tie_word_embeddings,
             num_kv_shared_layers,
             vision_config,
+            audio_config,
             hidden_size_per_layer_input,
             per_layer_model_projection_scale,
             per_layer_input_scale,
@@ -295,6 +342,46 @@ impl Gemma4Arch {
                 }
             })
             .collect()
+    }
+
+    /// Parse the `audio_config` block from a Gemma 4 `config.json`.
+    /// Returns `None` when the field is absent (31B text-only check-
+    /// points). For E4B the block is mandatory; we surface a `None`
+    /// without erroring so the loader can leave the audio tower
+    /// uninitialised and the runtime still serves text + vision.
+    fn parse_audio_config(v: &serde_json::Value) -> Option<Gemma4AudioConfig> {
+        let ac = v.get("audio_config")?;
+        let hidden_size = ac.get("hidden_size")?.as_u64()? as usize;
+        let num_hidden_layers = ac.get("num_hidden_layers")?.as_u64()? as usize;
+        // subsampling_conv_channels is a list of 2 ints; HF assigns
+        // [128, 32] on E4B. We hard-require length 2 — anything else
+        // is a config the forward path doesn't yet support.
+        let scc_arr = ac.get("subsampling_conv_channels")?.as_array()?;
+        if scc_arr.len() != 2 {
+            return None;
+        }
+        let scc: [usize; 2] = [
+            scc_arr[0].as_u64()? as usize,
+            scc_arr[1].as_u64()? as usize,
+        ];
+        Some(Gemma4AudioConfig {
+            hidden_size,
+            num_hidden_layers,
+            num_attention_heads: ac["num_attention_heads"].as_u64().unwrap_or(8) as usize,
+            output_proj_dims: ac["output_proj_dims"].as_u64().unwrap_or(1536) as usize,
+            conv_kernel_size: ac["conv_kernel_size"].as_u64().unwrap_or(5) as usize,
+            subsampling_conv_channels: scc,
+            attention_chunk_size: ac["attention_chunk_size"].as_u64().unwrap_or(12) as usize,
+            attention_context_left: ac["attention_context_left"].as_u64().unwrap_or(13) as usize,
+            attention_context_right: ac["attention_context_right"].as_u64().unwrap_or(0) as usize,
+            attention_logit_cap: ac["attention_logit_cap"].as_f64().unwrap_or(50.0) as f32,
+            attention_invalid_logits_value: ac["attention_invalid_logits_value"]
+                .as_f64()
+                .unwrap_or(-1.0e9) as f32,
+            residual_weight: ac["residual_weight"].as_f64().unwrap_or(0.5) as f32,
+            rms_norm_eps: ac["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
+            use_clipped_linears: ac["use_clipped_linears"].as_bool().unwrap_or(true),
+        })
     }
 
     fn parse_vision_config(v: &serde_json::Value) -> Option<Gemma4VisionConfig> {
@@ -521,6 +608,7 @@ mod tests {
             tie_word_embeddings: true,
             num_kv_shared_layers: None,
             vision_config: None,
+            audio_config: None,
             hidden_size_per_layer_input: None,
             per_layer_model_projection_scale: 0.0,
             per_layer_input_scale: 0.0,
@@ -544,6 +632,39 @@ mod tests {
             let got_full = types[i] == Gemma4LayerType::GlobalAttention;
             assert_eq!(got_full, want_full, "layer {i}");
         }
+    }
+
+    #[test]
+    fn parses_real_audio_config_from_e4b() {
+        // Mirror of `parses_real_layer_types`: parse the actual on-disk
+        // E4B config.json and assert the audio_config block lands on
+        // the values codex's review pinned to.
+        let path = std::path::Path::new("/home/r00t/gemma4-e4b/config.json");
+        if !path.exists() {
+            return; // not running on Cortex — skip
+        }
+        let bytes = std::fs::read(path).expect("read config");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("parse config");
+        let ac = Gemma4Arch::parse_audio_config(&v).expect("E4B audio_config present");
+        assert_eq!(ac.hidden_size, 1024);
+        assert_eq!(ac.num_hidden_layers, 12);
+        assert_eq!(ac.num_attention_heads, 8);
+        assert_eq!(ac.output_proj_dims, 1536);
+        assert_eq!(ac.conv_kernel_size, 5);
+        assert_eq!(ac.subsampling_conv_channels, [128, 32]);
+        assert_eq!(ac.attention_chunk_size, 12);
+        assert_eq!(ac.attention_context_left, 13);
+        assert_eq!(ac.attention_context_right, 0);
+        assert!((ac.residual_weight - 0.5).abs() < 1e-6);
+        assert!((ac.attention_logit_cap - 50.0).abs() < 1e-3);
+        assert!(ac.use_clipped_linears);
+    }
+
+    #[test]
+    fn audio_config_absent_on_31b_returns_none() {
+        // 31B's config has no audio_config block.
+        let v = serde_json::json!({});
+        assert!(Gemma4Arch::parse_audio_config(&v).is_none());
     }
 
     #[test]
@@ -579,6 +700,7 @@ mod tests {
             tie_word_embeddings: true,
             num_kv_shared_layers: Some(18),
             vision_config: None,
+            audio_config: None,
             hidden_size_per_layer_input: Some(256),
             per_layer_model_projection_scale: 0.0,
             per_layer_input_scale: 0.0,
@@ -626,6 +748,7 @@ mod tests {
             tie_word_embeddings: true,
             num_kv_shared_layers: None,
             vision_config: None,
+            audio_config: None,
             hidden_size_per_layer_input: None,
             per_layer_model_projection_scale: 0.0,
             per_layer_input_scale: 0.0,
@@ -761,6 +884,7 @@ mod tests {
             tie_word_embeddings: true,
             num_kv_shared_layers: None,
             vision_config: None,
+            audio_config: None,
             hidden_size_per_layer_input: None,
             per_layer_model_projection_scale: 0.0,
             per_layer_input_scale: 0.0,
