@@ -200,6 +200,15 @@ pub struct Qwen35Scratch {
     // dense MLP's down_proj cuBLASLt fp8_gemm_blockwise call.
     pub silu_mid_fp8_ptr: u64,    // FP8 [intermediate]
     pub silu_mid_scales_ptr: u64, // F32 [intermediate / 128]
+    // ── NVFP4 KV scratch (zero unless RVLLM_NVFP4_KV=1) ────
+    // q_fp8 holds the rotated FP8-E4M3 Q output produced by the
+    // NVFP4 RoPE kernel — shape [n_q_heads * head_dim] u8.
+    // q_scale_cache holds the per-(token, head) dynamic Q scale
+    // — shape [num_tokens, n_q_heads] f32. The "decode" scratch
+    // is sized for num_tokens=1; prefill carries its own batched
+    // version through the arena per call.
+    pub q_fp8_ptr: u64,
+    pub q_scale_cache_ptr: u64,
     pub scratch_bytes: usize,
 }
 
@@ -235,6 +244,13 @@ pub struct Qwen35OutsideKernels {
     pub fn_split_q_gate_f16: KernelFn,
     pub fused_rope_qwen_partial_f16kv_mod: LoadedModule,
     pub fn_fused_rope_qwen_partial_f16kv: KernelFn,
+    /// Qwen-specific NVFP4 RoPE + KV-write + FP8-Q kernel. Loaded
+    /// only when `RVLLM_NVFP4_KV=1`. Sibling of the Gemma 4 kernel
+    /// `fused_rope_partial_nvfp4kv`. Step 3 plumbing-only commit:
+    /// the kernel is resident but no dispatch site invokes it yet
+    /// (step 4 wires the decode path; step 5 wires prefill).
+    pub fused_rope_qwen_partial_nvfp4kv_mod: Option<LoadedModule>,
+    pub fn_fused_rope_qwen_partial_nvfp4kv: Option<KernelFn>,
     pub flash_attention_mod: LoadedModule,
     pub fn_flash_attention_2_decode_f16io: KernelFn,
     pub sigmoid_mul_f16_mod: LoadedModule,
@@ -633,6 +649,23 @@ impl Qwen35Bringup {
                     "qwen35_silu_mid_fp8", intermediate, 16)?.device_ptr(),
                 silu_mid_scales_ptr: arena.region(
                     "qwen35_silu_mid_scales", (intermediate / 128) * 4, 16)?.device_ptr(),
+                // NVFP4 Q-side scratch: only allocated when the KV
+                // layout is NVFP4. The NVFP4 RoPE kernel writes
+                // FP8-E4M3 Q + per-(token, head) f32 scale; decode
+                // is num_tokens=1, so q_scale_cache is [n_q_heads]
+                // f32 and q_fp8 is [n_q_heads * head_dim] u8.
+                q_fp8_ptr: match kv_dtype {
+                    Qwen35KvDtype::Nvfp4 => arena.region(
+                        "qwen35_q_fp8",
+                        n_q_heads * head_dim, 16)?.device_ptr(),
+                    Qwen35KvDtype::F16 => 0,
+                },
+                q_scale_cache_ptr: match kv_dtype {
+                    Qwen35KvDtype::Nvfp4 => arena.region(
+                        "qwen35_q_scale_cache",
+                        n_q_heads * 4, 16)?.device_ptr(),
+                    Qwen35KvDtype::F16 => 0,
+                },
                 scratch_bytes:
                     f16_bytes(hidden) * 4 +  // h_residual, h_work, o_out, down_out
                     f16_bytes(n_q_heads * head_dim) * 3 +  // q_out, q_gate, attn_out
@@ -709,6 +742,21 @@ impl Qwen35Bringup {
             let fn_fused_rope_qwen_partial_f16kv =
                 fused_rope_qwen_partial_f16kv_mod
                     .get_function("fused_rope_qwen_partial_f16kv_kernel")?;
+            // Step 3 (Qwen 3.6 27B NVFP4 plumbing). Resident-only.
+            // Loaded under the same env gate that drives the KV
+            // allocator above so the resident set matches the KV
+            // layout. Dispatch lands in steps 4-5.
+            let (fused_rope_qwen_partial_nvfp4kv_mod,
+                 fn_fused_rope_qwen_partial_nvfp4kv) = match kv_dtype {
+                Qwen35KvDtype::Nvfp4 => {
+                    let m = kernels.load_ptx(
+                        "fused_rope_qwen_partial_nvfp4kv")?;
+                    let f = m.get_function(
+                        "fused_rope_qwen_partial_nvfp4kv_kernel")?;
+                    (Some(m), Some(f))
+                }
+                Qwen35KvDtype::F16 => (None, None),
+            };
             let flash_attention_mod = kernels.load_ptx("flash_attention")?;
             let fn_flash_attention_2_decode_f16io = flash_attention_mod
                 .get_function("flash_attention_2_decode_f16io_kernel")?;
@@ -834,6 +882,8 @@ impl Qwen35Bringup {
                 fn_split_q_gate_f16,
                 fused_rope_qwen_partial_f16kv_mod,
                 fn_fused_rope_qwen_partial_f16kv,
+                fused_rope_qwen_partial_nvfp4kv_mod,
+                fn_fused_rope_qwen_partial_nvfp4kv,
                 flash_attention_mod,
                 fn_flash_attention_2_decode_f16io,
                 sigmoid_mul_f16_mod,
