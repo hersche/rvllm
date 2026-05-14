@@ -6997,6 +6997,121 @@ impl Gemma4Bringup {
         Ok(region)
     }
 
+    /// Q/K/V projection + Q-scale apply for the Gemma 4 audio
+    /// chunked attention. Three GEMMs (hidden_dim -> num_heads*head_dim
+    /// each) produce f32 [n_tokens, hidden_dim] buffers; the Q output
+    /// is scaled per-channel via the precomputed q_scale_vec.
+    ///
+    /// HF carries Q/K/V in f32 from projection through softmax. We
+    /// match that — the cuBLASLt wrapper produces f32 output natively
+    /// (f16 in, f32 accumulator + cast).
+    ///
+    /// Caller owns `q_scale_vec` (a head_dim f32 region from
+    /// `audio_q_scale_vector_upload`, where k_scale is already folded
+    /// in). After this call:
+    ///   * Q has the combined `q_scale * softplus(per_dim) * k_scale`
+    ///     applied per head_dim channel.
+    ///   * K and V are unscaled (k_scale lives on the Q side now).
+    ///
+    /// Returns the three arena regions in (Q, K, V) order; lifetime
+    /// is the request's checkpoint.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn forward_audio_attention_qkv(
+        &self,
+        attn: &rvllm_loader::gemma4_weights::Gemma4AudioAttention,
+        hidden_f16: u64,
+        n_tokens: usize,
+        hidden_dim: usize,
+        num_heads: usize,
+        head_dim: usize,
+        q_scale_vec: u64,
+        scratch_q_f32: &'static str,
+        scratch_k_f32: &'static str,
+        scratch_v_f32: &'static str,
+    ) -> Result<(rvllm_mem::Region<'_>, rvllm_mem::Region<'_>, rvllm_mem::Region<'_>)> {
+        use cudarc::driver::sys::*;
+        let q_proj_out = num_heads * head_dim; // == hidden_dim on E4B
+        let f32_bytes = n_tokens * q_proj_out * 4;
+
+        // Q proj: D[m, n] = Wq^T @ hidden ; out [n_tokens, q_proj_out] f32
+        let q = self.arena.region(scratch_q_f32, f32_bytes, 16)?;
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                attn.q.weight.offset_bytes,
+                hidden_f16,
+                q.device_ptr(),
+                q_proj_out as i32,
+                n_tokens as i32,
+                hidden_dim as i32,
+                self.stream.raw(),
+            )?;
+        }
+        // K proj
+        let k = self.arena.region(scratch_k_f32, f32_bytes, 16)?;
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                attn.k.weight.offset_bytes,
+                hidden_f16,
+                k.device_ptr(),
+                q_proj_out as i32,
+                n_tokens as i32,
+                hidden_dim as i32,
+                self.stream.raw(),
+            )?;
+        }
+        // V proj
+        let v = self.arena.region(scratch_v_f32, f32_bytes, 16)?;
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                attn.v.weight.offset_bytes,
+                hidden_f16,
+                v.device_ptr(),
+                q_proj_out as i32,
+                n_tokens as i32,
+                hidden_dim as i32,
+                self.stream.raw(),
+            )?;
+        }
+
+        // Apply per-head_dim scale to Q. The output layout from
+        // cuBLASLt is row-major [n_tokens, q_proj_out] = [n_tokens,
+        // num_heads * head_dim] so [outer = n_tokens * num_heads,
+        // head_dim] is a valid view.
+        unsafe {
+            let mut x = q.device_ptr();
+            let mut s = q_scale_vec;
+            let mut outer = (n_tokens * num_heads) as i32;
+            let mut hd = head_dim as i32;
+            let args = [
+                (&mut x)     as *mut u64 as *mut core::ffi::c_void,
+                (&mut s)     as *mut u64 as *mut core::ffi::c_void,
+                (&mut outer) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd)    as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let total = (n_tokens * q_proj_out) as i64;
+            let block: u32 = 256;
+            let grid: u32 = ((total + block as i64 - 1) / block as i64) as u32;
+            let rc = cuLaunchKernel(
+                self.fused.fn_scale_per_dim_f32.raw() as CUfunction,
+                grid, 1, 1,
+                block, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio attn: scale_per_dim_f32 launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        Ok((q, k, v))
+    }
+
     /// Phase 3b: Gemma 4 vision tower forward.
     ///
     /// Decodes an image, runs the 27-layer SigLIP-style ViT encoder
