@@ -163,12 +163,16 @@ impl MelExtractor {
     pub fn n_mels(&self) -> usize { self.cfg.n_mels }
 
     /// Number of frames produced for `n_samples` of f32 PCM with
-    /// the configured hop.
+    /// the configured hop. HF Gemma4 left-pads the input by
+    /// `frame_length/2` zeros (semicausal framing), so the effective
+    /// sample count is `n_samples + frame_length/2`.
     pub fn num_frames(&self, n_samples: usize) -> usize {
-        if n_samples < self.cfg.frame_length {
+        let pad = self.cfg.frame_length / 2;
+        let n_eff = n_samples + pad;
+        if n_eff < self.cfg.frame_length {
             0
         } else {
-            (n_samples - self.cfg.frame_length) / self.cfg.hop_length + 1
+            (n_eff - self.cfg.frame_length) / self.cfg.hop_length + 1
         }
     }
 
@@ -200,12 +204,26 @@ impl MelExtractor {
         let mut scratch = vec![rustfft::num_complex::Complex::<f32>::new(0.0, 0.0); cfg.n_fft];
         let mut power = vec![0.0f32; n_bins];
 
+        // HF semicausal framing: left-pad `frame_length/2` zeros so the
+        // first window's center aligns with sample 0 (HF
+        // feature_extraction_gemma4.py:180-199). For preemphasis=0
+        // we can ignore the +1 sample HF tacks on for the
+        // preemphasis filter.
+        let pad = cfg.frame_length / 2;
         for frame in 0..t {
-            let start = frame * cfg.hop_length;
-            // Window + zero-pad up to n_fft.
+            let frame_start = frame * cfg.hop_length;
             for i in 0..cfg.n_fft {
                 let re = if i < cfg.frame_length {
-                    samples[start + i] * self.window[i] * cfg.input_scale_factor
+                    // Map window index i -> padded sample index, then to
+                    // the live sample buffer (skipping the left-pad).
+                    let padded_idx = frame_start + i;
+                    let sample = if padded_idx < pad {
+                        0.0
+                    } else {
+                        let s_idx = padded_idx - pad;
+                        if s_idx < samples.len() { samples[s_idx] } else { 0.0 }
+                    };
+                    sample * self.window[i] * cfg.input_scale_factor
                 } else {
                     0.0
                 };
