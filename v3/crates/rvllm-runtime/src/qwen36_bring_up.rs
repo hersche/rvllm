@@ -4481,7 +4481,17 @@ impl Qwen36Bringup {
                         // per-token path.
                         // Round-27d: default-ON post-audit. "0"/"false"
                         // selects the legacy per-token sub-loop.
+                        // NVFP4 commit 4: when `kv_dtype == Nvfp4` we
+                        // unconditionally take the per-token else-branch
+                        // — the batched body still calls f16
+                        // RoPE+KV-write that would corrupt a packed-4-bit
+                        // cache. The per-token branch invokes
+                        // `apply_layer_full_attn`, which is NVFP4-aware
+                        // from commit 3. Optimised batched NVFP4 prefill
+                        // (unified-NVFP4-prefill kernel exists in PTX) is
+                        // a follow-up.
                         let batch_full = start_position == 0
+                            && !matches!(self.kv_dtype, Qwen36KvDtype::Nvfp4)
                             && std::env::var("RVLLM_QWEN36_BATCH_FULL_PREFILL")
                                 .map(|s| !matches!(s.as_str(),
                                     "0"|"false"|"FALSE"|"no"))
