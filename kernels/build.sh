@@ -195,6 +195,7 @@ for arch in $ARCHS; do
             flash_attention_split_decode_nvfp4kv_*|\
             paged_attention_v2_reduce_*|\
             fused_rope_partial_fp8kv*|fused_rope_partial_nvfp4kv*|fused_rope_cache_fp8kv*|\
+            fused_rope_qwen_partial_nvfp4kv|\
             fused_rmsnorm_*|fused_qk_rmsnorm*|fused_qkv_rmsnorm*|\
             fused_gelu_mul_fp8*|fused_gelu_mul_f16*|fused_gelu_mul_bf16*|\
             fused_norm_add_residual|fused_norm_add_residual_f16|fused_norm_add_residual_bf16|\
