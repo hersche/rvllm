@@ -1,5 +1,12 @@
 # Mistral 3.5 batched-prefill plan
 
+> **2026-05-14 update: BATCHED PREFILL IS DEFAULT-ON.** The dispatch
+> in `mistral35_bring_up.rs` enables the batched chunk path for
+> prompts >= 16 tokens automatically. Multi-token greedy works
+> end-to-end via the production profile. Performance benchmarking
+> (real throughput vs token-major fallback) is the remaining open
+> item; not blocking correctness. Kept below for design context.
+
 **Status:** design / scaffolding (Step 9-partial of `mistral-35-integration.md`).
 **Goal:** lay out which prefill phases of the Qwen 3.6 batched plan
 (`v3/QWEN_BATCHED_PREFILL_PLAN.md`) port directly to Mistral 3.5

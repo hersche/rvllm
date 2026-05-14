@@ -1,5 +1,15 @@
 # Mistral 3.5 Pixtral vision GPU forward — strategy doc
 
+> **2026-05-14 update: IMPLEMENTED AND VALIDATED.** Pixtral vision
+> works E2E in `rvllm-serve` via the production profile
+> `mobile-mistral35-rvllm.env` with `RVLLM_LOAD_VISION=1`. Probe:
+> 1-token classification of `/tmp/ball.png` returns "Orange";
+> 74-token describe returns a coherent "solid orange circle on
+> light blue background" description. The kernel-reuse map and
+> splice design below match what was implemented in
+> `forward_pixtral_vision` and the cuda_worker plumbing. Kept for
+> historical reference / future Pixtral-variant work.
+
 **Status:** design / scaffolding (Step 7 GPU half of `mistral-35-
 integration.md`).
 **Goal:** map the Pixtral ViT forward onto rvllm's existing

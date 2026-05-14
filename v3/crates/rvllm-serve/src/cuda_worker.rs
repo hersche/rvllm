@@ -288,7 +288,7 @@ pub async fn spawn_cuda_worker(
                 };
                 tracing::info!(
                     nvfp4_active = bringup.nvfp4_active,
-                    "Mistral 3.5 bring-up validated; forward path not yet implemented"
+                    "Mistral 3.5 bring-up validated; forward path ready"
                 );
                 let _ = ready_tx.send(Ok(()));
 

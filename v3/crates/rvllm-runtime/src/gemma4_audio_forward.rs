@@ -1,58 +1,34 @@
-//! Gemma 4 E4B native audio encoder forward (B6 scaffold).
+//! Gemma 4 E4B native audio encoder forward — types + legacy
+//! API stub.
 //!
-//! Mirrors `qwen_vision_forward.rs`'s structure: a public entry
-//! [`forward_gemma_audio`] takes a borrow bundle and the f32 mono PCM
-//! samples already resampled to 16 kHz by `openai::audio_fetch`, and
-//! returns a device-resident `[num_soft_tokens, output_proj_dims]`
-//! f16 buffer the caller can splice into the prefill residual after
-//! the text-side embed_audio projection.
+//! The LIVE audio path is `Gemma4Bringup::forward_gemma_audio_to_host`
+//! in `gemma4_bring_up.rs`. The cuda-worker calls it directly. It
+//! runs the full chain: mel compute (CPU) -> subsample (im2col +
+//! cuBLASLt + layernorm/ReLU x2) -> 12 encoder blocks (FFN + chunked
+//! attention with rel-pos bias + LightConv1D + FFN + norms) ->
+//! output_proj (1024 -> 1536) -> output_proj_b bias + parameter-
+//! free RMSNorm in f32 -> embed_audio_projection (1536 -> 2560) ->
+//! DtoH the f16 [num_soft_tokens, text_hidden] bytes for splice
+//! into the prefill residual. Validated on real user speech
+//! recordings — "Das ist ein Test.", "I am a human.", "Wie ist das
+//! Wetter heute?" — transcribed correctly.
 //!
-//! ## Scope of this commit (B6a)
-//!
-//! Scaffold + dispatcher only:
-//!   * the `Gemma4AudioForwardDeps` borrow bundle is wired,
-//!   * `forward_gemma_audio` returns
-//!     `Err(AttentionError::FeatureNotAvailable { ... })` with a
-//!     clear "B6 not yet wired" message,
-//!   * the cuda-worker calls this entry whenever
-//!     `Gemma4Bringup::audio_loaded()` is true AND the request carries
-//!     audio_items, so requests now fail-fast with a meaningful error
-//!     instead of running the unspliced soft-token IDs through the LM
-//!     head and producing gibberish.
-//!
-//! ## Coming next (B6b..d, separate commits)
-//!
-//!   B6b: mel CPU upload + 2-stage Conv2d (kernel=3, stride=2)
-//!        subsampling stack:
-//!          input  [T, n_mels=128]    f16
-//!          stage0 [T/2, n_mels/2=64, channels=128]  Conv2d + LayerNorm
-//!                                                    + ReLU
-//!          stage1 [T/4, n_mels/4=32, channels=32]   Conv2d + LayerNorm
-//!                                                    + ReLU
-//!          flatten   [T/4, 32*32=1024]
-//!          input_proj_linear  [T/4, 1024]            (clipped linear)
-//!        HF-parity dump + diff at flatten + after input_proj.
-//!
-//!   B6c: first encoder block end-to-end (norm_pre_attn → FFN1 ×0.5
-//!        → multi-head chunked attn → LConv1D → FFN2 ×0.5 → norm_out)
-//!        with HF-parity check on the residual at block exit.
-//!
-//!   B6d: extend to all 12 blocks; apply final output_proj; HF parity
-//!        on the post-tower output [num_soft_tokens, 1536].
+//! This file only provides the public `AudioForwardOutput` struct
+//! that the cuda-worker holds and the legacy `forward_gemma_audio`
+//! entry which is kept as a `FeatureNotAvailable` stub for any
+//! caller still using the old API. New code should call the
+//! Gemma4Bringup method directly.
 //!
 //! ## HF source cross-reference
 //!
-//! `/home/r00t/.venv/lib/python3.13/site-packages/transformers/models/gemma4/modeling_gemma4.py`
-//!   * `Gemma4AudioConvSubsampling.forward`              (≈line 320)
-//!   * `Gemma4AudioLightConv1d.forward`                  (≈line 200)
-//!   * `Gemma4AudioFeedForwardBlock.forward`             (≈line 390)
-//!   * `Gemma4AudioRelativePositionalEmbedding.forward`  (≈line 240)
-//!   * `Gemma4AudioConformerBlock.forward`               (≈line 410)
-//!   * `Gemma4AudioModel.forward`                        (≈line 1820)
-//!
-//! All shapes / constants in the docstring above are pinned against
-//! /home/r00t/gemma4-e4b/config.json::audio_config and the on-disk
-//! safetensor shapes verified at B5.
+//! `/home/r00t/.unsloth/studio/.venv_t5/transformers/models/gemma4/modeling_gemma4.py`
+//!   * `Gemma4AudioSubSampleConvProjection.forward`      (~line 345)
+//!   * `Gemma4AudioLightConv1d.forward`                  (~line 444)
+//!   * `Gemma4AudioFeedForward.forward`                  (~line 375)
+//!   * `Gemma4AudioRelPositionalEncoding.forward`        (~line 178)
+//!   * `Gemma4AudioAttention.forward`                    (~line 209)
+//!   * `Gemma4AudioLayer.forward`                        (~line 485)
+//!   * `Gemma4AudioModel.forward`                        (~line 1820)
 
 use rvllm_core::{AttentionError, AttnCtx, Result, RvllmError};
 
@@ -135,7 +111,7 @@ pub fn forward_gemma_audio(
 
     Err(RvllmError::Attention {
         err: AttentionError::FeatureNotAvailable {
-            op: "forward_gemma_audio (B6 encoder forward not yet wired)",
+            op: "forward_gemma_audio (legacy stub — call Gemma4Bringup::forward_gemma_audio_to_host instead)",
             backend: "Gemma4Audio",
         },
         ctx: AttnCtx {
