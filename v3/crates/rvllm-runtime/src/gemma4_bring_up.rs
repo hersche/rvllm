@@ -6365,13 +6365,17 @@ impl Gemma4Bringup {
         let out_f32 = self
             .arena
             .region("g4a_proj_f32", h1 * hidden * 4, 16)?;
+        // f16_gemm_f32 computes D = A * B^T = [m, k] * [k, n] = [m, n] row-major.
+        // For Linear out = x @ weight^T we want D[N, out] = x[N, in] * weight[out, in]^T.
+        // Pass a=x (m=N, k=in), b=weight (n=out, k=in). NOT the codex-2 (weight, x)
+        // order which gives D[out, N] (transposed of what downstream expects).
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                audio.subsample.input_proj.offset_bytes,
                 permuted.device_ptr(),
+                audio.subsample.input_proj.offset_bytes,
                 out_f32.device_ptr(),
-                hidden as i32,
                 h1 as i32,
+                hidden as i32,
                 proj_in_dim as i32,
                 self.stream.raw(),
             )?;
@@ -6490,11 +6494,11 @@ impl Gemma4Bringup {
         let inter_f32 = self.arena.region(scratch_inter_f32, n_tokens * h4 * 4, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                ffn.layer_1.weight.offset_bytes,
                 hidden,
+                ffn.layer_1.weight.offset_bytes,
                 inter_f32.device_ptr(),
-                h4 as i32,
                 n_tokens as i32,
+                h4 as i32,
                 h as i32,
                 self.stream.raw(),
             )?;
@@ -6524,11 +6528,11 @@ impl Gemma4Bringup {
         let out_f32 = self.arena.region(scratch_out_f32, n_tokens * h * 4, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                ffn.layer_2.weight.offset_bytes,
                 inter_f16.device_ptr(),
+                ffn.layer_2.weight.offset_bytes,
                 out_f32.device_ptr(),
-                h as i32,
                 n_tokens as i32,
+                h as i32,
                 h4 as i32,
                 self.stream.raw(),
             )?;
@@ -6718,11 +6722,11 @@ impl Gemma4Bringup {
         let pre_f32 = self.arena.region(scratch_pre_gemm_f32, n_tokens * two_h * 4, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                lconv.linear_start.weight.offset_bytes,
                 hidden,
+                lconv.linear_start.weight.offset_bytes,
                 pre_f32.device_ptr(),
-                two_h as i32,
                 n_tokens as i32,
+                two_h as i32,
                 h as i32,
                 self.stream.raw(),
             )?;
@@ -6884,11 +6888,11 @@ impl Gemma4Bringup {
         let post_f32 = self.arena.region(scratch_post_gemm_f32, n_tokens * h * 4, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                lconv.linear_end.weight.offset_bytes,
                 hidden,
+                lconv.linear_end.weight.offset_bytes,
                 post_f32.device_ptr(),
-                h as i32,
                 n_tokens as i32,
+                h as i32,
                 h as i32,
                 self.stream.raw(),
             )?;
@@ -7244,11 +7248,11 @@ impl Gemma4Bringup {
         let q = self.arena.region(scratch_q_f32, f32_bytes, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                attn.q.weight.offset_bytes,
                 hidden_f16,
+                attn.q.weight.offset_bytes,
                 q.device_ptr(),
-                q_proj_out as i32,
                 n_tokens as i32,
+                q_proj_out as i32,
                 hidden_dim as i32,
                 self.stream.raw(),
             )?;
@@ -7259,11 +7263,11 @@ impl Gemma4Bringup {
         let k = self.arena.region(scratch_k_f32, f32_bytes, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                attn.k.weight.offset_bytes,
                 hidden_f16,
+                attn.k.weight.offset_bytes,
                 k.device_ptr(),
-                q_proj_out as i32,
                 n_tokens as i32,
+                q_proj_out as i32,
                 hidden_dim as i32,
                 self.stream.raw(),
             )?;
@@ -7274,11 +7278,11 @@ impl Gemma4Bringup {
         let v = self.arena.region(scratch_v_f32, f32_bytes, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                attn.v.weight.offset_bytes,
                 hidden_f16,
+                attn.v.weight.offset_bytes,
                 v.device_ptr(),
-                q_proj_out as i32,
                 n_tokens as i32,
+                q_proj_out as i32,
                 hidden_dim as i32,
                 self.stream.raw(),
             )?;
@@ -7503,11 +7507,11 @@ impl Gemma4Bringup {
         let rel_k = self.arena.region(scratch_rel_k_f32, pos_len * proj_out * 4, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                attn.relative_k.offset_bytes,
                 pos_f16.device_ptr(),
+                attn.relative_k.offset_bytes,
                 rel_k.device_ptr(),
-                proj_out as i32,
                 pos_len as i32,
+                proj_out as i32,
                 hidden_dim as i32,
                 self.stream.raw(),
             )?;
@@ -7959,11 +7963,11 @@ impl Gemma4Bringup {
             "g4a_attn_post_f32", n_tokens * hidden_dim * 4, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                attn.post.weight.offset_bytes,
                 attn_out_perm_f16.device_ptr(),
+                attn.post.weight.offset_bytes,
                 post_out_f32.device_ptr(),
-                hidden_dim as i32,
                 n_tokens as i32,
+                hidden_dim as i32,
                 hidden_dim as i32,
                 stream_raw,
             )?;
@@ -8266,11 +8270,11 @@ impl Gemma4Bringup {
             "g4a_out_proj_f32", n_tokens * out_proj_dim * 4, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                audio.output_proj_w.offset_bytes,
                 hidden,
+                audio.output_proj_w.offset_bytes,
                 post_f32.device_ptr(),
-                out_proj_dim as i32,
                 n_tokens as i32,
+                out_proj_dim as i32,
                 hidden_dim as i32,
                 self.stream.raw(),
             )?;
@@ -8343,11 +8347,11 @@ impl Gemma4Bringup {
             "g4a_embed_f32", n_tokens * text_hidden_dim * 4, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                embed_audio_projection_offset,
                 post_f16.device_ptr(),
+                embed_audio_projection_offset,
                 emb_f32.device_ptr(),
-                text_hidden_dim as i32,
                 n_tokens as i32,
+                text_hidden_dim as i32,
                 out_proj_dim as i32,
                 self.stream.raw(),
             )?;
