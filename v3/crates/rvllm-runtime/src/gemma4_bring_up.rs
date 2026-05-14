@@ -524,6 +524,10 @@ pub struct Gemma4FusedModules {
     pub fn_silu_inplace_f16: KernelFn,
     pub causal_conv1d_f16_mod: LoadedModule,
     pub fn_causal_conv1d_f16: KernelFn,
+    pub tanh_softcap_inplace_f32_mod: LoadedModule,
+    pub fn_tanh_softcap_inplace_f32: KernelFn,
+    pub rel_shift_audio_f32_mod: LoadedModule,
+    pub fn_rel_shift_audio_f32: KernelFn,
     pub scale_inplace_f16_mod: LoadedModule,
     pub fn_scale_inplace_f16: KernelFn,
     pub add_bias_f16_mod: LoadedModule,
@@ -8540,6 +8544,12 @@ fn load_gemma4_fused(
     let causal_conv1d_f16_mod = loader.load_ptx("causal_conv1d_f16")?;
     let fn_causal_conv1d_f16 =
         causal_conv1d_f16_mod.get_function("causal_conv1d_f16_kernel")?;
+    let tanh_softcap_inplace_f32_mod = loader.load_ptx("tanh_softcap_inplace_f32")?;
+    let fn_tanh_softcap_inplace_f32 =
+        tanh_softcap_inplace_f32_mod.get_function("tanh_softcap_inplace_f32_kernel")?;
+    let rel_shift_audio_f32_mod = loader.load_ptx("rel_shift_audio_f32")?;
+    let fn_rel_shift_audio_f32 =
+        rel_shift_audio_f32_mod.get_function("rel_shift_audio_f32_kernel")?;
     let scale_inplace_f16_mod = loader.load_ptx("scale_inplace_f16")?;
     let fn_scale_inplace_f16 =
         scale_inplace_f16_mod.get_function("scale_inplace_f16_kernel")?;
@@ -8701,6 +8711,10 @@ fn load_gemma4_fused(
         fn_silu_inplace_f16,
         causal_conv1d_f16_mod,
         fn_causal_conv1d_f16,
+        tanh_softcap_inplace_f32_mod,
+        fn_tanh_softcap_inplace_f32,
+        rel_shift_audio_f32_mod,
+        fn_rel_shift_audio_f32,
         scale_inplace_f16_mod,
         fn_scale_inplace_f16,
         add_bias_f16_mod,
