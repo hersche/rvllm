@@ -184,11 +184,15 @@ impl MelExtractor {
     ///
     /// E4B: 40 ms / token, 750 max → up to 30 s of audio.
     pub fn num_soft_tokens(&self, n_samples: usize) -> usize {
-        let cfg = &self.cfg;
-        let samples_per_token =
-            (cfg.sampling_rate as u64 * cfg.audio_ms_per_token as u64 / 1000) as usize;
-        let raw = (n_samples + samples_per_token - 1) / samples_per_token; // ceil
-        raw.min(cfg.audio_seq_length as usize)
+        // The encoder subsamples num_frames by two Conv2d stride-2 stages
+        // (each ceil(n/2)). So actual soft-tokens = ceil(ceil(T/2)/2).
+        // Use this directly so admission predicts what the encoder will
+        // actually emit; the audio_ms_per_token-based formula was
+        // off by one on boundary lengths.
+        let t = self.num_frames(n_samples);
+        let after_s0 = (t + 1) / 2;
+        let after_s1 = (after_s0 + 1) / 2;
+        after_s1.min(self.cfg.audio_seq_length as usize)
     }
 
     /// Compute `[T, n_mels]` log-mel spectrogram as f32 row-major.
