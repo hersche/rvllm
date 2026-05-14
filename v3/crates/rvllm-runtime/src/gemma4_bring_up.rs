@@ -6921,6 +6921,70 @@ impl Gemma4Bringup {
         Ok(region)
     }
 
+    /// Compute the Gemma 4 audio relative-position encoding table
+    /// on the host and upload it as an f32 buffer of shape
+    /// `[pos_len, hidden_size]`.
+    ///
+    /// Per HF `Gemma4AudioRelPositionalEncoding.forward`:
+    ///
+    ///   num_timescales        = hidden_size / 2
+    ///   log_increment         = ln(10000) / max(num_timescales - 1, 1)
+    ///   inv_timescales[k]     = exp(k * -log_increment)
+    ///   position_ids          = [pos_len-1, pos_len-2, ..., 0]    (length pos_len)
+    ///   scaled_time[i, k]     = position_ids[i] * inv_timescales[k]
+    ///   pos_embed[i, :half]   = sin(scaled_time[i])
+    ///   pos_embed[i, half:]   = cos(scaled_time[i])
+    ///
+    /// `pos_len` equals `attention_context_left` (13 on E4B). The
+    /// table is identical for every request and every layer, so we
+    /// keep it as an f32 arena region (small: 13 × 1024 × 4 ≈ 52 KB)
+    /// and feed it to each layer's `relative_k_proj` GEMM.
+    ///
+    /// Returns the uploaded f32 region.
+    #[cfg(feature = "cuda")]
+    fn audio_pos_embed_upload(
+        &self,
+        hidden_size: usize,
+        pos_len: usize,
+        scratch_name: &'static str,
+    ) -> Result<rvllm_mem::Region<'_>> {
+        use cudarc::driver::sys::*;
+        let num_timescales = hidden_size / 2;
+        let log_increment = (10000.0_f32).ln() / ((num_timescales.max(2) - 1) as f32);
+        let mut inv_timescales = Vec::with_capacity(num_timescales);
+        for k in 0..num_timescales {
+            inv_timescales.push((-(k as f32) * log_increment).exp());
+        }
+        let mut table = vec![0.0_f32; pos_len * hidden_size];
+        for i in 0..pos_len {
+            // position_ids = pos_len-1 .. 0 (reversed) per HF.
+            let pid = (pos_len - 1 - i) as f32;
+            for k in 0..num_timescales {
+                let t = pid * inv_timescales[k];
+                table[i * hidden_size + k] = t.sin();
+                table[i * hidden_size + num_timescales + k] = t.cos();
+            }
+        }
+        let bytes = pos_len * hidden_size * 4;
+        let region = self.arena.region(scratch_name, bytes, 16)?;
+        unsafe {
+            let rc = cuMemcpyHtoDAsync_v2(
+                region.device_ptr(),
+                table.as_ptr() as *const core::ffi::c_void,
+                bytes,
+                self.stream.raw() as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio: HtoD pos_embed failed",
+                    rvllm_core::CudaErrorKind::Other,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(region)
+    }
+
     /// Phase 3b: Gemma 4 vision tower forward.
     ///
     /// Decodes an image, runs the 27-layer SigLIP-style ViT encoder
