@@ -7574,27 +7574,17 @@ impl Gemma4Bringup {
             "g4a_attn_pos_f16", "g4a_attn_rel_k_f32",
         )?;
 
-        let q_padded_f16 = self.arena.region(
-            "g4a_attn_q_padded_f16", q_padded_rows * hidden_dim * 2, 16)?;
-        let k_ctx_f16 = self.arena.region(
-            "g4a_attn_k_ctx_f16", num_blocks * context_size * hidden_dim * 2, 16)?;
+        // Q, K, rel_K stay in f32 through matrix_ac and matrix_bd
+        // (codex round 5 #1 / round 6 #2). V is cast to f16 because the
+        // V-transpose kernel + (scores @ V) GEMM still run in mixed
+        // precision via f16_gemm_f32_batched_strided. Lifting V to f32
+        // is a follow-up.
         let v_ctx_f16 = self.arena.region(
             "g4a_attn_v_ctx_f16", num_blocks * context_size * hidden_dim * 2, 16)?;
-        let rel_k_f16 = self.arena.region(
-            "g4a_attn_rel_k_f16", pos_len * hidden_dim * 2, 16)?;
         unsafe {
-            launch_cast_f32_to_f16(&self.stream, self.fused.fn_cast_f32_to_f16,
-                q_padded_f32.device_ptr(), q_padded_f16.device_ptr(),
-                (q_padded_rows * hidden_dim) as i32)?;
-            launch_cast_f32_to_f16(&self.stream, self.fused.fn_cast_f32_to_f16,
-                k_ctx_f32.device_ptr(), k_ctx_f16.device_ptr(),
-                (num_blocks * context_size * hidden_dim) as i32)?;
             launch_cast_f32_to_f16(&self.stream, self.fused.fn_cast_f32_to_f16,
                 v_ctx_f32.device_ptr(), v_ctx_f16.device_ptr(),
                 (num_blocks * context_size * hidden_dim) as i32)?;
-            launch_cast_f32_to_f16(&self.stream, self.fused.fn_cast_f32_to_f16,
-                rel_k_f32.device_ptr(), rel_k_f16.device_ptr(),
-                (pos_len * hidden_dim) as i32)?;
         }
 
         // scores layout per head h: [num_blocks, chunk, context] f32 contiguous
@@ -7626,15 +7616,16 @@ impl Gemma4Bringup {
         //            ldb = H*D,   stride_b = context*H*D
         //   out:     [chunk, context] contiguous per (h, blk), ldd = context,
         //            stride_d = chunk*context
+        // matrix_ac in f32: Q_f32 [num_blocks, chunk, H, D] (head offset h*D, 4 bytes/elem)
         for h in 0..num_heads {
-            let q_head_off = (h * head_dim * 2) as u64;
-            let k_head_off = (h * head_dim * 2) as u64;
+            let q_head_off = (h * head_dim * 4) as u64;
+            let k_head_off = (h * head_dim * 4) as u64;
             let scores_head_off =
                 (h * num_blocks * chunk_size * context_size * 4) as u64;
             unsafe {
-                self.cublaslt.f16_gemm_f32_batched_strided(
-                    q_padded_f16.device_ptr() + q_head_off,
-                    k_ctx_f16.device_ptr() + k_head_off,
+                self.cublaslt.f32_gemm_f32_batched_strided(
+                    q_padded_f32.device_ptr() + q_head_off,
+                    k_ctx_f32.device_ptr() + k_head_off,
                     scores_f32.device_ptr() + scores_head_off,
                     chunk_size as i32,
                     context_size as i32,
@@ -7685,15 +7676,16 @@ impl Gemma4Bringup {
         //   Q is [num_blocks*chunk, H, D]: per head stride_a = D (between rows it's H*D)
         //   rel_K_f16 is [pos_len, H, D]:  per head stride_b = D, ldb = H*D
         //   out per head: [num_blocks*chunk, pos_len] contiguous
+        // matrix_bd in f32: Q_f32 × rel_K_f32^T per head.
         let q_flat_rows = num_blocks * chunk_size;
         for h in 0..num_heads {
-            let q_head_off = (h * head_dim * 2) as u64;
-            let rel_k_head_off = (h * head_dim * 2) as u64;
+            let q_head_off = (h * head_dim * 4) as u64;
+            let rel_k_head_off = (h * head_dim * 4) as u64;
             let bd_head_off = (h * q_flat_rows * pos_len * 4) as u64;
             unsafe {
-                self.cublaslt.f16_gemm_f32_batched_strided(
-                    q_padded_f16.device_ptr() + q_head_off,
-                    rel_k_f16.device_ptr() + rel_k_head_off,
+                self.cublaslt.f32_gemm_f32_batched_strided(
+                    q_padded_f32.device_ptr() + q_head_off,
+                    rel_k_f32.device_ptr() + rel_k_head_off,
                     matrix_bd_f32.device_ptr() + bd_head_off,
                     q_flat_rows as i32,
                     pos_len as i32,
