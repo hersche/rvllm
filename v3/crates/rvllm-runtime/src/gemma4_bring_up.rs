@@ -789,6 +789,24 @@ impl PrefixProvenance {
     }
 }
 
+/// Spec-decode commit 3: per-engine metadata describing which base
+/// layers' K/V the `Gemma4AssistantForCausalLM` drafter cross-attends
+/// to at draft time. Populated at bring-up from
+/// `Gemma4Arch::assistant_shared_kv_sources()`; `None` on archs without
+/// a `num_kv_shared_layers` tail (31B). Live K/V device pointers are
+/// derived per-request inside `run_generate` from
+/// `kv_cache_ptr + kv_layer_offsets[sliding_source]` etc. — they're
+/// not held here because the cache pointer is per-session state.
+#[derive(Debug, Clone, Copy)]
+pub struct Gemma4AssistantKvSources {
+    /// Latest sliding-attention layer index within the non-shared
+    /// prefix. On E4B-it: 22.
+    pub sliding_source_layer: u32,
+    /// Latest full-attention layer index within the non-shared
+    /// prefix. On E4B-it: 23.
+    pub full_source_layer: u32,
+}
+
 pub struct Gemma4Bringup {
     pub fused: Gemma4FusedModules,
     pub sliding_attention: AttentionBackend,
@@ -803,6 +821,12 @@ pub struct Gemma4Bringup {
     pub stream: Stream,
     pub arena: HbmArena<'static>,
     pub ctx: Arc<CudaContextHandle>,
+    /// Spec-decode commit 3: source-layer indices for the
+    /// `Gemma4AssistantForCausalLM` drafter's cross-attention K/V.
+    /// `None` when the model has no shared-KV tail (e.g. 31B).
+    /// Read by commit 4's drafter forward; no path currently
+    /// consumes it.
+    pub assistant_kv_sources: Option<Gemma4AssistantKvSources>,
     /// Session-level prefix cache. Populated lazily on first
     /// `run_generate` call; kept across subsequent calls so the
     /// KV cache survives the worker's scratch-checkpoint restore.
@@ -1544,6 +1568,25 @@ impl Gemma4Bringup {
         // in our target matrix", which falls back to `WprLut`.
         let fused = load_gemma4_fused(&kernels, compile_target)?;
 
+        // Spec-decode commit 3: pre-compute the source-layer indices
+        // the Gemma 4 assistant-drafter will consume at draft time.
+        // `None` on archs without `num_kv_shared_layers` (e.g. 31B);
+        // populated on E4B-it as `(22, 23)`.
+        let assistant_kv_sources = arch
+            .assistant_shared_kv_sources()
+            .map(|(s, f)| {
+                eprintln!(
+                    "[gemma4] assistant-drafter shared-KV sources: \
+                     sliding=layer {s}, full=layer {f} \
+                     (num_hidden_layers={}, num_kv_shared_layers={:?})",
+                    arch.num_hidden_layers, arch.num_kv_shared_layers
+                );
+                Gemma4AssistantKvSources {
+                    sliding_source_layer: s as u32,
+                    full_source_layer: f as u32,
+                }
+            });
+
         Ok(Self {
             ctx,
             arena,
@@ -1558,6 +1601,7 @@ impl Gemma4Bringup {
             global_attention,
             policy,
             fused,
+            assistant_kv_sources,
             prefix_cache: std::sync::Mutex::new(None),
             // NVFP4 shadow diagnostic state (lazy-init in run_generate).
             nvfp4_shadow: std::sync::Mutex::new(None),

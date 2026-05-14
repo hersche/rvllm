@@ -507,6 +507,51 @@ impl Gemma4Arch {
         None
     }
 
+    /// Spec-decode commit 3: returns the `(sliding_source, full_source)`
+    /// base-model layer indices whose K/V are exposed to the
+    /// `Gemma4AssistantForCausalLM` drafter at draft time.
+    ///
+    /// The HF assistant model's `forward` requires
+    /// `shared_kv_states = {"sliding_attention": (K, V),
+    /// "full_attention": (K, V)}` — and per HF
+    /// `modeling_gemma4.py:1181-1187`, these K/V tensors come from the
+    /// LATEST layer of each `layer_type` within the non-shared prefix
+    /// (i.e. before the `num_kv_shared_layers` tail begins). On E4B-it
+    /// with `num_hidden_layers = 42` and `num_kv_shared_layers = 18`,
+    /// the non-shared prefix is layers `0..23`, and codex confirmed
+    /// the result `(22, 23)` — both layers' K/V satisfy
+    /// `store_full_length_kv = true` in HF's reference.
+    ///
+    /// Returns `None` when:
+    ///   * The arch has no `num_kv_shared_layers` set (e.g. 31B) — no
+    ///     "non-shared prefix" boundary exists, so the assistant
+    ///     architecture isn't applicable.
+    ///   * Either layer type is absent from the non-shared prefix.
+    pub fn assistant_shared_kv_sources(&self) -> Option<(usize, usize)> {
+        let shared = self.num_kv_shared_layers? as usize;
+        if shared == 0 {
+            return None;
+        }
+        let first_shared = self.num_hidden_layers.saturating_sub(shared);
+        let mut last_sliding: Option<usize> = None;
+        let mut last_full: Option<usize> = None;
+        for j in (0..first_shared).rev() {
+            match self.layer_types[j] {
+                Gemma4LayerType::SlidingAttention if last_sliding.is_none() => {
+                    last_sliding = Some(j);
+                }
+                Gemma4LayerType::GlobalAttention if last_full.is_none() => {
+                    last_full = Some(j);
+                }
+                _ => {}
+            }
+            if last_sliding.is_some() && last_full.is_some() {
+                break;
+            }
+        }
+        Some((last_sliding?, last_full?))
+    }
+
     pub fn rotary_dim_for_layer(&self, layer_idx: usize) -> usize {
         match self.layer_types[layer_idx] {
             // Sliding: full rotation of head_dim_sliding (256)
@@ -891,5 +936,92 @@ mod tests {
         };
         // 512 * 0.25 = 128
         assert_eq!(arch.rotary_dim_for_layer(0), 128);
+    }
+
+    #[test]
+    fn assistant_shared_kv_sources_matches_e4b_layout() {
+        // Build the E4B-it layer_types: 24 non-shared + 18 shared,
+        // ending pattern `[S,S,S,S,S,F]` repeated 7×. Codex's HF
+        // citation: last sliding source = layer 22, last full = 23.
+        let pattern = [
+            Gemma4LayerType::SlidingAttention,
+            Gemma4LayerType::SlidingAttention,
+            Gemma4LayerType::SlidingAttention,
+            Gemma4LayerType::SlidingAttention,
+            Gemma4LayerType::SlidingAttention,
+            Gemma4LayerType::GlobalAttention,
+        ];
+        let mut layer_types = Vec::with_capacity(42);
+        for _ in 0..7 {
+            layer_types.extend_from_slice(&pattern);
+        }
+        assert_eq!(layer_types.len(), 42);
+        // Sanity-check the E4B layer-type layout: layers 22 and 23
+        // are the two indices we expect to surface.
+        assert_eq!(layer_types[22], Gemma4LayerType::SlidingAttention);
+        assert_eq!(layer_types[23], Gemma4LayerType::GlobalAttention);
+
+        let arch = Gemma4Arch {
+            num_hidden_layers: 42,
+            hidden_size: 2560,
+            num_attention_heads: 8,
+            head_dim_sliding: 256,
+            head_dim_global: 512,
+            num_kv_heads_sliding: 4,
+            num_kv_heads_global: 1,
+            intermediate_size: 16384,
+            vocab_size: 262144,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 32768,
+            sliding_window_size: 512,
+            rope_theta_sliding: 10000.0,
+            rope_theta_global: 1_000_000.0,
+            partial_rotary_factor_global: 0.25,
+            logit_softcap: 30.0,
+            layer_types,
+            weight_prefix: "model".into(),
+            tie_word_embeddings: true,
+            num_kv_shared_layers: Some(18),
+            vision_config: None,
+            audio_config: None,
+            hidden_size_per_layer_input: Some(256),
+            per_layer_model_projection_scale: 0.0,
+            per_layer_input_scale: 0.0,
+        };
+
+        assert_eq!(arch.assistant_shared_kv_sources(), Some((22, 23)));
+    }
+
+    #[test]
+    fn assistant_shared_kv_sources_returns_none_without_shared_tail() {
+        let arch = Gemma4Arch {
+            num_hidden_layers: 6,
+            hidden_size: 5376,
+            num_attention_heads: 32,
+            head_dim_sliding: 256,
+            head_dim_global: 512,
+            num_kv_heads_sliding: 16,
+            num_kv_heads_global: 4,
+            intermediate_size: 21504,
+            vocab_size: 262144,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 262144,
+            sliding_window_size: 1024,
+            rope_theta_sliding: 10000.0,
+            rope_theta_global: 1_000_000.0,
+            partial_rotary_factor_global: 0.25,
+            logit_softcap: 30.0,
+            layer_types: vec![Gemma4LayerType::GlobalAttention; 6],
+            weight_prefix: "model".into(),
+            tie_word_embeddings: true,
+            // 31B-style: no shared tail.
+            num_kv_shared_layers: None,
+            vision_config: None,
+            audio_config: None,
+            hidden_size_per_layer_input: None,
+            per_layer_model_projection_scale: 0.0,
+            per_layer_input_scale: 0.0,
+        };
+        assert_eq!(arch.assistant_shared_kv_sources(), None);
     }
 }
