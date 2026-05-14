@@ -91,6 +91,21 @@ pub struct Qwen36OutsideKernels {
     /// cost in `apply_layer_full_attn` (Phase 4b prep).
     pub fused_rope_qwen_partial_f16kv_mod: LoadedModule,
     pub fn_fused_rope_qwen_partial_f16kv: KernelFn,
+    /// NVFP4 commit 2: Qwen-specific NVFP4 RoPE + packed-4-bit KV
+    /// write + FP8-E4M3 Q kernel. Same PTX the Qwen 3.5 27B path
+    /// uses (parameterised on `num_heads`, `num_kv_heads`,
+    /// `head_dim`, `rotary_dim`; partial NeoX pairing inside the
+    /// first `rotary_dim` elements). Loaded only when
+    /// `RVLLM_NVFP4_KV=1`. Dispatch lands in commit 3.
+    pub fused_rope_qwen_partial_nvfp4kv_mod: Option<LoadedModule>,
+    pub fn_fused_rope_qwen_partial_nvfp4kv: Option<KernelFn>,
+    /// NVFP4 commit 2: paged FA-2 decode kernel that reads packed
+    /// 4-bit K/V + per-(slot, kv_head) E4M3 microscale and writes
+    /// f16 output. Same PTX the Qwen 3.5 27B path uses; one CTA
+    /// per (seq, query_head) — the per-head dispatch has no GQA
+    /// cap, so Qwen 3.6's GQA=8 (16 q-heads / 2 kv-heads) is fine.
+    pub flash_attention_nvfp4kv_mod: Option<LoadedModule>,
+    pub fn_flash_attention_2_decode_nvfp4kv: Option<KernelFn>,
     /// Splits q_proj's interleaved `[num_heads, 2*head_dim]` output
     /// into separate q `[num_heads, head_dim]` + gate
     /// `[num_heads, head_dim]` regions. Replaces a host DtoH +
@@ -594,6 +609,31 @@ impl Qwen36Bringup {
             kernels.load_ptx("fused_rope_qwen_partial_f16kv")?;
         let fn_fused_rope_qwen_partial_f16kv = fused_rope_qwen_partial_f16kv_mod
             .get_function("fused_rope_qwen_partial_f16kv_kernel")?;
+        // NVFP4 commit 2: load the Qwen NVFP4 RoPE + paged decode
+        // kernels only when the same `RVLLM_NVFP4_KV=1` gate that
+        // drives the packed-K/V allocator is on, so the resident set
+        // matches the cache layout. The KV-allocator branch lives
+        // later in `load()`; reading the env here keeps the source
+        // of truth single (the env var itself), no plumbing needed.
+        let nvfp4_kv_on = std::env::var("RVLLM_NVFP4_KV")
+            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+            .unwrap_or(false);
+        let (fused_rope_qwen_partial_nvfp4kv_mod,
+             fn_fused_rope_qwen_partial_nvfp4kv) = if nvfp4_kv_on {
+            let m = kernels.load_ptx("fused_rope_qwen_partial_nvfp4kv")?;
+            let f = m.get_function("fused_rope_qwen_partial_nvfp4kv_kernel")?;
+            (Some(m), Some(f))
+        } else {
+            (None, None)
+        };
+        let (flash_attention_nvfp4kv_mod,
+             fn_flash_attention_2_decode_nvfp4kv) = if nvfp4_kv_on {
+            let m = kernels.load_ptx("flash_attention_nvfp4kv")?;
+            let f = m.get_function("flash_attention_2_decode_nvfp4kv_kernel")?;
+            (Some(m), Some(f))
+        } else {
+            (None, None)
+        };
         let split_q_gate_f16_mod = kernels.load_ptx("split_q_gate_f16")?;
         let fn_split_q_gate_f16 = split_q_gate_f16_mod
             .get_function("split_q_gate_f16_kernel")?;
@@ -788,6 +828,10 @@ impl Qwen36Bringup {
             fn_fused_rope_partial_f16kv,
             fused_rope_qwen_partial_f16kv_mod,
             fn_fused_rope_qwen_partial_f16kv,
+            fused_rope_qwen_partial_nvfp4kv_mod,
+            fn_fused_rope_qwen_partial_nvfp4kv,
+            flash_attention_nvfp4kv_mod,
+            fn_flash_attention_2_decode_nvfp4kv,
             split_q_gate_f16_mod,
             fn_split_q_gate_f16,
             conv_state_advance_f16_mod,
