@@ -7772,6 +7772,94 @@ unsafe fn launch_cast_f32_to_f16(
     Ok(())
 }
 
+/// Launcher for `silu_inplace_f16_kernel` (kernels/silu_inplace_f16.cu).
+/// One thread per element; computes x = x * sigmoid(x) in-place.
+#[cfg(feature = "cuda")]
+unsafe fn launch_silu_inplace_f16(
+    stream: &Stream,
+    kernel: rvllm_kernels::KernelFn,
+    x: u64,
+    n: i32,
+) -> Result<()> {
+    use cudarc::driver::sys::*;
+    if n <= 0 {
+        return Ok(());
+    }
+    let block: u32 = 256;
+    let grid: u32 = ((n as i64 + block as i64 - 1) / block as i64) as u32;
+    let mut x = x;
+    let mut n_ = n;
+    let args = [
+        (&mut x)  as *mut u64 as *mut core::ffi::c_void,
+        (&mut n_) as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let rc = cuLaunchKernel(
+        kernel.raw() as CUfunction,
+        grid, 1, 1,
+        block, 1, 1,
+        0,
+        stream.raw() as CUstream,
+        args.as_ptr() as *mut *mut core::ffi::c_void,
+        core::ptr::null_mut(),
+    );
+    if rc != CUresult::CUDA_SUCCESS {
+        return Err(rvllm_core::RvllmError::cuda(
+            "silu_inplace_f16 launch failed",
+            rvllm_core::CudaErrorKind::LaunchFailed,
+            rvllm_core::CudaCtx::setup(),
+        ));
+    }
+    Ok(())
+}
+
+/// Launcher for `glu_split_sigmoid_f16_kernel`
+/// (kernels/glu_split_sigmoid_f16.cu). Consumes [N, 2*H_out] f16
+/// and writes [N, H_out] f16: `dst[n, h] = src[n, h] * sigmoid(src[n, H_out + h])`.
+#[cfg(feature = "cuda")]
+unsafe fn launch_glu_split_sigmoid_f16(
+    stream: &Stream,
+    kernel: rvllm_kernels::KernelFn,
+    src: u64,
+    dst: u64,
+    n: i32,
+    h_out: i32,
+) -> Result<()> {
+    use cudarc::driver::sys::*;
+    let total = (n as i64) * (h_out as i64);
+    if total <= 0 {
+        return Ok(());
+    }
+    let block: u32 = 256;
+    let grid: u32 = ((total + block as i64 - 1) / block as i64) as u32;
+    let mut src = src;
+    let mut dst = dst;
+    let mut n_ = n;
+    let mut h_ = h_out;
+    let args = [
+        (&mut src) as *mut u64 as *mut core::ffi::c_void,
+        (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+        (&mut n_)  as *mut i32 as *mut core::ffi::c_void,
+        (&mut h_)  as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let rc = cuLaunchKernel(
+        kernel.raw() as CUfunction,
+        grid, 1, 1,
+        block, 1, 1,
+        0,
+        stream.raw() as CUstream,
+        args.as_ptr() as *mut *mut core::ffi::c_void,
+        core::ptr::null_mut(),
+    );
+    if rc != CUresult::CUDA_SUCCESS {
+        return Err(rvllm_core::RvllmError::cuda(
+            "glu_split_sigmoid_f16 launch failed",
+            rvllm_core::CudaErrorKind::LaunchFailed,
+            rvllm_core::CudaCtx::setup(),
+        ));
+    }
+    Ok(())
+}
+
 fn load_gemma4_fused(
     loader: &KernelLoader,
     target: Option<rvllm_core::CompileTarget>,
