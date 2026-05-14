@@ -6046,6 +6046,282 @@ impl Gemma4Bringup {
         })
     }
 
+    /// B6b: Gemma 4 E4B audio subsample stage forward.
+    ///
+    /// Runs the host-side mel-spectrogram extractor on the 16 kHz
+    /// mono f32 samples, uploads the result as f16, then walks the
+    /// two-stage Conv2d subsampler (im2col + cuBLASLt GEMM + cast +
+    /// fused LayerNorm+ReLU per stage), the channel-last transpose,
+    /// and the input_proj_linear matmul. Output is a device-resident
+    /// f16 buffer of shape `[num_soft_tokens_subsampled, audio_hidden=1024]`.
+    ///
+    /// **This is the subsample stage only.** B6c..d add the 12
+    /// encoder blocks (FFN + chunked attention + LConv1D + FFN +
+    /// norms) and the output_proj. Callers that need the full
+    /// pre-embed_audio output should not consume this method's
+    /// result directly — it isn't shape-compatible with
+    /// `model.embed_audio.embedding_projection`.
+    ///
+    /// Returns the device pointer + dims + intended soft-token
+    /// count. The arena buffers it allocates are auto-restored at
+    /// request end via the existing checkpoint mechanism.
+    #[cfg(feature = "cuda")]
+    pub fn forward_gemma_audio_subsample(
+        &self,
+        samples_16k_mono: &[f32],
+    ) -> Result<crate::gemma4_audio_forward::AudioForwardOutput> {
+        use cudarc::driver::sys::*;
+
+        let audio = self.model.audio.as_ref().ok_or_else(|| {
+            rvllm_core::RvllmError::cuda(
+                "audio: model.audio_tower not loaded",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+        let acfg = self.arch.audio_config.as_ref().ok_or_else(|| {
+            rvllm_core::RvllmError::cuda(
+                "audio: arch.audio_config not set",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+
+        // ── Host: compute mel spectrogram ────────────────────────────
+        // Uses the same MelExtractor config the handler used to
+        // predict num_soft_tokens, so the encoder cadence stays
+        // consistent across admission + runtime.
+        let mel_cfg = crate::audio_preprocess::MelConfig::gemma4_e4b();
+        let mel_extr = crate::audio_preprocess::MelExtractor::new(mel_cfg);
+        let mel = mel_extr.compute_mel(samples_16k_mono);
+        let t_in = mel_extr.num_frames(samples_16k_mono.len());
+        let n_mels = mel_cfg.n_mels;
+        if t_in == 0 {
+            return Err(rvllm_core::RvllmError::cuda(
+                "audio: mel produced 0 frames (input shorter than frame_length)",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+
+        // Conv2d output dims for k=3 s=2 p=1: floor((in - 1) / 2) + 1.
+        let h0 = (t_in + 1) / 2;
+        let w0 = (n_mels + 1) / 2; // 64
+        let h1 = (h0 + 1) / 2;
+        let w1 = (w0 + 1) / 2;     // 32
+        let c0 = acfg.subsampling_conv_channels[0]; // 128
+        let c1 = acfg.subsampling_conv_channels[1]; // 32
+        let hidden = acfg.hidden_size;              // 1024
+        let proj_in_dim = (c0 / 4) * c1;            // (128/4)*32 = 1024
+
+        // ── Upload mel as f16 to device ──────────────────────────────
+        // Allocate a scratch region for the f16-converted mel and
+        // copy from host. Lives until the request's arena checkpoint
+        // is restored.
+        let mel_bytes_f16 = t_in * n_mels * 2;
+        let mel_region = self.arena.region("g4a_mel_f16", mel_bytes_f16, 16)?;
+        let mel_f16_host: Vec<u16> = mel
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_bits())
+            .collect();
+        let mel_f16_bytes: &[u8] = bytemuck_cast_u16(&mel_f16_host);
+        unsafe { mel_region.copy_from_host(mel_f16_bytes)? };
+        let mel_dev = mel_region.device_ptr();
+
+        // ── Stage 0 Conv2d ───────────────────────────────────────────
+        // im2col: input [1, T, 128]  →  [1*9, h0 * w0]
+        let s0_spatial = h0 * w0;
+        let im2col0 = self
+            .arena
+            .region("g4a_s0_im2col", 9 * s0_spatial * 2, 16)?;
+        unsafe { launch_im2col_3x3_s2p1_f16(
+            &self.stream,
+            self.fused.fn_im2col_3x3_s2p1_f16,
+            mel_dev,
+            im2col0.device_ptr(),
+            1,
+            t_in as i32,
+            n_mels as i32,
+            h0 as i32,
+            w0 as i32,
+        ) }?;
+
+        // GEMM: weight[c0, 9] × im2col[9, s0_spatial] → conv0[c0, s0_spatial] f32
+        let conv0_f32 = self
+            .arena
+            .region("g4a_s0_conv_f32", c0 * s0_spatial * 4, 16)?;
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                audio.subsample.layer0_conv.offset_bytes,
+                im2col0.device_ptr(),
+                conv0_f32.device_ptr(),
+                c0 as i32,
+                s0_spatial as i32,
+                9,
+                self.stream.raw(),
+            )?;
+        }
+        // Cast to f16 in-place.
+        let conv0_f16 = self
+            .arena
+            .region("g4a_s0_conv_f16", c0 * s0_spatial * 2, 16)?;
+        unsafe { launch_cast_f32_to_f16(
+            &self.stream,
+            self.fused.fn_cast_f32_to_f16,
+            conv0_f32.device_ptr(),
+            conv0_f16.device_ptr(),
+            (c0 * s0_spatial) as i32,
+        ) }?;
+        // Fused LayerNorm-over-C + ReLU.
+        unsafe { launch_layernorm_relu_chw_f16(
+            &self.stream,
+            self.fused.fn_layernorm_relu_chw_f16,
+            conv0_f16.device_ptr(),
+            audio.subsample.layer0_norm.offset_bytes,
+            acfg.rms_norm_eps,
+            c0 as i32,
+            h0 as i32,
+            w0 as i32,
+        ) }?;
+
+        // ── Stage 1 Conv2d ───────────────────────────────────────────
+        // im2col: input [c0=128, h0, w0]  →  [c0*9=1152, h1 * w1]
+        let s1_spatial = h1 * w1;
+        let im2col1 = self
+            .arena
+            .region("g4a_s1_im2col", c0 * 9 * s1_spatial * 2, 16)?;
+        unsafe { launch_im2col_3x3_s2p1_f16(
+            &self.stream,
+            self.fused.fn_im2col_3x3_s2p1_f16,
+            conv0_f16.device_ptr(),
+            im2col1.device_ptr(),
+            c0 as i32,
+            h0 as i32,
+            w0 as i32,
+            h1 as i32,
+            w1 as i32,
+        ) }?;
+        let conv1_f32 = self
+            .arena
+            .region("g4a_s1_conv_f32", c1 * s1_spatial * 4, 16)?;
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                audio.subsample.layer1_conv.offset_bytes,
+                im2col1.device_ptr(),
+                conv1_f32.device_ptr(),
+                c1 as i32,
+                s1_spatial as i32,
+                (c0 * 9) as i32,
+                self.stream.raw(),
+            )?;
+        }
+        let conv1_f16 = self
+            .arena
+            .region("g4a_s1_conv_f16", c1 * s1_spatial * 2, 16)?;
+        unsafe { launch_cast_f32_to_f16(
+            &self.stream,
+            self.fused.fn_cast_f32_to_f16,
+            conv1_f32.device_ptr(),
+            conv1_f16.device_ptr(),
+            (c1 * s1_spatial) as i32,
+        ) }?;
+        unsafe { launch_layernorm_relu_chw_f16(
+            &self.stream,
+            self.fused.fn_layernorm_relu_chw_f16,
+            conv1_f16.device_ptr(),
+            audio.subsample.layer1_norm.offset_bytes,
+            acfg.rms_norm_eps,
+            c1 as i32,
+            h1 as i32,
+            w1 as i32,
+        ) }?;
+
+        // ── Transpose [C=32, h1, w1] → [h1, w1, 32] → flatten [h1, w1*32 = 1024]
+        let permuted = self
+            .arena
+            .region("g4a_s1_hwc", c1 * s1_spatial * 2, 16)?;
+        unsafe { launch_transpose_chw_to_hwc_f16(
+            &self.stream,
+            self.fused.fn_transpose_chw_to_hwc_f16,
+            conv1_f16.device_ptr(),
+            permuted.device_ptr(),
+            c1 as i32,
+            h1 as i32,
+            w1 as i32,
+        ) }?;
+        // After this point the layout is [h1, w1 * c1] contiguous,
+        // which matches HF's permute(0,2,3,1).reshape(B, h1, w1*c1)
+        // for B=1.
+
+        // ── input_proj_linear: [h1, 1024] @ weight[1024, 1024].T  ──
+        // Weight on disk is [hidden=1024, proj_in_dim=1024]. cuBLASLt
+        // f16_gemm_f32 computes D[m, n] = A^T @ B with A column-major
+        // [k, m], B column-major [k, n]. Set:
+        //   A = weight (col-major [k=1024, m=hidden=1024])
+        //   B = permuted (col-major [k=1024, n=h1])
+        //   D = output  (col-major [m=hidden, n=h1])  → row-major [h1, hidden]
+        let out_f32 = self
+            .arena
+            .region("g4a_proj_f32", h1 * hidden * 4, 16)?;
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                audio.subsample.input_proj.offset_bytes,
+                permuted.device_ptr(),
+                out_f32.device_ptr(),
+                hidden as i32,
+                h1 as i32,
+                proj_in_dim as i32,
+                self.stream.raw(),
+            )?;
+        }
+        let out_f16 = self
+            .arena
+            .region("g4a_proj_f16", h1 * hidden * 2, 16)?;
+        unsafe { launch_cast_f32_to_f16(
+            &self.stream,
+            self.fused.fn_cast_f32_to_f16,
+            out_f32.device_ptr(),
+            out_f16.device_ptr(),
+            (h1 * hidden) as i32,
+        ) }?;
+
+        // Sync so any error in this chain surfaces before the caller
+        // tries to consume the buffer; cost is one D2D fence per
+        // audio item which is negligible vs. the 12 encoder blocks
+        // that will follow in B6c..d.
+        unsafe { cuStreamSynchronize(self.stream.raw() as CUstream) };
+
+        // Optional debug dump for HF parity (gated by env). Writes
+        // raw f16 bytes for the subsample-stage output. Picked up
+        // by v3/tools/gemma4_e4b_audio_subsample_hf_dump.py +
+        // a row-cosine cmp script in a follow-up commit.
+        #[cfg(feature = "cuda")]
+        if let Ok(dir) = std::env::var("RVLLM_E4B_AUDIO_SUBSAMPLE_DUMP_DIR") {
+            let nbytes = (h1 * hidden) * 2;
+            let mut buf = vec![0u8; nbytes];
+            unsafe {
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut _,
+                    out_f16.device_ptr(),
+                    nbytes,
+                );
+            }
+            std::fs::create_dir_all(&dir).ok();
+            let path = std::path::Path::new(&dir).join("audio_subsample_out.bin");
+            let _ = std::fs::write(&path, &buf);
+            eprintln!(
+                "[audio-dump] subsample out [{} x {}] -> {}",
+                h1, hidden, path.display()
+            );
+        }
+
+        Ok(crate::gemma4_audio_forward::AudioForwardOutput {
+            device_ptr: out_f16.device_ptr(),
+            num_soft_tokens: h1,
+            output_proj_dims: hidden,
+        })
+    }
+
     /// Phase 3b: Gemma 4 vision tower forward.
     ///
     /// Decodes an image, runs the 27-layer SigLIP-style ViT encoder
@@ -7281,6 +7557,213 @@ impl Gemma4Bringup {
 
 fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+}
+
+fn bytemuck_cast_u16(v: &[u16]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) }
+}
+
+// ─── B6b audio kernel launchers ─────────────────────────────────────
+//
+// One thin wrapper per PTX entry-point. Each takes the kernel function
+// handle resolved at bring-up + the device pointers + the dim ints the
+// kernel reads. Launch params are chosen to match the kernel's grid /
+// block contract documented in the .cu source.
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_im2col_3x3_s2p1_f16(
+    stream: &Stream,
+    kernel: rvllm_kernels::KernelFn,
+    input: u64,
+    output: u64,
+    in_ch: i32,
+    h_in: i32,
+    w_in: i32,
+    h_out: i32,
+    w_out: i32,
+) -> Result<()> {
+    use cudarc::driver::sys::*;
+    let spatial = (h_out as i64) * (w_out as i64);
+    if spatial <= 0 {
+        return Ok(());
+    }
+    let block_x: u32 = 256;
+    let grid_x: u32 = ((spatial as u64 + block_x as u64 - 1) / block_x as u64) as u32;
+    let grid_y: u32 = (in_ch as u32) * 9;
+    let mut input = input;
+    let mut output = output;
+    let mut in_ch = in_ch;
+    let mut h_in = h_in;
+    let mut w_in = w_in;
+    let mut h_out = h_out;
+    let mut w_out = w_out;
+    let args = [
+        (&mut input)  as *mut u64 as *mut core::ffi::c_void,
+        (&mut output) as *mut u64 as *mut core::ffi::c_void,
+        (&mut in_ch)  as *mut i32 as *mut core::ffi::c_void,
+        (&mut h_in)   as *mut i32 as *mut core::ffi::c_void,
+        (&mut w_in)   as *mut i32 as *mut core::ffi::c_void,
+        (&mut h_out)  as *mut i32 as *mut core::ffi::c_void,
+        (&mut w_out)  as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let rc = cuLaunchKernel(
+        kernel.raw() as CUfunction,
+        grid_x, grid_y, 1,
+        block_x, 1, 1,
+        0,
+        stream.raw() as CUstream,
+        args.as_ptr() as *mut *mut core::ffi::c_void,
+        core::ptr::null_mut(),
+    );
+    if rc != CUresult::CUDA_SUCCESS {
+        return Err(rvllm_core::RvllmError::cuda(
+            "im2col_3x3_s2p1_f16 launch failed",
+            rvllm_core::CudaErrorKind::LaunchFailed,
+            rvllm_core::CudaCtx::setup(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+unsafe fn launch_layernorm_relu_chw_f16(
+    stream: &Stream,
+    kernel: rvllm_kernels::KernelFn,
+    x: u64,
+    gamma: u64,
+    eps: f32,
+    c: i32,
+    h: i32,
+    w: i32,
+) -> Result<()> {
+    use cudarc::driver::sys::*;
+    let pix = (h as i64) * (w as i64);
+    if pix <= 0 || c <= 0 {
+        return Ok(());
+    }
+    let mut x = x;
+    let mut gamma = gamma;
+    let mut eps = eps;
+    let mut c_ = c;
+    let mut h_ = h;
+    let mut w_ = w;
+    let args = [
+        (&mut x)     as *mut u64 as *mut core::ffi::c_void,
+        (&mut gamma) as *mut u64 as *mut core::ffi::c_void,
+        (&mut eps)   as *mut f32 as *mut core::ffi::c_void,
+        (&mut c_)    as *mut i32 as *mut core::ffi::c_void,
+        (&mut h_)    as *mut i32 as *mut core::ffi::c_void,
+        (&mut w_)    as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let rc = cuLaunchKernel(
+        kernel.raw() as CUfunction,
+        pix as u32, 1, 1,
+        c as u32, 1, 1,
+        0,
+        stream.raw() as CUstream,
+        args.as_ptr() as *mut *mut core::ffi::c_void,
+        core::ptr::null_mut(),
+    );
+    if rc != CUresult::CUDA_SUCCESS {
+        return Err(rvllm_core::RvllmError::cuda(
+            "layernorm_relu_chw_f16 launch failed",
+            rvllm_core::CudaErrorKind::LaunchFailed,
+            rvllm_core::CudaCtx::setup(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+unsafe fn launch_transpose_chw_to_hwc_f16(
+    stream: &Stream,
+    kernel: rvllm_kernels::KernelFn,
+    src: u64,
+    dst: u64,
+    c: i32,
+    h: i32,
+    w: i32,
+) -> Result<()> {
+    use cudarc::driver::sys::*;
+    let total = (c as i64) * (h as i64) * (w as i64);
+    if total <= 0 {
+        return Ok(());
+    }
+    let block: u32 = 256;
+    let grid: u32 = ((total as u64 + block as u64 - 1) / block as u64) as u32;
+    let mut src = src;
+    let mut dst = dst;
+    let mut c_ = c;
+    let mut h_ = h;
+    let mut w_ = w;
+    let args = [
+        (&mut src) as *mut u64 as *mut core::ffi::c_void,
+        (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+        (&mut c_)  as *mut i32 as *mut core::ffi::c_void,
+        (&mut h_)  as *mut i32 as *mut core::ffi::c_void,
+        (&mut w_)  as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let rc = cuLaunchKernel(
+        kernel.raw() as CUfunction,
+        grid, 1, 1,
+        block, 1, 1,
+        0,
+        stream.raw() as CUstream,
+        args.as_ptr() as *mut *mut core::ffi::c_void,
+        core::ptr::null_mut(),
+    );
+    if rc != CUresult::CUDA_SUCCESS {
+        return Err(rvllm_core::RvllmError::cuda(
+            "transpose_chw_to_hwc_f16 launch failed",
+            rvllm_core::CudaErrorKind::LaunchFailed,
+            rvllm_core::CudaCtx::setup(),
+        ));
+    }
+    Ok(())
+}
+
+/// Launcher for the existing `cast_f32_to_f16_kernel` (kernels/cast_fp.cu).
+/// One thread per element.
+#[cfg(feature = "cuda")]
+unsafe fn launch_cast_f32_to_f16(
+    stream: &Stream,
+    kernel: rvllm_kernels::KernelFn,
+    src_f32: u64,
+    dst_f16: u64,
+    n: i32,
+) -> Result<()> {
+    use cudarc::driver::sys::*;
+    if n <= 0 {
+        return Ok(());
+    }
+    let block: u32 = 256;
+    let grid: u32 = ((n as i64 + block as i64 - 1) / block as i64) as u32;
+    let mut src = src_f32;
+    let mut dst = dst_f16;
+    let mut n_ = n;
+    let args = [
+        (&mut src) as *mut u64 as *mut core::ffi::c_void,
+        (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+        (&mut n_)  as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let rc = cuLaunchKernel(
+        kernel.raw() as CUfunction,
+        grid, 1, 1,
+        block, 1, 1,
+        0,
+        stream.raw() as CUstream,
+        args.as_ptr() as *mut *mut core::ffi::c_void,
+        core::ptr::null_mut(),
+    );
+    if rc != CUresult::CUDA_SUCCESS {
+        return Err(rvllm_core::RvllmError::cuda(
+            "cast_f32_to_f16 launch failed",
+            rvllm_core::CudaErrorKind::LaunchFailed,
+            rvllm_core::CudaCtx::setup(),
+        ));
+    }
+    Ok(())
 }
 
 fn load_gemma4_fused(
