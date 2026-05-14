@@ -651,6 +651,11 @@
       "path": "rmsnorm_inplace_f16.ptx",
       "sha256": "1aef2417c71a593607976b4e251a557e28c7f1575b42e2c95ce9f23708b42a9c"
     },
+    "rmsnorm_no_scale_inplace_f16": {
+      "bytes": 7629,
+      "path": "rmsnorm_no_scale_inplace_f16.ptx",
+      "sha256": "af13ade552ba09d0bba6ec29a4b1e218708444c8b19c42285deb62d4966c4e84"
+    },
     "rope_split_half_bf16": {
       "bytes": 2098,
       "path": "rope_split_half_bf16.ptx",
@@ -922,5 +927,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "f99711c"
+  "revision": "59e167e"
 }
