@@ -7112,6 +7112,143 @@ impl Gemma4Bringup {
         Ok((q, k, v))
     }
 
+    /// Pad Q on the right with zeros to a multiple of `chunk_size`.
+    /// Input Q is f32 `[n_tokens, hidden_dim]`; output is f32
+    /// `[num_blocks * chunk_size, hidden_dim]` where
+    /// `num_blocks = ceil(n_tokens / chunk_size)`.
+    #[cfg(feature = "cuda")]
+    fn audio_attention_pad_q_f32(
+        &self,
+        q: u64,
+        n_tokens: usize,
+        hidden_dim: usize,
+        chunk_size: usize,
+        scratch: &'static str,
+    ) -> Result<(rvllm_mem::Region<'_>, usize)> {
+        use cudarc::driver::sys::*;
+        let num_blocks = (n_tokens + chunk_size - 1) / chunk_size;
+        let padded_rows = num_blocks * chunk_size;
+        let bytes = padded_rows * hidden_dim * 4;
+        let region = self.arena.region(scratch, bytes, 16)?;
+        unsafe {
+            // Copy the live rows first.
+            cuMemcpyDtoDAsync_v2(
+                region.device_ptr(),
+                q,
+                (n_tokens * hidden_dim * 4) as usize,
+                self.stream.raw() as CUstream,
+            );
+            // Zero-pad the trailing rows.
+            let tail_rows = padded_rows - n_tokens;
+            if tail_rows > 0 {
+                cuMemsetD8Async(
+                    region.device_ptr() + (n_tokens * hidden_dim * 4) as u64,
+                    0,
+                    tail_rows * hidden_dim * 4,
+                    self.stream.raw() as CUstream,
+                );
+            }
+        }
+        Ok((region, num_blocks))
+    }
+
+    /// Pad K (or V) with `past_horizon` zero rows on the left + tail
+    /// zeros so the total row count covers every block's context
+    /// window. Then run `audio_chunk_extract_context_f32` to produce
+    /// the `[num_blocks, context_size, num_heads, head_dim]` f32
+    /// context tensor consumed by the matrix_ac batched-strided GEMM.
+    ///
+    /// The right-pad must be at least `chunk_size - 1 + future_horizon`
+    /// rows so the last block's context window is fully in-range
+    /// without an OOB guard in the kernel. We over-allocate slightly
+    /// — cheap relative to the encoder block costs and lets us share
+    /// one pad buffer across all 12 layers via static naming.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn audio_attention_extract_context_f32(
+        &self,
+        kv: u64,
+        n_tokens: usize,
+        hidden_dim: usize,
+        num_heads: usize,
+        head_dim: usize,
+        num_blocks: usize,
+        chunk_size: usize,
+        past_horizon: usize,
+        context_size: usize,
+        scratch_pad: &'static str,
+        scratch_ctx: &'static str,
+    ) -> Result<rvllm_mem::Region<'_>> {
+        use cudarc::driver::sys::*;
+        // Total padded row count: `past_horizon` zeros on the left,
+        // `n_tokens` real rows, then enough zeros so block
+        // (num_blocks-1)'s `context_size`-wide window fits.
+        let last_block_start = (num_blocks - 1) * chunk_size;
+        let max_src = last_block_start + context_size;
+        let n_padded = max_src.max(past_horizon + n_tokens);
+        let pad_bytes = n_padded * hidden_dim * 4;
+        let pad = self.arena.region(scratch_pad, pad_bytes, 16)?;
+        unsafe {
+            // Zero the entire padded buffer first (covers both
+            // left and right pad).
+            cuMemsetD8Async(
+                pad.device_ptr(),
+                0,
+                pad_bytes,
+                self.stream.raw() as CUstream,
+            );
+            // Copy live rows into the [past_horizon..past_horizon+n_tokens) slice.
+            cuMemcpyDtoDAsync_v2(
+                pad.device_ptr() + (past_horizon * hidden_dim * 4) as u64,
+                kv,
+                (n_tokens * hidden_dim * 4) as usize,
+                self.stream.raw() as CUstream,
+            );
+        }
+        // Allocate context output: [num_blocks, context, H, D] f32.
+        let ctx_bytes = num_blocks * context_size * hidden_dim * 4;
+        let ctx = self.arena.region(scratch_ctx, ctx_bytes, 16)?;
+        unsafe {
+            let mut src = pad.device_ptr();
+            let mut dst = ctx.device_ptr();
+            let mut nb = num_blocks as i32;
+            let mut cs = context_size as i32;
+            let mut nh = num_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut ck = chunk_size as i32;
+            let mut np = n_padded as i32;
+            let args = [
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nb)  as *mut i32 as *mut core::ffi::c_void,
+                (&mut cs)  as *mut i32 as *mut core::ffi::c_void,
+                (&mut nh)  as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd)  as *mut i32 as *mut core::ffi::c_void,
+                (&mut ck)  as *mut i32 as *mut core::ffi::c_void,
+                (&mut np)  as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let total = (num_blocks * context_size * num_heads * head_dim) as i64;
+            let block: u32 = 256;
+            let grid: u32 = ((total + block as i64 - 1) / block as i64) as u32;
+            let rc = cuLaunchKernel(
+                self.fused.fn_audio_chunk_extract_context_f32.raw() as CUfunction,
+                grid, 1, 1,
+                block, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio attn: chunk_extract_context_f32 launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(ctx)
+    }
+
     /// Phase 3b: Gemma 4 vision tower forward.
     ///
     /// Decodes an image, runs the 27-layer SigLIP-style ViT encoder
