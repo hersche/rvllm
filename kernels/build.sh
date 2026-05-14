@@ -210,6 +210,7 @@ for arch in $ARCHS; do
             transpose_chw_to_hwc_f16|\
             glu_split_sigmoid_f16|silu_inplace_f16|\
             tanh_softcap_inplace_f32|rel_shift_audio_f32|\
+            scale_per_dim_f32|\
             extract_head_bf16|scatter_heads_bf16|\
             softmax_row_f32_to_bf16|gelu_tanh_mul_bf16|\
             scale_inplace_f32|transpose_heads_v_bf16|\
