@@ -64,7 +64,8 @@ Active profile lives at `/home/r00t/.rvllm/active-profile.env`
 
 - `mobile-31b-rvllm.env`         — Gemma 4 31B fp8-block (default)
 - `mobile-31b-rvllm-nvfp4.env`   — Gemma 4 31B NVFP4 KV
-- `mobile-qwen-rvllm.env`        — Qwen 3.6 35B-A3B fp8 + vision
+- `mobile-qwen-rvllm.env`        — Qwen 3.6 35B-A3B fp8 + vision (F16 KV)
+- `mobile-qwen-rvllm-nvfp4.env`  — Qwen 3.6 35B-A3B fp8 + vision + NVFP4 KV (validated 2026-05-15: text + ball.png coherent on hardware; 3.5× KV mem reduction)
 - `mobile-qwen35-rvllm.env`      — Qwen 3.5 27B dense (F16 KV) + Qwen3-VL vision
 - `mobile-qwen35-rvllm-nvfp4.env` — Qwen 3.5 27B dense NVFP4 KV + Qwen3-VL vision (validated 2026-05-14: text + ball.png coherent on hardware)
 - `mobile-e4b-rvllm.env`         — Gemma 4 E4B-it bf16->f16 + native audio
@@ -103,7 +104,7 @@ sudo systemctl restart rvllm-serve
 | Gemma 4 E4B-it | `gemma4_bring_up.rs` | wired (`mobile-e4b-rvllm-nvfp4.env`). |
 | Mistral 3.5 128B | `mistral35_bring_up.rs` | NVFP4 weights + NVFP4 KV (active production profile). |
 | Qwen 3.5 27B dense | `qwen35_bring_up.rs` | **wired 2026-05-14** (`mobile-qwen35-rvllm-nvfp4.env`). Five-step landing: KV allocator + dtype field, Qwen-specific `fused_rope_qwen_partial_nvfp4kv` kernel (NeoX partial RoPE with rotary_dim=64, amax6 V policy, no Hadamard), kernel load + Q-side scratch, decode dispatch (per-head FA-2 NVFP4, no GQA cap), prefill via per-token decode fallback. Validated on hardware: text + Qwen3-VL vision. F16 path bit-identical when `RVLLM_NVFP4_KV` is unset. |
-| Qwen 3.6 35B-A3B | `qwen36_bring_up.rs` | F16 KV only — NVFP4 KV not ported yet (separate effort, parallel to the qwen35 5-step landing). |
+| Qwen 3.6 35B-A3B | `qwen36_bring_up.rs` | **wired 2026-05-15** (`mobile-qwen-rvllm-nvfp4.env`). 4-commit port (~384 LOC, 0dd5d98..d31b8ae): layout plumbing, kernel load, decode dispatch, prefill fallback. Both kernels (`fused_rope_qwen_partial_nvfp4kv` + `flash_attention_2_decode_nvfp4kv_kernel`) reused as-is from the Qwen 3.5 work — only the dispatch wiring is per-family. Per-head decode handles GQA=8 without split-decode. Batched prefill flips to per-token loop on Nvfp4; unified-NVFP4-prefill (PTX exists) is a follow-up. Validated on hardware: text (German ghost joke 31 tok in 1.07s) + Qwen3-VL vision (same caption as F16 baseline). KV memory at 4096 ctx: 20 MiB packed + 2.5 MiB scales vs 80 MiB F16 (3.5× reduction). F16 path bit-identical when the gate is off. |
 
 ## Native multimodal vision (Qwen3-VL + Gemma4 + Pixtral)
 
