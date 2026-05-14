@@ -8110,18 +8110,34 @@ impl Gemma4Bringup {
         let sub = self.forward_gemma_audio_subsample(samples_16k_mono)?;
         let n_tokens = sub.num_soft_tokens;
         // sub.device_ptr is [n_tokens, hidden_dim] f16.
-        // Precompute pos_embed + Q-scale once.
+        // Precompute pos_embed once (shared across layers).
         let pos_embed = self.audio_pos_embed_upload(hidden_dim, pos_len,
             "g4a_pos_embed_f32")?;
-        let q_scale_vec = self.audio_q_scale_vector_upload(
-            &audio.blocks[0].self_attn.per_dim_scale, head_dim,
-            "g4a_q_scale_vec_f32")?;
         // Per-block scratch residual buffer.
         let scratch_residual = self.arena.region(
             "g4a_blk_residual_f16", n_tokens * hidden_dim * 2, 16)?;
 
         let mut hidden = sub.device_ptr;
-        for block_w in &audio.blocks {
+        for (li, block_w) in audio.blocks.iter().enumerate() {
+            // Per-layer Q-scale: HF stores per_dim_scale per layer.
+            // Use a unique scratch name per layer to avoid arena slot
+            // collision corrupting the in-flight value while the
+            // previous layer's attention still reads it (codex
+            // round-3 fix #2). The reuse-same-slot version regressed
+            // audio perception to "I cannot hear" — separate slots
+            // restored progress and let layer-specific scales apply.
+            let scale_name: &'static str = match li {
+                0 => "g4a_q_scale_L0", 1 => "g4a_q_scale_L1",
+                2 => "g4a_q_scale_L2", 3 => "g4a_q_scale_L3",
+                4 => "g4a_q_scale_L4", 5 => "g4a_q_scale_L5",
+                6 => "g4a_q_scale_L6", 7 => "g4a_q_scale_L7",
+                8 => "g4a_q_scale_L8", 9 => "g4a_q_scale_L9",
+                10 => "g4a_q_scale_L10", 11 => "g4a_q_scale_L11",
+                _ => "g4a_q_scale_other",
+            };
+            let q_scale_vec = self.audio_q_scale_vector_upload(
+                &block_w.self_attn.per_dim_scale, head_dim, scale_name,
+            )?;
             self.forward_audio_block(
                 block_w, hidden, scratch_residual.device_ptr(),
                 pos_embed.device_ptr(), q_scale_vec.device_ptr(),
@@ -8129,8 +8145,6 @@ impl Gemma4Bringup {
                 chunk_size, past_horizon, context_size, pos_len,
                 softcap, residual_weight, eps, conv_kernel_size,
             )?;
-            // hidden is updated in place by forward_audio_block.
-            let _ = hidden;
         }
 
         // output_proj: [n, hidden] -> [n, output_proj_dims=1536]
