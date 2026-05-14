@@ -6,10 +6,20 @@
       "path": "add_bias_f16.ptx",
       "sha256": "a962cd1f25d8e9c82cbd745ae221b4c00849fea3609c1549e07d384628946827"
     },
+    "add_inplace_f32": {
+      "bytes": 1183,
+      "path": "add_inplace_f32.ptx",
+      "sha256": "d9264a98127fbfee50e28d0255c2cdf4c10c3e06a7f470c1392d28700d38e52e"
+    },
     "argmax": {
       "bytes": 10636,
       "path": "argmax.ptx",
       "sha256": "91336a9928546748a48bd5b4cfd6a68ef04d1187a2b613c174a1e40142885027"
+    },
+    "audio_chunk_extract_context_f32": {
+      "bytes": 3089,
+      "path": "audio_chunk_extract_context_f32.ptx",
+      "sha256": "3b9a403003b8e72f05baeb435d60ea93436f5974de0f2a84d6619a506697ee50"
     },
     "awq_int4_gemm_sm120_wmma": {
       "bytes": 31915,
@@ -591,6 +601,11 @@
       "path": "qwen_linear_silu_l2_gqa_f16.ptx",
       "sha256": "0e841e9a6c35c219851e5e35d6a2e339f28754e78b44f115c3f507ce52c62d06"
     },
+    "rel_shift_audio_f32": {
+      "bytes": 3196,
+      "path": "rel_shift_audio_f32.ptx",
+      "sha256": "bfa996e27e4ac8b2bcc73ade0e15f276cd80663e0d0b3b5bb6bb5421a07680e2"
+    },
     "repetition_penalty": {
       "bytes": 4570,
       "path": "repetition_penalty.ptx",
@@ -660,6 +675,11 @@
       "bytes": 1035,
       "path": "scale_inplace_f32.ptx",
       "sha256": "d99b0dea2e2feedf74c27c87ecb247312f3f713e7c1e484ca8dacc3f9c38085f"
+    },
+    "scale_per_dim_f32": {
+      "bytes": 1684,
+      "path": "scale_per_dim_f32.ptx",
+      "sha256": "c218bf98c2f69ea34b3acf51aff57c2c20592965e400ef737c96a42b57e6c2cc"
     },
     "scale_rows_f32_ratio": {
       "bytes": 1573,
@@ -745,6 +765,11 @@
       "bytes": 1845,
       "path": "split_q_gate_f16.ptx",
       "sha256": "6635cb33db88d817c7cb7d3e45e3c31a77c5d79d9bea5a460a5868477f8a9095"
+    },
+    "tanh_softcap_inplace_f32": {
+      "bytes": 1881,
+      "path": "tanh_softcap_inplace_f32.ptx",
+      "sha256": "0c092c2efe6b0d87b89bf02af9b32d45150a32c7bbcf91dc01518526f172baee"
     },
     "topk_softmax_batched_f32": {
       "bytes": 6499,
@@ -862,5 +887,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "a15d5ed"
+  "revision": "01d64d0"
 }

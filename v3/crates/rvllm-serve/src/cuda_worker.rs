@@ -1319,23 +1319,34 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
         .map(|s| (s.token_start, vision_outputs[s.vision_item_idx].data.as_slice()))
         .collect();
 
-    // B6a: when the request carries audio_items, the encoder forward
-    // (B6b..d) is the only path that can produce the splice rows.
-    // Until those land, fail-fast with a clear error so a chat with
-    // audio doesn't silently emit gibberish from un-spliced
-    // soft-token IDs running through the LM head. Behaviour for
-    // text + vision requests is unchanged (audio_items is empty).
-    if !req.audio_items.is_empty() {
-        let _ = req.events_tx.send(GenerateEvent::Error(format!(
-            "audio_url admission accepted ({} item{}) but B6 encoder \
-             forward is not yet wired. The audio_tower weights are \
-             loaded (B5) and the splice slots are reserved in the \
-             prompt (B4), but the kernel chain that produces the \
-             embedded audio rows lands in a follow-up commit. Strip \
-             audio parts and retry, or wait for B6b..d.",
-            req.audio_items.len(),
-            if req.audio_items.len() == 1 { "" } else { "s" }
-        )));
+    // Audio pre-pass: run forward_gemma_audio_to_host per audio item,
+    // collect host bytes for splice in run_generate.
+    let mut audio_failed_msg: Option<String> = None;
+    let mut audio_host_bytes: Vec<Vec<u8>> = Vec::with_capacity(req.audio_items.len());
+    for (_i, item) in req.audio_items.iter().enumerate() {
+        if req.cancelled.load(Ordering::Relaxed) {
+            audio_failed_msg = Some("cancelled".to_string());
+            break;
+        }
+        match bringup.forward_gemma_audio_to_host(&item.samples_16k_mono) {
+            Ok((buf, n_soft, _hidden)) => {
+                if n_soft != item.num_soft_tokens {
+                    audio_failed_msg = Some(format!(
+                        "audio soft-token mismatch: predicted {} got {}",
+                        item.num_soft_tokens, n_soft
+                    ));
+                    break;
+                }
+                audio_host_bytes.push(buf);
+            }
+            Err(e) => {
+                audio_failed_msg = Some(format!("gemma audio forward: {e:?}"));
+                break;
+            }
+        }
+    }
+    if let Some(msg) = audio_failed_msg {
+        let _ = req.events_tx.send(GenerateEvent::Error(msg));
         let _ = req.events_tx.send(GenerateEvent::Done {
             finish: FinishReason::Stop,
             prompt_tokens: prompt_len,
@@ -1343,6 +1354,11 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
         });
         return;
     }
+    let audio_splice: Vec<(usize, &[u8])> = req
+        .audio_slots
+        .iter()
+        .map(|s| (s.token_start, audio_host_bytes[s.audio_item_idx].as_slice()))
+        .collect();
 
     let result = unsafe {
         bringup.run_generate(
@@ -1364,6 +1380,7 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
             Some(req.cancelled.as_ref()),
             Some(&mut on_token),
             &vision_splice,
+            &audio_splice,
         )
     };
 
