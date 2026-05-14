@@ -2202,23 +2202,57 @@ impl Qwen35Bringup {
             // production decode loop.
             return self.apply_full_attn_qkv_only(layer_idx, start_position);
         }
-        // Step 5 (Qwen 3.6 27B NVFP4 prefill) is not wired yet.
-        // The batched RoPE site below still launches the f16-KV
-        // kernel; that would corrupt a packed-4-bit KV cache.
-        // Fail fast so a profile mix-up surfaces as a clear error
-        // instead of a silent-garbage decode.
+        // Step 5 (Qwen 3.6 27B NVFP4 prefill). The batched f16 path
+        // below cannot write into a packed-4-bit KV cache, so when
+        // `kv_dtype == Nvfp4` we fall back to a per-token decode
+        // loop that reuses `apply_full_attn_qkv_only` (already
+        // NVFP4-aware via step 4). Slower than the unified-NVFP4
+        // prefill kernel that the kernels/ tree carries
+        // (`flash_attention_2_prefill_nvfp4kv_unified_kernel`),
+        // but correctness-first — it gives the NVFP4 path a
+        // working prefill today. Optimised batched prefill is a
+        // follow-up (step 5b).
         {
             let kvc = self.kv_cache.as_ref().ok_or_else(|| corrupt(
                 self.paths.model_dir.clone(),
                 "apply_full_attn_layer_batched: kv_cache absent".into()))?;
             if matches!(kvc.dtype, Qwen35KvDtype::Nvfp4) {
-                return Err(corrupt(
+                let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
                     self.paths.model_dir.clone(),
-                    "apply_full_attn_layer_batched: NVFP4 KV not yet \
-                     wired for batched prefill (step 5 of 5 — Qwen 3.6 \
-                     27B NVFP4). Set RVLLM_QWEN36_BATCH_FULL_PREFILL=0 \
-                     and retry, or use the F16 KV profile."
-                        .into()));
+                    "apply_full_attn_layer_batched(nvfp4): scratch \
+                     absent".into()))?;
+                let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+                    self.paths.model_dir.clone(),
+                    "apply_full_attn_layer_batched(nvfp4): stream \
+                     absent".into()))?;
+                let h = self.arch.base.hidden_size;
+                let row_bytes: usize = h * 2;
+                let stream_raw = stream.raw() as u64;
+                for t in 0..(num_tokens as usize) {
+                    use cudarc::driver::sys::*;
+                    let src = h_residual_buf + (t * row_bytes) as u64;
+                    let rc = cuMemcpyDtoDAsync_v2(
+                        scr.h_residual_ptr, src, row_bytes,
+                        stream_raw as CUstream);
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen35_bfattn(nvfp4) DtoD residual→scratch",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup()));
+                    }
+                    self.apply_full_attn_qkv_only(
+                        layer_idx, start_position + t as u32)?;
+                    let rc = cuMemcpyDtoDAsync_v2(
+                        src, scr.h_residual_ptr, row_bytes,
+                        stream_raw as CUstream);
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen35_bfattn(nvfp4) DtoD scratch→residual",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup()));
+                    }
+                }
+                return Ok(());
             }
         }
 
