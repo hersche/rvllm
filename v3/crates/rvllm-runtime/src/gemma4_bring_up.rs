@@ -6848,6 +6848,77 @@ impl Gemma4Bringup {
         Ok(())
     }
 
+    /// Compute the per-head Q scale vector used by Gemma 4 audio
+    /// attention on the host and upload it as an f32 buffer of
+    /// shape `[head_dim]`. The values are:
+    ///   scale[d] = q_scale_scalar * softplus(per_dim_scale[d])
+    /// where `q_scale_scalar = (head_dim ** -0.5) / ln(2)`.
+    ///
+    /// Because `per_dim_scale` is a learned f16 weight of shape
+    /// `[head_dim]` (128 values on E4B), the entire computation is
+    /// trivially fast on the CPU and avoids needing a softplus
+    /// kernel. The result is uploaded to a small arena region so
+    /// the attention forward can multiply Q[n, h, d] by scale[d]
+    /// per-channel without re-evaluating softplus.
+    #[cfg(feature = "cuda")]
+    fn audio_q_scale_vector_upload(
+        &self,
+        per_dim_scale: &rvllm_loader::weights::F16Weight,
+        head_dim: usize,
+        scratch_name: &'static str,
+    ) -> Result<rvllm_mem::Region<'_>> {
+        use cudarc::driver::sys::*;
+        let head_dim_f = head_dim as f32;
+        let q_scale_scalar = head_dim_f.powf(-0.5) / std::f32::consts::LN_2;
+        // Read per_dim_scale f16 weight from device into host: it's
+        // tiny (head_dim=128 -> 256 bytes), so a one-shot DtoH copy
+        // is fine.
+        let mut hb = vec![0u16; head_dim];
+        unsafe {
+            let rc = cuMemcpyDtoH_v2(
+                hb.as_mut_ptr() as *mut core::ffi::c_void,
+                per_dim_scale.offset_bytes,
+                head_dim * 2,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio: DtoH per_dim_scale failed",
+                    rvllm_core::CudaErrorKind::Other,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        // softplus(x) = ln(1 + exp(x)).
+        // Numerically stable: for x > 16, softplus(x) ≈ x.
+        let mut scale_f32 = Vec::with_capacity(head_dim);
+        for &h in &hb {
+            let v = half::f16::from_bits(h).to_f32();
+            let sp = if v > 16.0 {
+                v
+            } else {
+                (1.0_f32 + v.exp()).ln()
+            };
+            scale_f32.push(q_scale_scalar * sp);
+        }
+        let region = self.arena.region(scratch_name, head_dim * 4, 16)?;
+        unsafe {
+            let rc = cuMemcpyHtoDAsync_v2(
+                region.device_ptr(),
+                scale_f32.as_ptr() as *const core::ffi::c_void,
+                head_dim * 4,
+                self.stream.raw() as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio: HtoD q_scale vector failed",
+                    rvllm_core::CudaErrorKind::Other,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(region)
+    }
+
     /// Phase 3b: Gemma 4 vision tower forward.
     ///
     /// Decodes an image, runs the 27-layer SigLIP-style ViT encoder
