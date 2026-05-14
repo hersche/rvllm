@@ -6328,6 +6328,232 @@ impl Gemma4Bringup {
         })
     }
 
+    /// B6c FFN sub-block of one Gemma 4 audio encoder layer
+    /// (`Gemma4AudioFeedForward.forward`).
+    ///
+    /// HF math (PyTorch reference,
+    /// `models/gemma4/modeling_gemma4.py::Gemma4AudioFeedForward.forward`):
+    /// ```text
+    /// residual = h
+    /// h = clamp(h, -clip, clip)        # clip = 1e10, noop in f16
+    /// h = pre_layer_norm(h)            # RMSNorm with gamma
+    /// h = ffw_layer_1(h)               # [4H, H] linear
+    /// h = silu(h)
+    /// h = ffw_layer_2(h)               # [H, 4H] linear
+    /// h = clamp(h, -clip, clip)        # noop in f16
+    /// h = post_layer_norm(h)
+    /// h *= residual_weight             # 0.5
+    /// h += residual
+    /// ```
+    ///
+    /// Clamps are skipped because `gradient_clipping=1e10` is larger
+    /// than f16's representable range — the operation would only
+    /// touch values that have already overflowed to ±inf, which f16
+    /// can't carry into the next op anyway. If a future config picks
+    /// a finite clip this needs revisiting.
+    ///
+    /// Buffers:
+    /// - `hidden`         in/out, [n_tokens, H] f16
+    /// - `residual`       in,     [n_tokens, H] f16 (caller-owned)
+    /// - `inter_4h_f32`   scratch, [n_tokens, 4H] f32
+    /// - `inter_4h_f16`   scratch, [n_tokens, 4H] f16
+    /// - `out_h_f32`      scratch, [n_tokens, H]  f32
+    ///
+    /// All arena regions live for the duration of the request.
+    #[cfg(feature = "cuda")]
+    fn forward_audio_ffn(
+        &self,
+        ffn: &rvllm_loader::gemma4_weights::Gemma4AudioFfn,
+        residual: u64,
+        hidden: u64,
+        n_tokens: usize,
+        hidden_dim: usize,
+        residual_weight: f32,
+        eps: f32,
+        scratch_inter_f32: &'static str,
+        scratch_inter_f16: &'static str,
+        scratch_out_f32: &'static str,
+    ) -> Result<()> {
+        use cudarc::driver::sys::*;
+        if n_tokens == 0 {
+            return Ok(());
+        }
+        let h = hidden_dim;
+        let h4 = 4 * h;
+
+        // pre-norm into `hidden` in-place.
+        unsafe {
+            let mut x = hidden;
+            let mut g = ffn.pre_norm.offset_bytes;
+            let mut eps_ = eps;
+            let mut d = h as i32;
+            let args = [
+                (&mut x)    as *mut u64 as *mut core::ffi::c_void,
+                (&mut g)    as *mut u64 as *mut core::ffi::c_void,
+                (&mut eps_) as *mut f32 as *mut core::ffi::c_void,
+                (&mut d)    as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                self.fused.fn_rmsnorm.raw() as CUfunction,
+                n_tokens as u32, 1, 1,
+                (h as u32).min(1024), 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio ffn: pre-rmsnorm launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // ffw_layer_1: out[n,4H] = hidden[n,H] @ W1[4H,H].T
+        let inter_f32 = self.arena.region(scratch_inter_f32, n_tokens * h4 * 4, 16)?;
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                ffn.layer_1.weight.offset_bytes,
+                hidden,
+                inter_f32.device_ptr(),
+                h4 as i32,
+                n_tokens as i32,
+                h as i32,
+                self.stream.raw(),
+            )?;
+        }
+        let inter_f16 = self.arena.region(scratch_inter_f16, n_tokens * h4 * 2, 16)?;
+        unsafe { launch_cast_f32_to_f16(
+            &self.stream,
+            self.fused.fn_cast_f32_to_f16,
+            inter_f32.device_ptr(),
+            inter_f16.device_ptr(),
+            (n_tokens * h4) as i32,
+        ) }?;
+
+        // SiLU in-place on [n_tokens, 4H].
+        unsafe { launch_silu_inplace_f16(
+            &self.stream,
+            self.fused.fn_silu_inplace_f16,
+            inter_f16.device_ptr(),
+            (n_tokens * h4) as i32,
+        ) }?;
+
+        // ffw_layer_2: out[n,H] = inter[n,4H] @ W2[H,4H].T
+        let out_f32 = self.arena.region(scratch_out_f32, n_tokens * h * 4, 16)?;
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                ffn.layer_2.weight.offset_bytes,
+                inter_f16.device_ptr(),
+                out_f32.device_ptr(),
+                h as i32,
+                n_tokens as i32,
+                h4 as i32,
+                self.stream.raw(),
+            )?;
+        }
+        // cast back into `hidden` (over-writing the rmsnormed input).
+        unsafe { launch_cast_f32_to_f16(
+            &self.stream,
+            self.fused.fn_cast_f32_to_f16,
+            out_f32.device_ptr(),
+            hidden,
+            (n_tokens * h) as i32,
+        ) }?;
+
+        // post-norm in-place on `hidden`.
+        unsafe {
+            let mut x = hidden;
+            let mut g = ffn.post_norm.offset_bytes;
+            let mut eps_ = eps;
+            let mut d = h as i32;
+            let args = [
+                (&mut x)    as *mut u64 as *mut core::ffi::c_void,
+                (&mut g)    as *mut u64 as *mut core::ffi::c_void,
+                (&mut eps_) as *mut f32 as *mut core::ffi::c_void,
+                (&mut d)    as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                self.fused.fn_rmsnorm.raw() as CUfunction,
+                n_tokens as u32, 1, 1,
+                (h as u32).min(1024), 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio ffn: post-rmsnorm launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // hidden *= residual_weight  (scale_inplace_f16).
+        unsafe {
+            let mut x = hidden;
+            let mut s = residual_weight;
+            let mut n = (n_tokens * h) as i32;
+            let args = [
+                (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                (&mut s) as *mut f32 as *mut core::ffi::c_void,
+                (&mut n) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((n_tokens * h + 255) / 256) as u32;
+            let rc = cuLaunchKernel(
+                self.fused.fn_scale_inplace_f16.raw() as CUfunction,
+                grid, 1, 1,
+                block, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio ffn: scale_inplace launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // hidden += residual  (vector_add_f16, dst = a + b).
+        unsafe {
+            let mut a = hidden;
+            let mut b = residual;
+            let mut dst = hidden;
+            let mut n = (n_tokens * h) as i32;
+            let args = [
+                (&mut a)   as *mut u64 as *mut core::ffi::c_void,
+                (&mut b)   as *mut u64 as *mut core::ffi::c_void,
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut n)   as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((n_tokens * h + 255) / 256) as u32;
+            let rc = cuLaunchKernel(
+                self.fused.fn_vector_add.raw() as CUfunction,
+                grid, 1, 1,
+                block, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio ffn: vector_add launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Phase 3b: Gemma 4 vision tower forward.
     ///
     /// Decodes an image, runs the 27-layer SigLIP-style ViT encoder
