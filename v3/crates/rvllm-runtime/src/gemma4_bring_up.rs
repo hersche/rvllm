@@ -540,6 +540,8 @@ pub struct Gemma4FusedModules {
     pub fn_scale_scalar_inplace_f32: KernelFn,
     pub apply_audio_attn_mask_f32_mod: LoadedModule,
     pub fn_apply_audio_attn_mask_f32: KernelFn,
+    pub transpose_hwc_to_chw_f16_mod: LoadedModule,
+    pub fn_transpose_hwc_to_chw_f16: KernelFn,
     pub scale_inplace_f16_mod: LoadedModule,
     pub fn_scale_inplace_f16: KernelFn,
     pub add_bias_f16_mod: LoadedModule,
@@ -6216,18 +6218,53 @@ impl Gemma4Bringup {
                 self.stream.raw(),
             )?;
         }
-        // Cast to f16 in-place.
-        let conv0_f16 = self
+        // Cast to f16. GEMM output is row-major [spatial, out_ch] = HWC.
+        let conv0_hwc_f16 = self
             .arena
-            .region("g4a_s0_conv_f16", c0 * s0_spatial * 2, 16)?;
+            .region("g4a_s0_conv_hwc_f16", c0 * s0_spatial * 2, 16)?;
         unsafe { launch_cast_f32_to_f16(
             &self.stream,
             self.fused.fn_cast_f32_to_f16,
             conv0_f32.device_ptr(),
-            conv0_f16.device_ptr(),
+            conv0_hwc_f16.device_ptr(),
             (c0 * s0_spatial) as i32,
         ) }?;
-        // Fused LayerNorm-over-C + ReLU.
+        // Transpose HWC -> CHW so the existing layernorm_relu_chw + the
+        // stage-1 im2col (which expects CHW input) see the right layout.
+        let conv0_f16 = self
+            .arena
+            .region("g4a_s0_conv_f16", c0 * s0_spatial * 2, 16)?;
+        unsafe {
+            let mut src = conv0_hwc_f16.device_ptr();
+            let mut dst = conv0_f16.device_ptr();
+            let mut c_ = c0 as i32;
+            let mut h_ = h0 as i32;
+            let mut w_ = w0 as i32;
+            let args = [
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut c_) as *mut i32 as *mut core::ffi::c_void,
+                (&mut h_) as *mut i32 as *mut core::ffi::c_void,
+                (&mut w_) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let total = (c0 * s0_spatial) as i64;
+            let block: u32 = 256;
+            let grid: u32 = ((total + block as i64 - 1) / block as i64) as u32;
+            let rc = cuLaunchKernel(
+                self.fused.fn_transpose_hwc_to_chw_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio subsample: stage0 hwc->chw launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        // Fused LayerNorm-over-C + ReLU (now sees CHW correctly).
         unsafe { launch_layernorm_relu_chw_f16(
             &self.stream,
             self.fused.fn_layernorm_relu_chw_f16,
@@ -6270,16 +6307,50 @@ impl Gemma4Bringup {
                 self.stream.raw(),
             )?;
         }
-        let conv1_f16 = self
+        // Same HWC->CHW fix as stage 0.
+        let conv1_hwc_f16 = self
             .arena
-            .region("g4a_s1_conv_f16", c1 * s1_spatial * 2, 16)?;
+            .region("g4a_s1_conv_hwc_f16", c1 * s1_spatial * 2, 16)?;
         unsafe { launch_cast_f32_to_f16(
             &self.stream,
             self.fused.fn_cast_f32_to_f16,
             conv1_f32.device_ptr(),
-            conv1_f16.device_ptr(),
+            conv1_hwc_f16.device_ptr(),
             (c1 * s1_spatial) as i32,
         ) }?;
+        let conv1_f16 = self
+            .arena
+            .region("g4a_s1_conv_f16", c1 * s1_spatial * 2, 16)?;
+        unsafe {
+            let mut src = conv1_hwc_f16.device_ptr();
+            let mut dst = conv1_f16.device_ptr();
+            let mut c_ = c1 as i32;
+            let mut h_ = h1 as i32;
+            let mut w_ = w1 as i32;
+            let args = [
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut c_) as *mut i32 as *mut core::ffi::c_void,
+                (&mut h_) as *mut i32 as *mut core::ffi::c_void,
+                (&mut w_) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let total = (c1 * s1_spatial) as i64;
+            let block: u32 = 256;
+            let grid: u32 = ((total + block as i64 - 1) / block as i64) as u32;
+            let rc = cuLaunchKernel(
+                self.fused.fn_transpose_hwc_to_chw_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio subsample: stage1 hwc->chw launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
         unsafe { launch_layernorm_relu_chw_f16(
             &self.stream,
             self.fused.fn_layernorm_relu_chw_f16,
@@ -9873,6 +9944,9 @@ fn load_gemma4_fused(
     let apply_audio_attn_mask_f32_mod = loader.load_ptx("apply_audio_attn_mask_f32")?;
     let fn_apply_audio_attn_mask_f32 = apply_audio_attn_mask_f32_mod
         .get_function("apply_audio_attn_mask_f32_kernel")?;
+    let transpose_hwc_to_chw_f16_mod = loader.load_ptx("transpose_hwc_to_chw_f16")?;
+    let fn_transpose_hwc_to_chw_f16 = transpose_hwc_to_chw_f16_mod
+        .get_function("transpose_hwc_to_chw_f16_kernel")?;
     let scale_inplace_f16_mod = loader.load_ptx("scale_inplace_f16")?;
     let fn_scale_inplace_f16 =
         scale_inplace_f16_mod.get_function("scale_inplace_f16_kernel")?;
@@ -10050,6 +10124,8 @@ fn load_gemma4_fused(
         fn_scale_scalar_inplace_f32,
         apply_audio_attn_mask_f32_mod,
         fn_apply_audio_attn_mask_f32,
+        transpose_hwc_to_chw_f16_mod,
+        fn_transpose_hwc_to_chw_f16,
         scale_inplace_f16_mod,
         fn_scale_inplace_f16,
         add_bias_f16_mod,

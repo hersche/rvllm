@@ -381,6 +381,11 @@
       "path": "layernorm_relu_chw_f16.ptx",
       "sha256": "34cf87bae1909997ee018678b7229d4e23ebecf10909bbe7c36d8f2498569e50"
     },
+    "layernorm_relu_hwc_f16": {
+      "bytes": 6808,
+      "path": "layernorm_relu_hwc_f16.ptx",
+      "sha256": "8ef87c08a868cd19de688d3c2fe2ca1a6510036956efcbefb951fe8f15010654"
+    },
     "ldmatrix_probe": {
       "bytes": 2727,
       "path": "ldmatrix_probe.ptx",
@@ -811,6 +816,11 @@
       "path": "transpose_heads_v_f16.ptx",
       "sha256": "53b09258351917862b5fff2bd5b99b5d5c8881f9af12245d3c3029129ad28bac"
     },
+    "transpose_hwc_to_chw_f16": {
+      "bytes": 2554,
+      "path": "transpose_hwc_to_chw_f16.ptx",
+      "sha256": "b6c5954b904d57a73f937f60816aa677b22c75fab146fe5cea720389ab03b7b1"
+    },
     "transpose_v_chunked_f16": {
       "bytes": 2050,
       "path": "transpose_v_chunked_f16.ptx",
@@ -902,5 +912,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "a6f0374"
+  "revision": "ba7db39"
 }
