@@ -65,7 +65,27 @@ Active profile lives at `/home/r00t/.rvllm/active-profile.env`
 - `mobile-31b-rvllm.env`         — Gemma 4 31B fp8-block (default)
 - `mobile-31b-rvllm-nvfp4.env`   — Gemma 4 31B NVFP4 KV
 - `mobile-qwen-rvllm.env`        — Qwen 3.6 35B-A3B fp8 + vision
+- `mobile-qwen35-rvllm.env`      — Qwen 3.5 27B dense
+- `mobile-e4b-rvllm.env`         — Gemma 4 E4B-it bf16->f16 + native audio
+- `mobile-e4b-rvllm-nvfp4.env`   — Gemma 4 E4B-it NVFP4 KV
+- `mobile-mistral35-rvllm.env`   — Mistral 3.5 128B NVFP4 + Pixtral vision
 - `combo-*`, `creative-*`, `work-*` — Rusty mode-switch variants
+
+**Per-family debug-flag gates.** Some families have opt-in debug
+knobs that ALTER the forward path (single-token cap, KV bypass,
+RoPE-position override, layer dumps). They MUST be off in production
+profiles or the model returns capped/incorrect output. Each gate
+also rejects stale debug envs at startup so a stale debug-session
+env cannot leak into prod:
+
+- Mistral 3.5 (`mistral35`): `RVLLM_DEBUG_MISTRAL35=1` is the
+  umbrella gate. `RVLLM_SMOKE_MAX_NEW`, `RVLLM_KV_BYPASS`,
+  `RVLLM_SMOKE_ROPE_POS_OVERRIDE`, `RVLLM_SMOKE_FULL_DUMP`,
+  `RVLLM_SMOKE_ATTN_NO_PAST`, `RVLLM_BOUNDARY_DUMP*`,
+  `RVLLM_SMOKE_LAYER_RMS`, `RVLLM_SMOKE_DUMP_DIR`,
+  `RVLLM_SMOKE_NO_RESTORE`, `RVLLM_SMOKE_SINGLE` are inert without
+  the gate. Production profile must omit ALL of these. See
+  `v3/crates/rvllm-runtime/src/mistral35_bring_up.rs::validate_no_stale_debug_envs`.
 
 Switch + restart:
 ```bash

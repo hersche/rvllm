@@ -1,5 +1,29 @@
 # Mistral 3.5 integration status
 
+> **2026-05-14 status: multi-token greedy generation WORKS in
+> production mode.** The CUDA forward path, CUTLASS NVFP4 chain,
+> KV cache, RoPE, and decoder loop are all live. What had blocked
+> it from looking working previously was the profile shipping with
+> `RVLLM_DEBUG_MISTRAL35=1` + `RVLLM_SMOKE_MAX_NEW=1` +
+> `RVLLM_KV_BYPASS=1` set, which CAPS output to 1 token and
+> BYPASSES the KV cache. Stripping the debug flags from
+> `~/.rvllm/profiles/mobile-mistral35-rvllm.env` is sufficient.
+>
+> Defaults in code are correct: every `RVLLM_SMOKE_*` and
+> `RVLLM_KV_BYPASS` knob is gated behind `RVLLM_DEBUG_MISTRAL35=1`
+> and inert without it. Production profile must have neither.
+>
+> Probes (greedy, T=0):
+>   "Hauptstadt von Frankreich?"       -> "Die Hauptstadt von Frankreich ist **Paris**."
+>   "1+1?"                              -> "2"
+>   "Translate to German: The cat..."   -> "Die Katze saß auf der Matte."
+>   "Sag hallo."                        -> "Hallo! Wie kann ich dir heute helfen? 😊"
+>
+> Remaining open: Pixtral vision smoke (forward path is committed,
+> not E2E-validated against an image); batched-prefill performance
+> work (current path is single-token); cancellation/streaming
+> polish.
+
 Snapshot for the `rusty_sm121_mistral` branch after **34 incremental
 loop iterations**. The integration spec lives in
 `mistral-35-integration.md` (repo root); this file tracks what's
