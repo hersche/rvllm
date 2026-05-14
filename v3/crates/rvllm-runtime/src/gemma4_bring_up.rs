@@ -6669,14 +6669,13 @@ impl Gemma4Bringup {
 
         // hidden += residual  (vector_add_f16, dst = a + b).
         unsafe {
-            let mut a = hidden;
-            let mut b = residual;
+            // vector_add_f16 ABI is (dst, src, n) — 3 args, dst += src.
             let mut dst = hidden;
+            let mut src = residual;
             let mut n = (n_tokens * h) as i32;
             let args = [
-                (&mut a)   as *mut u64 as *mut core::ffi::c_void,
-                (&mut b)   as *mut u64 as *mut core::ffi::c_void,
                 (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
                 (&mut n)   as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = 256;
@@ -6971,14 +6970,13 @@ impl Gemma4Bringup {
 
         // hidden += residual.
         unsafe {
-            let mut a = hidden;
-            let mut b = residual;
+            // vector_add_f16 ABI is (dst, src, n) — 3 args, dst += src.
             let mut dst = hidden;
+            let mut src = residual;
             let mut n = (n_tokens * h) as i32;
             let args = [
-                (&mut a)   as *mut u64 as *mut core::ffi::c_void,
-                (&mut b)   as *mut u64 as *mut core::ffi::c_void,
                 (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
                 (&mut n)   as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = 256;
@@ -8163,14 +8161,13 @@ impl Gemma4Bringup {
         }
         // hidden += scratch_residual (the post-FFN1 residual).
         unsafe {
-            let mut a = hidden;
-            let mut b = scratch_residual;
+            // vector_add_f16 ABI is (dst, src, n) — 3 args, dst += src.
             let mut dst = hidden;
+            let mut src = scratch_residual;
             let mut n = (n_tokens * hidden_dim) as i32;
             let args = [
-                (&mut a) as *mut u64 as *mut core::ffi::c_void,
-                (&mut b) as *mut u64 as *mut core::ffi::c_void,
                 (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
                 (&mut n) as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = 256;
