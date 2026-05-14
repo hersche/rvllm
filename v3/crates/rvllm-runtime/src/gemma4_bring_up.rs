@@ -7249,6 +7249,60 @@ impl Gemma4Bringup {
         Ok(ctx)
     }
 
+    /// Per-layer projection of the shared sinusoidal position table
+    /// through the audio-attention's `relative_k_proj` linear:
+    ///   rel_K[pos_len, num_heads * head_dim] f32
+    ///     = pos_embed_f16 @ Wrk^T
+    /// where `pos_embed_f16` is the f16 cast of `pos_embed_f32`
+    /// (precomputed once via `audio_pos_embed_upload`).
+    ///
+    /// The cast goes into a per-layer scratch slot so the f16 stage
+    /// can be reused on each layer without re-touching the shared
+    /// f32 pos_embed region.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn audio_attention_rel_k_proj(
+        &self,
+        attn: &rvllm_loader::gemma4_weights::Gemma4AudioAttention,
+        pos_embed_f32: u64,
+        pos_len: usize,
+        hidden_dim: usize,
+        num_heads: usize,
+        head_dim: usize,
+        scratch_pos_f16: &'static str,
+        scratch_rel_k_f32: &'static str,
+    ) -> Result<rvllm_mem::Region<'_>> {
+        let proj_out = num_heads * head_dim;
+        // Cast pos_embed f32 -> f16 into a layer-scoped scratch
+        // (size pos_len * hidden * 2 bytes; ~26 KB for pos_len=13,
+        // hidden=1024).
+        let pos_f16 = self.arena.region(scratch_pos_f16, pos_len * hidden_dim * 2, 16)?;
+        // The existing cast_f32_to_f16 kernel handles this — same
+        // path as the audio subsample stage.
+        unsafe { launch_cast_f32_to_f16(
+            &self.stream,
+            self.fused.fn_cast_f32_to_f16,
+            pos_embed_f32,
+            pos_f16.device_ptr(),
+            (pos_len * hidden_dim) as i32,
+        ) }?;
+        // GEMM:  D[m=proj_out, n=pos_len] = Wrk^T @ pos_embed_f16
+        // Row-major view: D[pos_len, proj_out].
+        let rel_k = self.arena.region(scratch_rel_k_f32, pos_len * proj_out * 4, 16)?;
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                attn.relative_k.offset_bytes,
+                pos_f16.device_ptr(),
+                rel_k.device_ptr(),
+                proj_out as i32,
+                pos_len as i32,
+                hidden_dim as i32,
+                self.stream.raw(),
+            )?;
+        }
+        Ok(rel_k)
+    }
+
     /// Phase 3b: Gemma 4 vision tower forward.
     ///
     /// Decodes an image, runs the 27-layer SigLIP-style ViT encoder
