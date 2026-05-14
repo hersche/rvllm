@@ -12,7 +12,7 @@ Output dir (`--dump-dir`, default `/tmp/e4b_audio_dump/`):
   audio_input_mel.bin              [T_mel, 128]  f16
     (computed by HF Gemma4AudioProcessor on the test waveform)
   audio_after_subsample.bin        [N, 1024]  f16
-    (output of audio_tower.encoder.subsample_conv_projection)
+    (output of audio_tower.subsample_conv_projection)
 
 For each layer L in --dump-layers (default 0,1,11):
   audio_layer{L}_input.bin         [N, 1024]  f16  (block input)
@@ -93,16 +93,16 @@ def main():
 
     with torch.no_grad():
         # ---- subsample ----
-        h, _mask = audio_tower.encoder.subsample_conv_projection(mel, mask)
+        h, _mask = audio_tower.subsample_conv_projection(mel, mask)
         # h: [B=1, N, 1024]
         write_f16(dump_dir / "audio_after_subsample.bin", h[0])
 
         # ---- relative pos embed (shared across layers) ----
-        pos_embed = audio_tower.encoder.rel_pos_encoding(h)
+        pos_embed = audio_tower.rel_pos_enc(h)
         write_f16(dump_dir / "audio_pos_embed.bin", pos_embed[0])  # [13, 1024]
 
         # ---- run layers, dumping selected ----
-        for li, layer in enumerate(audio_tower.encoder.layers):
+        for li, layer in enumerate(audio_tower.layers):
             if li in layers:
                 write_f16(dump_dir / f"audio_layer{li}_input.bin", h[0])
             # FFN1
