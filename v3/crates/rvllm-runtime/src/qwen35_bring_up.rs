@@ -251,6 +251,14 @@ pub struct Qwen35OutsideKernels {
     /// (step 4 wires the decode path; step 5 wires prefill).
     pub fused_rope_qwen_partial_nvfp4kv_mod: Option<LoadedModule>,
     pub fn_fused_rope_qwen_partial_nvfp4kv: Option<KernelFn>,
+    /// `flash_attention_2_decode_nvfp4kv_kernel` — paged FA-2 decode
+    /// kernel that reads packed-4-bit K/V + per-(slot, kv_head)
+    /// E4M3 microscale and writes f16 output. Loaded only when
+    /// `RVLLM_NVFP4_KV=1`. One CTA per (seq, query_head); GQA cap
+    /// (`MAX_GQA_DECODE=4`) does not apply to this per-head path,
+    /// so Qwen 3.6 27B's GQA=6 is fine.
+    pub flash_attention_nvfp4kv_mod: Option<LoadedModule>,
+    pub fn_flash_attention_2_decode_nvfp4kv: Option<KernelFn>,
     pub flash_attention_mod: LoadedModule,
     pub fn_flash_attention_2_decode_f16io: KernelFn,
     pub sigmoid_mul_f16_mod: LoadedModule,
@@ -757,6 +765,16 @@ impl Qwen35Bringup {
                 }
                 Qwen35KvDtype::F16 => (None, None),
             };
+            let (flash_attention_nvfp4kv_mod,
+                 fn_flash_attention_2_decode_nvfp4kv) = match kv_dtype {
+                Qwen35KvDtype::Nvfp4 => {
+                    let m = kernels.load_ptx("flash_attention_nvfp4kv")?;
+                    let f = m.get_function(
+                        "flash_attention_2_decode_nvfp4kv_kernel")?;
+                    (Some(m), Some(f))
+                }
+                Qwen35KvDtype::F16 => (None, None),
+            };
             let flash_attention_mod = kernels.load_ptx("flash_attention")?;
             let fn_flash_attention_2_decode_f16io = flash_attention_mod
                 .get_function("flash_attention_2_decode_f16io_kernel")?;
@@ -884,6 +902,8 @@ impl Qwen35Bringup {
                 fn_fused_rope_qwen_partial_f16kv,
                 fused_rope_qwen_partial_nvfp4kv_mod,
                 fn_fused_rope_qwen_partial_nvfp4kv,
+                flash_attention_nvfp4kv_mod,
+                fn_flash_attention_2_decode_nvfp4kv,
                 flash_attention_mod,
                 fn_flash_attention_2_decode_f16io,
                 sigmoid_mul_f16_mod,
@@ -1729,6 +1749,13 @@ impl Qwen35Bringup {
                 }
             }
         }
+        // Step 4 (Qwen 3.6 27B NVFP4) dispatch.
+        //   * F16:   existing fused_rope_qwen_partial_f16kv launch
+        //   * Nvfp4: fused_rope_qwen_partial_nvfp4kv launch — writes
+        //     packed-4-bit K/V + per-(slot, kv_head) E4M3 scales +
+        //     FP8-E4M3 Q with per-(token, head) dynamic scale.
+        match layer_kv.dtype {
+        Qwen35KvDtype::F16 =>
         unsafe {
             use cudarc::driver::sys::*;
             let mut q_in = scr.q_out_ptr;
@@ -1777,6 +1804,82 @@ impl Qwen35Bringup {
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup()));
             }
+        },
+        Qwen35KvDtype::Nvfp4 => {
+            let fn_rope = ker.fn_fused_rope_qwen_partial_nvfp4kv
+                .ok_or_else(|| corrupt(
+                    self.paths.model_dir.clone(),
+                    "apply_full_attn_qkv_only: NVFP4 RoPE kernel \
+                     not loaded".into()))?;
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut q_in = scr.q_out_ptr;
+                let mut k_in = scr.k_out_ptr;
+                let mut v_in = scr.v_out_ptr;
+                let mut q_fp8_out = scr.q_fp8_ptr;
+                let mut key_packed = layer_kv.k_ptr;
+                let mut value_packed = layer_kv.v_ptr;
+                let mut key_scale = layer_kv.k_scale_ptr;
+                let mut value_scale = layer_kv.v_scale_ptr;
+                let mut cos = rope.cos_ptr;
+                let mut sin = rope.sin_ptr;
+                let mut positions_ptr = pos_region.device_ptr();
+                let mut slot_ptr = slot_region.device_ptr();
+                // No static-scalar Q descale here — we always feed
+                // the dynamic q_scale_cache. The kernel writes to
+                // q_scale_cache; the same buffer is read back by
+                // the NVFP4 decode kernel. The static fallback is
+                // unused (q_scale_cache != nullptr) but the arg
+                // must be a valid device pointer — reuse the
+                // cache pointer itself; the divide never sees this
+                // address because the dynamic path takes priority.
+                let mut q_scale_static = scr.q_scale_cache_ptr;
+                let mut q_scale_cache = scr.q_scale_cache_ptr;
+                let mut num_tokens: i32 = 1;
+                let mut nh = n_q_heads;
+                let mut nkh = n_kv_heads;
+                let mut hd = head_dim;
+                let mut rd: i32 = rope.rotary_dim as i32;
+                let args = [
+                    (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_fp8_out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut key_packed) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut value_packed) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut key_scale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut value_scale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut positions_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut slot_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_scale_static) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_scale_cache) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut num_tokens) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                // Grid: (num_tokens, max(num_heads, num_kv_heads)).
+                // Block: (head_dim) — one thread per element.
+                let grid_y = n_q_heads.max(n_kv_heads) as u32;
+                let rc = cuLaunchKernel(
+                    fn_rope.raw() as CUfunction,
+                    1, grid_y, 1,
+                    head_dim as u32, 1, 1, 0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 fused_rope_qwen_partial_nvfp4kv launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup()));
+                }
+            }
+        }
         }
 
         // (8) flash_attention_2_decode_f16io: single-token decode
@@ -1814,8 +1917,20 @@ impl Qwen35Bringup {
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
         const FA2_THREADS: i32 = 128;
         const FA2_BC: i32 = 32;
-        let smem_bytes =
-            2 * FA2_BC * head_dim * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+        // Step 4 (Qwen 3.6 27B NVFP4) decode dispatch.
+        //   * F16:   existing flash_attention_2_decode_f16io
+        //            (2 * BC * hd f32 = 2 * 32 * 256 * 4 = 64 KiB)
+        //   * Nvfp4: flash_attention_2_decode_nvfp4kv. K/V dequant
+        //            target is f16 smem (2 bytes/elem; halves the
+        //            K/V tile footprint vs. f32 → 32 KiB).
+        let smem_bytes = match layer_kv.dtype {
+            Qwen35KvDtype::F16 =>
+                2 * FA2_BC * head_dim * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4,
+            Qwen35KvDtype::Nvfp4 =>
+                2 * FA2_BC * head_dim * 2 + FA2_BC * 4 + (FA2_THREADS / 32) * 4,
+        };
+        match layer_kv.dtype {
+        Qwen35KvDtype::F16 =>
         unsafe {
             use cudarc::driver::sys::*;
             if smem_bytes as u32 >= 48 * 1024 {
@@ -1878,6 +1993,85 @@ impl Qwen35Bringup {
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup()));
             }
+        },
+        Qwen35KvDtype::Nvfp4 => {
+            let fn_dec = ker.fn_flash_attention_2_decode_nvfp4kv
+                .ok_or_else(|| corrupt(
+                    self.paths.model_dir.clone(),
+                    "apply_full_attn_qkv_only: NVFP4 decode kernel \
+                     not loaded".into()))?;
+            unsafe {
+                use cudarc::driver::sys::*;
+                if smem_bytes as u32 >= 48 * 1024 {
+                    let rc = cuFuncSetAttribute(
+                        fn_dec.raw() as CUfunction,
+                        CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        smem_bytes,
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen35 nvfp4-decode cuFuncSetAttribute",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                let mut output = scr.attn_out_ptr;
+                let mut query = scr.q_fp8_ptr;
+                let mut key_packed = layer_kv.k_ptr;
+                let mut value_packed = layer_kv.v_ptr;
+                let mut key_scale = layer_kv.k_scale_ptr;
+                let mut value_scale = layer_kv.v_scale_ptr;
+                let mut q_scale_cache = scr.q_scale_cache_ptr;
+                let mut block_tables = bt_ptr;
+                let mut context_lens = cl_ptr;
+                // Static-scalar Q descale fallback. Never read on
+                // the dynamic path (q_scale_cache != nullptr) but
+                // must be a valid device pointer; reuse the cache.
+                let mut q_descale = scr.q_scale_cache_ptr;
+                let mut scale_arg = scale;
+                let mut nh = n_q_heads;
+                let mut nkvh = n_kv_heads;
+                let mut hd = head_dim;
+                let mut bs: i32 = 1;
+                let mut mbps: i32 = kv_cache.max_pos as i32;
+                let mut window: i32 = -1;
+                let args = [
+                    (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut query) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut key_packed) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut value_packed) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut key_scale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut value_scale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_scale_cache) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut block_tables) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut context_lens) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_descale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut scale_arg) as *mut f32 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut bs) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut mbps) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut window) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let rc = cuLaunchKernel(
+                    fn_dec.raw() as CUfunction,
+                    1, n_q_heads as u32, 1,
+                    FA2_THREADS as u32, 1, 1,
+                    smem_bytes as u32,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 flash_attention_2_decode_nvfp4kv launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup()));
+                }
+            }
+        }
         }
 
         // (9) sigmoid_mul_f16: apply the attn_output_gate finisher.
@@ -2007,6 +2201,25 @@ impl Qwen35Bringup {
             // greedy canary stays byte-identical with the
             // production decode loop.
             return self.apply_full_attn_qkv_only(layer_idx, start_position);
+        }
+        // Step 5 (Qwen 3.6 27B NVFP4 prefill) is not wired yet.
+        // The batched RoPE site below still launches the f16-KV
+        // kernel; that would corrupt a packed-4-bit KV cache.
+        // Fail fast so a profile mix-up surfaces as a clear error
+        // instead of a silent-garbage decode.
+        {
+            let kvc = self.kv_cache.as_ref().ok_or_else(|| corrupt(
+                self.paths.model_dir.clone(),
+                "apply_full_attn_layer_batched: kv_cache absent".into()))?;
+            if matches!(kvc.dtype, Qwen35KvDtype::Nvfp4) {
+                return Err(corrupt(
+                    self.paths.model_dir.clone(),
+                    "apply_full_attn_layer_batched: NVFP4 KV not yet \
+                     wired for batched prefill (step 5 of 5 — Qwen 3.6 \
+                     27B NVFP4). Set RVLLM_QWEN36_BATCH_FULL_PREFILL=0 \
+                     and retry, or use the F16 KV profile."
+                        .into()));
+            }
         }
 
         let arch = &self.arch;
