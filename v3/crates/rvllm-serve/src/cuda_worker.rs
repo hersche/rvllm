@@ -1319,6 +1319,31 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
         .map(|s| (s.token_start, vision_outputs[s.vision_item_idx].data.as_slice()))
         .collect();
 
+    // B6a: when the request carries audio_items, the encoder forward
+    // (B6b..d) is the only path that can produce the splice rows.
+    // Until those land, fail-fast with a clear error so a chat with
+    // audio doesn't silently emit gibberish from un-spliced
+    // soft-token IDs running through the LM head. Behaviour for
+    // text + vision requests is unchanged (audio_items is empty).
+    if !req.audio_items.is_empty() {
+        let _ = req.events_tx.send(GenerateEvent::Error(format!(
+            "audio_url admission accepted ({} item{}) but B6 encoder \
+             forward is not yet wired. The audio_tower weights are \
+             loaded (B5) and the splice slots are reserved in the \
+             prompt (B4), but the kernel chain that produces the \
+             embedded audio rows lands in a follow-up commit. Strip \
+             audio parts and retry, or wait for B6b..d.",
+            req.audio_items.len(),
+            if req.audio_items.len() == 1 { "" } else { "s" }
+        )));
+        let _ = req.events_tx.send(GenerateEvent::Done {
+            finish: FinishReason::Stop,
+            prompt_tokens: prompt_len,
+            completion_tokens: 0,
+        });
+        return;
+    }
+
     let result = unsafe {
         bringup.run_generate(
             kernels.fn_embed,

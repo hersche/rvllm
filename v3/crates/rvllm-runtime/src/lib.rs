@@ -89,6 +89,10 @@ pub mod sched_state;
 pub mod vision_preprocess;
 // B1 (Gemma 4 E4B native audio): mel-spectrogram extractor.
 pub mod audio_preprocess;
+// B6a (Gemma 4 E4B native audio): encoder forward scaffold +
+// dispatcher. Currently returns FeatureNotAvailable; kernels +
+// layer-by-layer parity audits land in B6b..d.
+pub mod gemma4_audio_forward;
 pub mod scheduler;
 
 /// Re-export the Mistral 3.5 loader-side modules so downstream
