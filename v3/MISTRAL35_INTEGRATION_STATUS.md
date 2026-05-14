@@ -19,10 +19,27 @@
 >   "Translate to German: The cat..."   -> "Die Katze saß auf der Matte."
 >   "Sag hallo."                        -> "Hallo! Wie kann ich dir heute helfen? 😊"
 >
-> Remaining open: Pixtral vision smoke (forward path is committed,
-> not E2E-validated against an image); batched-prefill performance
-> work (current path is single-token); cancellation/streaming
-> polish.
+> **Pixtral vision validated** (same session, profile has
+> `RVLLM_LOAD_VISION=1`):
+>   1-token probe (`/tmp/ball.png` + "Welche Farbe...?") -> "Orange"
+>   74-token describe -> "The image shows a simple, solid orange
+>     circle centered on a light blue background. The circle is
+>     filled with a vibrant orange color and has no additional
+>     details, patterns, or textures..."
+>
+> **Streaming validated** — `stream=true` delivers role chunk,
+> content delta chunks, stop chunk, `[DONE]`. Per-token SSE works.
+>
+> Residual open items (lower priority):
+>   - Batched prefill performance: code default-on for prompts
+>     >= 16 tokens (`mistral35_bring_up.rs:5245`); not benchmarked
+>     under real load yet.
+>   - Mid-stream cancellation: code path is in place
+>     (`mistral35_bring_up.rs:5332`); not stress-tested.
+>   - `stream=true` + `stop=...` interaction still rejected at
+>     400 by `handlers.rs:549` (intentional or oversight: TBD).
+>   - Stale log messages saying "not yet implemented" in
+>     `cuda_worker.rs:291` and `mistral35_load.rs:675`.
 
 Snapshot for the `rusty_sm121_mistral` branch after **34 incremental
 loop iterations**. The integration spec lives in
