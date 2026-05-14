@@ -528,6 +528,8 @@ pub struct Gemma4FusedModules {
     pub fn_tanh_softcap_inplace_f32: KernelFn,
     pub rel_shift_audio_f32_mod: LoadedModule,
     pub fn_rel_shift_audio_f32: KernelFn,
+    pub scale_per_dim_f32_mod: LoadedModule,
+    pub fn_scale_per_dim_f32: KernelFn,
     pub scale_inplace_f16_mod: LoadedModule,
     pub fn_scale_inplace_f16: KernelFn,
     pub add_bias_f16_mod: LoadedModule,
@@ -8621,6 +8623,9 @@ fn load_gemma4_fused(
     let rel_shift_audio_f32_mod = loader.load_ptx("rel_shift_audio_f32")?;
     let fn_rel_shift_audio_f32 =
         rel_shift_audio_f32_mod.get_function("rel_shift_audio_f32_kernel")?;
+    let scale_per_dim_f32_mod = loader.load_ptx("scale_per_dim_f32")?;
+    let fn_scale_per_dim_f32 =
+        scale_per_dim_f32_mod.get_function("scale_per_dim_f32_kernel")?;
     let scale_inplace_f16_mod = loader.load_ptx("scale_inplace_f16")?;
     let fn_scale_inplace_f16 =
         scale_inplace_f16_mod.get_function("scale_inplace_f16_kernel")?;
@@ -8786,6 +8791,8 @@ fn load_gemma4_fused(
         fn_tanh_softcap_inplace_f32,
         rel_shift_audio_f32_mod,
         fn_rel_shift_audio_f32,
+        scale_per_dim_f32_mod,
+        fn_scale_per_dim_f32,
         scale_inplace_f16_mod,
         fn_scale_inplace_f16,
         add_bias_f16_mod,
