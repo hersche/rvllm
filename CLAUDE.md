@@ -94,12 +94,29 @@ sudo ln -sfn /home/r00t/.rvllm/profiles/<profile>.env \
 sudo systemctl restart rvllm-serve
 ```
 
-## Native multimodal vision (Qwen3-VL + Gemma4)
+## Native multimodal vision (Qwen3-VL + Gemma4 + Pixtral)
 
-Both vision towers run end-to-end as native Rust+CUDA inside this
-process — no Python sidecar. `image_url` parts on
+Three vision towers now run end-to-end as native Rust+CUDA inside
+this process — Qwen3-VL (Qwen 3.5 / 3.6), Gemma 4 SigLIP (31B / E4B),
+and Mistral 3.5 Pixtral — no Python sidecar. `image_url` parts on
 `/v1/chat/completions` go straight from the OpenAI handler through
-the same process to the GPU.
+the same process to the GPU. Verified end-to-end on `/tmp/ball.png`
+for all three families.
+
+## Native audio (Gemma 4 E4B-it)
+
+E4B-it has a native 12-layer chunked-attention audio encoder + a
+`POST /v1/audio/transcriptions` (whisper-compat multipart) endpoint.
+Audio path in summary: symphonia decode + rubato resample to 16 kHz
+mono f32 -> log-mel (CPU) -> subsample Conv2d stack -> 12 encoder
+blocks (FFN + chunked attention + LightConv1D + FFN + norms) ->
+output_proj (1024 -> 1536) -> embed_audio_projection (1536 -> 2560)
+-> splice into prefill residual at AudioSlot positions. Real-speech
+transcription verified on user-recorded mp3/ogg/m4a inputs:
+"Das ist ein Test.", "I am a human.", "Wie ist das Wetter heute?"
+all transcribed correctly. Audio module is in
+`v3/crates/rvllm-runtime/src/{audio_preprocess,gemma4_bring_up,gemma4_audio_forward}.rs`
+and the endpoint at `v3/crates/rvllm-serve/src/openai/transcriptions.rs`.
 
 Per-request flow:
 1. **Admission** (`crates/rvllm-serve/src/openai/handlers.rs ::
