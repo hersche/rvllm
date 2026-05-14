@@ -447,14 +447,6 @@ fn resample_to_target(
     }
     use rubato::Resampler;
     let ratio = target_rate as f64 / source_rate as f64;
-    // Chunk size is fixed by SincFixedIn; we pick something
-    // moderate-ish (1024 input frames per chunk) and zero-pad the
-    // last partial chunk. rubato's `process_partial` accepts a
-    // shorter final chunk with `Some(&[...])` but only if the
-    // resampler was built with `SincFixedOut`; SincFixedIn is the
-    // simpler API and zero-padding is cheap for the trailing
-    // <chunk_size samples. We then truncate the output by the
-    // expected length (ceil(in_len * ratio)).
     const CHUNK: usize = 1024;
     let mut resampler = rubato::SincFixedIn::<f32>::new(
         ratio,
@@ -473,11 +465,12 @@ fn resample_to_target(
     let expected_out = ((mono.len() as f64) * ratio).ceil() as usize;
     let mut out: Vec<f32> = Vec::with_capacity(expected_out + 32);
     let mut idx = 0usize;
-    while idx < mono.len() {
-        let end = (idx + CHUNK).min(mono.len());
-        let mut chunk = vec![0.0f32; CHUNK];
-        chunk[..(end - idx)].copy_from_slice(&mono[idx..end]);
-        let input = vec![chunk];
+    // Run full CHUNK-sized blocks through `process`. The last partial
+    // block is handed to `process_partial` so rubato applies its
+    // boundary handling instead of seeing fabricated zero samples
+    // mid-stream (codex round 10 #1).
+    while idx + CHUNK <= mono.len() {
+        let input = vec![mono[idx..idx + CHUNK].to_vec()];
         let produced = resampler
             .process(&input, None)
             .map_err(|e| AudioError::Resample(format!("process: {e}")))?;
@@ -485,10 +478,19 @@ fn resample_to_target(
         out.extend_from_slice(&ch0);
         idx += CHUNK;
     }
-    // Truncate trailing zero-pad-induced samples to the expected
-    // output length. Without this an 8 kHz, 800-sample input would
-    // pad to 1024 and emit ~2048 output samples; the caller
-    // expects 1600.
+    if idx < mono.len() {
+        let tail = vec![mono[idx..].to_vec()];
+        let produced = resampler
+            .process_partial(Some(&tail), None)
+            .map_err(|e| AudioError::Resample(format!("process_partial: {e}")))?;
+        let ch0 = produced.into_iter().next().unwrap_or_default();
+        out.extend_from_slice(&ch0);
+    }
+    // Flush any internal buffer by calling process_partial(None).
+    if let Ok(produced) = resampler.process_partial::<Vec<f32>>(None, None) {
+        let ch0 = produced.into_iter().next().unwrap_or_default();
+        out.extend_from_slice(&ch0);
+    }
     out.truncate(expected_out);
     Ok(out)
 }
