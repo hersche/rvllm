@@ -50,19 +50,44 @@ pub struct Qwen35EnginePaths {
     pub policy_json: PathBuf,
 }
 
+/// KV dtype carried by the per-layer cache. F16 is the legacy /
+/// production path; Nvfp4 is the packed-4-bit + E4M3 microscale
+/// path matching the Gemma 4 NVFP4 KV plumbing (4 elements / 2
+/// bytes for packed K/V, plus `[blocks, head_dim/16]` E4M3
+/// scales).
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen35KvDtype {
+    F16,
+    Nvfp4,
+}
+
 /// Per-full-attn-layer KV cache pair. Linear-attn layers don't
 /// carry a positional KV cache (state is SSM-style in
 /// `Qwen35LinearState`).
+///
+/// For F16 the packed/scale pointers are zero. For NVFP4 the
+/// `k_ptr` / `v_ptr` are the packed 4-bit buffers (1 byte per 2
+/// elements) and the `k_scale_ptr` / `v_scale_ptr` are the
+/// `[blocks, head_dim/16]` E4M3 microscale buffers; `dtype` is
+/// `Nvfp4`. Decoders dispatch via the dtype field.
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy)]
 pub struct Qwen35LayerKv {
     pub k_ptr: u64,
     pub v_ptr: u64,
+    pub k_scale_ptr: u64,
+    pub v_scale_ptr: u64,
+    pub dtype: Qwen35KvDtype,
 }
 
-/// Sparse BF16 KV cache — only the 16 full-attn layers carry a
+/// Sparse KV cache — only the 16 full-attn layers carry a
 /// `Qwen35LayerKv`. `layer_idx_to_full_idx[layer_idx]` returns
 /// `Some(full_rank)` for full-attn layers and `None` for linear.
+///
+/// `dtype` is uniform across all full-attn layers (per request and
+/// per profile). NVFP4 enabled via `RVLLM_NVFP4_KV=1` follows the
+/// same env-knob convention as the Gemma 4 path.
 #[cfg(feature = "cuda")]
 #[derive(Debug)]
 pub struct Qwen35KvCache {
@@ -72,6 +97,11 @@ pub struct Qwen35KvCache {
     pub n_kv_heads: usize,
     pub head_dim: usize,
     pub per_layer_bytes: usize,
+    /// Per-layer scale-buffer bytes for NVFP4 (zero for F16). Each
+    /// full-attn layer holds a K-scale and a V-scale buffer of this
+    /// size; the per-layer entry stores their device pointers.
+    pub per_layer_scale_bytes: usize,
+    pub dtype: Qwen35KvDtype,
     /// Persistent identity-permutation block_tables, shape
     /// `[max_pos]` i32, value `i` at index `i`. Allocated +
     /// filled once at bring-up. With `block_size=1` this is the
@@ -393,10 +423,34 @@ impl Qwen35Bringup {
                 arch.rope_theta,
             )?;
 
-            // KV cache: BF16 [max_pos, n_kv_heads, head_dim] per
-            // FULL-attn layer.
+            // KV cache: F16 [max_pos, n_kv_heads, head_dim] per FULL-
+            // attn layer by default. NVFP4 path (opt-in via
+            // RVLLM_NVFP4_KV=1) allocates packed-4-bit K/V (2 elements
+            // per byte) plus a separate [max_pos, n_kv_heads,
+            // head_dim/16] E4M3 scale buffer per layer, matching the
+            // Gemma 4 NVFP4 KV layout. Read path dispatches on
+            // `Qwen35LayerKv::dtype` (downstream wiring lands in
+            // step 3+; this commit is the plumbing-only no-op for f16).
             let n_kv_heads = arch.base.num_key_value_heads;
-            let per_layer_kv_bytes = kv_max_pos * n_kv_heads * head_dim * 2;
+            let nvfp4_kv = std::env::var("RVLLM_NVFP4_KV")
+                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(false);
+            let kv_dtype = if nvfp4_kv {
+                Qwen35KvDtype::Nvfp4
+            } else {
+                Qwen35KvDtype::F16
+            };
+            let total_kv_elems = kv_max_pos * n_kv_heads * head_dim;
+            // Packed NVFP4 = 1 byte per 2 elements. F16 = 2 bytes per
+            // element. Scale buffer (NVFP4 only) = head_dim/16 E4M3
+            // bytes per (pos, head). For F16 the scale bytes are 0.
+            let (per_layer_kv_bytes, per_layer_scale_bytes) = match kv_dtype {
+                Qwen35KvDtype::F16 => (total_kv_elems * 2, 0usize),
+                Qwen35KvDtype::Nvfp4 => (
+                    total_kv_elems / 2,
+                    kv_max_pos * n_kv_heads * (head_dim / 16),
+                ),
+            };
             let mut kv_layers: Vec<Qwen35LayerKv> = Vec::new();
             let mut layer_idx_to_full_idx: Vec<Option<usize>> =
                 vec![None; arch.base.num_hidden_layers];
@@ -407,9 +461,21 @@ impl Qwen35Bringup {
                         "qwen35_k_cache", per_layer_kv_bytes, 16)?;
                     let v_region = arena.region(
                         "qwen35_v_cache", per_layer_kv_bytes, 16)?;
+                    let (k_scale_ptr, v_scale_ptr) = if per_layer_scale_bytes > 0 {
+                        let ks = arena.region(
+                            "qwen35_k_scale", per_layer_scale_bytes, 16)?;
+                        let vs = arena.region(
+                            "qwen35_v_scale", per_layer_scale_bytes, 16)?;
+                        (ks.device_ptr(), vs.device_ptr())
+                    } else {
+                        (0u64, 0u64)
+                    };
                     kv_layers.push(Qwen35LayerKv {
                         k_ptr: k_region.device_ptr(),
                         v_ptr: v_region.device_ptr(),
+                        k_scale_ptr,
+                        v_scale_ptr,
+                        dtype: kv_dtype,
                     });
                     layer_idx_to_full_idx[li] = Some(next_full);
                     next_full += 1;
@@ -439,6 +505,8 @@ impl Qwen35Bringup {
                 n_kv_heads,
                 head_dim,
                 per_layer_bytes: per_layer_kv_bytes,
+                per_layer_scale_bytes,
+                dtype: kv_dtype,
                 block_tables_ptr: bt_region.device_ptr(),
                 context_lens_ptr: cl_region.device_ptr(),
             };
