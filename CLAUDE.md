@@ -65,7 +65,8 @@ Active profile lives at `/home/r00t/.rvllm/active-profile.env`
 - `mobile-31b-rvllm.env`         — Gemma 4 31B fp8-block (default)
 - `mobile-31b-rvllm-nvfp4.env`   — Gemma 4 31B NVFP4 KV
 - `mobile-qwen-rvllm.env`        — Qwen 3.6 35B-A3B fp8 + vision
-- `mobile-qwen35-rvllm.env`      — Qwen 3.5 27B dense
+- `mobile-qwen35-rvllm.env`      — Qwen 3.5 27B dense (F16 KV) + Qwen3-VL vision
+- `mobile-qwen35-rvllm-nvfp4.env` — Qwen 3.5 27B dense NVFP4 KV + Qwen3-VL vision (validated 2026-05-14: text + ball.png coherent on hardware)
 - `mobile-e4b-rvllm.env`         — Gemma 4 E4B-it bf16->f16 + native audio
 - `mobile-e4b-rvllm-nvfp4.env`   — Gemma 4 E4B-it NVFP4 KV
 - `mobile-mistral35-rvllm.env`   — Mistral 3.5 128B NVFP4 + Pixtral vision
@@ -93,6 +94,16 @@ sudo ln -sfn /home/r00t/.rvllm/profiles/<profile>.env \
              /home/r00t/.rvllm/active-profile.env
 sudo systemctl restart rvllm-serve
 ```
+
+## NVFP4 KV cache coverage
+
+| Family | Module | NVFP4 KV status |
+|---|---|---|
+| Gemma 4 31B | `gemma4_bring_up.rs` | wired; production NVFP4 profile (`mobile-31b-rvllm-nvfp4.env`). Hadamard rotation + per-token Q scale + amax6 V policy. |
+| Gemma 4 E4B-it | `gemma4_bring_up.rs` | wired (`mobile-e4b-rvllm-nvfp4.env`). |
+| Mistral 3.5 128B | `mistral35_bring_up.rs` | NVFP4 weights + NVFP4 KV (active production profile). |
+| Qwen 3.5 27B dense | `qwen35_bring_up.rs` | **wired 2026-05-14** (`mobile-qwen35-rvllm-nvfp4.env`). Five-step landing: KV allocator + dtype field, Qwen-specific `fused_rope_qwen_partial_nvfp4kv` kernel (NeoX partial RoPE with rotary_dim=64, amax6 V policy, no Hadamard), kernel load + Q-side scratch, decode dispatch (per-head FA-2 NVFP4, no GQA cap), prefill via per-token decode fallback. Validated on hardware: text + Qwen3-VL vision. F16 path bit-identical when `RVLLM_NVFP4_KV` is unset. |
+| Qwen 3.6 35B-A3B | `qwen36_bring_up.rs` | F16 KV only — NVFP4 KV not ported yet (separate effort, parallel to the qwen35 5-step landing). |
 
 ## Native multimodal vision (Qwen3-VL + Gemma4 + Pixtral)
 
