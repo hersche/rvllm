@@ -19,6 +19,7 @@ pub use compressed_tensors::{upload_awq_linear, upload_gemma4_awq_layer};
 pub use weights::AwqLayerWeights;
 pub mod fp8_quant;
 pub mod gemma4_arch;
+pub mod gemma4_drafter;
 pub mod gemma4_load;
 pub mod gemma4_weights;
 pub mod load;
