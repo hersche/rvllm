@@ -6216,6 +6216,7 @@ impl Gemma4Bringup {
         let mel_f16_bytes: &[u8] = bytemuck_cast_u16(&mel_f16_host);
         unsafe { mel_region.copy_from_host(mel_f16_bytes)? };
         let mel_dev = mel_region.device_ptr();
+        self.audio_dump_f16(mel_dev, t_in * n_mels, "audio_input_mel.bin");
 
         // ── Stage 0 Conv2d ───────────────────────────────────────────
         // im2col: input [1, T, 128]  →  [1*9, h0 * w0]
@@ -6261,6 +6262,10 @@ impl Gemma4Bringup {
             conv0_hwc_f16.device_ptr(),
             (c0 * s0_spatial) as i32,
         ) }?;
+        self.audio_dump_f32_as_f16(conv0_f32.device_ptr(), c0 * s0_spatial,
+            "audio_diag_conv0_f32.bin");
+        self.audio_dump_f16(conv0_hwc_f16.device_ptr(), c0 * s0_spatial,
+            "audio_diag_conv0_hwc.bin");
         // Transpose HWC -> CHW so the existing layernorm_relu_chw + the
         // stage-1 im2col (which expects CHW input) see the right layout.
         let conv0_f16 = self
@@ -6296,6 +6301,8 @@ impl Gemma4Bringup {
                 ));
             }
         }
+        self.audio_dump_f16(conv0_f16.device_ptr(), c0 * s0_spatial,
+            "audio_diag_conv0_chw_pre_ln.bin");
         // Fused LayerNorm-over-C + ReLU (now sees CHW correctly).
         unsafe { launch_layernorm_relu_chw_f16(
             &self.stream,
@@ -6308,6 +6315,8 @@ impl Gemma4Bringup {
             w0 as i32,
         ) }?;
 
+        self.audio_dump_f16(conv0_f16.device_ptr(), c0 * s0_spatial,
+            "audio_diag_after_s0_ln.bin");
         // ── Stage 1 Conv2d ───────────────────────────────────────────
         // im2col: input [c0=128, h0, w0]  →  [c0*9=1152, h1 * w1]
         let s1_spatial = h1 * w1;
@@ -6449,29 +6458,7 @@ impl Gemma4Bringup {
         // that will follow in B6c..d.
         unsafe { cuStreamSynchronize(self.stream.raw() as CUstream) };
 
-        // Optional debug dump for HF parity (gated by env). Writes
-        // raw f16 bytes for the subsample-stage output. Picked up
-        // by v3/tools/gemma4_e4b_audio_subsample_hf_dump.py +
-        // a row-cosine cmp script in a follow-up commit.
-        #[cfg(feature = "cuda")]
-        if let Ok(dir) = std::env::var("RVLLM_E4B_AUDIO_SUBSAMPLE_DUMP_DIR") {
-            let nbytes = (h1 * hidden) * 2;
-            let mut buf = vec![0u8; nbytes];
-            unsafe {
-                cudarc::driver::sys::cuMemcpyDtoH_v2(
-                    buf.as_mut_ptr() as *mut _,
-                    out_f16.device_ptr(),
-                    nbytes,
-                );
-            }
-            std::fs::create_dir_all(&dir).ok();
-            let path = std::path::Path::new(&dir).join("audio_subsample_out.bin");
-            let _ = std::fs::write(&path, &buf);
-            eprintln!(
-                "[audio-dump] subsample out [{} x {}] -> {}",
-                h1, hidden, path.display()
-            );
-        }
+        self.audio_dump_f16(out_f16.device_ptr(), h1 * hidden, "audio_after_subsample.bin");
 
         Ok(crate::gemma4_audio_forward::AudioForwardOutput {
             device_ptr: out_f16.device_ptr(),
@@ -7014,6 +7001,57 @@ impl Gemma4Bringup {
         }
 
         Ok(())
+    }
+
+    /// Optional debug dump (gated by RVLLM_E4B_AUDIO_DUMP_DIR env var)
+    /// of a device-side f16 buffer to the named .bin file. Caller is
+    /// responsible for stream-fence semantics.
+    #[cfg(feature = "cuda")]
+    fn audio_dump_f16(&self, dev_ptr: u64, n_elems: usize, name: &str) {
+        let Ok(dir) = std::env::var("RVLLM_E4B_AUDIO_DUMP_DIR") else { return; };
+        let nbytes = n_elems * 2;
+        let mut buf = vec![0u8; nbytes];
+        unsafe {
+            let rc = cudarc::driver::sys::cuStreamSynchronize(
+                self.stream.raw() as cudarc::driver::sys::CUstream,
+            );
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return; }
+            let rc = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut _, dev_ptr, nbytes,
+            );
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return; }
+        }
+        let _ = std::fs::create_dir_all(&dir);
+        let path = std::path::Path::new(&dir).join(name);
+        let _ = std::fs::write(&path, &buf);
+    }
+
+    /// Same as `audio_dump_f16` but for an f32 buffer cast to f16 on the
+    /// host before writing (so the diff harness can read all dumps as f16).
+    #[cfg(feature = "cuda")]
+    fn audio_dump_f32_as_f16(&self, dev_ptr: u64, n_elems: usize, name: &str) {
+        let Ok(dir) = std::env::var("RVLLM_E4B_AUDIO_DUMP_DIR") else { return; };
+        let nbytes_f32 = n_elems * 4;
+        let mut buf_f32 = vec![0u8; nbytes_f32];
+        unsafe {
+            let rc = cudarc::driver::sys::cuStreamSynchronize(
+                self.stream.raw() as cudarc::driver::sys::CUstream,
+            );
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return; }
+            let rc = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                buf_f32.as_mut_ptr() as *mut _, dev_ptr, nbytes_f32,
+            );
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return; }
+        }
+        let mut buf_f16 = Vec::with_capacity(n_elems * 2);
+        for chunk in buf_f32.chunks_exact(4) {
+            let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let h = half::f16::from_f32(v);
+            buf_f16.extend_from_slice(&h.to_bits().to_le_bytes());
+        }
+        let _ = std::fs::create_dir_all(&dir);
+        let path = std::path::Path::new(&dir).join(name);
+        let _ = std::fs::write(&path, &buf_f16);
     }
 
     /// In-place clamp of an f16 buffer to [lo, hi] on the current stream.
@@ -8270,6 +8308,10 @@ impl Gemma4Bringup {
             let q_scale_vec = self.audio_q_scale_vector_upload(
                 &block_w.self_attn.per_dim_scale, head_dim, scale_name,
             )?;
+            if li == 0 || li == 1 || li == 11 {
+                self.audio_dump_f16(hidden, n_tokens * hidden_dim,
+                    &format!("audio_layer{li}_input.bin"));
+            }
             self.forward_audio_block(
                 block_w, hidden, scratch_residual.device_ptr(),
                 pos_embed.device_ptr(), q_scale_vec.device_ptr(),
@@ -8277,7 +8319,14 @@ impl Gemma4Bringup {
                 chunk_size, past_horizon, context_size, pos_len,
                 softcap, residual_weight, eps, conv_kernel_size,
             )?;
+            if li == 0 || li == 1 || li == 11 {
+                self.audio_dump_f16(hidden, n_tokens * hidden_dim,
+                    &format!("audio_layer{li}_output.bin"));
+            }
         }
+        // pos_embed table itself (cast f32->f16 on host).
+        self.audio_dump_f32_as_f16(pos_embed.device_ptr(),
+            pos_len * hidden_dim, "audio_pos_embed.bin");
 
         // output_proj: [n, hidden] -> [n, output_proj_dims=1536]
         let out_proj_dim = acfg.output_proj_dims;
@@ -8371,6 +8420,9 @@ impl Gemma4Bringup {
                 self.stream.raw(),
             )?;
         }
+        // Dump the post_f16 stage (after output_proj + bias + pre-projection rmsnorm).
+        self.audio_dump_f16(post_f16.device_ptr(), n_tokens * out_proj_dim,
+            "audio_after_output_proj.bin");
         let emb_f16 = self.arena.region(
             "g4a_embed_f16", n_tokens * text_hidden_dim * 2, 16)?;
         unsafe {
@@ -8378,6 +8430,8 @@ impl Gemma4Bringup {
                 emb_f32.device_ptr(), emb_f16.device_ptr(),
                 (n_tokens * text_hidden_dim) as i32)?;
         }
+        self.audio_dump_f16(emb_f16.device_ptr(), n_tokens * text_hidden_dim,
+            "audio_after_embed_audio.bin");
         self.stream.fence()?;
         Ok(crate::gemma4_audio_forward::AudioForwardOutput {
             device_ptr: emb_f16.device_ptr(),
@@ -9841,12 +9895,18 @@ unsafe fn launch_cast_f32_to_f16(
     }
     let block: u32 = 256;
     let grid: u32 = ((n as i64 + block as i64 - 1) / block as i64) as u32;
-    let mut src = src_f32;
+    // Kernel signature is cast_f32_to_f16_kernel(output_f16, input_f32, n).
+    // The arg order MUST be (dst, src, n) — earlier launcher passed
+    // (src, dst, n) so the kernel was effectively reading from the
+    // uninitialized destination buffer and writing zeros into the
+    // source. Subsample / output_proj / V cast were all silently
+    // zeroing their outputs as a result.
     let mut dst = dst_f16;
+    let mut src = src_f32;
     let mut n_ = n;
     let args = [
-        (&mut src) as *mut u64 as *mut core::ffi::c_void,
         (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+        (&mut src) as *mut u64 as *mut core::ffi::c_void,
         (&mut n_)  as *mut i32 as *mut core::ffi::c_void,
     ];
     let rc = cuLaunchKernel(
