@@ -7728,39 +7728,15 @@ impl Gemma4Bringup {
         }
 
         // Cast post output to f16 into `hidden` (overwriting the input).
+        // No residual add here — HF order is norm_post_attn AFTER attention,
+        // residual add AFTER norm. The caller (forward_audio_block) handles
+        // both. `residual` parameter retained for backward-compat callers
+        // but is intentionally ignored here.
+        let _ = residual;
         unsafe {
             launch_cast_f32_to_f16(&self.stream, self.fused.fn_cast_f32_to_f16,
                 post_out_f32.device_ptr(), hidden,
                 (n_tokens * hidden_dim) as i32)?;
-        }
-
-        // hidden += residual.
-        unsafe {
-            let mut a = hidden;
-            let mut b = residual;
-            let mut dst = hidden;
-            let mut n = (n_tokens * hidden_dim) as i32;
-            let args = [
-                (&mut a) as *mut u64 as *mut core::ffi::c_void,
-                (&mut b) as *mut u64 as *mut core::ffi::c_void,
-                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
-                (&mut n) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let block: u32 = 256;
-            let grid: u32 = ((n_tokens * hidden_dim + 255) / 256) as u32;
-            let rc = cuLaunchKernel(
-                self.fused.fn_vector_add.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1, 0, stream_raw as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "audio attn: vector_add launch failed",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
         }
 
         Ok(())
@@ -7837,34 +7813,13 @@ impl Gemma4Bringup {
                 ));
             }
         }
-        // Attention writes into hidden, computes hidden = norm_post_attn(self_attn(hidden)) + residual.
-        // But the HF order is: residual_after_attn = self_attn(norm_pre_attn(x))
-        //                      hidden_after_attn  = norm_post_attn(residual_after_attn) + residual_input
-        // Our forward_audio_attention currently does the post norm internally? Let's review:
-        //   forward_audio_attention does: qkv -> attn computations -> post projection + residual.
-        // It does NOT do norm_post_attn. We need to do norm_post_attn AFTER attention.
-        // We'll restructure: have forward_audio_attention NOT add residual, then norm_post_attn + add residual here.
-        // For now keep the residual-add inside forward_audio_attention; norm_post_attn is left to be applied
-        // separately on hidden after attention finishes.
-        // Actually — the HF reference: tmp = norm_pre_attn(clamp(h))
-        //                              tmp, _ = self_attn(tmp, pos_embed, mask)
-        //                              tmp = clamp(tmp); tmp = norm_post_attn(tmp)
-        //                              h = tmp + residual
-        // So: attention output is post-projected but NOT normalized, NOT added to residual.
-        // norm_post_attn applies after, and then residual add.
-        // We need forward_audio_attention to NOT add residual either.
-        //
-        // For this first impl we'll pass `residual = hidden` (no-op delta-source) and accept the
-        // current implementation does an extra add. Correctness fix in a follow-up.
-        let dummy_residual = scratch_residual;
         self.forward_audio_attention(
             &block_w.self_attn,
-            hidden, dummy_residual, pos_embed_f32, q_scale_vec,
+            hidden, scratch_residual, pos_embed_f32, q_scale_vec,
             n_tokens, hidden_dim, num_heads, head_dim,
             chunk_size, past_horizon, context_size, pos_len, softcap,
         )?;
-        // norm_post_attn applied here on hidden (which already had +residual baked in -
-        // INCORRECT vs HF but proceeding to first compile).
+        // norm_post_attn(hidden) in-place.
         unsafe {
             let mut x = hidden;
             let mut g = block_w.norm_post_attn.offset_bytes;
@@ -7887,6 +7842,34 @@ impl Gemma4Bringup {
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
                     "audio block: norm_post_attn launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        // hidden += scratch_residual (the post-FFN1 residual).
+        unsafe {
+            let mut a = hidden;
+            let mut b = scratch_residual;
+            let mut dst = hidden;
+            let mut n = (n_tokens * hidden_dim) as i32;
+            let args = [
+                (&mut a) as *mut u64 as *mut core::ffi::c_void,
+                (&mut b) as *mut u64 as *mut core::ffi::c_void,
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut n) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((n_tokens * hidden_dim + 255) / 256) as u32;
+            let rc = cuLaunchKernel(
+                self.fused.fn_vector_add.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio block: attn residual add failed",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
