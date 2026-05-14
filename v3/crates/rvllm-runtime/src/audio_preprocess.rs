@@ -213,11 +213,12 @@ impl MelExtractor {
                 scratch[i].im = 0.0;
             }
             self.fft.process(&mut scratch);
+            // Magnitude spectrogram (HF feature_extraction_gemma4.py:206).
             for b in 0..n_bins {
                 let c = scratch[b];
-                power[b] = c.re * c.re + c.im * c.im;
+                power[b] = (c.re * c.re + c.im * c.im).sqrt();
             }
-            // Mel filter bank: out[frame, m] = log(max(floor, sum_b fb[m,b] * power[b]))
+            // Mel filter bank: out[frame, m] = log(sum_b fb[m,b] * mag[b] + floor).
             let frame_off = frame * cfg.n_mels;
             for m in 0..cfg.n_mels {
                 let fb_row = &self.filter_bank[m * n_bins..(m + 1) * n_bins];
@@ -225,8 +226,7 @@ impl MelExtractor {
                 for b in 0..n_bins {
                     acc += fb_row[b] * power[b];
                 }
-                let clamped = acc.max(cfg.mel_floor);
-                out[frame_off + m] = clamped.ln();
+                out[frame_off + m] = (acc + cfg.mel_floor).ln();
             }
         }
         out
@@ -254,7 +254,9 @@ fn mel_to_hz(mel: f32) -> f32 {
     700.0 * (10.0f32.powf(mel / 2595.0) - 1.0)
 }
 
-/// Slaney-style triangular mel filter bank, librosa-compatible.
+/// HTK mel scale, norm=None triangular filter bank, matching HF
+/// transformers `mel_filter_bank(..., norm=None, mel_scale="htk")`
+/// used by Gemma 4's audio feature extractor.
 /// Returns `[n_mels, n_bins]` row-major f32.
 fn mel_filter_bank(
     n_mels: usize,
@@ -265,13 +267,11 @@ fn mel_filter_bank(
 ) -> Vec<f32> {
     let mel_lo = hz_to_mel(f_min);
     let mel_hi = hz_to_mel(f_max);
-    // n_mels + 2 edges = n_mels triangles + 2 outer anchors.
     let mut mel_pts = Vec::with_capacity(n_mels + 2);
     for i in 0..(n_mels + 2) {
         let t = i as f32 / (n_mels + 1) as f32;
         mel_pts.push(mel_lo + t * (mel_hi - mel_lo));
     }
-    // Map mel anchors → linear Hz → fractional FFT-bin index.
     let n_fft = (n_bins - 1) * 2;
     let mut bin_pts = Vec::with_capacity(mel_pts.len());
     for &m in &mel_pts {
@@ -285,15 +285,13 @@ fn mel_filter_bank(
         let hi = bin_pts[m + 2];
         let inv_l = if ctr > lo { 1.0 / (ctr - lo) } else { 0.0 };
         let inv_r = if hi > ctr { 1.0 / (hi - ctr) } else { 0.0 };
-        // Slaney normalisation: triangle peak height = 2/(hi-lo) so
-        // equal-Hz-width filters integrate to the same area.
-        let slaney = 2.0 / (hi - lo).max(1e-12);
+        // norm=None — no Slaney area normalisation. Peak height = 1.0.
         for b in 0..n_bins {
             let bf = b as f32;
             let l = (bf - lo) * inv_l;
             let r = (hi - bf) * inv_r;
             let tri = l.min(r).max(0.0);
-            fb[m * n_bins + b] = tri * slaney;
+            fb[m * n_bins + b] = tri;
         }
     }
     fb
