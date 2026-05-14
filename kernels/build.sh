@@ -215,7 +215,8 @@ for arch in $ARCHS; do
             scale_scalar_inplace_f32|apply_audio_attn_mask_f32|\
             layernorm_relu_hwc_f16|transpose_hwc_to_chw_f16|\
             clamp_inplace_f16|clamp_inplace_f32|\
-            rmsnorm_no_scale_inplace_f16|\
+            rmsnorm_no_scale_inplace_f16|rmsnorm_no_scale_inplace_f32|\
+            add_bias_f16_to_f32|\
             extract_head_bf16|scatter_heads_bf16|\
             softmax_row_f32_to_bf16|gelu_tanh_mul_bf16|\
             scale_inplace_f32|transpose_heads_v_bf16|\

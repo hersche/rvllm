@@ -548,6 +548,10 @@ pub struct Gemma4FusedModules {
     pub fn_clamp_inplace_f32: KernelFn,
     pub rmsnorm_no_scale_inplace_f16_mod: LoadedModule,
     pub fn_rmsnorm_no_scale_inplace_f16: KernelFn,
+    pub rmsnorm_no_scale_inplace_f32_mod: LoadedModule,
+    pub fn_rmsnorm_no_scale_inplace_f32: KernelFn,
+    pub add_bias_f16_to_f32_mod: LoadedModule,
+    pub fn_add_bias_f16_to_f32: KernelFn,
     pub scale_inplace_f16_mod: LoadedModule,
     pub fn_scale_inplace_f16: KernelFn,
     pub add_bias_f16_mod: LoadedModule,
@@ -8272,17 +8276,12 @@ impl Gemma4Bringup {
                 self.stream.raw(),
             )?;
         }
-        let post_f16 = self.arena.region(
-            "g4a_out_proj_f16", n_tokens * out_proj_dim * 2, 16)?;
-        unsafe {
-            launch_cast_f32_to_f16(&self.stream, self.fused.fn_cast_f32_to_f16,
-                post_f32.device_ptr(), post_f16.device_ptr(),
-                (n_tokens * out_proj_dim) as i32)?;
-        }
-        // output_proj has bias=True in HF — add output_proj_b to post_f16.
+        // Stay in f32 through output_proj_b + embedding_pre_projection_norm
+        // to match HF's float arithmetic; cast to f16 only just before the
+        // embedding_projection GEMM.
         unsafe {
             use cudarc::driver::sys::*;
-            let mut tensor = post_f16.device_ptr();
+            let mut tensor = post_f32.device_ptr();
             let mut bias = audio.output_proj_b.offset_bytes;
             let mut dim = out_proj_dim as i32;
             let args = [
@@ -8292,7 +8291,7 @@ impl Gemma4Bringup {
             ];
             let block: u32 = (out_proj_dim as u32).min(1024);
             let rc = cuLaunchKernel(
-                self.fused.fn_add_bias_f16.raw() as CUfunction,
+                self.fused.fn_add_bias_f16_to_f32.raw() as CUfunction,
                 n_tokens as u32, 1, 1, block, 1, 1,
                 0, self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -8300,17 +8299,16 @@ impl Gemma4Bringup {
             );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "audio: output_proj bias add failed",
+                    "audio: output_proj bias add (f32) failed",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
             }
         }
-        // embed_audio.embedding_pre_projection_norm: parameter-free RMSNorm
-        // before embedding_projection (HF Gemma4MultimodalEmbedder, modeling_gemma4.py:1951).
+        // embedding_pre_projection_norm (parameter-free RMSNorm in f32).
         unsafe {
             use cudarc::driver::sys::*;
-            let mut x = post_f16.device_ptr();
+            let mut x = post_f32.device_ptr();
             let mut eps_ = 1.0e-6_f32;
             let mut dim = out_proj_dim as i32;
             let args = [
@@ -8320,7 +8318,7 @@ impl Gemma4Bringup {
             ];
             let block: u32 = (out_proj_dim as u32).min(1024);
             let rc = cuLaunchKernel(
-                self.fused.fn_rmsnorm_no_scale_inplace_f16.raw() as CUfunction,
+                self.fused.fn_rmsnorm_no_scale_inplace_f32.raw() as CUfunction,
                 n_tokens as u32, 1, 1, block, 1, 1,
                 0, self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -8328,11 +8326,18 @@ impl Gemma4Bringup {
             );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "audio: embedding_pre_projection_norm failed",
+                    "audio: embedding_pre_projection_norm (f32) failed",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
             }
+        }
+        let post_f16 = self.arena.region(
+            "g4a_out_proj_f16", n_tokens * out_proj_dim * 2, 16)?;
+        unsafe {
+            launch_cast_f32_to_f16(&self.stream, self.fused.fn_cast_f32_to_f16,
+                post_f32.device_ptr(), post_f16.device_ptr(),
+                (n_tokens * out_proj_dim) as i32)?;
         }
         // embed_audio_projection: [n, 1536] -> [n, text_hidden]
         let emb_f32 = self.arena.region(
@@ -10135,6 +10140,12 @@ fn load_gemma4_fused(
     let rmsnorm_no_scale_inplace_f16_mod = loader.load_ptx("rmsnorm_no_scale_inplace_f16")?;
     let fn_rmsnorm_no_scale_inplace_f16 = rmsnorm_no_scale_inplace_f16_mod
         .get_function("rmsnorm_no_scale_inplace_f16_kernel")?;
+    let rmsnorm_no_scale_inplace_f32_mod = loader.load_ptx("rmsnorm_no_scale_inplace_f32")?;
+    let fn_rmsnorm_no_scale_inplace_f32 = rmsnorm_no_scale_inplace_f32_mod
+        .get_function("rmsnorm_no_scale_inplace_f32_kernel")?;
+    let add_bias_f16_to_f32_mod = loader.load_ptx("add_bias_f16_to_f32")?;
+    let fn_add_bias_f16_to_f32 = add_bias_f16_to_f32_mod
+        .get_function("add_bias_f16_to_f32_kernel")?;
     let scale_inplace_f16_mod = loader.load_ptx("scale_inplace_f16")?;
     let fn_scale_inplace_f16 =
         scale_inplace_f16_mod.get_function("scale_inplace_f16_kernel")?;
@@ -10320,6 +10331,10 @@ fn load_gemma4_fused(
         fn_clamp_inplace_f32,
         rmsnorm_no_scale_inplace_f16_mod,
         fn_rmsnorm_no_scale_inplace_f16,
+        rmsnorm_no_scale_inplace_f32_mod,
+        fn_rmsnorm_no_scale_inplace_f32,
+        add_bias_f16_to_f32_mod,
+        fn_add_bias_f16_to_f32,
         scale_inplace_f16_mod,
         fn_scale_inplace_f16,
         add_bias_f16_mod,
