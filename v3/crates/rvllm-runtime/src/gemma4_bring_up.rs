@@ -542,6 +542,10 @@ pub struct Gemma4FusedModules {
     pub fn_apply_audio_attn_mask_f32: KernelFn,
     pub transpose_hwc_to_chw_f16_mod: LoadedModule,
     pub fn_transpose_hwc_to_chw_f16: KernelFn,
+    pub clamp_inplace_f16_mod: LoadedModule,
+    pub fn_clamp_inplace_f16: KernelFn,
+    pub clamp_inplace_f32_mod: LoadedModule,
+    pub fn_clamp_inplace_f32: KernelFn,
     pub scale_inplace_f16_mod: LoadedModule,
     pub fn_scale_inplace_f16: KernelFn,
     pub add_bias_f16_mod: LoadedModule,
@@ -6530,7 +6534,9 @@ impl Gemma4Bringup {
             }
         }
 
-        // ffw_layer_1: out[n,4H] = hidden[n,H] @ W1[4H,H].T
+        // ffw_layer_1: clipped-linear input clamp (on rmsnormed hidden) -> GEMM -> output clamp.
+        self.audio_clamp_inplace_f16(hidden, (n_tokens * h) as i32,
+            ffn.layer_1.input_min, ffn.layer_1.input_max)?;
         let inter_f32 = self.arena.region(scratch_inter_f32, n_tokens * h4 * 4, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
@@ -6543,6 +6549,8 @@ impl Gemma4Bringup {
                 self.stream.raw(),
             )?;
         }
+        self.audio_clamp_inplace_f32(inter_f32.device_ptr(), (n_tokens * h4) as i32,
+            ffn.layer_1.output_min, ffn.layer_1.output_max)?;
         let inter_f16 = self.arena.region(scratch_inter_f16, n_tokens * h4 * 2, 16)?;
         unsafe { launch_cast_f32_to_f16(
             &self.stream,
@@ -6560,7 +6568,9 @@ impl Gemma4Bringup {
             (n_tokens * h4) as i32,
         ) }?;
 
-        // ffw_layer_2: out[n,H] = inter[n,4H] @ W2[H,4H].T
+        // ffw_layer_2: clipped-linear input clamp -> GEMM -> output clamp.
+        self.audio_clamp_inplace_f16(inter_f16.device_ptr(), (n_tokens * h4) as i32,
+            ffn.layer_2.input_min, ffn.layer_2.input_max)?;
         let out_f32 = self.arena.region(scratch_out_f32, n_tokens * h * 4, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
@@ -6573,6 +6583,8 @@ impl Gemma4Bringup {
                 self.stream.raw(),
             )?;
         }
+        self.audio_clamp_inplace_f32(out_f32.device_ptr(), (n_tokens * h) as i32,
+            ffn.layer_2.output_min, ffn.layer_2.output_max)?;
         // cast back into `hidden` (over-writing the rmsnormed input).
         unsafe { launch_cast_f32_to_f16(
             &self.stream,
@@ -6750,7 +6762,9 @@ impl Gemma4Bringup {
             }
         }
 
-        // linear_start: [n, H] -> [n, 2H], f32 then cast.
+        // linear_start: clipped input clamp -> GEMM -> output clamp.
+        self.audio_clamp_inplace_f16(hidden, (n_tokens * h) as i32,
+            lconv.linear_start.input_min, lconv.linear_start.input_max)?;
         let two_h = 2 * h;
         let pre_f32 = self.arena.region(scratch_pre_gemm_f32, n_tokens * two_h * 4, 16)?;
         unsafe {
@@ -6764,6 +6778,10 @@ impl Gemma4Bringup {
                 self.stream.raw(),
             )?;
         }
+        // linear_start output clamp on the f32 buffer.
+        self.audio_clamp_inplace_f32(pre_f32.device_ptr(),
+            (n_tokens * two_h) as i32,
+            lconv.linear_start.output_min, lconv.linear_start.output_max)?;
         // Reuse `hidden` as the linear_start [N, 2H] target — too small.
         // We need a [N, 2H] f16 buffer; size = 2 * N*H * 2 bytes.
         // Use the padded buffer slot's first half by allocating a
@@ -6907,7 +6925,9 @@ impl Gemma4Bringup {
             (n_tokens * h) as i32,
         ) }?;
 
-        // linear_end: [n, H] -> [n, H].
+        // linear_end: clipped input clamp -> GEMM -> output clamp.
+        self.audio_clamp_inplace_f16(hidden, (n_tokens * h) as i32,
+            lconv.linear_end.input_min, lconv.linear_end.input_max)?;
         let post_f32 = self.arena.region(scratch_post_gemm_f32, n_tokens * h * 4, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
@@ -6920,6 +6940,8 @@ impl Gemma4Bringup {
                 self.stream.raw(),
             )?;
         }
+        self.audio_clamp_inplace_f32(post_f32.device_ptr(), (n_tokens * h) as i32,
+            lconv.linear_end.output_min, lconv.linear_end.output_max)?;
         unsafe { launch_cast_f32_to_f16(
             &self.stream,
             self.fused.fn_cast_f32_to_f16,
@@ -6959,6 +6981,76 @@ impl Gemma4Bringup {
             }
         }
 
+        Ok(())
+    }
+
+    /// In-place clamp of an f16 buffer to [lo, hi] on the current stream.
+    #[cfg(feature = "cuda")]
+    fn audio_clamp_inplace_f16(&self, x: u64, n: i32, lo: f32, hi: f32) -> Result<()> {
+        use cudarc::driver::sys::*;
+        if n <= 0 { return Ok(()); }
+        unsafe {
+            let mut x = x;
+            let mut lo = lo;
+            let mut hi = hi;
+            let mut n_ = n;
+            let args = [
+                (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                (&mut lo) as *mut f32 as *mut core::ffi::c_void,
+                (&mut hi) as *mut f32 as *mut core::ffi::c_void,
+                (&mut n_) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((n as i64 + block as i64 - 1) / block as i64) as u32;
+            let rc = cuLaunchKernel(
+                self.fused.fn_clamp_inplace_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio: clamp_inplace_f16 launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// In-place clamp of an f32 buffer to [lo, hi] on the current stream.
+    #[cfg(feature = "cuda")]
+    fn audio_clamp_inplace_f32(&self, x: u64, n: i32, lo: f32, hi: f32) -> Result<()> {
+        use cudarc::driver::sys::*;
+        if n <= 0 { return Ok(()); }
+        unsafe {
+            let mut x = x;
+            let mut lo = lo;
+            let mut hi = hi;
+            let mut n_ = n;
+            let args = [
+                (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                (&mut lo) as *mut f32 as *mut core::ffi::c_void,
+                (&mut hi) as *mut f32 as *mut core::ffi::c_void,
+                (&mut n_) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((n as i64 + block as i64 - 1) / block as i64) as u32;
+            let rc = cuLaunchKernel(
+                self.fused.fn_clamp_inplace_f32.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio: clamp_inplace_f32 launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -7144,7 +7236,8 @@ impl Gemma4Bringup {
         let q_proj_out = num_heads * head_dim; // == hidden_dim on E4B
         let f32_bytes = n_tokens * q_proj_out * 4;
 
-        // Q proj: D[m, n] = Wq^T @ hidden ; out [n_tokens, q_proj_out] f32
+        let nq = (n_tokens * q_proj_out) as i32;
+        // Q proj + output clamp (Gemma4ClippableLinear semantics).
         let q = self.arena.region(scratch_q_f32, f32_bytes, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
@@ -7157,7 +7250,9 @@ impl Gemma4Bringup {
                 self.stream.raw(),
             )?;
         }
-        // K proj
+        self.audio_clamp_inplace_f32(q.device_ptr(), nq,
+            attn.q.output_min, attn.q.output_max)?;
+        // K proj + output clamp.
         let k = self.arena.region(scratch_k_f32, f32_bytes, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
@@ -7170,7 +7265,9 @@ impl Gemma4Bringup {
                 self.stream.raw(),
             )?;
         }
-        // V proj
+        self.audio_clamp_inplace_f32(k.device_ptr(), nq,
+            attn.k.output_min, attn.k.output_max)?;
+        // V proj + output clamp.
         let v = self.arena.region(scratch_v_f32, f32_bytes, 16)?;
         unsafe {
             self.cublaslt.f16_gemm_f32(
@@ -7183,6 +7280,8 @@ impl Gemma4Bringup {
                 self.stream.raw(),
             )?;
         }
+        self.audio_clamp_inplace_f32(v.device_ptr(), nq,
+            attn.v.output_min, attn.v.output_max)?;
 
         // Apply per-head_dim scale to Q. The output layout from
         // cuBLASLt is row-major [n_tokens, q_proj_out] = [n_tokens,
@@ -7855,8 +7954,12 @@ impl Gemma4Bringup {
                 (num_blocks * chunk_size * hidden_dim) as i32)?;
         }
 
-        // Post projection: out_f32[N, hidden] = attn_perm_f16[N, hidden] @ W_post^T.
-        // Only the first n_tokens rows matter for downstream.
+        // Post projection (clipped linear): input clamp on attn output, GEMM, output clamp.
+        self.audio_clamp_inplace_f16(
+            attn_out_perm_f16.device_ptr(),
+            (n_tokens * hidden_dim) as i32,
+            attn.post.input_min, attn.post.input_max,
+        )?;
         let post_out_f32 = self.arena.region(
             "g4a_attn_post_f32", n_tokens * hidden_dim * 4, 16)?;
         unsafe {
@@ -7870,6 +7973,11 @@ impl Gemma4Bringup {
                 stream_raw,
             )?;
         }
+        self.audio_clamp_inplace_f32(
+            post_out_f32.device_ptr(),
+            (n_tokens * hidden_dim) as i32,
+            attn.post.output_min, attn.post.output_max,
+        )?;
 
         // Cast post output to f16 into `hidden` (overwriting the input).
         // No residual add here — HF order is norm_post_attn AFTER attention,
@@ -9961,6 +10069,12 @@ fn load_gemma4_fused(
     let transpose_hwc_to_chw_f16_mod = loader.load_ptx("transpose_hwc_to_chw_f16")?;
     let fn_transpose_hwc_to_chw_f16 = transpose_hwc_to_chw_f16_mod
         .get_function("transpose_hwc_to_chw_f16_kernel")?;
+    let clamp_inplace_f16_mod = loader.load_ptx("clamp_inplace_f16")?;
+    let fn_clamp_inplace_f16 = clamp_inplace_f16_mod
+        .get_function("clamp_inplace_f16_kernel")?;
+    let clamp_inplace_f32_mod = loader.load_ptx("clamp_inplace_f32")?;
+    let fn_clamp_inplace_f32 = clamp_inplace_f32_mod
+        .get_function("clamp_inplace_f32_kernel")?;
     let scale_inplace_f16_mod = loader.load_ptx("scale_inplace_f16")?;
     let fn_scale_inplace_f16 =
         scale_inplace_f16_mod.get_function("scale_inplace_f16_kernel")?;
@@ -10140,6 +10254,10 @@ fn load_gemma4_fused(
         fn_apply_audio_attn_mask_f32,
         transpose_hwc_to_chw_f16_mod,
         fn_transpose_hwc_to_chw_f16,
+        clamp_inplace_f16_mod,
+        fn_clamp_inplace_f16,
+        clamp_inplace_f32_mod,
+        fn_clamp_inplace_f32,
         scale_inplace_f16_mod,
         fn_scale_inplace_f16,
         add_bias_f16_mod,

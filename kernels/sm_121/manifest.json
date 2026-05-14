@@ -51,6 +51,16 @@
       "path": "causal_conv1d_f16.ptx",
       "sha256": "ac5ac20ae30468b48afee780c9e5839f7562ac06133d70e5a944ecfb87b7982f"
     },
+    "clamp_inplace_f16": {
+      "bytes": 1446,
+      "path": "clamp_inplace_f16.ptx",
+      "sha256": "6418c710a6407e841d14f7fbc0911d53bd6dcbf2cabcfffe69f20075771cd68b"
+    },
+    "clamp_inplace_f32": {
+      "bytes": 1283,
+      "path": "clamp_inplace_f32.ptx",
+      "sha256": "6d2f99eb743c884e913a82e19bbce4a0a28c9a53c5417a3783045536fcf4b3d2"
+    },
     "conv_state_advance_batched_f16": {
       "bytes": 8311,
       "path": "conv_state_advance_batched_f16.ptx",
@@ -912,5 +922,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "ba7db39"
+  "revision": "f99711c"
 }
