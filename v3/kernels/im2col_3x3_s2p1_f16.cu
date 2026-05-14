@@ -64,7 +64,13 @@ __global__ void im2col_3x3_s2p1_f16_kernel(
         v = __float2half(0.0f);
     }
 
+    // Output layout: row-major [spatial, in_ch * 9] so that cuBLAS's
+    // f16_gemm_f32 (which expects B as col-major [k, n] == row-major
+    // [n, k] for the caller-side b_f16) reads im2col with k on the
+    // INNER axis. Previously we wrote [in_ch * 9, spatial], causing
+    // cuBLAS to interpret im2col with stride-mismatched access, which
+    // silently produced near-orthogonal results vs HF.
     const long long out_idx =
-        (long long)patch_idx * spatial_total + spatial_idx;
+        (long long)spatial_idx * (in_ch * 9) + patch_idx;
     output[out_idx] = v;
 }

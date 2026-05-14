@@ -382,9 +382,9 @@
       "sha256": "31f1f25eaab5a900d48cd0ae58288bd22b553115d5802919b5dcccd53479c023"
     },
     "im2col_3x3_s2p1_f16": {
-      "bytes": 2942,
+      "bytes": 2951,
       "path": "im2col_3x3_s2p1_f16.ptx",
-      "sha256": "8632bc78e8ae4e325fb1a716584fcb546b54a6925175b21b92ed8366d8f6aab1"
+      "sha256": "204c07b30c5918be749accf9be65414a7985c1c57b0658d1038e98347ead0fdc"
     },
     "layernorm_inplace_f16": {
       "bytes": 13646,
@@ -937,5 +937,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "b36eff6"
+  "revision": "20fbce3"
 }

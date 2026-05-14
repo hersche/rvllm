@@ -6251,59 +6251,27 @@ impl Gemma4Bringup {
                 self.stream.raw(),
             )?;
         }
-        // Cast to f16. GEMM output is row-major [spatial, out_ch] = HWC.
-        let conv0_hwc_f16 = self
+        // f16_gemm_f32 output is row-major [m, n] = [out_ch, spatial]
+        // = CHW already. Earlier codex round-2 claim that it was HWC was
+        // wrong (verified by per-stage HF parity dump: rvllm dump at
+        // [s=0, c=0..6] was zero matching the corner-padding pattern
+        // for c=0 across w=0..6, which is the CHW interpretation).
+        // No transpose needed before layernorm_relu_chw.
+        let conv0_f16 = self
             .arena
-            .region("g4a_s0_conv_hwc_f16", c0 * s0_spatial * 2, 16)?;
+            .region("g4a_s0_conv_f16", c0 * s0_spatial * 2, 16)?;
         unsafe { launch_cast_f32_to_f16(
             &self.stream,
             self.fused.fn_cast_f32_to_f16,
             conv0_f32.device_ptr(),
-            conv0_hwc_f16.device_ptr(),
+            conv0_f16.device_ptr(),
             (c0 * s0_spatial) as i32,
         ) }?;
         self.audio_dump_f32_as_f16(conv0_f32.device_ptr(), c0 * s0_spatial,
             "audio_diag_conv0_f32.bin");
-        self.audio_dump_f16(conv0_hwc_f16.device_ptr(), c0 * s0_spatial,
-            "audio_diag_conv0_hwc.bin");
-        // Transpose HWC -> CHW so the existing layernorm_relu_chw + the
-        // stage-1 im2col (which expects CHW input) see the right layout.
-        let conv0_f16 = self
-            .arena
-            .region("g4a_s0_conv_f16", c0 * s0_spatial * 2, 16)?;
-        unsafe {
-            let mut src = conv0_hwc_f16.device_ptr();
-            let mut dst = conv0_f16.device_ptr();
-            let mut c_ = c0 as i32;
-            let mut h_ = h0 as i32;
-            let mut w_ = w0 as i32;
-            let args = [
-                (&mut src) as *mut u64 as *mut core::ffi::c_void,
-                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
-                (&mut c_) as *mut i32 as *mut core::ffi::c_void,
-                (&mut h_) as *mut i32 as *mut core::ffi::c_void,
-                (&mut w_) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let total = (c0 * s0_spatial) as i64;
-            let block: u32 = 256;
-            let grid: u32 = ((total + block as i64 - 1) / block as i64) as u32;
-            let rc = cuLaunchKernel(
-                self.fused.fn_transpose_hwc_to_chw_f16.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1, 0, self.stream.raw() as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "audio subsample: stage0 hwc->chw launch failed",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
-        }
         self.audio_dump_f16(conv0_f16.device_ptr(), c0 * s0_spatial,
             "audio_diag_conv0_chw_pre_ln.bin");
-        // Fused LayerNorm-over-C + ReLU (now sees CHW correctly).
+        // Fused LayerNorm-over-C + ReLU (CHW input).
         unsafe { launch_layernorm_relu_chw_f16(
             &self.stream,
             self.fused.fn_layernorm_relu_chw_f16,
@@ -6348,50 +6316,17 @@ impl Gemma4Bringup {
                 self.stream.raw(),
             )?;
         }
-        // Same HWC->CHW fix as stage 0.
-        let conv1_hwc_f16 = self
+        // GEMM output is CHW directly (see stage 0 comment).
+        let conv1_f16 = self
             .arena
-            .region("g4a_s1_conv_hwc_f16", c1 * s1_spatial * 2, 16)?;
+            .region("g4a_s1_conv_f16", c1 * s1_spatial * 2, 16)?;
         unsafe { launch_cast_f32_to_f16(
             &self.stream,
             self.fused.fn_cast_f32_to_f16,
             conv1_f32.device_ptr(),
-            conv1_hwc_f16.device_ptr(),
+            conv1_f16.device_ptr(),
             (c1 * s1_spatial) as i32,
         ) }?;
-        let conv1_f16 = self
-            .arena
-            .region("g4a_s1_conv_f16", c1 * s1_spatial * 2, 16)?;
-        unsafe {
-            let mut src = conv1_hwc_f16.device_ptr();
-            let mut dst = conv1_f16.device_ptr();
-            let mut c_ = c1 as i32;
-            let mut h_ = h1 as i32;
-            let mut w_ = w1 as i32;
-            let args = [
-                (&mut src) as *mut u64 as *mut core::ffi::c_void,
-                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
-                (&mut c_) as *mut i32 as *mut core::ffi::c_void,
-                (&mut h_) as *mut i32 as *mut core::ffi::c_void,
-                (&mut w_) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let total = (c1 * s1_spatial) as i64;
-            let block: u32 = 256;
-            let grid: u32 = ((total + block as i64 - 1) / block as i64) as u32;
-            let rc = cuLaunchKernel(
-                self.fused.fn_transpose_hwc_to_chw_f16.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1, 0, self.stream.raw() as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "audio subsample: stage1 hwc->chw launch failed",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
-        }
         unsafe { launch_layernorm_relu_chw_f16(
             &self.stream,
             self.fused.fn_layernorm_relu_chw_f16,

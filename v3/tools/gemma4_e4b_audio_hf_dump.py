@@ -92,9 +92,27 @@ def main():
     write_f16(dump_dir / "audio_input_mel.bin", mel[0].T)  # [T_mel, 128]
 
     with torch.no_grad():
-        # ---- subsample ----
-        h, _mask = audio_tower.subsample_conv_projection(mel, mask)
-        # h: [B=1, N, 1024]
+        # ---- subsample with per-stage hooks ----
+        ss = audio_tower.subsample_conv_projection
+        # Stage 0 conv input is mel.unsqueeze(1) -> [B, 1, T, 128]
+        h0_in = mel.unsqueeze(1)
+        h0_conv = ss.layer0.conv(h0_in.to(ss.layer0.conv.weight.dtype))
+        # CHW shape [B, c0, h0, w0]; write transposed-to-HWC for diff convenience.
+        write_f16(dump_dir / "audio_subsample_stage0_conv.bin",
+                  h0_conv[0].permute(1, 2, 0))  # [h0, w0, c0]
+        h0_act = ss.layer0.act(ss.layer0.norm(h0_conv.permute(0, 2, 3, 1)).permute(0, 3, 1, 2))
+        write_f16(dump_dir / "audio_subsample_stage0_act.bin",
+                  h0_act[0].permute(1, 2, 0))  # [h0, w0, c0]
+        h1_conv = ss.layer1.conv(h0_act.to(ss.layer1.conv.weight.dtype))
+        write_f16(dump_dir / "audio_subsample_stage1_conv.bin",
+                  h1_conv[0].permute(1, 2, 0))  # [h1, w1, c1]
+        h1_act = ss.layer1.act(ss.layer1.norm(h1_conv.permute(0, 2, 3, 1)).permute(0, 3, 1, 2))
+        write_f16(dump_dir / "audio_subsample_stage1_act.bin",
+                  h1_act[0].permute(1, 2, 0))  # [h1, w1, c1]
+        # final reshape input to input_proj_linear: [B, h1, w1*c1=1024]
+        h1_flat = h1_act.permute(0, 2, 3, 1).contiguous().reshape(h1_act.shape[0], h1_act.shape[2], -1)
+        write_f16(dump_dir / "audio_subsample_pre_proj.bin", h1_flat[0])  # [h1, 1024]
+        h = ss.input_proj_linear(h1_flat)
         write_f16(dump_dir / "audio_after_subsample.bin", h[0])
 
         # ---- relative pos embed (shared across layers) ----
