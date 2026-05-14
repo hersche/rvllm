@@ -516,6 +516,12 @@ pub struct Gemma4FusedModules {
     pub fn_layernorm_relu_chw_f16: KernelFn,
     pub transpose_chw_to_hwc_f16_mod: LoadedModule,
     pub fn_transpose_chw_to_hwc_f16: KernelFn,
+    // B6c: audio encoder block building blocks. glu_split (sigmoid
+    // gate) for LightConv1d, plain silu inplace for FFN + LConv post.
+    pub glu_split_sigmoid_f16_mod: LoadedModule,
+    pub fn_glu_split_sigmoid_f16: KernelFn,
+    pub silu_inplace_f16_mod: LoadedModule,
+    pub fn_silu_inplace_f16: KernelFn,
     pub scale_inplace_f16_mod: LoadedModule,
     pub fn_scale_inplace_f16: KernelFn,
     pub add_bias_f16_mod: LoadedModule,
@@ -7920,6 +7926,13 @@ fn load_gemma4_fused(
     let transpose_chw_to_hwc_f16_mod = loader.load_ptx("transpose_chw_to_hwc_f16")?;
     let fn_transpose_chw_to_hwc_f16 =
         transpose_chw_to_hwc_f16_mod.get_function("transpose_chw_to_hwc_f16_kernel")?;
+    // B6c: audio encoder block helpers.
+    let glu_split_sigmoid_f16_mod = loader.load_ptx("glu_split_sigmoid_f16")?;
+    let fn_glu_split_sigmoid_f16 =
+        glu_split_sigmoid_f16_mod.get_function("glu_split_sigmoid_f16_kernel")?;
+    let silu_inplace_f16_mod = loader.load_ptx("silu_inplace_f16")?;
+    let fn_silu_inplace_f16 =
+        silu_inplace_f16_mod.get_function("silu_inplace_f16_kernel")?;
     let scale_inplace_f16_mod = loader.load_ptx("scale_inplace_f16")?;
     let fn_scale_inplace_f16 =
         scale_inplace_f16_mod.get_function("scale_inplace_f16_kernel")?;
@@ -8075,6 +8088,10 @@ fn load_gemma4_fused(
         fn_layernorm_relu_chw_f16,
         transpose_chw_to_hwc_f16_mod,
         fn_transpose_chw_to_hwc_f16,
+        glu_split_sigmoid_f16_mod,
+        fn_glu_split_sigmoid_f16,
+        silu_inplace_f16_mod,
+        fn_silu_inplace_f16,
         scale_inplace_f16_mod,
         fn_scale_inplace_f16,
         add_bias_f16_mod,
