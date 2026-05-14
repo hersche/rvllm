@@ -132,6 +132,21 @@ pub struct VisionItem {
 pub enum GenerateEvent {
     /// One newly generated token.
     Token { id: u32, position: u32 },
+    /// Speculative-decode step report. Emitted ONCE per drafter
+    /// verification round when `RVLLM_GEMMA4_SPEC_DECODE=1`:
+    /// `drafted` is K (tokens proposed by the drafter for this
+    /// round), `accepted` is the prefix that survived base
+    /// verification (`accepted <= drafted`), and `cumulative_decoded`
+    /// is the running count of accepted output tokens since
+    /// generation started. Followed by `accepted+1` `Token`
+    /// events (the accepted prefix plus the base's own argmax at
+    /// the divergence point). Off-by-default; resident-only in
+    /// commit 1 (no emitter wired yet).
+    SpeculativeStep {
+        drafted: u32,
+        accepted: u32,
+        cumulative_decoded: u32,
+    },
     /// Stream ended normally. Carries the reason + usage counts.
     Done { finish: FinishReason, prompt_tokens: u32, completion_tokens: u32 },
     /// Stream ended with an error. Handler maps to `ApiError`.
@@ -359,6 +374,10 @@ mod tests {
         {
             match ev {
                 GenerateEvent::Token { id, .. } => ids.push(id),
+                GenerateEvent::SpeculativeStep { .. } => {
+                    // Mock worker never emits this; ignored if it
+                    // ever shows up. Real handlers may log it.
+                }
                 GenerateEvent::Done { finish, completion_tokens, .. } => {
                     assert_eq!(finish, FinishReason::Length);
                     assert_eq!(completion_tokens, 3);

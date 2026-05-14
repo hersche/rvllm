@@ -995,6 +995,10 @@ async fn chat_collect(
                     usage = Usage::new(prompt_tokens, completion_tokens);
                     break;
                 }
+                Some(GenerateEvent::SpeculativeStep { .. }) => {
+                    // Spec-decode telemetry. Non-streaming aggregator
+                    // doesn't surface per-step accept rate; ignored.
+                }
                 Some(GenerateEvent::Error(msg)) => return Err(ApiError::Internal(msg)),
                 // Cycle 34 P0 fix (codex bug #2): worker channel closing
                 // without a Done event is a worker crash, not a clean
@@ -1538,6 +1542,17 @@ fn chat_stream_sse(
                         // looking SSE stream. We now emit an OpenAI-shaped
                         // error event (`data: {"error":{...}}`) before
                         // `[DONE]` so clients can distinguish reliably.
+                        Some(GenerateEvent::SpeculativeStep { drafted, accepted, cumulative_decoded }) => {
+                            tracing::debug!(
+                                drafted, accepted, cumulative_decoded,
+                                "spec-decode step",
+                            );
+                            ctx.state = S::Content {
+                                rx, decoder, accum, emitted, in_tool,
+                                token_ids, streamed_visible,
+                            };
+                            continue;
+                        }
                         Some(GenerateEvent::Error(msg)) => {
                             tracing::error!(error = %msg, "SSE worker error — emitting error event");
                             ctx.state = S::EmitError(msg);
@@ -2069,6 +2084,10 @@ async fn completion_collect(
                     usage = Usage::new(prompt_tokens, completion_tokens);
                     break;
                 }
+                Some(GenerateEvent::SpeculativeStep { .. }) => {
+                    // Spec-decode telemetry; completions aggregator
+                    // doesn't surface accept rate.
+                }
                 Some(GenerateEvent::Error(msg)) => return Err(ApiError::Internal(msg)),
                 // Cycle 34 P0 fix (codex bug #2): same fix as the chat
                 // handler — channel close before Done is a worker fault,
@@ -2218,6 +2237,14 @@ fn completion_stream_sse(
                     },
                     Some(GenerateEvent::Done { finish, .. }) => {
                         ctx.state = S::Finish(finish);
+                        continue;
+                    }
+                    Some(GenerateEvent::SpeculativeStep { drafted, accepted, cumulative_decoded }) => {
+                        tracing::debug!(
+                            drafted, accepted, cumulative_decoded,
+                            "spec-decode step (completion SSE)",
+                        );
+                        ctx.state = S::Content { rx, decoder };
                         continue;
                     }
                     // Worker error / channel close: emit an OpenAI-shaped

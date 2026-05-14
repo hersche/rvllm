@@ -63,6 +63,9 @@ fn try_build_state() -> Option<(AppState, std::thread::JoinHandle<()>)> {
         sse_keepalive: Duration::from_secs(15),
         shutdown_drain_timeout: Duration::from_secs(5),
         model_family: rvllm_serve::ModelFamily::Auto,
+        spec_decode: false,
+        spec_drafter_dir: std::path::PathBuf::new(),
+        spec_k: 6,
     };
     config.validate().expect("test config valid");
 
@@ -101,6 +104,9 @@ fn try_build_state_with_erroring_worker(
         sse_keepalive: Duration::from_secs(15),
         shutdown_drain_timeout: Duration::from_secs(5),
         model_family: rvllm_serve::ModelFamily::Auto,
+        spec_decode: false,
+        spec_drafter_dir: std::path::PathBuf::new(),
+        spec_k: 6,
     };
     config.validate().expect("test config valid");
     let tokenizer = rvllm_serve::tokenize::TokenizerHandle::load(&dir).expect("tokenizer");

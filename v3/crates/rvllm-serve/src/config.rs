@@ -102,6 +102,21 @@ pub struct ServerConfig {
     /// config-marker detection. Anything else asserts the model
     /// matches and fails on mismatch.
     pub model_family: ModelFamily,
+    /// Spec-decode commit 1: opt-in greedy speculative decoding via
+    /// the Gemma 4 E4B assistant drafter. When enabled, requires
+    /// `spec_drafter_dir` to point at a valid
+    /// `Gemma4AssistantForCausalLM` checkpoint. Default OFF —
+    /// resident-only in commit 1; the gate is parsed but no engine
+    /// branches on it yet.
+    pub spec_decode: bool,
+    /// Drafter checkpoint directory (Gemma 4 E4B assistant).
+    /// Required only when `spec_decode == true`. Read from
+    /// `RVLLM_GEMMA4_DRAFTER_DIR`.
+    pub spec_drafter_dir: PathBuf,
+    /// Number of draft tokens K proposed per verification round
+    /// (`RVLLM_GEMMA4_SPEC_K`, default 6). Read at config time but
+    /// only consumed when `spec_decode == true`.
+    pub spec_k: u32,
 }
 
 impl Default for ServerConfig {
@@ -116,6 +131,9 @@ impl Default for ServerConfig {
             sse_keepalive: Duration::from_secs(15),
             shutdown_drain_timeout: Duration::from_secs(30),
             model_family: ModelFamily::Auto,
+            spec_decode: false,
+            spec_drafter_dir: PathBuf::new(),
+            spec_k: 6,
         }
     }
 }
@@ -157,6 +175,20 @@ impl ServerConfig {
         if self.request_timeout.is_zero() {
             return Err(ConfigError::InvalidRequestTimeout);
         }
+        // Spec-decode commit 1: when the gate is on, the drafter
+        // directory must be set + readable. K must be >= 1.
+        if self.spec_decode {
+            if self.spec_drafter_dir.as_os_str().is_empty() {
+                return Err(ConfigError::MissingSpecDrafterDir);
+            }
+            if !self.spec_drafter_dir.is_dir() {
+                return Err(ConfigError::SpecDrafterDirMissing(
+                    self.spec_drafter_dir.clone()));
+            }
+            if self.spec_k == 0 {
+                return Err(ConfigError::InvalidSpecK);
+            }
+        }
         Ok(())
     }
 }
@@ -177,6 +209,12 @@ pub enum ConfigError {
     InvalidModelId,
     #[error("--request-timeout-secs must be > 0 (zero deadlines reject every request)")]
     InvalidRequestTimeout,
+    #[error("RVLLM_GEMMA4_SPEC_DECODE=1 set but RVLLM_GEMMA4_DRAFTER_DIR is empty")]
+    MissingSpecDrafterDir,
+    #[error("RVLLM_GEMMA4_DRAFTER_DIR does not exist or is not a directory: {0}")]
+    SpecDrafterDirMissing(PathBuf),
+    #[error("RVLLM_GEMMA4_SPEC_K must be >= 1")]
+    InvalidSpecK,
 }
 
 #[cfg(test)]
@@ -225,5 +263,75 @@ mod tests {
             ..ServerConfig::default()
         };
         assert!(matches!(c.validate(), Err(ConfigError::InvalidRequestTimeout)));
+    }
+
+    // Spec-decode commit 1 validation.
+
+    #[test]
+    fn validate_rejects_spec_decode_without_drafter_dir() {
+        let here = std::env::current_dir().expect("cwd");
+        let c = ServerConfig {
+            model_dir: here,
+            model_id: "test".into(),
+            max_queue_depth: 2,
+            max_new_tokens_cap: 32,
+            request_timeout: Duration::from_secs(60),
+            spec_decode: true,
+            spec_drafter_dir: PathBuf::new(),
+            spec_k: 6,
+            ..ServerConfig::default()
+        };
+        assert!(matches!(c.validate(), Err(ConfigError::MissingSpecDrafterDir)));
+    }
+
+    #[test]
+    fn validate_rejects_spec_decode_with_bogus_drafter_dir() {
+        let here = std::env::current_dir().expect("cwd");
+        let c = ServerConfig {
+            model_dir: here,
+            model_id: "test".into(),
+            max_queue_depth: 2,
+            max_new_tokens_cap: 32,
+            request_timeout: Duration::from_secs(60),
+            spec_decode: true,
+            spec_drafter_dir: PathBuf::from("/this/dir/does/not/exist/rvllm-test"),
+            spec_k: 6,
+            ..ServerConfig::default()
+        };
+        assert!(matches!(c.validate(), Err(ConfigError::SpecDrafterDirMissing(_))));
+    }
+
+    #[test]
+    fn validate_rejects_spec_k_zero() {
+        let here = std::env::current_dir().expect("cwd");
+        let c = ServerConfig {
+            model_dir: here.clone(),
+            model_id: "test".into(),
+            max_queue_depth: 2,
+            max_new_tokens_cap: 32,
+            request_timeout: Duration::from_secs(60),
+            spec_decode: true,
+            spec_drafter_dir: here, // existing dir, satisfies the path check
+            spec_k: 0,
+            ..ServerConfig::default()
+        };
+        assert!(matches!(c.validate(), Err(ConfigError::InvalidSpecK)));
+    }
+
+    #[test]
+    fn validate_ignores_spec_fields_when_decode_off() {
+        let here = std::env::current_dir().expect("cwd");
+        let c = ServerConfig {
+            model_dir: here,
+            model_id: "test".into(),
+            max_queue_depth: 2,
+            max_new_tokens_cap: 32,
+            request_timeout: Duration::from_secs(60),
+            spec_decode: false,
+            spec_drafter_dir: PathBuf::new(),
+            spec_k: 0,
+            ..ServerConfig::default()
+        };
+        assert!(c.validate().is_ok());
     }
 }

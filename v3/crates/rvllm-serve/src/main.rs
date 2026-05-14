@@ -122,6 +122,21 @@ async fn main() -> anyhow_compat::Result<()> {
     let model_family = ModelFamily::parse(&cli.model_family)
         .map_err(|e| anyhow_compat::err(format!("--model-family: {e}")))?;
 
+    // Spec-decode commit 1: env-only configuration (no CLI flag).
+    // `RVLLM_GEMMA4_SPEC_DECODE=1` turns it on; the drafter dir is
+    // read from `RVLLM_GEMMA4_DRAFTER_DIR`; K from
+    // `RVLLM_GEMMA4_SPEC_K` (default 6). Resident-only — no engine
+    // path branches on these yet; commit 7 wires the alternative
+    // decode loop. ConfigError surfaces missing/invalid combinations
+    // at startup.
+    let spec_decode = std::env::var("RVLLM_GEMMA4_SPEC_DECODE")
+        .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+        .unwrap_or(false);
+    let spec_drafter_dir = std::env::var("RVLLM_GEMMA4_DRAFTER_DIR")
+        .map(PathBuf::from).unwrap_or_default();
+    let spec_k: u32 = std::env::var("RVLLM_GEMMA4_SPEC_K")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+
     let config = ServerConfig {
         bind: cli.bind,
         model_dir: cli.model_dir.clone(),
@@ -131,6 +146,9 @@ async fn main() -> anyhow_compat::Result<()> {
         request_timeout: Duration::from_secs(cli.request_timeout_secs),
         shutdown_drain_timeout: Duration::from_secs(cli.shutdown_drain_secs),
         model_family,
+        spec_decode,
+        spec_drafter_dir,
+        spec_k,
         ..ServerConfig::default()
     };
     config.validate().map_err(|e| anyhow_compat::err(format!("config: {e}")))?;
