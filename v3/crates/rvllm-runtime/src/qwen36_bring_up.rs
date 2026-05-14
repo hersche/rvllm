@@ -23,6 +23,18 @@ use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
 use crate::gemma4_bring_up::Gemma4EnginePaths;
 use crate::qwen36_arch::Qwen36Arch;
 
+/// Paged KV-cache dtype for Qwen 3.6 full-attention layers. F16 is
+/// the production default; Nvfp4 is opt-in via `RVLLM_NVFP4_KV=1` and
+/// matches the layout used by the Qwen 3.5 27B + Gemma 4 NVFP4 paths
+/// (packed 4-bit K/V + per-(slot, kv_head, head_dim/16) E4M3
+/// microscale). Decoders dispatch on this field; F16 stays
+/// byte-identical when the gate is off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen36KvDtype {
+    F16,
+    Nvfp4,
+}
+
 /// Kernel function pointers + their LoadedModule anchors needed for the
 /// Qwen 3.6 outside-only forward path (embedding lookup, final RMSNorm,
 /// lm_head matmul, argmax).
@@ -406,17 +418,36 @@ pub struct Qwen36Bringup {
     /// MoE layer × every token (4 KiB) and converted f16→f32; same
     /// caching pattern as `router_host_cache` (Phase 4b-prep iter16).
     pub shared_gate_host_cache: Vec<Vec<f32>>,
-    /// Phase 4u: paged f16 KV cache for the 10 full-attention
-    /// layers. Layout `[num_full_layers, 2 (K+V), num_blocks,
-    /// block_size, num_kv_heads, head_dim]` f16. Pre-allocated above
-    /// the scratch checkpoint so it survives `arena.restore()`
-    /// between requests. Reset alongside `reset_linear_state` on
-    /// fresh sessions.
+    /// Phase 4u: paged KV cache for the 10 full-attention layers.
+    /// Layout when `kv_dtype == F16`:
+    ///   `[num_full_layers, 2 (K+V), num_blocks, block_size,
+    ///    num_kv_heads, head_dim]` f16 (2 bytes/elem).
+    /// Layout when `kv_dtype == Nvfp4` (opt-in via `RVLLM_NVFP4_KV=1`):
+    ///   same shape but packed 4-bit (1 byte per 2 elems), so the
+    ///   buffer is half the F16 size; the companion microscale
+    ///   buffer (`kv_cache_scale_ptr`) holds the per-(slot, kv_head,
+    ///   block16) E4M3 scales required to reconstruct the values.
+    /// Pre-allocated above the scratch checkpoint so it survives
+    /// `arena.restore()` between requests. Reset alongside
+    /// `reset_linear_state` on fresh sessions.
     pub kv_cache_ptr: u64,
     pub kv_cache_bytes: usize,
     pub kv_cache_layer_bytes: usize,
     pub kv_cache_num_blocks: u32,
     pub kv_cache_block_size: u32,
+    /// NVFP4 commit 1: KV layout discriminator. F16 is the
+    /// production default; Nvfp4 is opt-in via `RVLLM_NVFP4_KV=1`
+    /// and matches the Qwen 3.5 27B NVFP4 KV plumbing — packed
+    /// 4-bit K/V + per-(slot, kv_head, head_dim/16) E4M3 microscale.
+    pub kv_dtype: Qwen36KvDtype,
+    /// NVFP4 commit 1: companion microscale buffer pointer. Zero
+    /// when `kv_dtype == F16`. When NVFP4 is on, layout is
+    ///   `[num_full_layers, 2 (K+V), num_blocks, block_size,
+    ///    num_kv_heads, head_dim/16]` __nv_fp8_e4m3 (1 byte/elem).
+    /// One scale per 16-element NVFP4 block.
+    pub kv_cache_scale_ptr: u64,
+    pub kv_cache_scale_bytes: usize,
+    pub kv_cache_scale_layer_bytes: usize,
     /// Persistent device pointer to the identity block table
     /// `[0, 1, …, kv_cache_num_blocks-1]` i32. The paged-attention
     /// path used to rebuild + re-upload this constant table every
@@ -1014,13 +1045,29 @@ impl Qwen36Bringup {
         let kv_cache_num_blocks = kv_max_tokens.div_ceil(kv_cache_block_size);
         let nkvh = arch.base.num_key_value_heads;
         let hd = arch.base.head_dim;
-        // 2 = K + V. Each slot is f16 (2 bytes).
-        let kv_cache_layer_bytes = 2usize
-            * (kv_cache_num_blocks as usize)
+        // NVFP4 commit 1: pick dtype before sizing. F16 stays 2
+        // bytes/elem; NVFP4 is packed 4-bit (1 byte per 2 elems)
+        // and carries a separate E4M3 microscale buffer with one
+        // scale per 16-element block. Decoders dispatch on
+        // `Qwen36Bringup::kv_dtype`. Env gate is shared with the
+        // Qwen 3.5 and Gemma 4 NVFP4 paths.
+        let nvfp4_kv = std::env::var("RVLLM_NVFP4_KV")
+            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+            .unwrap_or(false);
+        let kv_dtype = if nvfp4_kv {
+            Qwen36KvDtype::Nvfp4
+        } else {
+            Qwen36KvDtype::F16
+        };
+        // 2 = K + V. Bytes-per-elem differs per dtype.
+        let kv_slots = (kv_cache_num_blocks as usize)
             * (kv_cache_block_size as usize)
             * nkvh
-            * hd
-            * 2;
+            * hd;
+        let kv_cache_layer_bytes = match kv_dtype {
+            Qwen36KvDtype::F16 => 2usize * kv_slots * 2, // 2-byte f16
+            Qwen36KvDtype::Nvfp4 => 2usize * (kv_slots / 2), // 4-bit packed
+        };
         let kv_cache_bytes = n_full_layers * kv_cache_layer_bytes;
         let kv_cache_region =
             arena.region("qwen36_kv_cache", kv_cache_bytes, 16)?;
@@ -1041,15 +1088,47 @@ impl Qwen36Bringup {
             }
         }
         let kv_cache_ptr = kv_cache_region.device_ptr();
+        // NVFP4 commit 1: companion microscale buffer. Only present
+        // when `kv_dtype == Nvfp4`. One E4M3 scale (1 byte) per
+        // 16-element packed block.
+        let (kv_cache_scale_ptr,
+             kv_cache_scale_layer_bytes,
+             kv_cache_scale_bytes) = match kv_dtype {
+            Qwen36KvDtype::F16 => (0u64, 0usize, 0usize),
+            Qwen36KvDtype::Nvfp4 => {
+                let layer_bytes = 2usize * (kv_slots / 16); // K+V × slots/16
+                let total = n_full_layers * layer_bytes;
+                let region = arena.region(
+                    "qwen36_kv_cache_scale", total, 16)?;
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let rc = cuMemsetD8_v2(region.device_ptr(), 0, total);
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36_kv_cache_scale cuMemsetD8",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                (region.device_ptr(), layer_bytes, total)
+            }
+        };
         eprintln!(
             "[qwen36] paged KV cache allocated: {n_full_layers} full-attn \
              layers × {:.1} MiB ({} blocks × {} tokens × 2 (K+V) × \
-             {nkvh} kv_heads × {hd} hd × f16) = {:.1} MiB total \
-             (zero-initialised).",
+             {nkvh} kv_heads × {hd} hd × {dt_label}) = {:.1} MiB total \
+             (zero-initialised). NVFP4 scale buffer: {:.1} MiB total.",
             kv_cache_layer_bytes as f64 / (1024.0 * 1024.0),
             kv_cache_num_blocks,
             kv_cache_block_size,
             kv_cache_bytes as f64 / (1024.0 * 1024.0),
+            kv_cache_scale_bytes as f64 / (1024.0 * 1024.0),
+            dt_label = match kv_dtype {
+                Qwen36KvDtype::F16 => "f16",
+                Qwen36KvDtype::Nvfp4 => "nvfp4-packed",
+            },
         );
 
         // Phase 5f: conv1d state cache. Each linear-attn layer keeps the
@@ -1133,6 +1212,10 @@ impl Qwen36Bringup {
             kv_cache_layer_bytes,
             kv_cache_num_blocks,
             kv_cache_block_size,
+            kv_dtype,
+            kv_cache_scale_ptr,
+            kv_cache_scale_bytes,
+            kv_cache_scale_layer_bytes,
             bt_persistent_ptr: 0, // populated below
             conv_state_ptr,
             conv_state_bytes,
@@ -1410,8 +1493,29 @@ impl Qwen36Bringup {
         self.kv_cache_ptr + off as u64
     }
 
+    /// NVFP4 commit 1: device pointer for full-attn layer's slice of
+    /// the companion microscale buffer. Returns 0 when
+    /// `kv_dtype == F16` (no scale buffer allocated) or when the
+    /// computed offset overflows the buffer. Same `layer_seq_idx`
+    /// semantics as `kv_cache_layer_ptr`.
+    pub fn kv_cache_scale_layer_ptr(&self, layer_seq_idx: u32) -> u64 {
+        if self.kv_cache_scale_ptr == 0
+            || self.kv_cache_scale_layer_bytes == 0
+        {
+            return 0;
+        }
+        let off = (layer_seq_idx as usize)
+            .saturating_mul(self.kv_cache_scale_layer_bytes);
+        if off + self.kv_cache_scale_layer_bytes > self.kv_cache_scale_bytes {
+            return 0;
+        }
+        self.kv_cache_scale_ptr + off as u64
+    }
+
     /// Phase 4u: zero out the paged KV cache (all full-attn layers).
     /// Called on session boundaries alongside `reset_linear_state`.
+    /// NVFP4 commit 1: also zeros the companion microscale buffer
+    /// when present.
     pub fn reset_kv_cache(&self) -> Result<()> {
         #[cfg(feature = "cuda")]
         unsafe {
@@ -1428,6 +1532,21 @@ impl Qwen36Bringup {
                     rvllm_core::CudaErrorKind::MemcpyFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
+            }
+            if self.kv_cache_scale_ptr != 0 && self.kv_cache_scale_bytes > 0 {
+                let rc = cuMemsetD8Async(
+                    self.kv_cache_scale_ptr,
+                    0,
+                    self.kv_cache_scale_bytes,
+                    self.stream.raw() as CUstream,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 reset_kv_cache (scale)",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
         }
         Ok(())
