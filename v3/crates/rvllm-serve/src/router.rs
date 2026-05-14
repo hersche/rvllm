@@ -122,6 +122,11 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/completions",
             post(crate::openai::handlers::completions)
+                .route_layer(admission_layer.clone()),
+        )
+        .route(
+            "/v1/audio/transcriptions",
+            post(crate::openai::transcriptions::audio_transcriptions)
                 .route_layer(admission_layer),
         )
         // OpenAI's 2025 "Responses API". Different request/response
