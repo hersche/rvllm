@@ -346,10 +346,20 @@
       "path": "hadamard_unrotate_f16.ptx",
       "sha256": "31f1f25eaab5a900d48cd0ae58288bd22b553115d5802919b5dcccd53479c023"
     },
+    "im2col_3x3_s2p1_f16": {
+      "bytes": 2942,
+      "path": "im2col_3x3_s2p1_f16.ptx",
+      "sha256": "8632bc78e8ae4e325fb1a716584fcb546b54a6925175b21b92ed8366d8f6aab1"
+    },
     "layernorm_inplace_f16": {
       "bytes": 13646,
       "path": "layernorm_inplace_f16.ptx",
       "sha256": "f89dbbf5c83f8b13e074f9d34ba424783c68b424ef58fa8b9123891635378285"
+    },
+    "layernorm_relu_chw_f16": {
+      "bytes": 7035,
+      "path": "layernorm_relu_chw_f16.ptx",
+      "sha256": "34cf87bae1909997ee018678b7229d4e23ebecf10909bbe7c36d8f2498569e50"
     },
     "ldmatrix_probe": {
       "bytes": 2727,
@@ -741,6 +751,11 @@
       "path": "transpose_2d_f16.ptx",
       "sha256": "97504936faf40af4c4ecebbd9ae3066b2ce3e2edea7dea0d71728de8bb3b9fc0"
     },
+    "transpose_chw_to_hwc_f16": {
+      "bytes": 2531,
+      "path": "transpose_chw_to_hwc_f16.ptx",
+      "sha256": "5eedc4433fb7401fcf08875e32ebb6a0bed0a4dbed90062572506f1f8a09255b"
+    },
     "transpose_heads_v_bf16": {
       "bytes": 1656,
       "path": "transpose_heads_v_bf16.ptx",
@@ -837,5 +852,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "b56a239"
+  "revision": "15b515e"
 }
