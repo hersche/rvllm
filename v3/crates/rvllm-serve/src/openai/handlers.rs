@@ -382,6 +382,40 @@ pub async fn chat_completions(
                     ));
                 }
             }
+            // B4: same rejection for audio-soft-token + audio-boundary
+            // markers on Gemma 4 when RVLLM_E4B_AUDIO=1. The audio
+            // splice-slot scanner in tokenize.rs looks for these
+            // token IDs (258881 / 256000 / 258883) and would let a
+            // user-supplied literal claim a real audio's splice slot.
+            // Gate on the same admission flag so non-E4B / non-audio
+            // builds keep the prior behaviour.
+            let audio_admitted = std::env::var("RVLLM_E4B_AUDIO")
+                .map(|s| s == "1")
+                .unwrap_or(false);
+            if audio_admitted
+                && matches!(state.vision_arch, crate::router::VisionArch::Gemma4)
+            {
+                // Real special-token strings on Gemma 4 (verified
+                // against the tokenizer): `<|audio>` = 256000 (boa),
+                // `<|audio|>` = 258881 (soft), `<audio|>` = 258883
+                // (eoa). The renderer-side splice scan looks for
+                // 258881; the boundary tokens never appear in valid
+                // user input.
+                let audio_markers: &[&str] =
+                    &["<|audio>", "<|audio|>", "<audio|>"];
+                for marker in audio_markers {
+                    if c.text_contains(marker) {
+                        return Err(ApiError::invalid_param(
+                            format!(
+                                "messages[{i}].content contains reserved audio marker \
+                                 `{marker}`; this string is not allowed in chat text"
+                            ),
+                            "messages",
+                            "reserved_marker_in_text",
+                        ));
+                    }
+                }
+            }
         }
         match m.role {
             Role::User | Role::System => {
@@ -751,26 +785,42 @@ pub async fn chat_completions(
         .as_deref()
         .map(|s| s.trim().to_ascii_lowercase())
         .unwrap_or_else(|| "none".to_string());
-    type RenderOut = (Vec<u32>, Vec<crate::tokenize::VisionSlot>, Vec<crate::worker::VisionItem>);
+    type RenderOut = (
+        Vec<u32>,
+        Vec<crate::tokenize::VisionSlot>,
+        Vec<crate::worker::VisionItem>,
+        Vec<crate::tokenize::AudioSlot>,
+        Vec<crate::worker::AudioItem>,
+    );
+    let render_audio_items = audio_items;
     let render_join = tokio::task::spawn_blocking(move || -> ApiResult<RenderOut> {
         let _admission = render_admission;
         let eff = render_reasoning_effort.as_str();
-        if vision_items.is_empty() {
-            Ok((render_tokenizer.render_chat(&render_messages, render_tools.as_ref(), eff)?,
+        // B4: route through the multimodal renderer whenever EITHER
+        // vision OR audio items are present. The vision-only path
+        // stays bit-identical when audio_items is empty (the
+        // audio-expansion loop early-returns).
+        if vision_items.is_empty() && render_audio_items.is_empty() {
+            Ok((
+                render_tokenizer.render_chat(&render_messages, render_tools.as_ref(), eff)?,
                 Vec::new(),
-                vision_items))
+                vision_items,
+                Vec::new(),
+                render_audio_items,
+            ))
         } else {
-            let (ids, slots) = render_tokenizer.render_chat_with_vision(
+            let (ids, vslots, aslots) = render_tokenizer.render_chat_with_vision(
                 &render_messages,
                 render_tools.as_ref(),
                 &vision_items,
                 render_vision_arch,
                 eff,
+                &render_audio_items,
             )?;
-            Ok((ids, slots, vision_items))
+            Ok((ids, vslots, vision_items, aslots, render_audio_items))
         }
     });
-    let (prompt_ids, vision_slots, vision_items) = match tokio::time::timeout_at(request_deadline, render_join).await {
+    let (prompt_ids, vision_slots, vision_items, audio_slots, audio_items) = match tokio::time::timeout_at(request_deadline, render_join).await {
         Ok(joined) => joined
             .map_err(|e| ApiError::Internal(format!("template render joined: {e}")))??,
         Err(_) => {
@@ -814,9 +864,7 @@ pub async fn chat_completions(
         vision_items,
         vision_slots,
         audio_items,
-        // B4 will populate `audio_slots` from the renderer; until
-        // then the worker-side splice short-circuits on empty.
-        audio_slots: Vec::new(),
+        audio_slots,
         events_tx,
         cancelled: cancelled.clone(),
         // Hand the worker a clone of the admission permit so the

@@ -230,7 +230,8 @@ impl TokenizerHandle {
         vision_items: &[crate::worker::VisionItem],
         vision_arch: crate::router::VisionArch,
         reasoning_effort: &str,
-    ) -> Result<(Vec<u32>, Vec<VisionSlot>), ApiError> {
+        audio_items: &[crate::worker::AudioItem],
+    ) -> Result<(Vec<u32>, Vec<VisionSlot>, Vec<AudioSlot>), ApiError> {
         // Render via the existing template path. Build per-message
         // content as a typed list when image parts are present, so the
         // Jinja `{%- if 'image' in item %}` branch fires and emits the
@@ -268,11 +269,23 @@ impl TokenizerHandle {
                                     "image": image_url.url,
                                     "image_url": { "url": image_url.url }
                                 })),
-                                // B3a: Audio is typed but the chat
-                                // template doesn't render it as text;
-                                // skip here. B4 will splice the
-                                // audio-soft-token run separately.
-                                ChatContentPart::Audio { .. } => None,
+                                // B4: emit a single `<|audio|>` special-
+                                // token sentinel per audio_url part on
+                                // Gemma 4. The HF tokenizer maps the
+                                // literal string to token id 258881; the
+                                // post-render scan below replaces each
+                                // occurrence with
+                                // `boa(256000) + 258881*N + eoa(258883)`
+                                // and records an AudioSlot. Other
+                                // families fall through to None — they
+                                // have no audio path.
+                                ChatContentPart::Audio { .. } => match vision_arch {
+                                    crate::router::VisionArch::Gemma4 => Some(serde_json::json!({
+                                        "type": "text",
+                                        "text": "<|audio|>"
+                                    })),
+                                    _ => None,
+                                },
                                 ChatContentPart::Other { .. } => None,
                             })
                             .collect();
@@ -528,7 +541,81 @@ impl TokenizerHandle {
             num_images = vision_items.len(),
             "render_chat_with_vision: tokenized + expanded image placeholders"
         );
-        Ok((expanded, slots))
+
+        // ────────────────────────────────────────────────────────────────
+        // B4: expand `<|audio|>` (id 258881) occurrences into
+        // `boa(256000) + 258881*num_soft + eoa(258883)` runs. Only fires
+        // on Gemma 4; non-E4B families never emit the marker in the
+        // first place. Each occurrence consumes the next `audio_items[i]`
+        // in document order, and produces one AudioSlot per audio. The
+        // slot's `num_tokens` is the SOFT-token count
+        // (= cuda-worker splice rows); the surrounding boa/eoa tokens
+        // are NOT part of the splice.
+        let audio_slots: Vec<AudioSlot> = if matches!(vision_arch, crate::router::VisionArch::Gemma4)
+            && !audio_items.is_empty()
+        {
+            const AUDIO_SOFT: u32 = 258_881;
+            const AUDIO_BOA:  u32 = 256_000;
+            const AUDIO_EOA:  u32 = 258_883;
+            let extra: usize = audio_items
+                .iter()
+                .map(|a| {
+                    // boa + soft*N + eoa replaces ONE source token →
+                    // net growth is (N + 1) per audio item.
+                    a.num_soft_tokens.saturating_add(1)
+                })
+                .sum();
+            let mut audio_expanded: Vec<u32> = Vec::with_capacity(expanded.len() + extra);
+            let mut audio_slots: Vec<AudioSlot> = Vec::with_capacity(audio_items.len());
+            let mut next_audio = 0usize;
+            for tok in &expanded {
+                if *tok == AUDIO_SOFT {
+                    let item = audio_items.get(next_audio).ok_or_else(|| {
+                        ApiError::Tokenize(format!(
+                            "more `<|audio|>` placeholder tokens in template than audio items \
+                             ({} found, {} provided)",
+                            next_audio + 1,
+                            audio_items.len()
+                        ))
+                    })?;
+                    let n = item.num_soft_tokens;
+                    if n == 0 {
+                        return Err(ApiError::Tokenize(
+                            "audio item with num_soft_tokens=0".into(),
+                        ));
+                    }
+                    audio_expanded.push(AUDIO_BOA);
+                    let token_start = audio_expanded.len();
+                    audio_expanded.extend(std::iter::repeat(AUDIO_SOFT).take(n));
+                    audio_expanded.push(AUDIO_EOA);
+                    audio_slots.push(AudioSlot {
+                        token_start,
+                        num_tokens: n,
+                        audio_item_idx: next_audio,
+                    });
+                    next_audio += 1;
+                } else {
+                    audio_expanded.push(*tok);
+                }
+            }
+            if next_audio != audio_items.len() {
+                return Err(ApiError::Tokenize(format!(
+                    "fewer `<|audio|>` placeholder tokens in template ({}) than audio items ({})",
+                    next_audio,
+                    audio_items.len()
+                )));
+            }
+            expanded = audio_expanded;
+            tracing::debug!(
+                prompt_tokens = expanded.len(),
+                num_audio_items = audio_items.len(),
+                "render_chat_with_vision: expanded audio_soft_token runs"
+            );
+            audio_slots
+        } else {
+            Vec::new()
+        };
+        Ok((expanded, slots, audio_slots))
     }
 
     /// Render the chat template around `messages` and return prompt
