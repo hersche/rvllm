@@ -6853,8 +6853,15 @@ impl Gemma4Bringup {
     /// Compute the per-head Q scale vector used by Gemma 4 audio
     /// attention on the host and upload it as an f32 buffer of
     /// shape `[head_dim]`. The values are:
-    ///   scale[d] = q_scale_scalar * softplus(per_dim_scale[d])
-    /// where `q_scale_scalar = (head_dim ** -0.5) / ln(2)`.
+    ///   scale[d] = q_scale_scalar * softplus(per_dim_scale[d]) * k_scale
+    /// where:
+    ///   q_scale_scalar = (head_dim ** -0.5) / ln(2)
+    ///   k_scale        = ln(1 + e) / ln(2)
+    ///
+    /// HF applies `q_scale_scalar * softplus(per_dim_scale)` to Q
+    /// and `k_scale` to K. Mathematically the attention scores
+    /// depend only on the product, so we fold both into the Q-side
+    /// scale and skip the separate K scaling launch.
     ///
     /// Because `per_dim_scale` is a learned f16 weight of shape
     /// `[head_dim]` (128 values on E4B), the entire computation is
@@ -6872,6 +6879,9 @@ impl Gemma4Bringup {
         use cudarc::driver::sys::*;
         let head_dim_f = head_dim as f32;
         let q_scale_scalar = head_dim_f.powf(-0.5) / std::f32::consts::LN_2;
+        let k_scale_scalar =
+            (1.0_f32 + std::f32::consts::E).ln() / std::f32::consts::LN_2;
+        let combined_scalar = q_scale_scalar * k_scale_scalar;
         // Read per_dim_scale f16 weight from device into host: it's
         // tiny (head_dim=128 -> 256 bytes), so a one-shot DtoH copy
         // is fine.
@@ -6900,7 +6910,7 @@ impl Gemma4Bringup {
             } else {
                 (1.0_f32 + v.exp()).ln()
             };
-            scale_f32.push(q_scale_scalar * sp);
+            scale_f32.push(combined_scalar * sp);
         }
         let region = self.arena.region(scratch_name, head_dim * 4, 16)?;
         unsafe {
