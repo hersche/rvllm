@@ -6359,11 +6359,41 @@ impl Qwen36Bringup {
         let half = (self.kv_cache_layer_bytes / 2) as u64;
         let k_cache_layer_ptr = kv_layer_ptr;
         let v_cache_layer_ptr = kv_layer_ptr + half;
+        // NVFP4 commit 3: companion scale buffer layer pointer.
+        // Zero on F16; on Nvfp4 split into K/V halves the same way
+        // as the packed cache (K then V).
+        let scale_layer_ptr = self.kv_cache_scale_layer_ptr(full_seq_idx);
+        let scale_half = (self.kv_cache_scale_layer_bytes / 2) as u64;
+        let k_scale_layer_ptr = scale_layer_ptr;
+        let v_scale_layer_ptr = if scale_layer_ptr == 0 { 0 }
+            else { scale_layer_ptr + scale_half };
+        // NVFP4 commit 3: per-call FP8 Q + dynamic Q scale scratch.
+        // Only allocated on the Nvfp4 path. Decode is num_tokens=1,
+        // so q_fp8 is [num_heads * head_dim] u8 and q_scale_cache
+        // is [num_heads] f32.
+        let (q_fp8_ptr, q_scale_cache_ptr) = match self.kv_dtype {
+            Qwen36KvDtype::F16 => (0u64, 0u64),
+            Qwen36KvDtype::Nvfp4 => {
+                let r_fp8 = self.arena.region(
+                    "qwen36_pf_q_fp8",
+                    (num_heads * head_dim) as usize, 16)?;
+                let r_sc = self.arena.region(
+                    "qwen36_pf_q_scale_cache",
+                    (num_heads as usize) * 4, 16)?;
+                (r_fp8.device_ptr(), r_sc.device_ptr())
+            }
+        };
         // Phase 4b-prep iter35: caller-hoisted pos+cl HtoD; we just
         // use the device pointers passed in.
         let _ = position; // RoPE reads from pos_dev_ptr instead.
         let slot_dev_ptr = pos_dev_ptr;
+        // NVFP4 commit 3: dispatch the RoPE+KV-write kernel by dtype.
+        // F16 path unchanged; Nvfp4 path uses the Qwen-specific NVFP4
+        // RoPE kernel from `fused_rope_qwen_partial_nvfp4kv.cu`,
+        // shared with the Qwen 3.5 27B NVFP4 wiring.
         #[cfg(feature = "cuda")]
+        match self.kv_dtype {
+        Qwen36KvDtype::F16 =>
         unsafe {
             use cudarc::driver::sys::*;
             let mut q_in_p = q_split_region.device_ptr();
@@ -6415,6 +6445,81 @@ impl Qwen36Bringup {
                     rvllm_core::CudaCtx::setup(),
                 ));
             }
+        },
+        Qwen36KvDtype::Nvfp4 => {
+            // The NVFP4 RoPE kernel is loaded under the same env
+            // gate (`RVLLM_NVFP4_KV=1`) that drives `kv_dtype ==
+            // Nvfp4`. If this branch fires the kernel must be
+            // present; `.expect` documents that invariant.
+            let fn_rope = self.outside_kernels
+                .fn_fused_rope_qwen_partial_nvfp4kv
+                .expect("qwen36 NVFP4 RoPE kernel not loaded — \
+                         RVLLM_NVFP4_KV env gate inconsistency");
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut q_in_p = q_split_region.device_ptr();
+                let mut k_in_p = k_region.device_ptr();
+                let mut v_in_p = v_region.device_ptr();
+                let mut q_fp8_out = q_fp8_ptr;
+                let mut key_packed = k_cache_layer_ptr;
+                let mut value_packed = v_cache_layer_ptr;
+                let mut key_scale = k_scale_layer_ptr;
+                let mut value_scale = v_scale_layer_ptr;
+                let mut cos_p = self.rope_cos;
+                let mut sin_p = self.rope_sin;
+                let mut pos_p = pos_dev_ptr;
+                let mut slot_p = slot_dev_ptr;
+                // Static-scalar Q descale fallback: never read on
+                // the dynamic path (q_scale_cache != nullptr) but
+                // must be a valid device pointer; reuse the cache.
+                let mut q_scale_static = q_scale_cache_ptr;
+                let mut q_scale_dyn = q_scale_cache_ptr;
+                let mut nt: i32 = m as i32;
+                let mut nh: i32 = num_heads as i32;
+                let mut nkh: i32 = num_kv_heads as i32;
+                let mut hd_i: i32 = head_dim as i32;
+                let mut rd: i32 = rotary_dim as i32;
+                let args = [
+                    (&mut q_in_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut k_in_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut v_in_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_fp8_out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut key_packed) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut value_packed) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut key_scale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut value_scale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_scale_static) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_scale_dyn) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                // Grid (num_tokens, max(num_heads, num_kv_heads)),
+                // block (head_dim) — one thread per element.
+                let grid_y = num_heads.max(num_kv_heads);
+                let rc = cuLaunchKernel(
+                    fn_rope.raw() as CUfunction,
+                    m as u32, grid_y, 1,
+                    head_dim, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 full_attn fused_rope_qwen_nvfp4 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+        }
         }
         // No fence: paged FA2 decode runs on the same stream after
         // the fused_rope kernel writes Q (in-place into q_split_region)
@@ -6435,7 +6540,15 @@ impl Qwen36Bringup {
         let attn_out_region =
             self.arena.region("qwen36_pf_attn_out", q_size * 2, 16)?;
         let scale = 1.0 / (head_dim as f32).sqrt();
+        // NVFP4 commit 3: decode-attention dispatch.
+        //   * F16:   existing flash_attention_2_decode_f16io (smem
+        //            uses f32 K/V tiles → 2*BC*hd*4 bytes).
+        //   * NVFP4: flash_attention_2_decode_nvfp4kv. K/V dequant
+        //            target is f16 smem (2 bytes/elem; halves the
+        //            K/V tile footprint vs F16 → 32 KiB at hd=256).
         #[cfg(feature = "cuda")]
+        match self.kv_dtype {
+        Qwen36KvDtype::F16 =>
         unsafe {
             use cudarc::driver::sys::*;
             const FA2_THREADS: i32 = 128;
@@ -6486,12 +6599,90 @@ impl Qwen36Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
-        if rc != CUresult::CUDA_SUCCESS {
-            return Err(rvllm_core::RvllmError::cuda(
-                "qwen36 flash_attention_2_decode_f16io launch",
-                rvllm_core::CudaErrorKind::LaunchFailed,
-                rvllm_core::CudaCtx::setup(),
-            ));
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 flash_attention_2_decode_f16io launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        },
+        Qwen36KvDtype::Nvfp4 => {
+            let fn_dec = self.outside_kernels
+                .fn_flash_attention_2_decode_nvfp4kv
+                .expect("qwen36 NVFP4 decode kernel not loaded — \
+                         RVLLM_NVFP4_KV env gate inconsistency");
+            unsafe {
+                use cudarc::driver::sys::*;
+                const FA2_THREADS: i32 = 128;
+                const FA2_BC: i32 = 32;
+                let hd_i = head_dim as i32;
+                // f16 smem dequant (2 bytes/elem) vs F16's f32 (4).
+                let smem_bytes = 2 * FA2_BC * hd_i * 2
+                    + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+                if smem_bytes as u32 >= 48 * 1024 {
+                    let _ = cuFuncSetAttribute(
+                        fn_dec.raw() as CUfunction,
+                        CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        smem_bytes,
+                    );
+                }
+                let mut output = attn_out_region.device_ptr();
+                let mut query = q_fp8_ptr;
+                let mut key_packed = k_cache_layer_ptr;
+                let mut value_packed = v_cache_layer_ptr;
+                let mut key_scale = k_scale_layer_ptr;
+                let mut value_scale = v_scale_layer_ptr;
+                let mut q_scale_dyn = q_scale_cache_ptr;
+                let mut block_tables = self.bt_persistent_ptr;
+                let mut context_lens = cl_dev_ptr;
+                // Static-scalar Q descale fallback ptr; same
+                // never-dereferenced-on-dynamic-path reasoning as
+                // the RoPE kernel above.
+                let mut q_descale = q_scale_cache_ptr;
+                let mut scale_arg = scale;
+                let mut nh = num_heads as i32;
+                let mut nkvh = num_kv_heads as i32;
+                let mut hd = head_dim as i32;
+                let mut bs = self.kv_cache_block_size as i32;
+                let mut mbps = self.kv_cache_num_blocks as i32;
+                let mut window: i32 = -1;
+                let args = [
+                    (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut query) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut key_packed) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut value_packed) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut key_scale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut value_scale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_scale_dyn) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut block_tables) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut context_lens) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_descale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut scale_arg) as *mut f32 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut bs) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut mbps) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut window) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let rc = cuLaunchKernel(
+                    fn_dec.raw() as CUfunction,
+                    1, num_heads, 1,
+                    FA2_THREADS as u32, 1, 1,
+                    smem_bytes as u32,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 flash_attention_2_decode_nvfp4kv launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
         }
         }
         // No fence: attn_output_gate kernel runs on the same stream.
