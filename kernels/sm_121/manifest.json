@@ -11,6 +11,11 @@
       "path": "add_inplace_f32.ptx",
       "sha256": "d9264a98127fbfee50e28d0255c2cdf4c10c3e06a7f470c1392d28700d38e52e"
     },
+    "apply_audio_attn_mask_f32": {
+      "bytes": 3075,
+      "path": "apply_audio_attn_mask_f32.ptx",
+      "sha256": "1dff8453114a6eced8d7887ea9a1ee0270ea62bfc1f27678aa45f1b95301cf59"
+    },
     "argmax": {
       "bytes": 10636,
       "path": "argmax.ptx",
@@ -686,6 +691,11 @@
       "path": "scale_rows_f32_ratio.ptx",
       "sha256": "a9a6f1907c0be8f1ed0d08cf958d626f21dc20b2004d912c31b7e1f35aa12c11"
     },
+    "scale_scalar_inplace_f32": {
+      "bytes": 1141,
+      "path": "scale_scalar_inplace_f32.ptx",
+      "sha256": "e21ce5c240c678bd1cdbc27f7f1a7a84fb52f536b4d1966830b25b309c52b201"
+    },
     "scaled_add_f16_to_f32": {
       "bytes": 1413,
       "path": "scaled_add_f16_to_f32.ptx",
@@ -801,6 +811,11 @@
       "path": "transpose_heads_v_f16.ptx",
       "sha256": "53b09258351917862b5fff2bd5b99b5d5c8881f9af12245d3c3029129ad28bac"
     },
+    "transpose_v_chunked_f16": {
+      "bytes": 2050,
+      "path": "transpose_v_chunked_f16.ptx",
+      "sha256": "9ceccd19c185d8454633c84216584c957eff0b4cee067a904e06f52e510c4c6b"
+    },
     "vector_add_bf16": {
       "bytes": 1375,
       "path": "vector_add_bf16.ptx",
@@ -887,5 +902,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "01d64d0"
+  "revision": "a6f0374"
 }

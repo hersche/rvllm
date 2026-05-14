@@ -211,7 +211,8 @@ for arch in $ARCHS; do
             glu_split_sigmoid_f16|silu_inplace_f16|\
             tanh_softcap_inplace_f32|rel_shift_audio_f32|\
             scale_per_dim_f32|audio_chunk_extract_context_f32|\
-            add_inplace_f32|\
+            add_inplace_f32|transpose_v_chunked_f16|\
+            scale_scalar_inplace_f32|apply_audio_attn_mask_f32|\
             extract_head_bf16|scatter_heads_bf16|\
             softmax_row_f32_to_bf16|gelu_tanh_mul_bf16|\
             scale_inplace_f32|transpose_heads_v_bf16|\

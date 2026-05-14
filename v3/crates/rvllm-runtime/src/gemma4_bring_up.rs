@@ -534,6 +534,12 @@ pub struct Gemma4FusedModules {
     pub fn_audio_chunk_extract_context_f32: KernelFn,
     pub add_inplace_f32_mod: LoadedModule,
     pub fn_add_inplace_f32: KernelFn,
+    pub transpose_v_chunked_f16_mod: LoadedModule,
+    pub fn_transpose_v_chunked_f16: KernelFn,
+    pub scale_scalar_inplace_f32_mod: LoadedModule,
+    pub fn_scale_scalar_inplace_f32: KernelFn,
+    pub apply_audio_attn_mask_f32_mod: LoadedModule,
+    pub fn_apply_audio_attn_mask_f32: KernelFn,
     pub scale_inplace_f16_mod: LoadedModule,
     pub fn_scale_inplace_f16: KernelFn,
     pub add_bias_f16_mod: LoadedModule,
@@ -6914,9 +6920,9 @@ impl Gemma4Bringup {
         use cudarc::driver::sys::*;
         let head_dim_f = head_dim as f32;
         let q_scale_scalar = head_dim_f.powf(-0.5) / std::f32::consts::LN_2;
-        let k_scale_scalar =
-            (1.0_f32 + std::f32::consts::E).ln() / std::f32::consts::LN_2;
-        let combined_scalar = q_scale_scalar * k_scale_scalar;
+        // k_scale is applied to K (not relative_K) in HF, so do NOT fold
+        // it here — apply it separately to matrix_ac after the GEMM.
+        let combined_scalar = q_scale_scalar;
         // Read per_dim_scale f16 weight from device into host: it's
         // tiny (head_dim=128 -> 256 bytes), so a one-shot DtoH copy
         // is fine.
@@ -7465,6 +7471,36 @@ impl Gemma4Bringup {
             }
         }
 
+        // Apply k_scale to scores_f32 (matrix_ac contribution only). HF
+        // scales K (real K context) by k_scale = ln(1+e)/ln2 but does NOT
+        // scale relative_K. Since matrix_ac = Q @ K^T and scaling is
+        // linear, equivalent to scaling scores_f32 by k_scale here.
+        unsafe {
+            let mut x = scores_f32.device_ptr();
+            let mut c = (1.0_f32 + std::f32::consts::E).ln() / std::f32::consts::LN_2;
+            let mut n = (num_heads * num_blocks * chunk_size * context_size) as i32;
+            let args = [
+                (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                (&mut c) as *mut f32 as *mut core::ffi::c_void,
+                (&mut n) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((n as i64 + block as i64 - 1) / block as i64) as u32;
+            let rc = cuLaunchKernel(
+                self.fused.fn_scale_scalar_inplace_f32.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0, stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio attn: k_scale apply failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
         // matrix_bd per head: Q_flat[h, num_blocks*chunk, head_dim] @ rel_K^T[h, head_dim, pos_len]
         //   Q is [num_blocks*chunk, H, D]: per head stride_a = D (between rows it's H*D)
         //   rel_K_f16 is [pos_len, H, D]:  per head stride_b = D, ldb = H*D
@@ -7594,6 +7630,44 @@ impl Gemma4Bringup {
             }
         }
 
+        // Mask invalid context positions (source row out of [0, n_tokens)).
+        unsafe {
+            let mut x = scores_f32.device_ptr();
+            let mut nh = num_heads as i32;
+            let mut nb = num_blocks as i32;
+            let mut cs = chunk_size as i32;
+            let mut ctx = context_size as i32;
+            let mut ph = past_horizon as i32;
+            let mut nt = n_tokens as i32;
+            let mut inv = -1.0e9_f32;
+            let args = [
+                (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nb) as *mut i32 as *mut core::ffi::c_void,
+                (&mut cs) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ctx) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ph) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                (&mut inv) as *mut f32 as *mut core::ffi::c_void,
+            ];
+            let total = (num_heads * num_blocks * chunk_size * context_size) as i64;
+            let block: u32 = 256;
+            let grid: u32 = ((total + block as i64 - 1) / block as i64) as u32;
+            let rc = cuLaunchKernel(
+                self.fused.fn_apply_audio_attn_mask_f32.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0, stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio attn: mask launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
         // Softmax: per-row softmax over context dim. num_rows = H*NB*chunk.
         unsafe {
             let mut out = scores_f16.device_ptr();
@@ -7621,79 +7695,78 @@ impl Gemma4Bringup {
             }
         }
 
-        // attn @ V_ctx: per head, per block, out[chunk, head_dim] = scores[chunk, context] @ V_ctx[context, head_dim]
-        // scores_f16 layout: [num_heads, num_blocks, chunk, context] contiguous.
-        // Per head h: stride_a = chunk*context between blocks, lda = context.
-        // V_ctx_f16:  [num_blocks, context, num_heads, head_dim] — per head start
-        //    at h*D, ldb = H*D, stride_b = context*H*D.
-        // Output per head: [num_blocks, chunk, head_dim] contiguous, ldd = head_dim,
-        //    stride_d = chunk*head_dim. Final layout: [num_heads, num_blocks, chunk, head_dim] f32.
-        let attn_out_f32 = self.arena.region(
-            "g4a_attn_out_f32",
-            num_heads * num_blocks * chunk_size * head_dim * 4, 16)?;
-        for h in 0..num_heads {
-            let scores_head_off =
-                (h * num_blocks * chunk_size * context_size * 2) as u64;
-            let v_head_off = (h * head_dim * 2) as u64;
-            let out_head_off = (h * num_blocks * chunk_size * head_dim * 4) as u64;
-            unsafe {
-                self.cublaslt.f16_gemm_f32_batched_strided(
-                    scores_f16.device_ptr() + scores_head_off,
-                    v_ctx_f16.device_ptr() + v_head_off,
-                    attn_out_f32.device_ptr() + out_head_off,
-                    chunk_size as i32,
-                    head_dim as i32,
-                    context_size as i32,
-                    num_blocks as i32,
-                    context_size as i32,
-                    (num_heads * head_dim) as i32,
-                    head_dim as i32,
-                    (chunk_size * context_size) as i64,
-                    (context_size * num_heads * head_dim) as i64,
-                    (chunk_size * head_dim) as i64,
-                    stream_raw,
-                )?;
+        // Transpose V_ctx from [num_blocks, context, H, D] -> V_T [num_blocks, H, D, context]
+        // so the GEMM helper (which computes A * B^T effectively) gets a
+        // B that, when "transposed by the helper", yields V in the
+        // natural [context, D] orientation.
+        let v_t_f16 = self.arena.region(
+            "g4a_attn_v_t_f16",
+            num_blocks * num_heads * head_dim * context_size * 2, 16)?;
+        unsafe {
+            let mut out = v_t_f16.device_ptr();
+            let mut inp = v_ctx_f16.device_ptr();
+            let mut nb = num_blocks as i32;
+            let mut ctx = context_size as i32;
+            let mut nh = num_heads as i32;
+            let mut hd = head_dim as i32;
+            let args = [
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nb) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ctx) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                self.fused.fn_transpose_v_chunked_f16.raw() as CUfunction,
+                (context_size * num_blocks) as u32, num_heads as u32, 1,
+                head_dim as u32, 1, 1,
+                0, stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio attn: transpose_v_chunked launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
             }
         }
 
-        // Permute [num_heads, num_blocks, chunk, head_dim] -> [num_blocks, chunk, num_heads, head_dim]
-        // -> trim to [n_tokens, num_heads * head_dim] for post projection.
-        // Reuse audio_chunk_extract_context kernel's pattern? Simpler: do a small kernel.
-        // Actually we can do this with cuMemcpy 2D — but that's still nontrivial.
-        // Just write into a flat scratch via a simple permute kernel pattern in Rust using
-        // strided launches. Use a small per-element permute by recycling existing transpose
-        // logic: write attn_out_permuted_f32[blk, c, h, d] = attn_out_f32[h, blk, c, d].
-        // No existing kernel does this — use add_inplace_f32-style helper? No.
-        // Instead: do the (scores @ V) GEMM differently — interleave heads in output
-        // by changing stride_d. Output per head with stride_d = head_dim * num_heads
-        // and ldd = head_dim * num_heads. Then output is already [num_blocks, chunk, H, D]
-        // when concatenated across heads at offset h*head_dim.
-        // (rewriting above loop in place)
-
-        // The above attn_out layout is not what we need. Redo: write directly into
-        // permuted layout by adjusting offsets.
+        // scores @ V — per-head batched-strided GEMM.
+        // wrapper computes D[m,n] = A * B^T (the documented Q@K^T pattern).
+        // We want C[chunk, head_dim] = scores[chunk, context] @ V[context, head_dim].
+        // Setting B = V_T[head_dim, context] (already transposed) gives
+        // wrapper(scores, V_T) -> scores @ V_T^T = scores @ V. ✓
+        //
+        // scores_f16 per head per block: contiguous [chunk, context], lda = context.
+        // V_T per (blk, h): contiguous [head_dim, context], ldb = context.
+        // Output written into [num_blocks, chunk, H, D] perm layout at per-head
+        // offset h*head_dim, stride between rows H*head_dim, stride between
+        // batches chunk*H*head_dim.
         let attn_out_perm_f32 = self.arena.region(
             "g4a_attn_out_perm_f32",
             num_blocks * chunk_size * num_heads * head_dim * 4, 16)?;
         for h in 0..num_heads {
             let scores_head_off =
                 (h * num_blocks * chunk_size * context_size * 2) as u64;
-            let v_head_off = (h * head_dim * 2) as u64;
+            let v_t_head_off = (h * head_dim * context_size * 2) as u64;
             let out_head_off = (h * head_dim * 4) as u64;
             unsafe {
                 self.cublaslt.f16_gemm_f32_batched_strided(
                     scores_f16.device_ptr() + scores_head_off,
-                    v_ctx_f16.device_ptr() + v_head_off,
+                    v_t_f16.device_ptr() + v_t_head_off,
                     attn_out_perm_f32.device_ptr() + out_head_off,
                     chunk_size as i32,
                     head_dim as i32,
                     context_size as i32,
                     num_blocks as i32,
                     context_size as i32,
-                    (num_heads * head_dim) as i32,
+                    context_size as i32,
                     (num_heads * head_dim) as i32,
                     (chunk_size * context_size) as i64,
-                    (context_size * num_heads * head_dim) as i64,
+                    (num_heads * head_dim * context_size) as i64,
                     (chunk_size * num_heads * head_dim) as i64,
                     stream_raw,
                 )?;
@@ -9791,6 +9864,15 @@ fn load_gemma4_fused(
     let add_inplace_f32_mod = loader.load_ptx("add_inplace_f32")?;
     let fn_add_inplace_f32 =
         add_inplace_f32_mod.get_function("add_inplace_f32_kernel")?;
+    let transpose_v_chunked_f16_mod = loader.load_ptx("transpose_v_chunked_f16")?;
+    let fn_transpose_v_chunked_f16 = transpose_v_chunked_f16_mod
+        .get_function("transpose_v_chunked_f16_kernel")?;
+    let scale_scalar_inplace_f32_mod = loader.load_ptx("scale_scalar_inplace_f32")?;
+    let fn_scale_scalar_inplace_f32 = scale_scalar_inplace_f32_mod
+        .get_function("scale_scalar_inplace_f32_kernel")?;
+    let apply_audio_attn_mask_f32_mod = loader.load_ptx("apply_audio_attn_mask_f32")?;
+    let fn_apply_audio_attn_mask_f32 = apply_audio_attn_mask_f32_mod
+        .get_function("apply_audio_attn_mask_f32_kernel")?;
     let scale_inplace_f16_mod = loader.load_ptx("scale_inplace_f16")?;
     let fn_scale_inplace_f16 =
         scale_inplace_f16_mod.get_function("scale_inplace_f16_kernel")?;
@@ -9962,6 +10044,12 @@ fn load_gemma4_fused(
         fn_audio_chunk_extract_context_f32,
         add_inplace_f32_mod,
         fn_add_inplace_f32,
+        transpose_v_chunked_f16_mod,
+        fn_transpose_v_chunked_f16,
+        scale_scalar_inplace_f32_mod,
+        fn_scale_scalar_inplace_f32,
+        apply_audio_attn_mask_f32_mod,
+        fn_apply_audio_attn_mask_f32,
         scale_inplace_f16_mod,
         fn_scale_inplace_f16,
         add_bias_f16_mod,
