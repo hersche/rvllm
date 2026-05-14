@@ -6809,25 +6809,29 @@ impl Gemma4Bringup {
         // is ≥ 2*N*H*2 only when N <= 4 (not the common case). So we
         // still need a distinct slot.
         //
-        // Reuse `scratch_pre_gemm_f32` slot for the f16 staging by
-        // re-requesting it with f16 sizing — arena handles this via
-        // the same name as long as bytes don't exceed previous
-        // request. Pre-gemm slot is N*2H*4 bytes (f32) = N*2H*4 ≥
-        // N*2H*2 (f16) ✓ — we can safely cast in place.
+        // Cast linear_start output to a DISTINCT [N, 2H] f16 buffer.
+        // The previous version cast f32->f16 in place on `pre_f32`, but
+        // the cast kernel is per-element parallel: thread k writes 2
+        // bytes at offset 2k while thread k/2 still needs to read 4
+        // bytes at offset 4k = 2*(2k), so writes from later threads
+        // can clobber f32 source bytes that earlier threads have yet
+        // to read. Race condition (codex round 6 fix #1).
+        let lstart_f16 = self.arena.region(
+            "g4a_blk_lconv_lstart_f16", n_tokens * two_h * 2, 16)?;
         unsafe { launch_cast_f32_to_f16(
             &self.stream,
             self.fused.fn_cast_f32_to_f16,
             pre_f32.device_ptr(),
-            pre_f32.device_ptr(),   // in-place cast: f32 buf reused as f16, first half occupied
+            lstart_f16.device_ptr(),
             (n_tokens * two_h) as i32,
         ) }?;
 
-        // GLU split: read [N, 2H] f16 from pre_f32 (now treated as
-        // f16), write [N, H] f16 into glu_buf.
+        // GLU split: read [N, 2H] f16 from lstart_f16, write [N, H]
+        // f16 into glu_buf.
         unsafe { launch_glu_split_sigmoid_f16(
             &self.stream,
             self.fused.fn_glu_split_sigmoid_f16,
-            pre_f32.device_ptr(),
+            lstart_f16.device_ptr(),
             glu_buf.device_ptr(),
             n_tokens as i32,
             h as i32,
