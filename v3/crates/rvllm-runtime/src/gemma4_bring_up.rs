@@ -522,6 +522,8 @@ pub struct Gemma4FusedModules {
     pub fn_glu_split_sigmoid_f16: KernelFn,
     pub silu_inplace_f16_mod: LoadedModule,
     pub fn_silu_inplace_f16: KernelFn,
+    pub causal_conv1d_f16_mod: LoadedModule,
+    pub fn_causal_conv1d_f16: KernelFn,
     pub scale_inplace_f16_mod: LoadedModule,
     pub fn_scale_inplace_f16: KernelFn,
     pub add_bias_f16_mod: LoadedModule,
@@ -6554,6 +6556,294 @@ impl Gemma4Bringup {
         Ok(())
     }
 
+    /// B6c LightConv1D sub-block of one Gemma 4 audio encoder layer
+    /// (`Gemma4AudioLightConv1d.forward`).
+    ///
+    /// HF math:
+    /// ```text
+    /// residual = h
+    /// h = pre_layer_norm(h)                  # RMSNorm
+    /// h = linear_start(h)                    # [H -> 2H]
+    /// h = glu(h, dim=-1)                     # [N, 2H] -> [N, H], sigmoid GLU
+    /// h = depthwise_conv1d(h.T).T            # causal, ks=5, groups=H
+    /// h = clamp(h)                           # noop in f16
+    /// h = conv_norm(h)                       # RMSNorm
+    /// h = silu(h)
+    /// h = linear_end(h)                      # [H -> H]
+    /// h += residual                          # full residual, no scale
+    /// ```
+    ///
+    /// Tensor layout note: HF transposes (B, N, H) to (B, H, N) for
+    /// the conv1d. The existing `causal_conv1d_f16` kernel consumes
+    /// row-major `[seq_len+ks-1, channels]` (channel-last), which
+    /// matches our (B=1, N, H) layout directly — no host-side
+    /// transpose is needed. We just left-pad with `ks-stride = 4`
+    /// zero rows.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn forward_audio_lconv1d(
+        &self,
+        lconv: &rvllm_loader::gemma4_weights::Gemma4AudioLConv1d,
+        residual: u64,
+        hidden: u64,
+        n_tokens: usize,
+        hidden_dim: usize,
+        conv_kernel_size: usize,
+        eps: f32,
+        scratch_pre_gemm_f32: &'static str,
+        scratch_glu_f16: &'static str,
+        scratch_padded_f16: &'static str,
+        scratch_post_gemm_f32: &'static str,
+    ) -> Result<()> {
+        use cudarc::driver::sys::*;
+        if n_tokens == 0 {
+            return Ok(());
+        }
+        let h = hidden_dim;
+        let ks = conv_kernel_size;
+        let left_pad = ks.saturating_sub(1); // stride is 1, dilation 1
+
+        // pre_norm in-place on hidden.
+        unsafe {
+            let mut x = hidden;
+            let mut g = lconv.pre_norm.offset_bytes;
+            let mut eps_ = eps;
+            let mut d = h as i32;
+            let args = [
+                (&mut x)    as *mut u64 as *mut core::ffi::c_void,
+                (&mut g)    as *mut u64 as *mut core::ffi::c_void,
+                (&mut eps_) as *mut f32 as *mut core::ffi::c_void,
+                (&mut d)    as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                self.fused.fn_rmsnorm.raw() as CUfunction,
+                n_tokens as u32, 1, 1,
+                (h as u32).min(1024), 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio lconv1d: pre-rmsnorm launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // linear_start: [n, H] -> [n, 2H], f32 then cast.
+        let two_h = 2 * h;
+        let pre_f32 = self.arena.region(scratch_pre_gemm_f32, n_tokens * two_h * 4, 16)?;
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                lconv.linear_start.weight.offset_bytes,
+                hidden,
+                pre_f32.device_ptr(),
+                two_h as i32,
+                n_tokens as i32,
+                h as i32,
+                self.stream.raw(),
+            )?;
+        }
+        // Reuse `hidden` as the linear_start [N, 2H] target — too small.
+        // We need a [N, 2H] f16 buffer; size = 2 * N*H * 2 bytes.
+        // Use the padded buffer slot's first half by allocating a
+        // dedicated f16 region.
+        // glu produces [N, H] f16; write that into a separate scratch
+        // so the padded conv buffer can layout zeros + glu output.
+        let glu_buf = self.arena.region(scratch_glu_f16, n_tokens * h * 2, 16)?;
+        // Cast linear_start output to f16. We need [N, 2H] f16 to feed
+        // GLU. Reuse `pre_f32`'s slot is not possible (f32 vs f16
+        // strides differ); allocate fresh f16 staging using the same
+        // scratch name + offset trick. Simpler: do GEMM-then-cast
+        // into `glu_buf` of size [N, 2H] f16, then call glu in-place
+        // splitting; but glu writes [N, H] so input/output overlap is
+        // a problem.
+        //
+        // Cleanest: allocate a separate `lstart_f16` [N, 2H] arena
+        // region. We'll borrow `scratch_padded_f16` for that — its
+        // size is [N+ks-1, H] = [N+4, H], i.e. (N+4)*H*2 bytes which
+        // is ≥ 2*N*H*2 only when N <= 4 (not the common case). So we
+        // still need a distinct slot.
+        //
+        // Reuse `scratch_pre_gemm_f32` slot for the f16 staging by
+        // re-requesting it with f16 sizing — arena handles this via
+        // the same name as long as bytes don't exceed previous
+        // request. Pre-gemm slot is N*2H*4 bytes (f32) = N*2H*4 ≥
+        // N*2H*2 (f16) ✓ — we can safely cast in place.
+        unsafe { launch_cast_f32_to_f16(
+            &self.stream,
+            self.fused.fn_cast_f32_to_f16,
+            pre_f32.device_ptr(),
+            pre_f32.device_ptr(),   // in-place cast: f32 buf reused as f16, first half occupied
+            (n_tokens * two_h) as i32,
+        ) }?;
+
+        // GLU split: read [N, 2H] f16 from pre_f32 (now treated as
+        // f16), write [N, H] f16 into glu_buf.
+        unsafe { launch_glu_split_sigmoid_f16(
+            &self.stream,
+            self.fused.fn_glu_split_sigmoid_f16,
+            pre_f32.device_ptr(),
+            glu_buf.device_ptr(),
+            n_tokens as i32,
+            h as i32,
+        ) }?;
+
+        // Build the padded conv input [N + ks-1, H] f16:
+        //   rows [0..left_pad)            = 0
+        //   rows [left_pad..left_pad+N)   = glu_buf
+        let padded_rows = n_tokens + left_pad;
+        let padded_bytes = padded_rows * h * 2;
+        let padded = self.arena.region(scratch_padded_f16, padded_bytes, 16)?;
+        unsafe {
+            // Zero the leading left_pad rows.
+            let zero_bytes = left_pad * h * 2;
+            cuMemsetD8Async(
+                padded.device_ptr(),
+                0,
+                zero_bytes,
+                self.stream.raw() as CUstream,
+            );
+            // Copy GLU output into rows [left_pad..].
+            cuMemcpyDtoDAsync_v2(
+                padded.device_ptr() + zero_bytes as u64,
+                glu_buf.device_ptr(),
+                (n_tokens * h * 2) as usize,
+                self.stream.raw() as CUstream,
+            );
+        }
+
+        // causal_conv1d_f16: output [N, H] f16 into `hidden`
+        // (overwrites the rmsnormed input we already consumed).
+        unsafe {
+            let mut out = hidden;
+            let mut inp = padded.device_ptr();
+            let mut w = lconv.depthwise.offset_bytes;
+            let mut seq = n_tokens as i32;
+            let mut ch = h as i32;
+            let mut ks_ = ks as i32;
+            let args = [
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut w)   as *mut u64 as *mut core::ffi::c_void,
+                (&mut seq) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ch)  as *mut i32 as *mut core::ffi::c_void,
+                (&mut ks_) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            // Grid (ceil(channels/BLOCK), seq_len, 1), block (BLOCK,1,1).
+            let block: u32 = 128;
+            let grid_x: u32 = ((h as u32 + block - 1) / block) as u32;
+            let rc = cuLaunchKernel(
+                self.fused.fn_causal_conv1d_f16.raw() as CUfunction,
+                grid_x, n_tokens as u32, 1,
+                block, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio lconv1d: causal_conv1d_f16 launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // conv_norm in-place on hidden.
+        unsafe {
+            let mut x = hidden;
+            let mut g = lconv.conv_norm.offset_bytes;
+            let mut eps_ = eps;
+            let mut d = h as i32;
+            let args = [
+                (&mut x)    as *mut u64 as *mut core::ffi::c_void,
+                (&mut g)    as *mut u64 as *mut core::ffi::c_void,
+                (&mut eps_) as *mut f32 as *mut core::ffi::c_void,
+                (&mut d)    as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                self.fused.fn_rmsnorm.raw() as CUfunction,
+                n_tokens as u32, 1, 1,
+                (h as u32).min(1024), 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio lconv1d: conv_norm launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // SiLU in-place [N, H].
+        unsafe { launch_silu_inplace_f16(
+            &self.stream,
+            self.fused.fn_silu_inplace_f16,
+            hidden,
+            (n_tokens * h) as i32,
+        ) }?;
+
+        // linear_end: [n, H] -> [n, H].
+        let post_f32 = self.arena.region(scratch_post_gemm_f32, n_tokens * h * 4, 16)?;
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                lconv.linear_end.weight.offset_bytes,
+                hidden,
+                post_f32.device_ptr(),
+                h as i32,
+                n_tokens as i32,
+                h as i32,
+                self.stream.raw(),
+            )?;
+        }
+        unsafe { launch_cast_f32_to_f16(
+            &self.stream,
+            self.fused.fn_cast_f32_to_f16,
+            post_f32.device_ptr(),
+            hidden,
+            (n_tokens * h) as i32,
+        ) }?;
+
+        // hidden += residual.
+        unsafe {
+            let mut a = hidden;
+            let mut b = residual;
+            let mut dst = hidden;
+            let mut n = (n_tokens * h) as i32;
+            let args = [
+                (&mut a)   as *mut u64 as *mut core::ffi::c_void,
+                (&mut b)   as *mut u64 as *mut core::ffi::c_void,
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut n)   as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((n_tokens * h + 255) / 256) as u32;
+            let rc = cuLaunchKernel(
+                self.fused.fn_vector_add.raw() as CUfunction,
+                grid, 1, 1,
+                block, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "audio lconv1d: vector_add launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Phase 3b: Gemma 4 vision tower forward.
     ///
     /// Decodes an image, runs the 27-layer SigLIP-style ViT encoder
@@ -8247,6 +8537,9 @@ fn load_gemma4_fused(
     let silu_inplace_f16_mod = loader.load_ptx("silu_inplace_f16")?;
     let fn_silu_inplace_f16 =
         silu_inplace_f16_mod.get_function("silu_inplace_f16_kernel")?;
+    let causal_conv1d_f16_mod = loader.load_ptx("causal_conv1d_f16")?;
+    let fn_causal_conv1d_f16 =
+        causal_conv1d_f16_mod.get_function("causal_conv1d_f16_kernel")?;
     let scale_inplace_f16_mod = loader.load_ptx("scale_inplace_f16")?;
     let fn_scale_inplace_f16 =
         scale_inplace_f16_mod.get_function("scale_inplace_f16_kernel")?;
@@ -8406,6 +8699,8 @@ fn load_gemma4_fused(
         fn_glu_split_sigmoid_f16,
         silu_inplace_f16_mod,
         fn_silu_inplace_f16,
+        causal_conv1d_f16_mod,
+        fn_causal_conv1d_f16,
         scale_inplace_f16_mod,
         fn_scale_inplace_f16,
         add_bias_f16_mod,
