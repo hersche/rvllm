@@ -807,6 +807,17 @@ pub struct Gemma4AssistantKvSources {
     pub full_source_layer: u32,
 }
 
+/// Per-request K-prefix accept stats from `run_generate_speculative`.
+/// Populated at the end of each spec-decode request and consumed by
+/// the worker via `take_last_spec_stats()` for `SpeculativeStep`
+/// event emission.
+#[derive(Debug, Clone, Copy)]
+pub struct LastSpecStats {
+    pub drafted: u32,
+    pub accepted: u32,
+    pub cumulative_decoded: u32,
+}
+
 pub struct Gemma4Bringup {
     pub fused: Gemma4FusedModules,
     pub sliding_attention: AttentionBackend,
@@ -855,6 +866,14 @@ pub struct Gemma4Bringup {
     /// buffer holding the post-last-decode hidden — wrong position
     /// for drafter step 1 → accept_rate stuck near 0.
     pub base_last_hidden_snapshot_pending: std::sync::atomic::AtomicBool,
+    /// Spec-decode commit 25: last-request K-prefix accept-rate
+    /// stats from `run_generate_speculative`. Populated at the end
+    /// of the spec-decode path; cleared (taken) by the worker right
+    /// after `run_generate_speculative` returns, then re-emitted as
+    /// a `GenerateEvent::SpeculativeStep` so the HTTP handler can
+    /// set the `X-RVLLM-Accept-Rate` response header. Idle when
+    /// spec-decode is off.
+    pub last_spec_stats: std::sync::Mutex<Option<LastSpecStats>>,
     /// Session-level prefix cache. Populated lazily on first
     /// `run_generate` call; kept across subsequent calls so the
     /// KV cache survives the worker's scratch-checkpoint restore.
@@ -1634,6 +1653,7 @@ impl Gemma4Bringup {
             base_last_hidden_ptr: std::sync::atomic::AtomicU64::new(0),
             base_last_hidden_snapshot_pending:
                 std::sync::atomic::AtomicBool::new(false),
+            last_spec_stats: std::sync::Mutex::new(None),
             prefix_cache: std::sync::Mutex::new(None),
             // (assistant_kv_sources is set above; drafter slot stays
             // empty until commit 7 calls `ensure_drafter` from the
@@ -4141,7 +4161,24 @@ impl Gemma4Bringup {
             "Gemma 4 speculative K-prefix verify (sequential; base ran K \
              sequential decodes — batched-verify speedup deferred)"
         );
+        // Commit 25: stash for the worker to drain and emit as a
+        // SpeculativeStep event → X-RVLLM-Accept-Rate response header.
+        *self.last_spec_stats.lock().unwrap() = Some(LastSpecStats {
+            drafted: drafter_tokens.len() as u32,
+            accepted: accept_len as u32,
+            cumulative_decoded: _base_first_tok.len() as u32,
+        });
         Ok(_base_first_tok)
+    }
+
+    /// Drain and return the last spec-decode request's K-prefix
+    /// accept stats. Called by the worker right after
+    /// `run_generate_speculative` returns; the value is then
+    /// re-emitted as a `GenerateEvent::SpeculativeStep` event.
+    /// Returns `None` if no spec-decode request has happened yet
+    /// or if the previous value has already been taken.
+    pub fn take_last_spec_stats(&self) -> Option<LastSpecStats> {
+        self.last_spec_stats.lock().unwrap().take()
     }
 
     #[cfg(feature = "cuda")]

@@ -903,12 +903,15 @@ pub async fn chat_completions(
         )))
     } else {
         let _cancel_guard = CancelOnDrop(cancelled.clone());
-        let body = chat_collect(
+        let (body, accept_rate) = chat_collect(
             &model_id, &tokenizer, events_rx, cancelled, remaining,
             request_id, &stop_text,
         )
         .await?;
-        Ok(ChatCompletionsResponse::Json(Json(body)))
+        match accept_rate {
+            Some(rate) => Ok(ChatCompletionsResponse::JsonWithAcceptRate(Json(body), rate)),
+            None => Ok(ChatCompletionsResponse::Json(Json(body))),
+        }
     }
 }
 
@@ -918,6 +921,10 @@ pub async fn chat_completions(
 /// we don't want that nested generic in the handler signature.
 pub enum ChatCompletionsResponse {
     Json(Json<ChatCompletionResponse>),
+    /// Commit 25: JSON body with an `X-RVLLM-Accept-Rate` header
+    /// attached. Set on non-streaming completions that went through
+    /// the spec-decode path.
+    JsonWithAcceptRate(Json<ChatCompletionResponse>, f32),
     Stream(axum::response::Response),
 }
 
@@ -925,6 +932,13 @@ impl IntoResponse for ChatCompletionsResponse {
     fn into_response(self) -> axum::response::Response {
         match self {
             Self::Json(j) => j.into_response(),
+            Self::JsonWithAcceptRate(j, rate) => {
+                let mut resp = j.into_response();
+                if let Ok(v) = format!("{:.4}", rate).parse() {
+                    resp.headers_mut().insert("x-rvllm-accept-rate", v);
+                }
+                resp
+            }
             Self::Stream(r) => r,
         }
     }
@@ -939,10 +953,17 @@ async fn chat_collect(
     request_timeout: std::time::Duration,
     request_id: Uuid,
     stop_text: &[String],
-) -> ApiResult<ChatCompletionResponse> {
+) -> ApiResult<(ChatCompletionResponse, Option<f32>)> {
     let mut token_ids: Vec<u32> = Vec::new();
     let mut finish: Option<FinishReason> = None;
     let mut usage = Usage::default();
+    // Commit 25: aggregate spec-decode K-prefix accept stats across
+    // SpeculativeStep events. Single-shot today (one event per
+    // request); accumulator keeps multi-step decoding correct when
+    // the future batched-verify path emits more than one event.
+    let mut spec_drafted: u32 = 0;
+    let mut spec_accepted: u32 = 0;
+    let mut spec_seen: bool = false;
 
     // Drain loop with wall-clock deadline. Deadline fires → flip
     // cancellation + return 504. Channel close (worker gone) also
@@ -995,9 +1016,10 @@ async fn chat_collect(
                     usage = Usage::new(prompt_tokens, completion_tokens);
                     break;
                 }
-                Some(GenerateEvent::SpeculativeStep { .. }) => {
-                    // Spec-decode telemetry. Non-streaming aggregator
-                    // doesn't surface per-step accept rate; ignored.
+                Some(GenerateEvent::SpeculativeStep { drafted, accepted, .. }) => {
+                    spec_drafted = spec_drafted.saturating_add(drafted);
+                    spec_accepted = spec_accepted.saturating_add(accepted);
+                    spec_seen = true;
                 }
                 Some(GenerateEvent::Error(msg)) => return Err(ApiError::Internal(msg)),
                 // Cycle 34 P0 fix (codex bug #2): worker channel closing
@@ -1041,7 +1063,7 @@ async fn chat_collect(
     }));
 
     let (message, finish_reason) = shape_assistant_message(text, finish);
-    Ok(ChatCompletionResponse {
+    let body = ChatCompletionResponse {
         id: new_chat_completion_id(),
         object: "chat.completion",
         created: unix_now_secs(),
@@ -1052,7 +1074,13 @@ async fn chat_collect(
             finish_reason,
         }],
         usage,
-    })
+    };
+    let accept_rate: Option<f32> = if spec_seen && spec_drafted > 0 {
+        Some(spec_accepted as f32 / spec_drafted as f32)
+    } else {
+        None
+    };
+    Ok((body, accept_rate))
 }
 
 /// Gemma 4 emits tool calls as plain text inside the reply (see

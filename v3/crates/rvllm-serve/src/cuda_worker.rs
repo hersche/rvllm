@@ -1473,6 +1473,19 @@ fn run_one(
 
     match result {
         Ok(generated_ids) => {
+            // Commit 25: drain per-request spec-decode accept stats
+            // (if any) and emit as a SpeculativeStep event so the
+            // HTTP handler can surface them via X-RVLLM-Accept-Rate.
+            // No-op when spec-decode is off (stats stay None).
+            if spec_cfg.enabled {
+                if let Some(stats) = bringup.take_last_spec_stats() {
+                    let _ = req.events_tx.send(GenerateEvent::SpeculativeStep {
+                        drafted: stats.drafted,
+                        accepted: stats.accepted,
+                        cumulative_decoded: stats.cumulative_decoded,
+                    });
+                }
+            }
             // Tokens were already emitted to the events channel via
             // the on_token callback during run_generate. We just
             // need the final Done event with the right finish_reason
