@@ -4020,6 +4020,14 @@ impl Gemma4Bringup {
                 field: "RVLLM_GEMMA4_SPEC_K",
             });
         }
+        // Commit 40: batched-verify hot path. When on, the warmup
+        // base prefill is dropped to max_new=1 (we don't need K
+        // sequential base decodes — verify happens via lm_head on
+        // K captured hiddens from a SECOND base call that batched-
+        // prefills the K drafts). Without this gate the legacy
+        // sequential-decode verify runs (= K+1 base decodes).
+        let batched_verify_mode =
+            std::env::var("RVLLM_GEMMA4_SPEC_BATCHED").as_deref() == Ok("1");
         // Commit 28: allow non-greedy when typical-acceptance mode is
         // opted in via env. Greedy stays the default; non-greedy
         // without the env flag still errors so the production path
@@ -4095,6 +4103,13 @@ impl Gemma4Bringup {
         // Step (a): init prefix cache (idempotent — no-op after
         // first call).
         self.init_prefix_cache()?;
+        // Commit 40: snapshot arena BEFORE the warmup so the
+        // batched-verify branch (much later in this function)
+        // can reclaim warmup + drafter K-loop scratch before
+        // calling run_generate a SECOND time. The bonus_tok_vec
+        // and emitted Vec are host-side; the K-buffer is above
+        // scratch. So restoring to this checkpoint is safe.
+        let arena_ck_at_entry = self.arena.checkpoint();
 
         // Commit 18: arm the one-shot base_last_hidden snapshot
         // BEFORE calling run_generate. The hook inside run_generate
@@ -4135,11 +4150,19 @@ impl Gemma4Bringup {
         // legal value (run_generate rejects 0). The one decode
         // step costs ~30 ms; the resulting token is discarded.
         // No vision / audio splice. Greedy. No on_token / cancel.
+        //
+        // Commit 40: in batched-verify mode, only need the warmup
+        // to capture base_last_hidden (drafter step 1 input). The
+        // K verify tokens come from lm_head on captured K hiddens
+        // after a SECOND run_generate call below. So drop the
+        // warmup decodes to 1 — saves K sequential decodes per
+        // outer iter (= the speedup gate).
+        let warmup_max_new = if batched_verify_mode { 1 } else { max_new };
         let _base_first_tok = self.run_generate(
             fn_embed,
             self.fused.fn_argmax,
             prompt_ids,
-            max_new,
+            warmup_max_new,
             _eos_ids,
             /* shadow_requested */ false,
             SamplingConfig::Greedy,
@@ -5138,6 +5161,246 @@ impl Gemma4Bringup {
             current_base_hidden = workspace.out_hidden;
         }
         } // end for k_step
+
+        // Commit 40 — batched-verify hot path.
+        // After K drafter forwards completed, instead of comparing
+        // against `_base_first_tok` (= K sequential base decodes from
+        // the warmup, which is exactly the wall-clock cost spec-decode
+        // is supposed to eliminate), do:
+        //
+        //   1. self.run_generate(prompt + drafts, max_new=1)
+        //      → prefix-cache hits on the original P prompt tokens
+        //      → batched-prefill of K drafts (ONE forward pass on
+        //        FP8/NVFP4 KV; F16 KV silently falls back to per-token)
+        //      → 1 decode step produces base argmax at position P+K
+        //        (= the "bonus" base token when all drafts accepted)
+        //      → the K-row capture hook (also commit 40, fixed) writes
+        //        K post-layer-loop, pre-final-norm hiddens into
+        //        `base_last_k_hidden_ptr`
+        //   2. final_norm + lm_head_M=K + softcap + argmax_M=K on the
+        //      K-buffer → K base argmaxes ('base_argmax_K') corresponding
+        //      to verify at draft positions [P, P+1, ..., P+K-1].
+        //   3. accept_len = longest prefix where drafts[i] == base_argmax_K[i].
+        //   4. Emit drafts[..accept_len] + (bonus if all accepted, else
+        //      divergence base argmax at position accept_len).
+        //
+        // Per-iter cost: 1 prefix-cached prompt prefill (cheap) + K
+        // drafter forwards + 1 batched K-draft prefill + 1 base decode.
+        // Vs legacy: 1 prompt prefill + K drafter forwards + K+1
+        // sequential base decodes. Speedup factor = (K+1) base decodes
+        // → (1 batched prefill of K + 1 decode) ≈ 1.7–2.6× per repo's
+        // Qwen 3.6 batched-prefill numbers, at expected accept_rate.
+        if batched_verify_mode && !drafter_tokens.is_empty() {
+            let k_actual = drafter_tokens.len() as u32;
+            // Reclaim ALL scratch from the warmup base prefill +
+            // drafter K-loop. Drafter tokens are on host; shadow KV
+            // and base_last_hidden_ptr live above the worker's
+            // scratch checkpoint (allocated in ensure_drafter
+            // pre-checkpoint); persistent_kv is also above
+            // scratch (allocated in init_prefix_cache from the
+            // worker before scratch_ck). So restore is safe and
+            // frees enough scratch for the second batched-prefill
+            // run_generate to fit on the same request.
+            unsafe { self.arena.restore(arena_ck_at_entry); }
+            // Arm K-row capture before the second base call.
+            self.base_last_k_count
+                .store(k_actual, std::sync::atomic::Ordering::Release);
+            self.base_last_k_snapshot_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+
+            // Build prompt + drafts.
+            let mut prompt_and_drafts: Vec<u32> =
+                Vec::with_capacity(prompt_ids.len() + drafter_tokens.len());
+            prompt_and_drafts.extend_from_slice(prompt_ids);
+            prompt_and_drafts.extend_from_slice(&drafter_tokens);
+
+            // Second base call: batched-prefill K drafts + 1 decode.
+            // Greedy + no callbacks; prefix-cache makes the prompt
+            // prefill a no-op after the first iter.
+            let bonus_tok_vec = self.run_generate(
+                fn_embed,
+                self.fused.fn_argmax,
+                &prompt_and_drafts,
+                1,
+                _eos_ids,
+                /* shadow_requested */ false,
+                SamplingConfig::Greedy,
+                _cancel,
+                None,
+                &[],
+                &[],
+            )?;
+
+            // Apply final_norm + lm_head + softcap + argmax on the K
+            // captured hiddens.
+            let k_ptr = self
+                .base_last_k_hidden_ptr
+                .load(std::sync::atomic::Ordering::Acquire);
+            if k_ptr == 0 {
+                return Err(rvllm_core::RvllmError::Attention {
+                    err: rvllm_core::AttentionError::FeatureNotAvailable {
+                        op: "run_generate_speculative_batched: base_last_k_hidden_ptr is zero",
+                        backend: "Gemma4SpecDecode",
+                    },
+                    ctx: rvllm_core::AttnCtx {
+                        op: "run_generate_speculative_batched",
+                        stream,
+                        num_seqs: 1,
+                        head_dim: self.arch.max_head_dim() as u32,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+            // Final norm on K rows in-place.
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: k_actual,
+                hidden: hidden_u,
+                eps: arch.rms_norm_eps,
+            }
+            .launch(
+                self.fused.fn_rmsnorm,
+                k_ptr,
+                self.model.final_norm.offset_bytes,
+                stream,
+            )?;
+            // LM head: GEMM M=K, N=vocab, K=hidden, out f32 logits.
+            let logits_region = arena.region(
+                "spec_batched_verify_logits",
+                (k_actual as usize) * (vocab_u as usize) * 4,
+                16,
+            )?;
+            self.cublaslt.f16_gemm_f32(
+                k_ptr,
+                self.model.lm_head_f16.offset_bytes,
+                logits_region.device_ptr(),
+                k_actual as i32,
+                vocab_u as i32,
+                hidden_u as i32,
+                stream,
+            )?;
+            // Softcap on the K-row f32 logits (same as run_generate path).
+            if arch.logit_softcap > 0.0 {
+                rvllm_fused::gemma4_launcher::LogitSoftcapLaunch {
+                    num_tokens: k_actual,
+                    vocab: vocab_u,
+                    cap: arch.logit_softcap,
+                }
+                .launch(
+                    self.fused.fn_softcap_f32,
+                    logits_region.device_ptr(),
+                    stream,
+                )?;
+            }
+            // Argmax K rows → device u32 buffer → host.
+            let argmax_region = arena.region(
+                "spec_batched_verify_argmax",
+                (k_actual as usize) * 4,
+                16,
+            )?;
+            rvllm_fused::ArgmaxLaunch {
+                num_tokens: k_actual,
+                vocab: vocab_u,
+            }
+            .launch(
+                self.fused.fn_argmax,
+                logits_region.device_ptr(),
+                argmax_region.device_ptr(),
+                stream,
+            )?;
+            self.stream.fence()?;
+            let mut base_argmax_k = vec![0u32; k_actual as usize];
+            let rc = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                base_argmax_k.as_mut_ptr() as *mut _,
+                argmax_region.device_ptr(),
+                (k_actual as usize) * 4,
+            );
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "run_generate_speculative_batched: argmax DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+
+            // Greedy accept_len. Verify mapping (position-aligned):
+            //
+            //   drafts[0]   (position P)     vs  warmup _base_first_tok[0]
+            //                                    (= argmax over hidden_{P-1})
+            //   drafts[i>=1] (position P+i)  vs  base_argmax_K[i-1]
+            //                                    (= argmax over hidden_{P+i-1})
+            //
+            // The K-buffer was captured at K positions [P..P+K-1];
+            // lm_head on those produces predictions for positions
+            // [P+1..P+K] = base_argmax_K[0..K-1]. The base's prediction
+            // for position P itself comes from the WARMUP base call
+            // (hidden_{P-1}) and lives in _base_first_tok[0].
+            let mut accept_len: usize = 0;
+            let warmup_b_p = _base_first_tok.first().copied();
+            let kmax = k_actual as usize;
+            for i in 0..kmax {
+                let base_at_pos_i = if i == 0 {
+                    warmup_b_p
+                } else {
+                    base_argmax_k.get(i - 1).copied()
+                };
+                match base_at_pos_i {
+                    Some(b) if drafter_tokens[i] == b => accept_len += 1,
+                    _ => break,
+                }
+            }
+
+            // Stats.
+            *self.last_spec_stats.lock().unwrap() = Some(LastSpecStats {
+                drafted: k_actual,
+                accepted: accept_len as u32,
+                cumulative_decoded: (accept_len + 1) as u32,
+            });
+
+            // Emit accepted prefix + 1 divergence/bonus token.
+            //
+            //   If accept_len == K: all drafts accepted; bonus = base's
+            //     prediction at P+K = base_argmax_K[K-1]
+            //   If accept_len < K: divergence at position P+accept_len;
+            //     the correct base token there is:
+            //       accept_len == 0 → warmup _base_first_tok[0]
+            //       accept_len >= 1 → base_argmax_K[accept_len - 1]
+            let mut emitted: Vec<u32> = drafter_tokens
+                .iter()
+                .take(accept_len)
+                .copied()
+                .collect();
+            if accept_len == kmax {
+                if let Some(b) = base_argmax_k.last().copied() {
+                    emitted.push(b);
+                }
+            } else if accept_len == 0 {
+                if let Some(b) = warmup_b_p {
+                    emitted.push(b);
+                }
+            } else {
+                if let Some(b) = base_argmax_k.get(accept_len - 1).copied() {
+                    emitted.push(b);
+                }
+            }
+            let _ = bonus_tok_vec; // not used; equivalent to base_argmax_k[K-1]
+
+            tracing::info!(
+                spec_k,
+                k_actual,
+                accept_len,
+                accept_rate = accept_len as f32 / k_actual as f32,
+                emitted = emitted.len(),
+                drafted = ?drafter_tokens,
+                warmup_b_p = ?warmup_b_p,
+                base_argmax = ?base_argmax_k,
+                "Gemma 4 BATCHED-verify spec-decode (single batched-prefill of K drafts + lm_head M=K)"
+            );
+
+            // Reclaim scratch (above-scratch K-buffer + base_last_hidden
+            // survive). Host-side `emitted` already populated.
+            unsafe { self.arena.restore(arena_ck_at_entry); }
+            return Ok(emitted);
+        }
 
         // Commit 24 + 26: K-prefix verify. accept_len is the longest
         // prefix where drafter agrees with base, either via:
@@ -7972,6 +8235,50 @@ impl Gemma4Bringup {
                 (hidden * 2) as _,
             );
 
+            // Commit 40 — spec-decode batched verify, FIRST half.
+            // Capture LAST K residual rows BEFORE the single-row
+            // extraction below collapses everything to row 0. These
+            // are POST-layer-loop, PRE-final-norm hiddens.
+            //
+            // The consumer (`run_generate_speculative_batched`)
+            // applies final-norm + lm_head + softcap + argmax on the
+            // K-buffer itself, decoupled from this call's lm_head
+            // (which still produces 1 logit row for the bonus decode).
+            //
+            // Default path: ptr == 0 → cheap atomic load + branch.
+            {
+                let k_dst = self
+                    .base_last_k_hidden_ptr
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if k_dst != 0
+                    && self
+                        .base_last_k_snapshot_pending
+                        .swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
+                    let k_requested = self
+                        .base_last_k_count
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    let k: u32 = k_requested.min(new_q);
+                    if k > 0 {
+                        let row_bytes = (hidden as usize) * 2;
+                        let src_off = (new_q - k) as u64 * hidden as u64 * 2;
+                        let rc = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                            k_dst,
+                            residual_ptr + src_off,
+                            (k as usize) * row_bytes,
+                            stream as cudarc::driver::sys::CUstream,
+                        );
+                        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                            return Err(rvllm_core::RvllmError::cuda(
+                                "run_generate: base_last_k_hidden DtoD capture",
+                                rvllm_core::CudaErrorKind::MemcpyFailed,
+                                rvllm_core::CudaCtx::setup(),
+                            ));
+                        }
+                    }
+                }
+            }
+
             // Extract last token's residual for decode
             if new_q > 1 {
                 let last_offset = (new_q - 1) as u64 * hidden as u64 * 2;
@@ -8074,41 +8381,10 @@ impl Gemma4Bringup {
                     ));
                 }
             }
-            // Commit 38 (batched verify): also capture LAST K rows of
-            // the residual buffer (post-final-norm). residual_ptr
-            // points to the last row; the K-buffer receives rows
-            // [last - K + 1 .. last + 1]. This sits inside
-            // `forward_prefill`, fires on the prefill final-norm exit,
-            // and lets the spec-decode caller apply lm_head to the K
-            // draft positions in one GEMM (M=K, not K x M=1).
-            let k_dst = self
-                .base_last_k_hidden_ptr
-                .load(std::sync::atomic::Ordering::Acquire);
-            if k_dst != 0
-                && self
-                    .base_last_k_snapshot_pending
-                    .swap(false, std::sync::atomic::Ordering::AcqRel)
-            {
-                let k = self.base_last_k_count
-                    .load(std::sync::atomic::Ordering::Acquire) as usize;
-                if k > 0 {
-                    let row_bytes = (hidden as usize) * 2;
-                    let src = residual_ptr - (((k - 1) * row_bytes) as u64);
-                    let rc = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-                        k_dst,
-                        src,
-                        k * row_bytes,
-                        stream as cudarc::driver::sys::CUstream,
-                    );
-                    if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                        return Err(rvllm_core::RvllmError::cuda(
-                            "run_generate: base_last_k_hidden DtoD capture",
-                            rvllm_core::CudaErrorKind::MemcpyFailed,
-                            rvllm_core::CudaCtx::setup(),
-                        ));
-                    }
-                }
-            }
+            // (commit 40) base_last_k_hidden capture moved to the
+            // earlier site, BEFORE row-extraction collapses
+            // residual_ptr to a single row. See same-commit edit
+            // ~30 lines above.
         }
         self.cublaslt.f16_gemm_f32(residual_ptr, self.model.lm_head_f16.offset_bytes,
             logits_f32.device_ptr(), 1, vocab as i32, hidden as i32, stream)?;
