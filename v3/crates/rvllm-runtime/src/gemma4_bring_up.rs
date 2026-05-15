@@ -4267,6 +4267,113 @@ impl Gemma4Bringup {
                     probe_fn("layer0_q_post_rope(q)", workspace.q, q_rows.min(32));
                 }
                 probe_fn("after_xattn(attn_out)", workspace.attn_out, q_rows.min(32));
+
+                // Commit 31g (codex round 8): CPU-reference cross-attn
+                // at layer 0 only. Computes softmax(scale * Q·K^T) V
+                // on host for the SAME inputs the FA kernel saw.
+                // If CPU and GPU differ → FA kernel has a bug.
+                // If they match → FA innocent, bug is upstream.
+                if li == 0
+                    && std::env::var("RVLLM_SPEC_DEBUG_CPU_ATTN").as_deref() == Ok("1")
+                {
+                    let _ = self.stream.fence();
+                    let nheads = drafter.arch.num_attention_heads;
+                    let hd = layer.effective_head_dim;
+                    let ctx_len = prompt_ids.len();
+                    // The drafter lock is already held by the outer
+                    // block — re-locking would self-deadlock since
+                    // std::Mutex is not re-entrant. Use the existing
+                    // `drafter` reference from the outer scope.
+                    let shadow = drafter.shadow_kv.expect("shadow_kv populated");
+                    let shadow_k = shadow.sliding_k_ptr;
+                    let shadow_v = shadow.sliding_v_ptr;
+                    let nkvh = shadow.sliding_num_kv_heads as usize;
+                    let mut h_q = vec![0u16; nheads * hd];
+                    let mut h_k = vec![0u16; ctx_len * nkvh * hd];
+                    let mut h_v = vec![0u16; ctx_len * nkvh * hd];
+                    let mut h_attn = vec![0u16; nheads * hd];
+                    let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        h_q.as_mut_ptr() as *mut _, workspace.q,
+                        nheads * hd * 2);
+                    let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        h_k.as_mut_ptr() as *mut _, shadow_k,
+                        ctx_len * nkvh * hd * 2);
+                    let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        h_v.as_mut_ptr() as *mut _, shadow_v,
+                        ctx_len * nkvh * hd * 2);
+                    let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        h_attn.as_mut_ptr() as *mut _, workspace.attn_out,
+                        nheads * hd * 2);
+                    let to_f32 = |b: u16| half::f16::from_bits(b).to_f32();
+                    // CPU compute for head 0 only (representative).
+                    let h = 0usize;
+                    let kv_head = h * nkvh / nheads;
+                    let q_h: Vec<f32> = (0..hd).map(|d| to_f32(h_q[h*hd + d])).collect();
+                    let mut scores = vec![0f32; ctx_len];
+                    for t in 0..ctx_len {
+                        let mut dot = 0f32;
+                        for d in 0..hd {
+                            let k_td = to_f32(h_k[(t * nkvh + kv_head) * hd + d]);
+                            dot += q_h[d] * k_td;
+                        }
+                        scores[t] = dot * scale;
+                    }
+                    // softmax
+                    let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum_e = 0f64;
+                    let mut exps = vec![0f64; ctx_len];
+                    for t in 0..ctx_len {
+                        let e = ((scores[t] - max_s) as f64).exp();
+                        exps[t] = e;
+                        sum_e += e;
+                    }
+                    let probs: Vec<f64> = exps.iter().map(|e| e / sum_e).collect();
+                    // CPU attended V
+                    let mut cpu_out = vec![0f32; hd];
+                    for d in 0..hd {
+                        let mut acc = 0f64;
+                        for t in 0..ctx_len {
+                            let v_td = to_f32(h_v[(t * nkvh + kv_head) * hd + d]) as f64;
+                            acc += probs[t] * v_td;
+                        }
+                        cpu_out[d] = acc as f32;
+                    }
+                    // GPU head-0 attn_out
+                    let gpu_out: Vec<f32> = (0..hd).map(|d| to_f32(h_attn[h*hd + d])).collect();
+                    // Compare
+                    let mut max_abs_diff = 0f32;
+                    let mut dot = 0f64;
+                    let mut nc = 0f64; let mut ng = 0f64;
+                    for d in 0..hd {
+                        let diff = (cpu_out[d] - gpu_out[d]).abs();
+                        if diff > max_abs_diff { max_abs_diff = diff; }
+                        dot += (cpu_out[d] * gpu_out[d]) as f64;
+                        nc += (cpu_out[d] * cpu_out[d]) as f64;
+                        ng += (gpu_out[d] * gpu_out[d]) as f64;
+                    }
+                    let cos = dot / (nc.sqrt() * ng.sqrt() + 1e-30);
+                    // top-5 attention positions
+                    let mut idx_sorted: Vec<usize> = (0..ctx_len).collect();
+                    idx_sorted.sort_by(|a, b| probs[*b].partial_cmp(&probs[*a]).unwrap_or(std::cmp::Ordering::Equal));
+                    let top5: Vec<(usize, f64)> = idx_sorted.iter().take(5)
+                        .map(|&i| (i, probs[i])).collect();
+                    eprintln!(
+                        "[spec-cpu-attn] li=0 h=0 ctx_len={} scale={:.4} top5={:?}",
+                        ctx_len, scale, top5,
+                    );
+                    eprintln!(
+                        "[spec-cpu-attn] CPU_head0[..8]={:?}",
+                        &cpu_out[..8],
+                    );
+                    eprintln!(
+                        "[spec-cpu-attn] GPU_head0[..8]={:?}",
+                        &gpu_out[..8],
+                    );
+                    eprintln!(
+                        "[spec-cpu-attn] max_abs_diff={:.4} cosine={:.6}",
+                        max_abs_diff, cos,
+                    );
+                }
                 self.run_drafter_layer_attn_finisher(drafter, &workspace, li)?;
                 probe_fn("after_attn_finisher(hidden)", workspace.hidden, 32);
                 self.run_drafter_layer_mlp_finisher(drafter, &workspace, li)?;
