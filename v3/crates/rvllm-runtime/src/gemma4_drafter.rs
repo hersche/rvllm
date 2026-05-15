@@ -101,6 +101,14 @@ pub struct DrafterStepWorkspace {
     pub pre_projection_in: u64,
     /// f16[hidden_size] assistant hidden stream.
     pub hidden: u64,
+    /// f16[hidden_size] residual_1 save buffer. Holds the pre-norm
+    /// residual that `q_side` snapshots before doing the in-place
+    /// `input_layernorm`. `attn_finisher` reads from this for the
+    /// residual_1 add. Added in commit 22 alongside the layer_scalar
+    /// fix — without this snapshot the residual_1 add was using the
+    /// post-input-layernorm tensor instead of the original residual,
+    /// silently destroying the residual stream every layer.
+    pub residual1: u64,
     /// f32 scratch for GEMM outputs. Sized for the largest assistant
     /// projection row count used by q_proj/gate/up/down/pre/post.
     pub gemm_f32: u64,
@@ -316,6 +324,7 @@ impl Gemma4DrafterRuntime {
                 16,
             )?,
             hidden: region("drafter_hidden", a.hidden_size * 2, 16)?,
+            residual1: region("drafter_residual1", a.hidden_size * 2, 16)?,
             gemm_f32: region("drafter_gemm_f32", max_projection * 4, 16)?,
             proj_f16: region("drafter_proj_f16", max_projection * 2, 16)?,
             q: region("drafter_q", max_q_rows * 2, 16)?,

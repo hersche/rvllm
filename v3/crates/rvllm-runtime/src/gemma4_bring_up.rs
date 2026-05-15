@@ -4239,6 +4239,28 @@ impl Gemma4Bringup {
         let stream = self.stream.raw();
         let eps = drafter.arch.rms_norm_eps;
 
+        // Step 0 (commit 22): snapshot the pre-norm residual into
+        // workspace.residual1 before the in-place input_layernorm
+        // destroys it. attn_finisher reads back from residual1 for
+        // the residual_1 add (Gemma's `residual + post_attn_norm(...)`
+        // semantics).
+        {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyDtoDAsync_v2(
+                workspace.residual1,
+                workspace.hidden,
+                hidden * 2,
+                stream as CUstream,
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "drafter_q_side residual1 snapshot DtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
         // Step 1: input_layernorm on workspace.hidden, in place.
         rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: 1,
@@ -4482,11 +4504,33 @@ impl Gemma4Bringup {
             stream,
         )?;
 
-        // Step 4: residual_1: workspace.hidden += workspace.proj_f16
-        //   via vector_add_f16(dst, src, n). Same ABI the audio /
-        //   PLE paths use elsewhere in this file.
+        // Step 4: residual_1: workspace.hidden = workspace.residual1 +
+        //   workspace.proj_f16. Reload the saved pre-norm residual
+        //   from workspace.residual1 (snapshotted in q_side step 0),
+        //   then vector_add the projected attn output.
+        //
+        //   Commit 22 fix: the previous code did
+        //     workspace.hidden += workspace.proj_f16
+        //   but workspace.hidden was the POST-input_layernorm tensor
+        //   from q_side step 1 — the residual stream had been
+        //   destroyed by the in-place norm. Result: residual stream
+        //   silently broken, drafter produced a deterministic but
+        //   wrong token every prompt, accept_rate stuck at 0.0.
         {
             use cudarc::driver::sys::*;
+            let r = cuMemcpyDtoDAsync_v2(
+                workspace.hidden,
+                workspace.residual1,
+                hidden * 2,
+                stream as CUstream,
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "drafter_layer_attn_finisher residual1 reload",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
             let mut dst = workspace.hidden;
             let mut src = workspace.proj_f16;
             let mut n: i32 = hidden as i32;
@@ -4767,10 +4811,86 @@ impl Gemma4Bringup {
             }
         }
 
-        // Step 9 (TODO): hidden *= layer_scalar[1]. HF defaults the
-        // scalar to 1.0 (init.ones_) so skipping is currently
-        // numerically a no-op. A real device-side broadcast multiply
-        // lands once profile dumps show the trained scalar drifted.
+        // Step 9 (commit 22): hidden *= layer_scalar[1].
+        //
+        // Codex round-3 inspection of the assistant checkpoint:
+        //   L0 = 0.0320  L1 = 0.2051  L2 = 0.3594  L3 = 0.1641
+        // The trained scalars are NOT 1.0 — they damp each layer's
+        // contribution. Skipping them inflated the drafter final
+        // hidden RMS by ~9x (observed 9.13 vs expected ~1) and made
+        // the MaskedEmbedder argmax point at a wrong-but-deterministic
+        // token (255970), driving accept_rate to 0.0 even though the
+        // MaskedEmbedder kernel itself is correct (verified commit 21).
+        //
+        // Apply at the END of each drafter layer, after
+        // residual_2 = residual + post_ff_norm(down_proj(...)) —
+        // matches the assistant's layer epilogue semantics.
+        {
+            use cudarc::driver::sys::*;
+            self.stream.fence()?;
+            let mut scalar_bytes: [u8; 2] = [0; 2];
+            let rc = cuMemcpyDtoH_v2(
+                scalar_bytes.as_mut_ptr() as *mut _,
+                layer.layer_scalar,
+                2,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "drafter_mlp_finisher layer_scalar DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+            let scalar_bits = u16::from_le_bytes(scalar_bytes);
+            let scalar_f32 = half::f16::from_bits(scalar_bits).to_f32();
+
+            if std::env::var("RVLLM_SPEC_DEBUG").as_deref() == Ok("1") {
+                let mut h = vec![0u16; hidden as usize];
+                let _ = cuMemcpyDtoH_v2(
+                    h.as_mut_ptr() as *mut _,
+                    workspace.hidden,
+                    (hidden as usize) * 2,
+                );
+                let mut s = 0f64;
+                for &b in &h {
+                    let x = half::f16::from_bits(b).to_f32() as f64;
+                    s += x * x;
+                }
+                let pre_rms = (s / h.len() as f64).sqrt() as f32;
+                eprintln!(
+                    "[spec-debug] layer {} scalar={:.4} pre_rms={:.4} \
+                     expected_post_rms={:.4}",
+                    layer_idx, scalar_f32, pre_rms, pre_rms * scalar_f32,
+                );
+            }
+
+            let mut x = workspace.hidden;
+            let mut s = scalar_f32;
+            let mut n = hidden as i32;
+            let args = [
+                (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                (&mut s) as *mut f32 as *mut core::ffi::c_void,
+                (&mut n) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((n as u32 + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                self.fused.fn_scale_inplace_f16.raw() as CUfunction,
+                grid, 1, 1,
+                block, 1, 1,
+                0,
+                stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "drafter_mlp_finisher layer_scalar scale_inplace",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
 
         tracing::trace!(
             layer_idx,
@@ -4778,7 +4898,7 @@ impl Gemma4Bringup {
             intermediate,
             "completed Gemma 4 speculative drafter layer MLP-finisher \
              (pre_ff_norm + gate/up + gelu_mul + down + post_ff_norm + \
-              residual_2; layer_scalar deferred)",
+              residual_2 + layer_scalar)",
         );
         Ok(())
     }
