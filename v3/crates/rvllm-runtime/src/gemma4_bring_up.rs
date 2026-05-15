@@ -3739,6 +3739,11 @@ impl Gemma4Bringup {
             // Commit 12: fold attn_out back into the residual stream
             // via o_proj + post_attention_layernorm + residual add.
             self.run_drafter_layer_attn_finisher(drafter, &workspace, 0)?;
+            // Commit 13: MLP path (pre_ff_norm + gate/up/gelu·mul +
+            // down + post_ff_norm + residual_2). Closes the second
+            // residual of layer 0; only layer_scalar (=1.0 per HF
+            // default) is intentionally skipped.
+            self.run_drafter_layer_mlp_finisher(drafter, &workspace, 0)?;
         }
         tracing::debug!(
             "Gemma 4 speculative path: pre_projection + layer 0 Q-side \
@@ -4167,6 +4172,264 @@ impl Gemma4Bringup {
             q_rows,
             "completed Gemma 4 speculative drafter layer attn-finisher \
              (o_proj + post_attention_layernorm + residual_1)",
+        );
+        Ok(())
+    }
+
+    /// Spec-decode commit 13: MLP-side close-out for one drafter
+    /// layer. Runs:
+    ///
+    ///   `pre_feedforward_layernorm → gate_proj + up_proj →
+    ///    gelu_tanh(gate)*up → down_proj → post_feedforward_layernorm
+    ///    → residual_2`.
+    ///
+    /// Layer_scalar is NOT applied here. Per HF
+    /// `Gemma4TextDecoderLayer.__init__` it is initialised to 1.0
+    /// (`init.ones_(module.layer_scalar)`); E4B's trained drafter
+    /// uses the default. A follow-up commit will add a real
+    /// device-side scalar multiply if profile dumps show the
+    /// scalar drifted away from 1.0.
+    ///
+    /// Buffer usage:
+    ///   * `workspace.hidden` — residual stream in/out.
+    ///   * Per-call arena scratch (`spec_drafter_residual2`) holds
+    ///     the saved residual across the MLP path. Sized for
+    ///     `hidden_size * 2` bytes (f16).
+    ///   * Per-call arena scratch (`spec_drafter_gate_up`) holds the
+    ///     concatenated `[gate || up]` rows that
+    ///     `fused_gelu_mul_f16_kernel` expects. Sized for
+    ///     `2 * intermediate_size * 2` bytes (f16).
+    ///   * `workspace.gemm_f32` is shared by both GEMMs (cast→f16
+    ///     immediately, so no overlap).
+    ///
+    /// No new CUDA kernels — five existing launchers
+    /// (`cublaslt.f16_gemm_f32` ×3, `launch_cast_f32_to_f16` ×3,
+    /// `RmsnormInplaceLaunch` ×2, `fn_gelu_mul`, `fn_vector_add`).
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    unsafe fn run_drafter_layer_mlp_finisher(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        layer_idx: usize,
+    ) -> Result<()> {
+        let hidden = drafter.arch.hidden_size;
+        let intermediate = drafter.arch.intermediate_size;
+        let layer = drafter.layers.get(layer_idx).ok_or_else(|| {
+            rvllm_core::RvllmError::Loader {
+                err: rvllm_core::LoaderError::Corrupt {
+                    detail: format!(
+                        "run_drafter_layer_mlp_finisher: layer_idx \
+                         {layer_idx} out of range (drafter has {} layers)",
+                        drafter.layers.len()
+                    ),
+                },
+                ctx: rvllm_core::LoaderCtx {
+                    path: drafter.shard_path.clone(),
+                    tensor: None,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            }
+        })?;
+        let stream = self.stream.raw();
+        let eps = drafter.arch.rms_norm_eps;
+
+        // Scratches.
+        let residual2_region = self.arena.region(
+            "spec_drafter_residual2", hidden * 2, 16,
+        )?;
+        let gate_up_region = self.arena.region(
+            "spec_drafter_gate_up", 2 * intermediate * 2, 16,
+        )?;
+        let gate_offset_bytes: u64 = 0;
+        let up_offset_bytes: u64 = (intermediate as u64) * 2;
+        let gate_ptr = gate_up_region.device_ptr() + gate_offset_bytes;
+        let up_ptr = gate_up_region.device_ptr() + up_offset_bytes;
+
+        // Step 1: residual_2 = workspace.hidden  (DtoD copy)
+        {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyDtoDAsync_v2(
+                residual2_region.device_ptr(),
+                workspace.hidden,
+                hidden * 2,
+                stream as CUstream,
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "drafter_mlp_finisher residual_2 DtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // Step 2: pre_feedforward_layernorm on workspace.hidden in
+        // place.
+        rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: 1,
+            hidden: hidden as u32,
+            eps,
+        }
+        .launch(
+            self.fused.fn_rmsnorm,
+            workspace.hidden,
+            layer.pre_feedforward_layernorm,
+            stream,
+        )?;
+
+        // Step 3: gate_proj = hidden @ Wgate^T  → f32 → f16 into
+        // gate half of gate_up_combined.
+        self.cublaslt.f16_gemm_f32(
+            workspace.hidden,
+            layer.mlp_gate_proj,
+            workspace.gemm_f32,
+            1,
+            intermediate as i32,
+            hidden as i32,
+            stream,
+        )?;
+        launch_cast_f32_to_f16(
+            &self.stream,
+            self.fused.fn_cast_f32_to_f16,
+            workspace.gemm_f32,
+            gate_ptr,
+            intermediate as i32,
+        )?;
+
+        // Step 4: up_proj = hidden @ Wup^T  → f32 → f16 into up half.
+        self.cublaslt.f16_gemm_f32(
+            workspace.hidden,
+            layer.mlp_up_proj,
+            workspace.gemm_f32,
+            1,
+            intermediate as i32,
+            hidden as i32,
+            stream,
+        )?;
+        launch_cast_f32_to_f16(
+            &self.stream,
+            self.fused.fn_cast_f32_to_f16,
+            workspace.gemm_f32,
+            up_ptr,
+            intermediate as i32,
+        )?;
+
+        // Step 5: fused_gelu_mul_f16: output = gelu_tanh(gate) * up.
+        // The kernel reads gate AND up at index i, then writes
+        // output[i] — safe in place against the gate half because
+        // each thread writes after reading from the same index.
+        // Grid: (num_tokens=1, 1, 1), block: 1024-thread striped over
+        // intermediate.
+        {
+            use cudarc::driver::sys::*;
+            let mut out_p = gate_ptr;       // write back into gate half
+            let mut gate_up = gate_up_region.device_ptr();
+            let mut inter_i = intermediate as i32;
+            let args = [
+                (&mut out_p)   as *mut u64 as *mut core::ffi::c_void,
+                (&mut gate_up) as *mut u64 as *mut core::ffi::c_void,
+                (&mut inter_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            // 1024 threads is the __launch_bounds__ ceiling; cap at
+            // intermediate so we don't over-spawn for tiny dims.
+            let block: u32 = 1024u32.min(intermediate as u32).max(1);
+            let rc = cuLaunchKernel(
+                self.fused.fn_gelu_mul.raw() as CUfunction,
+                1, 1, 1,
+                block, 1, 1,
+                0,
+                stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "drafter_mlp_finisher fused_gelu_mul_f16",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // Step 6: down_proj = mlp_out @ Wdown^T → f32 → f16 into
+        // workspace.hidden (overwrites the residual'd stream).
+        self.cublaslt.f16_gemm_f32(
+            gate_ptr,
+            layer.mlp_down_proj,
+            workspace.gemm_f32,
+            1,
+            hidden as i32,
+            intermediate as i32,
+            stream,
+        )?;
+        launch_cast_f32_to_f16(
+            &self.stream,
+            self.fused.fn_cast_f32_to_f16,
+            workspace.gemm_f32,
+            workspace.hidden,
+            hidden as i32,
+        )?;
+
+        // Step 7: post_feedforward_layernorm on workspace.hidden in
+        // place.
+        rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: 1,
+            hidden: hidden as u32,
+            eps,
+        }
+        .launch(
+            self.fused.fn_rmsnorm,
+            workspace.hidden,
+            layer.post_feedforward_layernorm,
+            stream,
+        )?;
+
+        // Step 8: residual_2: workspace.hidden = residual2 +
+        // workspace.hidden. fn_vector_add ABI is (dst, src, n) →
+        // dst += src.
+        {
+            use cudarc::driver::sys::*;
+            let mut dst = workspace.hidden;
+            let mut src = residual2_region.device_ptr();
+            let mut n: i32 = hidden as i32;
+            let args = [
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                (&mut n)   as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((n as u32 + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                self.fused.fn_vector_add.raw() as CUfunction,
+                grid, 1, 1,
+                block, 1, 1,
+                0,
+                stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "drafter_mlp_finisher residual_2 vector_add",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // Step 9 (TODO): hidden *= layer_scalar[1]. HF defaults the
+        // scalar to 1.0 (init.ones_) so skipping is currently
+        // numerically a no-op. A real device-side broadcast multiply
+        // lands once profile dumps show the trained scalar drifted.
+
+        tracing::trace!(
+            layer_idx,
+            hidden,
+            intermediate,
+            "completed Gemma 4 speculative drafter layer MLP-finisher \
+             (pre_ff_norm + gate/up + gelu_mul + down + post_ff_norm + \
+              residual_2; layer_scalar deferred)",
         );
         Ok(())
     }
