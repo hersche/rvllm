@@ -1732,6 +1732,16 @@ impl Gemma4Bringup {
                 .get_function("flash_attention_2_decode_f16io_kernel")?;
             rt.attach_flash_attention_kernel(module, entry);
         }
+        // Commit 15: BC=16 sibling of the f16io kernel, needed for
+        // head_dim=512 (drafter global layer) so dynamic smem fits
+        // the sm_121 ~100 KiB per-CTA cap.
+        #[cfg(feature = "cuda")]
+        {
+            let module = self.kernels.load_ptx("flash_attention_decode_f16io_bc16")?;
+            let entry = module
+                .get_function("flash_attention_2_decode_f16io_kernel")?;
+            rt.attach_flash_attention_bc16_kernel(module, entry);
+        }
         // Commits 10b/10c: load the shadow-KV dequant kernels (FP8
         // → F16 and NVFP4-packed → F16). Same lazy gate as the rest
         // of the drafter PTX bundle.
@@ -3720,51 +3730,17 @@ impl Gemma4Bringup {
                 self.run_drafter_layer_q_side(
                     drafter, &workspace, li, step.position)?;
                 if is_global {
-                    // GB10 sm_121 caps per-CTA dynamic smem at
-                    // ~100 KiB; head_dim=512 with the compile-time
-                    // BC=32 wants 128 KiB. Detect that via a
-                    // FeatureNotAvailable return from
-                    // launch_cross_attn_global and fall back to
-                    // zero-attn for this layer (attn_out := 0) so
-                    // the rest of the forward + MaskedEmbedder
-                    // still produces an argmax. A BC=16 f16io
-                    // kernel build will land the proper path.
-                    let res = drafter.launch_cross_attn_global(
+                    // Commit 15: BC=16 path now fits the sm_121
+                    // smem cap; the earlier zero-attn fallback is
+                    // gone. Errors bubble.
+                    drafter.launch_cross_attn_global(
                         workspace.attn_out,
                         workspace.q,
                         block_tables_region.device_ptr(),
                         context_lens_region.device_ptr(),
                         scale,
                         stream,
-                    );
-                    match res {
-                        Ok(()) => {}
-                        Err(rvllm_core::RvllmError::Attention {
-                            err: rvllm_core::AttentionError::FeatureNotAvailable { .. },
-                            ..
-                        }) => {
-                            // Zero workspace.attn_out so the
-                            // downstream o_proj sees a clean
-                            // attention contribution of zero for
-                            // this layer.
-                            let q_rows = (drafter.arch.num_attention_heads
-                                * drafter.layers[li].effective_head_dim) as usize;
-                            let n_bytes = q_rows * 2;
-                            cuda_check!(
-                                cudarc::driver::sys::cuMemsetD8Async(
-                                    workspace.attn_out, 0, n_bytes,
-                                    stream as cudarc::driver::sys::CUstream),
-                                "spec_global_attn_zero_fallback", 0u64);
-                            tracing::warn!(
-                                layer_idx = li,
-                                "drafter global-layer cross-attn fell back \
-                                 to zero attn_out (BC=32 head_dim=512 \
-                                 exceeds sm_121 smem cap; BC=16 build \
-                                 pending)"
-                            );
-                        }
-                        Err(e) => return Err(e),
-                    }
+                    )?;
                 } else {
                     drafter.launch_cross_attn_sliding(
                         workspace.attn_out,

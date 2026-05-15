@@ -236,6 +236,13 @@ pub struct Gemma4DrafterRuntime {
     /// when spec-decode is on.
     pub flash_attention_mod: Option<rvllm_kernels::LoadedModule>,
     pub fn_flash_attention_2_decode_f16io: Option<rvllm_kernels::KernelFn>,
+    /// BC=16 build of the f16io decode kernel, loaded from
+    /// `flash_attention_decode_f16io_bc16.ptx`. Used by
+    /// `launch_cross_attn_global` so head_dim=512 fits the
+    /// sm_121 dynamic-smem ceiling (~64 KiB instead of ~128 KiB).
+    /// Same kernel symbol name as the BC=32 path; different module.
+    pub flash_attention_bc16_mod: Option<rvllm_kernels::LoadedModule>,
+    pub fn_flash_attention_2_decode_f16io_bc16: Option<rvllm_kernels::KernelFn>,
     /// Spec-decode commit 10b/10c: shadow-KV dequant kernels. Loaded
     /// from `kernels/sm_121/gemma4_drafter_dequant.ptx` by
     /// `Gemma4Bringup::ensure_drafter`. The two entries handle FP8
@@ -521,6 +528,8 @@ impl Gemma4DrafterRuntime {
             shadow_kv: None,
             flash_attention_mod: None,
             fn_flash_attention_2_decode_f16io: None,
+            flash_attention_bc16_mod: None,
+            fn_flash_attention_2_decode_f16io_bc16: None,
             drafter_dequant_mod: None,
             fn_drafter_dequant_fp8_to_f16: None,
             fn_drafter_dequant_nvfp4_to_f16: None,
@@ -566,6 +575,18 @@ impl Gemma4DrafterRuntime {
     ) {
         self.flash_attention_mod = Some(module);
         self.fn_flash_attention_2_decode_f16io = Some(entry);
+    }
+
+    /// BC=16 sibling of `attach_flash_attention_kernel` used by the
+    /// global-layer cross-attention path. Loaded from
+    /// `flash_attention_decode_f16io_bc16.ptx`.
+    pub fn attach_flash_attention_bc16_kernel(
+        &mut self,
+        module: rvllm_kernels::LoadedModule,
+        entry: rvllm_kernels::KernelFn,
+    ) {
+        self.flash_attention_bc16_mod = Some(module);
+        self.fn_flash_attention_2_decode_f16io_bc16 = Some(entry);
     }
 
     /// Spec-decode commit 10b/10c: install the two shadow-KV dequant
@@ -876,46 +897,49 @@ impl Gemma4DrafterRuntime {
             },
             bt: std::backtrace::Backtrace::capture(),
         })?;
-        let fn_decode = self.fn_flash_attention_2_decode_f16io.ok_or_else(|| {
-            RvllmError::Attention {
-                err: AttentionError::FeatureNotAvailable {
-                    op: "launch_cross_attn_global: flash_attention_2_decode_f16io \
-                         kernel not attached",
-                    backend: "Gemma4Drafter",
-                },
-                ctx: AttnCtx {
-                    op: "launch_cross_attn_global",
-                    stream,
-                    num_seqs: 1,
-                    head_dim: self.arch.head_dim_global as u32,
-                },
-                bt: std::backtrace::Backtrace::capture(),
+        // Commit 15: prefer the BC=16 build so head_dim=512 fits the
+        // sm_121 per-CTA dynamic-smem ceiling (~64 KiB at BC=16 vs.
+        // ~128 KiB at BC=32). Falls back to BC=32 if the BC=16 module
+        // wasn't loaded (older engine that missed `ensure_drafter`'s
+        // BC=16 attach — kept defensive even though the load is
+        // unconditional in the current build).
+        let (fn_decode, fa2_bc) = match self.fn_flash_attention_2_decode_f16io_bc16 {
+            Some(k) => (k, 16i32),
+            None => {
+                let fb = self.fn_flash_attention_2_decode_f16io.ok_or_else(|| {
+                    RvllmError::Attention {
+                        err: AttentionError::FeatureNotAvailable {
+                            op: "launch_cross_attn_global: neither BC=16 nor BC=32 \
+                                 f16io kernel attached",
+                            backend: "Gemma4Drafter",
+                        },
+                        ctx: AttnCtx {
+                            op: "launch_cross_attn_global",
+                            stream,
+                            num_seqs: 1,
+                            head_dim: self.arch.head_dim_global as u32,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    }
+                })?;
+                (fb, 32i32)
             }
-        })?;
+        };
         use cudarc::driver::sys::*;
         const FA2_THREADS: i32 = 128;
-        const FA2_BC: i32 = 32;
         let num_heads = self.arch.num_attention_heads as i32;
         let num_kv_heads = shadow.full_num_kv_heads as i32;
         let head_dim = shadow.full_head_dim as i32;
         let smem_bytes =
-            2 * FA2_BC * head_dim * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
-        // GB10 sm_121 caps dynamic shared-memory per CTA at ~100 KiB.
-        // At head_dim=512 with the compile-time BC=32, the f16io
-        // decode kernel needs 128 KiB → `cuFuncSetAttribute` rejects
-        // it. A BC=16 f16io variant build (`-DFA2_BC=16`) would land
-        // the same workload at 64 KiB; for now, surface a clear
-        // FeatureNotAvailable so the driver loop can fall back
-        // (skip the global-layer cross-attn) and the spec path
-        // doesn't crash mid-forward.
+            2 * fa2_bc * head_dim * 4 + fa2_bc * 4 + (FA2_THREADS / 32) * 4;
         const SM121_MAX_DYN_SMEM_BYTES: i32 = 96 * 1024;
         if smem_bytes > SM121_MAX_DYN_SMEM_BYTES {
             return Err(RvllmError::Attention {
                 err: AttentionError::FeatureNotAvailable {
-                    op: "launch_cross_attn_global: head_dim=512 needs \
-                         128 KiB dynamic smem with BC=32 — exceeds \
-                         the sm_121 per-CTA cap. A BC=16 f16io kernel \
-                         build is pending.",
+                    op: "launch_cross_attn_global: smem requirement \
+                         exceeds the sm_121 ~100 KiB per-CTA cap even \
+                         at BC=16; head_dim probably too large for \
+                         the current kernel build",
                     backend: "Gemma4Drafter",
                 },
                 ctx: AttnCtx {
@@ -1149,6 +1173,8 @@ impl Gemma4DrafterRuntime {
             shadow_kv: None,
             flash_attention_mod: None,
             fn_flash_attention_2_decode_f16io: None,
+            flash_attention_bc16_mod: None,
+            fn_flash_attention_2_decode_f16io_bc16: None,
             drafter_dequant_mod: None,
             fn_drafter_dequant_fp8_to_f16: None,
             fn_drafter_dequant_nvfp4_to_f16: None,

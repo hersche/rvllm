@@ -197,6 +197,7 @@ for arch in $ARCHS; do
             fused_rope_partial_fp8kv*|fused_rope_partial_nvfp4kv*|fused_rope_cache_fp8kv*|\
             fused_rope_qwen_partial_nvfp4kv|\
             gemma4_masked_embedder|gemma4_drafter_dequant|\
+            flash_attention_decode_f16io_bc16|\
             fused_rmsnorm_*|fused_qk_rmsnorm*|fused_qkv_rmsnorm*|\
             fused_gelu_mul_fp8*|fused_gelu_mul_f16*|fused_gelu_mul_bf16*|\
             fused_norm_add_residual|fused_norm_add_residual_f16|fused_norm_add_residual_bf16|\
