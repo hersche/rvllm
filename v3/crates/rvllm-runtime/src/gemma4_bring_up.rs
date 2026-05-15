@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rvllm_attention::{AttentionBackend, Fa3Kernels};
-use rvllm_core::Result;
+use rvllm_core::{LoaderCtx, LoaderError, Result, RvllmError};
 use rvllm_cutlass::{CublasLt, CutlassBackend, Policy};
 use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
@@ -827,6 +827,14 @@ pub struct Gemma4Bringup {
     /// Read by commit 4's drafter forward; no path currently
     /// consumes it.
     pub assistant_kv_sources: Option<Gemma4AssistantKvSources>,
+    /// Spec-decode commit 4: lazy-uploaded Gemma 4 E4B assistant
+    /// drafter weights. Populated by `ensure_drafter` on the first
+    /// request observing `ServerConfig::spec_decode == true`. When
+    /// spec-decode is off the slot stays `None` and consumes zero
+    /// HBM. Holding behind a `Mutex<Option<_>>` keeps construction
+    /// at-most-once + thread-safe under the cuda-worker's single
+    /// thread + shared by future request paths.
+    pub drafter: crate::gemma4_drafter::DrafterSlot,
     /// Session-level prefix cache. Populated lazily on first
     /// `run_generate` call; kept across subsequent calls so the
     /// KV cache survives the worker's scratch-checkpoint restore.
@@ -1602,7 +1610,12 @@ impl Gemma4Bringup {
             policy,
             fused,
             assistant_kv_sources,
+            drafter: std::sync::Mutex::new(None),
             prefix_cache: std::sync::Mutex::new(None),
+            // (assistant_kv_sources is set above; drafter slot stays
+            // empty until commit 7 calls `ensure_drafter` from the
+            // spec-decode loop. Backward-compat: with spec_decode=false
+            // the slot is never populated and HBM stays untouched.)
             // NVFP4 shadow diagnostic state (lazy-init in run_generate).
             nvfp4_shadow: std::sync::Mutex::new(None),
             nvfp4_shadow_dumped: std::sync::atomic::AtomicBool::new(false),
@@ -1612,6 +1625,62 @@ impl Gemma4Bringup {
             nvfp4_hadamard: std::sync::Mutex::new(None),
             // === END HADAMARD ROTATION ===
         })
+    }
+
+    /// Spec-decode commit 4: lazy-initialise the Gemma 4 assistant
+    /// drafter. Reads `RVLLM_GEMMA4_DRAFTER_DIR` (validated at startup
+    /// by `ServerConfig`), parses the safetensors layout via
+    /// `rvllm_loader::gemma4_drafter::Gemma4DrafterWeightLayout`, then
+    /// uploads every BF16 weight as F16 + the I64 token_ordering
+    /// as-is to the engine's HBM arena.
+    ///
+    /// Backward-compat invariants:
+    ///   * Only called from paths gated by
+    ///     `ServerConfig::spec_decode == true`. With the gate off this
+    ///     function is unreachable; the drafter slot stays `None` and
+    ///     consumes zero HBM.
+    ///   * At-most-once per engine instance — the mutex guards against
+    ///     concurrent uploads. Subsequent calls observe `Some(_)` and
+    ///     return immediately.
+    ///   * Refuses to upload when the base arch has no
+    ///     `assistant_kv_sources` (e.g. 31B) — surfaces a clear error
+    ///     instead of silently producing a drafter that has no base
+    ///     K/V to cross-attend to.
+    ///
+    /// On success, `self.drafter.lock()` returns `Some(runtime)` for
+    /// future `run_generate` calls (wired in commit 7).
+    pub fn ensure_drafter(&self, drafter_dir: &std::path::Path) -> Result<()> {
+        // Cheap pre-check outside the lock.
+        if self.drafter.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        if self.assistant_kv_sources.is_none() {
+            return Err(RvllmError::Loader {
+                err: LoaderError::Corrupt {
+                    detail:
+                        "ensure_drafter: base model has no \
+                         assistant_kv_sources (num_kv_shared_layers \
+                         unset). The Gemma 4 assistant drafter requires \
+                         an E4B-style model with a shared-KV tail."
+                            .into(),
+                },
+                ctx: LoaderCtx { path: drafter_dir.to_path_buf(), tensor: None },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let layout = rvllm_loader::gemma4_drafter::Gemma4DrafterWeightLayout::from_dir(
+            drafter_dir,
+        )?;
+        #[cfg(feature = "cuda")]
+        let rt = crate::gemma4_drafter::Gemma4DrafterRuntime::load(&layout, &self.arena)?;
+        #[cfg(not(feature = "cuda"))]
+        let rt = crate::gemma4_drafter::Gemma4DrafterRuntime::load_mock(&layout)?;
+        let mut slot = self.drafter.lock().unwrap();
+        // Re-check inside the lock — another thread may have raced.
+        if slot.is_none() {
+            *slot = Some(rt);
+        }
+        Ok(())
     }
 
     /// Allocate the session-level prefix cache's KV cache region.
