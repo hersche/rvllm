@@ -876,6 +876,15 @@ pub struct Gemma4Bringup {
     pub base_last_k_count: std::sync::atomic::AtomicU32,
     /// Commit 38: one-shot gate, twin of base_last_hidden_snapshot_pending.
     pub base_last_k_snapshot_pending: std::sync::atomic::AtomicBool,
+    /// Commit 43: skip-warmup flag — when true at run_generate_speculative
+    /// entry, the warmup base prefill is bypassed (base_last_hidden was
+    /// populated by the previous outer iter's batched-verify branch
+    /// from K-buffer[accept_len - 1]).
+    pub skip_next_warmup: std::sync::atomic::AtomicBool,
+    /// Commit 43: cached base argmax at the next iter's warmup
+    /// position (= base_argmax_K[accept_len - 1] from prev iter).
+    /// `u32::MAX` is the sentinel "no cached value".
+    pub saved_warmup_b_p: std::sync::atomic::AtomicU32,
     /// Spec-decode commit 25: last-request K-prefix accept-rate
     /// stats from `run_generate_speculative`. Populated at the end
     /// of the spec-decode path; cleared (taken) by the worker right
@@ -1678,6 +1687,8 @@ impl Gemma4Bringup {
                 std::sync::atomic::AtomicBool::new(false),
             base_last_k_hidden_ptr: std::sync::atomic::AtomicU64::new(0),
             base_last_k_count: std::sync::atomic::AtomicU32::new(0),
+            skip_next_warmup: std::sync::atomic::AtomicBool::new(false),
+            saved_warmup_b_p: std::sync::atomic::AtomicU32::new(u32::MAX),
             base_last_k_snapshot_pending:
                 std::sync::atomic::AtomicBool::new(false),
             last_spec_stats: std::sync::Mutex::new(None),
@@ -4158,19 +4169,61 @@ impl Gemma4Bringup {
         // warmup decodes to 1 — saves K sequential decodes per
         // outer iter (= the speedup gate).
         let warmup_max_new = if batched_verify_mode { 1 } else { max_new };
-        let _base_first_tok = self.run_generate(
-            fn_embed,
-            self.fused.fn_argmax,
-            prompt_ids,
-            warmup_max_new,
-            _eos_ids,
-            /* shadow_requested */ false,
-            SamplingConfig::Greedy,
-            _cancel,
-            _on_token.take(),
-            /* vision_splice */ &[],
-            /* audio_splice */ &[],
-        )?;
+        // Commit 43: skip-warmup path. When the previous outer iter's
+        // batched-verify branch armed `skip_next_warmup` (only fires
+        // when accept_len >= 1 AND RVLLM_GEMMA4_SPEC_SKIP_WARMUP=1):
+        //   - bypass the warmup run_generate entirely (saves one base
+        //     prefill per iter, the headline speedup)
+        //   - base_last_hidden_ptr was DtoD-populated by the prev iter
+        //     from K-buffer[accept_len - 1] (POST-final-norm hidden of
+        //     the last accepted draft)
+        //   - _base_first_tok[0] is filled from saved_warmup_b_p (=
+        //     prev iter's base_argmax_K[accept_len - 1] = base's
+        //     prediction at the would-be warmup position).
+        let skip_warmup_active = batched_verify_mode
+            && std::env::var("RVLLM_GEMMA4_SPEC_SKIP_WARMUP").as_deref() == Ok("1")
+            && self
+                .skip_next_warmup
+                .swap(false, std::sync::atomic::Ordering::AcqRel);
+        let _base_first_tok: Vec<u32> = if skip_warmup_active {
+            let cached = self
+                .saved_warmup_b_p
+                .swap(u32::MAX, std::sync::atomic::Ordering::AcqRel);
+            if cached == u32::MAX {
+                // Sentinel reached without a real value — fall through
+                // to the normal warmup path. Defensive; should not fire
+                // because the flag-and-value are armed together.
+                self.run_generate(
+                    fn_embed,
+                    self.fused.fn_argmax,
+                    prompt_ids,
+                    warmup_max_new,
+                    _eos_ids,
+                    /* shadow_requested */ false,
+                    SamplingConfig::Greedy,
+                    _cancel,
+                    _on_token.take(),
+                    /* vision_splice */ &[],
+                    /* audio_splice */ &[],
+                )?
+            } else {
+                vec![cached]
+            }
+        } else {
+            self.run_generate(
+                fn_embed,
+                self.fused.fn_argmax,
+                prompt_ids,
+                warmup_max_new,
+                _eos_ids,
+                /* shadow_requested */ false,
+                SamplingConfig::Greedy,
+                _cancel,
+                _on_token.take(),
+                /* vision_splice */ &[],
+                /* audio_splice */ &[],
+            )?
+        };
 
         // Step (c): pull real KV layout + pointers out of the
         // session prefix cache and the per-layer dtype rule (same
@@ -5602,10 +5655,84 @@ impl Gemma4Bringup {
                 }
             }
 
+            // Commit 43 — skip-warmup arming.
+            //
+            // When RVLLM_GEMMA4_SPEC_SKIP_WARMUP=1 and accept_len >= 1:
+            //   * Drop the bonus/divergence emit so the next iter
+            //     conditions on K-buffer[accept_len - 1] without an
+            //     uncommitted-hidden gap (the bonus token's hidden was
+            //     never computed by base).
+            //   * DtoD copy K-buffer[accept_len - 1] into
+            //     base_last_hidden_ptr (post-final-norm hidden at
+            //     position P+accept_len-1 — the last accepted draft).
+            //   * Cache base_argmax_K[accept_len - 1] for next iter's
+            //     warmup_b_p (= base's prediction at the position the
+            //     next iter's drafter step 0 will emit at).
+            //   * Arm `skip_next_warmup`. Next call to
+            //     run_generate_speculative sees the flag, bypasses the
+            //     run_generate(prompt, max_new=1) warmup call, and
+            //     reads _base_first_tok[0] from saved_warmup_b_p.
+            //
+            // This is the headline speedup: -1 base prefill per iter.
+            // Net per-iter cost in skip mode + accept_len > 0:
+            //   - K drafter forwards (cheap)
+            //   - 1 batched-prefill base call (K rows)  [verify]
+            //   - lm_head_K + final_norm_K + argmax_K   [verify]
+            // Vs baseline (no spec): 1 base decode per emitted token.
+            // Each iter emits accept_len tokens. Breakeven shifts to
+            // ~0 — any positive accept_rate yields speedup.
+            let skip_warmup_env = std::env::var("RVLLM_GEMMA4_SPEC_SKIP_WARMUP")
+                .as_deref() == Ok("1");
+            let mut emit_for_skip = emitted.clone();
+            if skip_warmup_env && accept_len >= 1 && accept_len <= kmax {
+                // Drop the bonus/divergence token — next iter will
+                // re-derive the prediction at position P+accept_len
+                // via the cached saved_warmup_b_p.
+                emit_for_skip.truncate(accept_len);
+                // DtoD copy K-buffer[accept_len - 1] → base_last_hidden_ptr.
+                let dst_hidden = self
+                    .base_last_hidden_ptr
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let k_src = self
+                    .base_last_k_hidden_ptr
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if dst_hidden != 0 && k_src != 0 {
+                    let row_bytes = (hidden_u as usize) * 2;
+                    let src_off = ((accept_len - 1) as u64) * (row_bytes as u64);
+                    let rc = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                        dst_hidden,
+                        k_src + src_off,
+                        row_bytes,
+                        stream as cudarc::driver::sys::CUstream,
+                    );
+                    if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "spec batched skip-warmup: K-row → base_last_hidden DtoD",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                    // Ensure copy completes before next call could
+                    // read the buffer (defensive).
+                    self.stream.fence()?;
+                    // Cache the next iter's warmup base argmax.
+                    let cached_b = base_argmax_k[accept_len - 1];
+                    self.saved_warmup_b_p
+                        .store(cached_b, std::sync::atomic::Ordering::Release);
+                    self.skip_next_warmup
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let emitted_final = if skip_warmup_env && accept_len >= 1 {
+                emit_for_skip
+            } else {
+                emitted
+            };
+
             // Reclaim scratch (above-scratch K-buffer + base_last_hidden
             // survive). Host-side `emitted` already populated.
             unsafe { self.arena.restore(arena_ck_at_entry); }
-            return Ok(emitted);
+            return Ok(emitted_final);
         }
 
         // Commit 24 + 26: K-prefix verify. accept_len is the longest
