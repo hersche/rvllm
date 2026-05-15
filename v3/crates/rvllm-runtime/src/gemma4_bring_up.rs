@@ -4097,6 +4097,7 @@ impl Gemma4Bringup {
                 let q_rows = drafter.arch.num_attention_heads * layer.effective_head_dim;
                 if li == 0 {
                     probe_fn("layer0_entry(hidden)", workspace.hidden, 32);
+                    probe_fn("layer0_q_post_rope(q)", workspace.q, q_rows.min(32));
                 }
                 probe_fn("after_xattn(attn_out)", workspace.attn_out, q_rows.min(32));
                 self.run_drafter_layer_attn_finisher(drafter, &workspace, li)?;
@@ -4767,10 +4768,25 @@ impl Gemma4Bringup {
             (self.model.rope_cos_sliding.offset_bytes,
              self.model.rope_sin_sliding.offset_bytes)
         };
+        // Commit 31 experiment: RVLLM_SPEC_Q_ROPE_MODE selects
+        // Q-side RoPE behavior for the drafter:
+        //   current  — pass `position` to base RoPE table (default)
+        //   pos0     — pass 0 (no rotation: cos=1, sin=0 at pos 0)
+        //   no_rope  — skip Q-side RoPE launch entirely
+        // Codex hypothesis: vLLM uses the draft model's own RoPE
+        // object, not the base's table. If conv/period differs, our
+        // Q is rotated inconsistently with base K and the cross-attn
+        // softmax saturates on the wrong position.
+        let q_rope_mode = std::env::var("RVLLM_SPEC_Q_ROPE_MODE")
+            .unwrap_or_else(|_| "current".to_string());
+        let effective_pos: i32 = match q_rope_mode.as_str() {
+            "pos0" => 0,
+            _ => position as i32,
+        };
+        let skip_rope = q_rope_mode == "no_rope";
         let pos_region = self.arena.region("spec_drafter_q_rope_pos", 4, 16)?;
-        let pos_host: i32 = position as i32;
-        pos_region.copy_from_host(&pos_host.to_le_bytes())?;
-        {
+        pos_region.copy_from_host(&effective_pos.to_le_bytes())?;
+        if !skip_rope {
             use cudarc::driver::sys::*;
             let mut q_in: u64 = workspace.q;
             let mut k_in: u64 = 0;
