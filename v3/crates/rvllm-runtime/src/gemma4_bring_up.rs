@@ -4809,7 +4809,19 @@ impl Gemma4Bringup {
                         let log_q = drafter_log_q
                             .get(i).copied().unwrap_or(f32::NEG_INFINITY) as f64;
                         // log_accept = min(0, log p_b - log q)
-                        let log_accept = (log_p_b - log_q).min(0.0);
+                        // Commit 34: env-tunable bias on the acceptance
+                        // ratio. Default 0 = strict Leviathan/Kalman.
+                        // Positive bias loosens (closer to "always
+                        // accept"). Calibration knob for the sparse-
+                        // drafter / full-vocab-base probability scale
+                        // mismatch — drafter's 4096-candidate softmax
+                        // is much sharper than base's 262144-vocab
+                        // softmax, so naive ratio over-rejects.
+                        let bias: f64 = std::env::var("RVLLM_GEMMA4_SPEC_ACCEPT_BIAS")
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let log_accept = (log_p_b - log_q + bias).min(0.0);
                         let u = next_u01().max(1e-300);
                         let log_u = u.ln();
                         if log_u <= log_accept {
