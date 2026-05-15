@@ -4127,6 +4127,32 @@ impl Gemma4Bringup {
                 };
                 self.run_drafter_layer_q_side(
                     drafter, &workspace, li, step.position)?;
+                // Commit 31d (codex): zero-Q test. Zero workspace.q
+                // before cross-attn. If drafter output is UNCHANGED,
+                // the FA kernel is not actually consuming our Q,
+                // pinning the bug to a Q-pointer / kernel-wiring
+                // issue rather than RoPE / softmax / KV.
+                if std::env::var("RVLLM_SPEC_ZERO_Q").as_deref() == Ok("1") {
+                    let q_rows = drafter.arch.num_attention_heads * layer.effective_head_dim;
+                    let rc = cudarc::driver::sys::cuMemsetD8Async(
+                        workspace.q, 0, q_rows * 2, stream as cudarc::driver::sys::CUstream);
+                    if li == 0 {
+                        let _ = self.stream.fence();
+                        let mut buf = vec![0u16; q_rows];
+                        let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                            buf.as_mut_ptr() as *mut _,
+                            workspace.q,
+                            q_rows * 2,
+                        );
+                        let max_abs = buf.iter()
+                            .map(|&b| half::f16::from_bits(b).to_f32().abs())
+                            .fold(0f32, f32::max);
+                        eprintln!(
+                            "[spec-zeroq] li=0 memset_rc={:?} q_max_abs_after_memset={:.6}",
+                            rc, max_abs,
+                        );
+                    }
+                }
                 if is_global {
                     // Commit 15: BC=16 path now fits the sm_121
                     // smem cap; the earlier zero-attn fallback is
