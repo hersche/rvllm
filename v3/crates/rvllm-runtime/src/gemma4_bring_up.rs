@@ -3676,32 +3676,15 @@ impl Gemma4Bringup {
             let drafter = guard.as_ref().expect("checked above");
             drafter.prepare_pre_projection_input(&step, &workspace, stream)?;
             self.run_drafter_pre_projection(drafter, &workspace)?;
-            // Commit 7+8: layer 0 Q-side, now including RoPE on Q.
-            // `step.position` is 0 at this commit (no real base
-            // prefill yet — see the comment above where
-            // `DrafterForwardStep.position` is built), which makes
-            // RoPE a no-op (cos=1, sin=0). Still exercises the
-            // launch path on real device memory.
-            self.run_drafter_layer_q_side(drafter, &workspace, 0, step.position)?;
-
             // Commit 10+11: populate the drafter's F16 shadow KV
-            // from the BASE's source-layer K/V, then launch the
-            // assistant cross-attention against it.
-            //
-            // The shadow_kv was allocated zeroed during
-            // ensure_drafter at sizes computed from `base.arch +
-            // RVLLM_NUM_BLOCKS`. Here we use the SAME arithmetic
-            // the spec_kv allocator above used so the layer-bytes
-            // match.
+            // from the BASE's source-layer K/V. Done ONCE before the
+            // layer loop — both source layers' K/V are needed by the
+            // 4 drafter layers (3 sliding read from sliding shadow,
+            // layer 3 reads from full shadow).
             let shadow = drafter.shadow_kv.expect(
                 "shadow_kv attached by ensure_drafter when spec_decode is on"
             );
             let sliding_li = sources.sliding_source_layer as usize;
-            let full_li = sources.full_source_layer as usize;
-            // spec_kv K-half ptr for a source layer = base + layer_offset.
-            // V-half offset within a layer is (layer_elems / 2) on the
-            // F16 path, mirroring source_view() above. The view
-            // already encodes the layout so we reuse it.
             let sliding_view = source_view(sources.sliding_source_layer);
             let full_view = source_view(sources.full_source_layer);
             drafter.populate_shadow_kv_from_base(
@@ -3718,46 +3701,167 @@ impl Gemma4Bringup {
                 shadow.full_layer_bytes,
                 stream,
             )?;
-            let _ = full_li; // already accounted for via full_view above.
-            // Cross-attention for layer 0 (sliding source).
-            // attn_out goes into workspace.attn_out (f16 [num_heads
-            // * head_dim]). Output is discarded — full forward
-            // (o_proj + MLP + remaining layers + final_norm +
-            // MaskedEmbedder) lands in subsequent commits.
-            let head_dim_sliding = drafter.arch.head_dim_sliding as f32;
-            let scale = 1.0_f32 / head_dim_sliding.sqrt();
             let sliding_window = self.arch.sliding_window_size as i32;
-            drafter.launch_cross_attn_sliding(
-                workspace.attn_out,
-                workspace.q,
-                block_tables_region.device_ptr(),
-                context_lens_region.device_ptr(),
-                scale,
-                sliding_window,
+
+            // Commits 7-14: drive all 4 drafter layers. Each layer
+            // shares the same Q-side helper + an attn-finisher +
+            // an mlp-finisher; only the cross-attn launcher differs
+            // (sliding vs global). The driver loop here is the
+            // narrow integration site.
+            let num_layers = drafter.layers.len();
+            for li in 0..num_layers {
+                let layer = &drafter.layers[li];
+                let is_global = matches!(
+                    layer.layer_type,
+                    rvllm_loader::gemma4_drafter::DrafterLayerType::Full
+                );
+                let eff_hd = layer.effective_head_dim as f32;
+                let scale = 1.0_f32 / eff_hd.sqrt();
+                self.run_drafter_layer_q_side(
+                    drafter, &workspace, li, step.position)?;
+                if is_global {
+                    // GB10 sm_121 caps per-CTA dynamic smem at
+                    // ~100 KiB; head_dim=512 with the compile-time
+                    // BC=32 wants 128 KiB. Detect that via a
+                    // FeatureNotAvailable return from
+                    // launch_cross_attn_global and fall back to
+                    // zero-attn for this layer (attn_out := 0) so
+                    // the rest of the forward + MaskedEmbedder
+                    // still produces an argmax. A BC=16 f16io
+                    // kernel build will land the proper path.
+                    let res = drafter.launch_cross_attn_global(
+                        workspace.attn_out,
+                        workspace.q,
+                        block_tables_region.device_ptr(),
+                        context_lens_region.device_ptr(),
+                        scale,
+                        stream,
+                    );
+                    match res {
+                        Ok(()) => {}
+                        Err(rvllm_core::RvllmError::Attention {
+                            err: rvllm_core::AttentionError::FeatureNotAvailable { .. },
+                            ..
+                        }) => {
+                            // Zero workspace.attn_out so the
+                            // downstream o_proj sees a clean
+                            // attention contribution of zero for
+                            // this layer.
+                            let q_rows = (drafter.arch.num_attention_heads
+                                * drafter.layers[li].effective_head_dim) as usize;
+                            let n_bytes = q_rows * 2;
+                            cuda_check!(
+                                cudarc::driver::sys::cuMemsetD8Async(
+                                    workspace.attn_out, 0, n_bytes,
+                                    stream as cudarc::driver::sys::CUstream),
+                                "spec_global_attn_zero_fallback", 0u64);
+                            tracing::warn!(
+                                layer_idx = li,
+                                "drafter global-layer cross-attn fell back \
+                                 to zero attn_out (BC=32 head_dim=512 \
+                                 exceeds sm_121 smem cap; BC=16 build \
+                                 pending)"
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    drafter.launch_cross_attn_sliding(
+                        workspace.attn_out,
+                        workspace.q,
+                        block_tables_region.device_ptr(),
+                        context_lens_region.device_ptr(),
+                        scale,
+                        sliding_window,
+                        stream,
+                    )?;
+                }
+                self.run_drafter_layer_attn_finisher(drafter, &workspace, li)?;
+                self.run_drafter_layer_mlp_finisher(drafter, &workspace, li)?;
+            }
+
+            // Commit 14: `model.norm` final RMSNorm — single launch
+            // over `workspace.hidden` with drafter's tied final norm
+            // gamma. Mirrors HF's `Gemma4Model.norm` applied to
+            // `last_hidden_state` before lm_head.
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1,
+                hidden: drafter.arch.hidden_size as u32,
+                eps: drafter.arch.rms_norm_eps,
+            }
+            .launch(
+                self.fused.fn_rmsnorm,
+                workspace.hidden,
+                drafter.top.final_norm,
                 stream,
             )?;
-            // Commit 12: fold attn_out back into the residual stream
-            // via o_proj + post_attention_layernorm + residual add.
-            self.run_drafter_layer_attn_finisher(drafter, &workspace, 0)?;
-            // Commit 13: MLP path (pre_ff_norm + gate/up/gelu·mul +
-            // down + post_ff_norm + residual_2). Closes the second
-            // residual of layer 0; only layer_scalar (=1.0 per HF
-            // default) is intentionally skipped.
-            self.run_drafter_layer_mlp_finisher(drafter, &workspace, 0)?;
+
+            // Commit 14: MaskedEmbedder argmax → workspace.out_token_id.
+            // Uses the drafter's centroids + token_ordering +
+            // embed_tokens (tied lm_head) and the post-final-norm
+            // workspace.hidden. Output is the next draft token id
+            // (i32 [1]); the run-out of writing it to centroid_logits
+            // is unused at this stage.
+            let n_centroids = drafter.arch.num_centroids as i32;
+            let top_k = drafter.arch.centroid_intermediate_top_k as i32;
+            let vocab = drafter.arch.vocab_size as i32;
+            let per_centroid: i32 = if n_centroids > 0 {
+                vocab / n_centroids
+            } else { 0 };
+            let fn_masked = drafter
+                .fn_masked_embedder_argmax_f16
+                .expect("MaskedEmbedder kernel attached in ensure_drafter");
+            crate::gemma4_drafter::launch_masked_embedder_argmax_f16(
+                fn_masked,
+                workspace.hidden,
+                drafter.top.centroids,
+                drafter.top.token_ordering,
+                drafter.top.embed_tokens,
+                drafter.arch.hidden_size as i32,
+                n_centroids,
+                top_k,
+                per_centroid,
+                vocab,
+                workspace.out_token_id,
+                /* out_logit */ 0,
+                stream,
+            )?;
+
+            // Commit 14: post_projection → workspace.out_hidden. Feeds
+            // the NEXT MTP step's `pre_projection` input chain.
+            // Output is captured but unused at this commit since the
+            // K-draft loop hasn't landed; arena restore reclaims it.
+            self.cublaslt.f16_gemm_f32(
+                workspace.hidden,
+                drafter.top.post_projection,
+                workspace.gemm_f32,
+                1,
+                drafter.arch.backbone_hidden_size as i32,
+                drafter.arch.hidden_size as i32,
+                stream,
+            )?;
+            launch_cast_f32_to_f16(
+                &self.stream,
+                self.fused.fn_cast_f32_to_f16,
+                workspace.gemm_f32,
+                workspace.out_hidden,
+                drafter.arch.backbone_hidden_size as i32,
+            )?;
         }
         tracing::debug!(
-            "Gemma 4 speculative path: pre_projection + layer 0 Q-side \
-             exercised on real pointers; cross-attn + MaskedEmbedder \
-             still pending"
+            "Gemma 4 speculative path: one full drafter MTP step \
+             exercised on real pointers; K-draft loop + base verify \
+             + acceptance still pending"
         );
 
         // Avoid an unused-binding warning on `max_new` for now —
-        // commit 7 actually drives a K-step draft loop.
+        // a follow-up commit drives a real K-step draft loop and
+        // returns the accepted tokens.
         let _ = max_new;
 
         Err(rvllm_core::RvllmError::Attention {
             err: rvllm_core::AttentionError::FeatureNotAvailable {
-                op: "Gemma4Bringup::run_generate_speculative (assistant one-step forward pending: cross-attn + MaskedEmbedder)",
+                op: "Gemma4Bringup::run_generate_speculative (full drafter MTP step runs; K-draft loop + base verify + acceptance pending)",
                 backend: "Gemma4SpecDecode",
             },
             ctx: rvllm_core::AttnCtx {
@@ -3952,28 +4056,31 @@ impl Gemma4Bringup {
         // `if (head_idx < num_kv_heads)`, dead-code with the count
         // zeroed, so the null K/V pointers below are never
         // dereferenced.
-        if !matches!(
+        // Commit 14: route both sliding and global layers. Sliding
+        // layers use full rotation (rotary_dim == head_dim_sliding)
+        // and the sliding cos/sin tables; global layers use partial
+        // rotation (`partial_rotary_factor=0.25` on E4B → rotary_dim
+        // = head_dim_global*0.25 = 128) with the global tables.
+        let is_global = matches!(
             layer.layer_type,
-            rvllm_loader::gemma4_drafter::DrafterLayerType::Sliding
-        ) {
-            // Commit 8 scope: global layer (partial rotary factor) is
-            // wired alongside cross-attention in a follow-up.
-            return Err(rvllm_core::RvllmError::Attention {
-                err: rvllm_core::AttentionError::FeatureNotAvailable {
-                    op: "Gemma4Bringup::run_drafter_layer_q_side: \
-                         global drafter layer requires partial-factor \
-                         RoPE — pending with cross-attn integration",
-                    backend: "Gemma4SpecDecode",
-                },
-                ctx: rvllm_core::AttnCtx {
-                    op: "run_drafter_layer_q_side(global)",
-                    stream,
-                    num_seqs: 1,
-                    head_dim: eff_hd as u32,
-                },
-                bt: std::backtrace::Backtrace::capture(),
-            });
-        }
+            rvllm_loader::gemma4_drafter::DrafterLayerType::Full
+        );
+        // Drafter config explicitly carries partial_rotary_factor=0.25;
+        // hardcoded here (same convention as base Gemma 4 E4B) until
+        // `Gemma4DrafterArch` exposes the field.
+        const PARTIAL_ROTARY_FACTOR_GLOBAL: f32 = 0.25;
+        let rotary_dim: i32 = if is_global {
+            ((eff_hd as f32) * PARTIAL_ROTARY_FACTOR_GLOBAL) as i32
+        } else {
+            eff_hd as i32
+        };
+        let (cos_table_off, sin_table_off) = if is_global {
+            (self.model.rope_cos_global.offset_bytes,
+             self.model.rope_sin_global.offset_bytes)
+        } else {
+            (self.model.rope_cos_sliding.offset_bytes,
+             self.model.rope_sin_sliding.offset_bytes)
+        };
         let pos_region = self.arena.region("spec_drafter_q_rope_pos", 4, 16)?;
         let pos_host: i32 = position as i32;
         pos_region.copy_from_host(&pos_host.to_le_bytes())?;
@@ -3985,15 +4092,15 @@ impl Gemma4Bringup {
             let mut q_out: u64 = workspace.q;
             let mut key_cache: u64 = 0;
             let mut value_cache: u64 = 0;
-            let mut cos_table: u64 = self.model.rope_cos_sliding.offset_bytes;
-            let mut sin_table: u64 = self.model.rope_sin_sliding.offset_bytes;
+            let mut cos_table: u64 = cos_table_off;
+            let mut sin_table: u64 = sin_table_off;
             let mut positions_ptr: u64 = pos_region.device_ptr();
             let mut slot_mapping_ptr: u64 = 0;
             let mut num_tokens_arg: i32 = 1;
             let mut num_heads_arg: i32 = num_heads as i32;
             let mut num_kv_heads_arg: i32 = 0;
             let mut head_dim_arg: i32 = eff_hd as i32;
-            let mut rotary_dim_arg: i32 = eff_hd as i32; // full rotation for sliding
+            let mut rotary_dim_arg: i32 = rotary_dim;
             let args: [*mut core::ffi::c_void; 15] = [
                 &mut q_in           as *mut _ as *mut _,
                 &mut k_in           as *mut _ as *mut _,

@@ -846,6 +846,148 @@ impl Gemma4DrafterRuntime {
         Ok(())
     }
 
+    /// Spec-decode commit 14: cross-attention for a global-source
+    /// drafter layer (layer 3 on E4B). Mirrors
+    /// `launch_cross_attn_sliding` but reads from
+    /// `shadow_kv.full_{k,v}_ptr`, uses `full_num_kv_heads /
+    /// full_head_dim`, and passes `window_size_left = -1` so the
+    /// FA-2 decode kernel attends to the full context.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_cross_attn_global(
+        &self,
+        output: u64,
+        query: u64,
+        block_tables: u64,
+        context_lens: u64,
+        scale: f32,
+        stream: u64,
+    ) -> Result<()> {
+        let shadow = self.shadow_kv.as_ref().ok_or_else(|| RvllmError::Attention {
+            err: AttentionError::FeatureNotAvailable {
+                op: "launch_cross_attn_global: shadow_kv not attached",
+                backend: "Gemma4Drafter",
+            },
+            ctx: AttnCtx {
+                op: "launch_cross_attn_global",
+                stream,
+                num_seqs: 1,
+                head_dim: self.arch.head_dim_global as u32,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        })?;
+        let fn_decode = self.fn_flash_attention_2_decode_f16io.ok_or_else(|| {
+            RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    op: "launch_cross_attn_global: flash_attention_2_decode_f16io \
+                         kernel not attached",
+                    backend: "Gemma4Drafter",
+                },
+                ctx: AttnCtx {
+                    op: "launch_cross_attn_global",
+                    stream,
+                    num_seqs: 1,
+                    head_dim: self.arch.head_dim_global as u32,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            }
+        })?;
+        use cudarc::driver::sys::*;
+        const FA2_THREADS: i32 = 128;
+        const FA2_BC: i32 = 32;
+        let num_heads = self.arch.num_attention_heads as i32;
+        let num_kv_heads = shadow.full_num_kv_heads as i32;
+        let head_dim = shadow.full_head_dim as i32;
+        let smem_bytes =
+            2 * FA2_BC * head_dim * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+        // GB10 sm_121 caps dynamic shared-memory per CTA at ~100 KiB.
+        // At head_dim=512 with the compile-time BC=32, the f16io
+        // decode kernel needs 128 KiB → `cuFuncSetAttribute` rejects
+        // it. A BC=16 f16io variant build (`-DFA2_BC=16`) would land
+        // the same workload at 64 KiB; for now, surface a clear
+        // FeatureNotAvailable so the driver loop can fall back
+        // (skip the global-layer cross-attn) and the spec path
+        // doesn't crash mid-forward.
+        const SM121_MAX_DYN_SMEM_BYTES: i32 = 96 * 1024;
+        if smem_bytes > SM121_MAX_DYN_SMEM_BYTES {
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    op: "launch_cross_attn_global: head_dim=512 needs \
+                         128 KiB dynamic smem with BC=32 — exceeds \
+                         the sm_121 per-CTA cap. A BC=16 f16io kernel \
+                         build is pending.",
+                    backend: "Gemma4Drafter",
+                },
+                ctx: AttnCtx {
+                    op: "launch_cross_attn_global",
+                    stream,
+                    num_seqs: 1,
+                    head_dim: head_dim as u32,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        if smem_bytes as u32 >= 48 * 1024 {
+            let rc = cuFuncSetAttribute(
+                fn_decode.raw() as CUfunction,
+                CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                smem_bytes,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "launch_cross_attn_global: cuFuncSetAttribute",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let mut a_out = output;
+        let mut a_q = query;
+        let mut a_k = shadow.full_k_ptr;
+        let mut a_v = shadow.full_v_ptr;
+        let mut a_bt = block_tables;
+        let mut a_cl = context_lens;
+        let mut a_scale = scale;
+        let mut a_nh = num_heads;
+        let mut a_nkvh = num_kv_heads;
+        let mut a_hd = head_dim;
+        let mut a_bs = shadow.block_size as i32;
+        let mut a_mbps = shadow.max_blocks_per_seq as i32;
+        let mut a_win: i32 = -1; // global attention — no window
+        let args: [*mut core::ffi::c_void; 13] = [
+            &mut a_out  as *mut _ as *mut _,
+            &mut a_q    as *mut _ as *mut _,
+            &mut a_k    as *mut _ as *mut _,
+            &mut a_v    as *mut _ as *mut _,
+            &mut a_bt   as *mut _ as *mut _,
+            &mut a_cl   as *mut _ as *mut _,
+            &mut a_scale as *mut _ as *mut _,
+            &mut a_nh   as *mut _ as *mut _,
+            &mut a_nkvh as *mut _ as *mut _,
+            &mut a_hd   as *mut _ as *mut _,
+            &mut a_bs   as *mut _ as *mut _,
+            &mut a_mbps as *mut _ as *mut _,
+            &mut a_win  as *mut _ as *mut _,
+        ];
+        let rc = cuLaunchKernel(
+            fn_decode.raw() as CUfunction,
+            1, num_heads as u32, 1,
+            FA2_THREADS as u32, 1, 1,
+            smem_bytes as u32,
+            stream as CUstream,
+            args.as_ptr() as *mut *mut core::ffi::c_void,
+            core::ptr::null_mut(),
+        );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "launch_cross_attn_global: flash_attention_2_decode_f16io",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Spec-decode commit 11: launch the assistant's cross-attention
     /// for a sliding-source layer. Wraps the shared
     /// `flash_attention_2_decode_f16io_kernel` against the drafter's
