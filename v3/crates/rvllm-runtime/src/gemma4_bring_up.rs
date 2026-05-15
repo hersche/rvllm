@@ -835,6 +835,17 @@ pub struct Gemma4Bringup {
     /// at-most-once + thread-safe under the cuda-worker's single
     /// thread + shared by future request paths.
     pub drafter: crate::gemma4_drafter::DrafterSlot,
+    /// Spec-decode commit 16: persistent f16[hidden_size] buffer for
+    /// the base's pre-lm-head last-prompt-token hidden state.
+    /// Allocated above the scratch checkpoint by `ensure_drafter`
+    /// when spec_decode is on; left at zero otherwise.
+    ///
+    /// `run_generate` writes into this buffer after final RMSNorm +
+    /// bf16→f16 widen, gated on `self.base_last_hidden_ptr != 0` —
+    /// so non-spec engines pay zero cost. `run_generate_speculative`
+    /// reads from it as the drafter's `base_hidden_last_step` for
+    /// the `pre_projection` input concat.
+    pub base_last_hidden_ptr: std::sync::atomic::AtomicU64,
     /// Session-level prefix cache. Populated lazily on first
     /// `run_generate` call; kept across subsequent calls so the
     /// KV cache survives the worker's scratch-checkpoint restore.
@@ -1611,6 +1622,7 @@ impl Gemma4Bringup {
             fused,
             assistant_kv_sources,
             drafter: std::sync::Mutex::new(None),
+            base_last_hidden_ptr: std::sync::atomic::AtomicU64::new(0),
             prefix_cache: std::sync::Mutex::new(None),
             // (assistant_kv_sources is set above; drafter slot stays
             // empty until commit 7 calls `ensure_drafter` from the
@@ -1753,6 +1765,43 @@ impl Gemma4Bringup {
             let nvfp4_entry = module
                 .get_function("gemma4_drafter_dequant_nvfp4_to_f16_kernel")?;
             rt.attach_drafter_dequant_kernels(module, fp8_entry, nvfp4_entry);
+        }
+        // Commit 16: allocate the base_last_hidden_ptr buffer above
+        // the scratch checkpoint so the next run_generate writes the
+        // normalized pre-lm-head hidden of the last prompt token here
+        // and arena.restore() doesn't reclaim it between requests.
+        #[cfg(feature = "cuda")]
+        {
+            if self
+                .base_last_hidden_ptr
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+            {
+                let h = self.arch.hidden_size;
+                let region = self.arena.region(
+                    "gemma4_base_last_hidden", h * 2, 16,
+                )?;
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let rc = cuMemsetD8_v2(region.device_ptr(), 0, h * 2);
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "gemma4_base_last_hidden zero-init",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                self.base_last_hidden_ptr.store(
+                    region.device_ptr(),
+                    std::sync::atomic::Ordering::Release,
+                );
+                eprintln!(
+                    "[gemma4-drafter] base_last_hidden buffer allocated \
+                     above scratch ({} bytes f16)",
+                    h * 2
+                );
+            }
         }
         // Commit 9: allocate F16 shadow KV at the two base source
         // layers (sliding source = layer 22, full source = layer 23
@@ -3459,86 +3508,112 @@ impl Gemma4Bringup {
             });
         }
 
-        // Commit 5a: build the minimum real base metadata needed to
-        // exercise drafter.prepare_pre_projection_input +
-        // bringup.run_drafter_pre_projection without touching the
-        // baseline `run_generate` path.
+        // Commit 16: REAL base prefill. Drive the existing
+        // `run_generate` machinery for `max_new = 1` (prefix-cache
+        // initialised, drafter dir / shadow attached). This:
         //
-        // We mirror the per-call arena allocation arithmetic from
-        // `run_generate`'s non-prefix-cache branch (see lines
-        // 3858-3907 of this file) — same `block_size = 32`,
-        // `num_blocks_total = env or 1024`, same per-layer dtype
-        // selection — so the KV-cache + scale region we hand to
-        // the drafter has byte-identical layout to what base prefill
-        // would produce. No real prefill runs here yet: KV bytes are
-        // zero, and `base_hidden_last_step` is a zero buffer. The
-        // resulting `pre_projection_in = [last_token_embed; 0]` runs
-        // through `run_drafter_pre_projection` to validate the
-        // GEMM + cast plumbing end-to-end on real device pointers;
-        // its OUTPUT is intentionally discarded because we still
-        // return `FeatureNotAvailable` below (cross-attn +
-        // MaskedEmbedder pending).
+        //   1. fills `prefix_cache.kv_cache_ptr` with REAL K/V
+        //      across all 42 base layers (including the source
+        //      layers 22/23 the drafter cross-attends to).
+        //   2. via the new commit-16 DtoD hook in `run_generate`,
+        //      captures the normalized pre-lm-head hidden of the
+        //      last prompt token into `self.base_last_hidden_ptr`.
+        //
+        // We then read both back here, build the drafter inputs on
+        // REAL data, and run one MTP step. K-step draft loop +
+        // verify + acceptance still pending below.
         let arch = &self.arch;
         let hidden_u = arch.hidden_size as u32;
         let vocab_u = arch.vocab_size as u32;
         let stream = self.stream.raw();
         let arena = &self.arena;
 
-        let block_size: u32 = 32;
-        let num_blocks_total: u32 = std::env::var("RVLLM_NUM_BLOCKS")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
-        let max_blocks_per_seq = num_blocks_total;
+        // Step (a): init prefix cache (idempotent — no-op after
+        // first call).
+        self.init_prefix_cache()?;
+
+        // Step (b): run base prefill. `max_new=1` is the smallest
+        // legal value (run_generate rejects 0). The one decode
+        // step costs ~30 ms; the resulting token is discarded.
+        // No vision / audio splice. Greedy. No on_token / cancel.
+        let _base_first_tok = self.run_generate(
+            fn_embed,
+            self.fused.fn_argmax,
+            prompt_ids,
+            /* max_new */ 1,
+            /* eos_ids */ &[],
+            /* shadow_requested */ false,
+            SamplingConfig::Greedy,
+            None,
+            None,
+            /* vision_splice */ &[],
+            /* audio_splice */ &[],
+        )?;
+
+        // Step (c): pull real KV layout + pointers out of the
+        // session prefix cache and the per-layer dtype rule (same
+        // rule run_generate uses).
+        let base_hidden_last_step_ptr = self
+            .base_last_hidden_ptr
+            .load(std::sync::atomic::Ordering::Acquire);
+        if base_hidden_last_step_ptr == 0 {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    op: "run_generate_speculative: base_last_hidden_ptr \
+                         is zero after run_generate — ensure_drafter \
+                         must allocate it (spec_decode gate enabled?)",
+                    backend: "Gemma4SpecDecode",
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "run_generate_speculative",
+                    stream,
+                    num_seqs: 1,
+                    head_dim: self.arch.max_head_dim() as u32,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let (kv_base_ptr, kv_scale_base_ptr,
+             kv_layer_offsets, kv_scale_layer_offsets,
+             num_blocks_total, block_size, max_blocks_per_seq) = {
+            let pc_guard = self.prefix_cache.lock().unwrap();
+            let pc = pc_guard.as_ref().ok_or_else(|| rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    op: "run_generate_speculative: prefix cache not \
+                         populated after run_generate",
+                    backend: "Gemma4SpecDecode",
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "run_generate_speculative",
+                    stream,
+                    num_seqs: 1,
+                    head_dim: self.arch.max_head_dim() as u32,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            })?;
+            (
+                pc.kv_cache_ptr,
+                pc.kv_scale_ptr,
+                pc.kv_layer_offsets.clone(),
+                pc.kv_scale_layer_offsets.clone(),
+                pc.num_blocks_total,
+                pc.block_size,
+                pc.num_blocks_total,
+            )
+        };
         let sliding_blocks = num_blocks_total;
 
-        // Per-layer KV layout — duplicated arithmetic from the
-        // per-call fallback in `run_generate`. Kept inline rather
-        // than refactored so the baseline stays byte-for-byte.
-        let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
-        let mut kv_scale_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        // Per-layer dtype rule — same one the base allocator uses
+        // (and the shadow KV expects).
         let mut kv_dtype_per_layer: Vec<crate::gemma4_layer_exec::KvDtype> =
             Vec::with_capacity(arch.num_hidden_layers);
-        let mut kv_total_bytes: u64 = 0;
-        let mut kv_scale_total_bytes: u64 = 0;
         for l in 0..arch.num_hidden_layers {
-            kv_layer_offsets.push(kv_total_bytes);
-            kv_scale_layer_offsets.push(kv_scale_total_bytes);
-            let is_global = arch.layer_types[l]
-                == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
-            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
-            let nkvh = arch.num_kv_heads_for_layer(l) as u32;
-            let hd = arch.head_dim_for_layer(l) as u32;
-            let layer_elems =
-                2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
-            let kv_dtype_l = crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(
-                arch.layer_types[l], l, false);
-            kv_dtype_per_layer.push(kv_dtype_l);
-            kv_total_bytes += match kv_dtype_l {
-                crate::gemma4_layer_exec::KvDtype::F16 => layer_elems * 2,
-                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems,
-                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 2,
-            };
-            let layer_scale_slots =
-                2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64;
-            kv_scale_total_bytes += match kv_dtype_l {
-                crate::gemma4_layer_exec::KvDtype::F16 => 0,
-                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_scale_slots * 4,
-                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 16,
-            };
+            kv_dtype_per_layer.push(
+                crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(
+                    arch.layer_types[l], l, false));
         }
-        let kv_region = arena.region("spec_kv", kv_total_bytes.max(16) as usize, 256)?;
-        cuda_check!(
-            cudarc::driver::sys::cuMemsetD8_v2(
-                kv_region.device_ptr(), 0, kv_total_bytes as usize),
-            "spec_kv_zero", 0u64);
-        let kv_scale_region = arena.region(
-            "spec_kv_scale", kv_scale_total_bytes.max(16) as usize, 16)?;
-        cuda_check!(
-            cudarc::driver::sys::cuMemsetD8_v2(
-                kv_scale_region.device_ptr(), 0, kv_scale_total_bytes as usize),
-            "spec_kv_scale_zero", 0u64);
 
-        // Persistent identity block-tables [0..num_blocks_total) i32,
-        // matching the layout the FA-2 decode launcher walks.
+        // Persistent identity block-tables [0..num_blocks_total).
         let block_tables_region = arena.region(
             "spec_block_tables", (num_blocks_total as usize) * 4, 16)?;
         {
@@ -3549,19 +3624,25 @@ impl Gemma4Bringup {
             block_tables_region.copy_from_host(&bt_host)?;
         }
 
-        // context_lens i32[1] = number of committed base tokens.
-        // For this commit we have no committed base tokens (prefill
-        // hasn't run yet); the prompt itself is what the future
-        // prefill will consume.
+        // context_lens i32[1] = base committed length the drafter
+        // cross-attn should attend to. After run_generate(max_new=1)
+        // the base committed `prompt_len + 1` tokens to the KV
+        // cache; the drafter is predicting the token AT that
+        // position, so it attends to all `prompt_len + 1` prior
+        // K/V slots.
+        let ctx_len_val: i32 = (prompt_ids.len() as i32) + 1;
         let context_lens_region = arena.region("spec_ctx_lens", 4, 16)?;
-        let ctx_len_host: i32 = 0;
-        context_lens_region.copy_from_host(&ctx_len_host.to_le_bytes())?;
+        context_lens_region.copy_from_host(&ctx_len_val.to_le_bytes())?;
 
-        // Token-ids region + last-prompt-token embedding (the
-        // assistant's "input embedding for next position").
+        // last_token_embed: embed the LAST-COMMITTED base token. For
+        // the first MTP step that's `_base_first_tok[0]` (base's
+        // argmax at the next position). Falls back to prompt's last
+        // id if the base output is empty (defensive).
+        let last_committed_tok: u32 = _base_first_tok
+            .last().copied()
+            .unwrap_or_else(|| *prompt_ids.last().unwrap_or(&0));
         let token_ids_region = arena.region("spec_tok_ids", 4, 16)?;
-        let last_tok_id: u32 = *prompt_ids.last().expect("prompt_ids non-empty above");
-        token_ids_region.copy_from_host(&last_tok_id.to_le_bytes())?;
+        token_ids_region.copy_from_host(&last_committed_tok.to_le_bytes())?;
         let last_token_embed = arena.region(
             "spec_last_tok_embed", (hidden_u as usize) * 2, 16)?;
         rvllm_fused::EmbeddingGatherLaunch { num_tokens: 1, hidden: hidden_u, vocab: vocab_u }
@@ -3573,26 +3654,12 @@ impl Gemma4Bringup {
                 stream,
             )?;
 
-        // Placeholder base-final-hidden buffer — zero-initialised.
-        // Filled by real base prefill in commit 7; for now the
-        // discard-output drafter pre_projection drives valid HBM.
-        let base_hidden_last_step = arena.region(
-            "spec_base_hidden_last_step", (hidden_u as usize) * 2, 16)?;
-        cuda_check!(
-            cudarc::driver::sys::cuMemsetD8_v2(
-                base_hidden_last_step.device_ptr(), 0, (hidden_u as usize) * 2),
-            "spec_base_hidden_last_step_zero", 0u64);
+        // base_hidden_last_step is no longer a stub — the run_generate
+        // hook wrote it.
+        let base_hidden_last_step_real = base_hidden_last_step_ptr;
 
-        // Source-layer K/V pointers + per-(slot, kv_head) scale
-        // pointers per `assistant_kv_sources`. Each source layer's
-        // K/V live as a contiguous `[2 (K+V), num_blocks, block_size,
-        // num_kv_heads, head_dim]` region; the V half starts at
-        // `+ layer_elems_byte_size / 2` from the K half — same
-        // accounting the FA-2 paged decode launcher already expects.
         let sources = self.assistant_kv_sources
             .expect("guarded above by assistant_kv_sources.is_none()");
-        let kv_base_ptr = kv_region.device_ptr();
-        let kv_scale_base_ptr = kv_scale_region.device_ptr();
         let kv_dtype_root = crate::gemma4_layer_exec::KvDtype::from_env(false);
 
         let source_view = |layer_idx: u32| -> crate::gemma4_drafter::DrafterBaseKvView {
@@ -3663,12 +3730,17 @@ impl Gemma4Bringup {
             "allocated Gemma 4 speculative drafter one-step workspace",
         );
 
+        // Commit 16: position is the absolute slot the drafter is
+        // predicting next. After run_generate(max_new=1) base has
+        // committed prompt_len + 1 tokens, so the next prediction
+        // slot is prompt_len + 1.
+        let drafter_position: u32 = (prompt_ids.len() as u32) + 1;
         let step = crate::gemma4_drafter::DrafterForwardStep {
-            base_hidden_last_step: base_hidden_last_step.device_ptr(),
+            base_hidden_last_step: base_hidden_last_step_real,
             last_token_embed: last_token_embed.device_ptr(),
             sliding_kv,
             full_kv,
-            position: 0,
+            position: drafter_position,
             out_logits: workspace.centroid_logits,
             out_hidden: workspace.out_hidden,
             out_token_id: workspace.out_token_id,
@@ -6382,6 +6454,34 @@ impl Gemma4Bringup {
         if lm_head_bf16 {
             rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: hidden }
                 .launch(kernels.bf16_to_f16_sat, residual_ptr, residual_ptr, stream)?;
+        }
+        // Spec-decode commit 16: when ensure_drafter has allocated
+        // the base-last-hidden capture buffer (only when
+        // ServerConfig::spec_decode is on), snapshot the normalized
+        // pre-lm-head hidden of the last prompt token (or last
+        // accepted decode token) here. Drafter's pre_projection
+        // input concat reads this buffer.
+        // Zero-pointer guard makes this a single atomic load on the
+        // default (non-spec) path.
+        {
+            let dst = self
+                .base_last_hidden_ptr
+                .load(std::sync::atomic::Ordering::Acquire);
+            if dst != 0 {
+                let rc = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                    dst,
+                    residual_ptr,
+                    (hidden as usize) * 2,
+                    stream as cudarc::driver::sys::CUstream,
+                );
+                if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "run_generate: base_last_hidden DtoD capture",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
         }
         self.cublaslt.f16_gemm_f32(residual_ptr, self.model.lm_head_f16.offset_bytes,
             logits_f32.device_ptr(), 1, vocab as i32, hidden as i32, stream)?;
