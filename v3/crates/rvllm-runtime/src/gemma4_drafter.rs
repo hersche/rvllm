@@ -622,7 +622,15 @@ impl Gemma4DrafterRuntime {
     /// `sliding_bytes` / `full_bytes` are the per-buffer (K or V)
     /// sizes the caller has already computed for the active spec
     /// request — must match `shadow_kv.{sliding,full}_layer_bytes`.
+    ///
+    /// Commit 20: takes separate `sliding_kv_dtype` and `full_kv_dtype`
+    /// instead of a single dtype for both. On hybrid configs (e.g.
+    /// NVFP4 sliding + FP8 global) layer 22 and layer 23 use different
+    /// KV cache dtypes — feeding both layers through the sliding-layer
+    /// dtype path silently dequanted the full source layer with the
+    /// wrong codec, producing junk K/V in the shadow.
     #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn populate_shadow_kv_from_base(
         &self,
         base_sliding_k: u64,
@@ -633,7 +641,8 @@ impl Gemma4DrafterRuntime {
         base_sliding_v_scale: u64,
         base_full_k_scale: u64,
         base_full_v_scale: u64,
-        base_kv_dtype: crate::gemma4_layer_exec::KvDtype,
+        sliding_kv_dtype: crate::gemma4_layer_exec::KvDtype,
+        full_kv_dtype: crate::gemma4_layer_exec::KvDtype,
         sliding_bytes: usize,
         full_bytes: usize,
         stream: u64,
@@ -672,10 +681,68 @@ impl Gemma4DrafterRuntime {
         // F16 element counts in the shadow (one buffer = K or V).
         let sliding_elems = (sliding_bytes / 2) as i64;
         let full_elems = (full_bytes / 2) as i64;
-        match base_kv_dtype {
+
+        // Sliding source layer (K + V).
+        self.populate_one_source_layer(
+            shadow.sliding_k_ptr,
+            shadow.sliding_v_ptr,
+            base_sliding_k,
+            base_sliding_v,
+            base_sliding_k_scale,
+            base_sliding_v_scale,
+            shadow.sliding_num_kv_heads as i32,
+            shadow.sliding_head_dim as i32,
+            sliding_bytes,
+            sliding_elems,
+            sliding_kv_dtype,
+            "sliding",
+            stream,
+        )?;
+
+        // Full / global source layer (K + V).
+        self.populate_one_source_layer(
+            shadow.full_k_ptr,
+            shadow.full_v_ptr,
+            base_full_k,
+            base_full_v,
+            base_full_k_scale,
+            base_full_v_scale,
+            shadow.full_num_kv_heads as i32,
+            shadow.full_head_dim as i32,
+            full_bytes,
+            full_elems,
+            full_kv_dtype,
+            "full",
+            stream,
+        )?;
+        Ok(())
+    }
+
+    /// Per-source-layer dispatch helper for `populate_shadow_kv_from_base`.
+    /// One call writes both K and V for ONE source layer using the dtype
+    /// the base actually used at that layer (the bug commit 20 fixed:
+    /// hybrid configs have different sliding vs full dtypes).
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn populate_one_source_layer(
+        &self,
+        shadow_k: u64,
+        shadow_v: u64,
+        base_k: u64,
+        base_v: u64,
+        base_k_scale: u64,
+        base_v_scale: u64,
+        nkvh: i32,
+        head_dim: i32,
+        layer_bytes: usize,
+        n_elems: i64,
+        kv_dtype: crate::gemma4_layer_exec::KvDtype,
+        which: &'static str,
+        stream: u64,
+    ) -> Result<()> {
+        match kv_dtype {
             crate::gemma4_layer_exec::KvDtype::F16 => {
-                let _ = (base_sliding_k_scale, base_sliding_v_scale,
-                         base_full_k_scale, base_full_v_scale);
+                let _ = (base_k_scale, base_v_scale, nkvh, head_dim);
                 use cudarc::driver::sys::*;
                 let do_copy = |dst: u64, src: u64, n: usize, op: &'static str|
                     -> Result<()> {
@@ -695,10 +762,10 @@ impl Gemma4DrafterRuntime {
                     }
                     Ok(())
                 };
-                do_copy(shadow.sliding_k_ptr, base_sliding_k, sliding_bytes, "sliding_k")?;
-                do_copy(shadow.sliding_v_ptr, base_sliding_v, sliding_bytes, "sliding_v")?;
-                do_copy(shadow.full_k_ptr,    base_full_k,    full_bytes,    "full_k")?;
-                do_copy(shadow.full_v_ptr,    base_full_v,    full_bytes,    "full_v")?;
+                let k_op = if which == "sliding" { "sliding_k" } else { "full_k" };
+                let v_op = if which == "sliding" { "sliding_v" } else { "full_v" };
+                do_copy(shadow_k, base_k, layer_bytes, k_op)?;
+                do_copy(shadow_v, base_v, layer_bytes, v_op)?;
                 Ok(())
             }
             crate::gemma4_layer_exec::KvDtype::Fp8 => {
@@ -718,29 +785,13 @@ impl Gemma4DrafterRuntime {
                         bt: std::backtrace::Backtrace::capture(),
                     }
                 })?;
-                // Commit 19: pass per-(slot, kv_head) f32 scale
-                // buffers. Per-layer shape arguments come from
-                // `shadow_kv` (which was sized off the base arch).
-                let sliding_nkvh = shadow.sliding_num_kv_heads as i32;
-                let sliding_hd = shadow.sliding_head_dim as i32;
-                let full_nkvh = shadow.full_num_kv_heads as i32;
-                let full_hd = shadow.full_head_dim as i32;
                 self.launch_fp8_dequant_to_shadow(
-                    fn_fp8, base_sliding_k, base_sliding_k_scale,
-                    shadow.sliding_k_ptr, sliding_nkvh, sliding_hd,
-                    sliding_elems, stream)?;
+                    fn_fp8, base_k, base_k_scale,
+                    shadow_k, nkvh, head_dim, n_elems, stream)?;
                 self.launch_fp8_dequant_to_shadow(
-                    fn_fp8, base_sliding_v, base_sliding_v_scale,
-                    shadow.sliding_v_ptr, sliding_nkvh, sliding_hd,
-                    sliding_elems, stream)?;
-                self.launch_fp8_dequant_to_shadow(
-                    fn_fp8, base_full_k, base_full_k_scale,
-                    shadow.full_k_ptr, full_nkvh, full_hd,
-                    full_elems, stream)?;
-                self.launch_fp8_dequant_to_shadow(
-                    fn_fp8, base_full_v, base_full_v_scale,
-                    shadow.full_v_ptr, full_nkvh, full_hd,
-                    full_elems, stream)?;
+                    fn_fp8, base_v, base_v_scale,
+                    shadow_v, nkvh, head_dim, n_elems, stream)?;
+                let _ = which;
                 Ok(())
             }
             crate::gemma4_layer_exec::KvDtype::Nvfp4 => {
@@ -761,17 +812,12 @@ impl Gemma4DrafterRuntime {
                     }
                 })?;
                 self.launch_nvfp4_dequant_to_shadow(
-                    fn_nvfp4, base_sliding_k, base_sliding_k_scale,
-                    shadow.sliding_k_ptr, sliding_elems, stream)?;
+                    fn_nvfp4, base_k, base_k_scale,
+                    shadow_k, n_elems, stream)?;
                 self.launch_nvfp4_dequant_to_shadow(
-                    fn_nvfp4, base_sliding_v, base_sliding_v_scale,
-                    shadow.sliding_v_ptr, sliding_elems, stream)?;
-                self.launch_nvfp4_dequant_to_shadow(
-                    fn_nvfp4, base_full_k, base_full_k_scale,
-                    shadow.full_k_ptr, full_elems, stream)?;
-                self.launch_nvfp4_dequant_to_shadow(
-                    fn_nvfp4, base_full_v, base_full_v_scale,
-                    shadow.full_v_ptr, full_elems, stream)?;
+                    fn_nvfp4, base_v, base_v_scale,
+                    shadow_v, n_elems, stream)?;
+                let _ = (nkvh, head_dim, which);
                 Ok(())
             }
         }

@@ -3804,8 +3804,13 @@ impl Gemma4Bringup {
                 "shadow_kv attached by ensure_drafter when spec_decode is on"
             );
             let sliding_li = sources.sliding_source_layer as usize;
+            let full_li = sources.full_source_layer as usize;
             let sliding_view = source_view(sources.sliding_source_layer);
             let full_view = source_view(sources.full_source_layer);
+            // Commit 20: hybrid configs (e.g. NVFP4 sliding + FP8 global)
+            // give the two source layers different KV dtypes. Pass each
+            // layer's dtype independently; the populator dispatches per
+            // layer rather than once for both.
             drafter.populate_shadow_kv_from_base(
                 sliding_view.k_cache,
                 sliding_view.v_cache,
@@ -3816,6 +3821,7 @@ impl Gemma4Bringup {
                 full_view.k_scale_cache,
                 full_view.v_scale_cache,
                 kv_dtype_per_layer[sliding_li],
+                kv_dtype_per_layer[full_li],
                 shadow.sliding_layer_bytes,
                 shadow.full_layer_bytes,
                 stream,
