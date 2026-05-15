@@ -5322,6 +5322,89 @@ impl Gemma4Bringup {
                 ));
             }
 
+            // Commit 41 — typical-acceptance in batched mode.
+            //
+            // When RVLLM_GEMMA4_SPEC_TYPICAL=1, the verify uses
+            // modified-rejection-sampling (Leviathan/Kalman) on log-
+            // probabilities derived from base's softcap'd vocab
+            // logits + drafter's log_q (already collected during the
+            // drafter K-loop). The K-row logits buffer covers positions
+            // P+1..P+K (rows 0..K-1). For i=0 (position P) we need an
+            // extra row: lm_head over base_last_hidden (= POST-final-
+            // norm hidden at P-1 from the warmup). Costs one M=1 GEMM
+            // + one M=1 softcap + one MB DtoH per outer iter — small
+            // vs the per-iter base decode.
+            //
+            // Acceptance bias `RVLLM_GEMMA4_SPEC_ACCEPT_BIAS` is the
+            // same env knob as commit 34. Use bias>0 to compensate for
+            // the drafter vs base softmax temperature mismatch (the
+            // E4B drafter's 2048-centroid sparse softmax is much
+            // sharper than the 262K-vocab base softmax, so naive
+            // ratio over-rejects).
+            let typical_in_batched = typical_mode
+                && !drafter_log_q.is_empty();
+            let typical_buffers: Option<(Vec<f32>, Vec<f32>)> = if typical_in_batched {
+                let vocab_sz = vocab_u as usize;
+                // 1. lm_head over base_last_hidden → warmup logits row.
+                let warmup_logits_region = arena.region(
+                    "spec_batched_warmup_logits",
+                    vocab_sz * 4,
+                    16,
+                )?;
+                self.cublaslt.f16_gemm_f32(
+                    base_hidden_last_step_real,
+                    self.model.lm_head_f16.offset_bytes,
+                    warmup_logits_region.device_ptr(),
+                    1,
+                    vocab_u as i32,
+                    hidden_u as i32,
+                    stream,
+                )?;
+                if arch.logit_softcap > 0.0 {
+                    rvllm_fused::gemma4_launcher::LogitSoftcapLaunch {
+                        num_tokens: 1,
+                        vocab: vocab_u,
+                        cap: arch.logit_softcap,
+                    }
+                    .launch(
+                        self.fused.fn_softcap_f32,
+                        warmup_logits_region.device_ptr(),
+                        stream,
+                    )?;
+                }
+                self.stream.fence()?;
+                // 2. DtoH warmup logits + K logits.
+                let mut warmup_logits = vec![0.0f32; vocab_sz];
+                let rc = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    warmup_logits.as_mut_ptr() as *mut _,
+                    warmup_logits_region.device_ptr(),
+                    vocab_sz * 4,
+                );
+                if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "spec batched typical: warmup logits DtoH",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+                let mut k_logits = vec![0.0f32; (k_actual as usize) * vocab_sz];
+                let rc = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    k_logits.as_mut_ptr() as *mut _,
+                    logits_region.device_ptr(),
+                    (k_actual as usize) * vocab_sz * 4,
+                );
+                if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "spec batched typical: K logits DtoH",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+                Some((warmup_logits, k_logits))
+            } else {
+                None
+            };
+
             // Greedy accept_len. Verify mapping (position-aligned):
             //
             //   drafts[0]   (position P)     vs  warmup _base_first_tok[0]
@@ -5337,16 +5420,86 @@ impl Gemma4Bringup {
             let mut accept_len: usize = 0;
             let warmup_b_p = _base_first_tok.first().copied();
             let kmax = k_actual as usize;
+            // Commit 41 — typical-acceptance bias + temperature, same
+            // semantics as the legacy verify path so existing
+            // calibration knobs carry over.
+            let typical_temp: f32 = if typical_in_batched {
+                match sampling {
+                    SamplingConfig::Stochastic { temperature, .. } => temperature.max(1e-6),
+                    SamplingConfig::Greedy => 1.0,
+                }
+            } else { 0.0 };
+            let bias_env: f64 = std::env::var("RVLLM_GEMMA4_SPEC_ACCEPT_BIAS")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            // Per-iter rng for the acceptance Us. Independent of the
+            // drafter sampling rng so the two don't perturb each other.
+            let mut accept_rng_state: u64 = {
+                let mut h: u64 = 0x517C_C1B7_2722_0A95;
+                for &t in prompt_ids.iter().take(16) {
+                    h = h.wrapping_mul(0x100000001B3).wrapping_add(t as u64);
+                }
+                h.wrapping_add(drafter_tokens.iter().copied().sum::<u32>() as u64)
+            };
+            let mut next_u01 = || -> f64 {
+                accept_rng_state ^= accept_rng_state << 13;
+                accept_rng_state ^= accept_rng_state >> 7;
+                accept_rng_state ^= accept_rng_state << 17;
+                ((accept_rng_state >> 33) as f64) / ((1u64 << 31) as f64)
+            };
+            let vocab_sz = vocab_u as usize;
             for i in 0..kmax {
                 let base_at_pos_i = if i == 0 {
                     warmup_b_p
                 } else {
                     base_argmax_k.get(i - 1).copied()
                 };
-                match base_at_pos_i {
-                    Some(b) if drafter_tokens[i] == b => accept_len += 1,
-                    _ => break,
+                let d_tok = drafter_tokens[i];
+                if let Some(b) = base_at_pos_i {
+                    if d_tok == b {
+                        accept_len += 1;
+                        continue;
+                    }
                 }
+                // Greedy mismatch → fall through to typical-acceptance
+                // if the env mode is on AND we have logits for this row.
+                if let Some((ref warmup_logits, ref k_logits)) = typical_buffers {
+                    let row: &[f32] = if i == 0 {
+                        &warmup_logits[..]
+                    } else {
+                        let off = (i - 1) * vocab_sz;
+                        &k_logits[off..off + vocab_sz]
+                    };
+                    let d_idx = d_tok as usize;
+                    if d_idx < vocab_sz {
+                        let inv_t = 1.0f32 / typical_temp.max(1e-6);
+                        let mut max_l = f32::NEG_INFINITY;
+                        for &l in row {
+                            if l.is_finite() && l > max_l { max_l = l; }
+                        }
+                        let mut lse: f64 = 0.0;
+                        for &l in row {
+                            if !l.is_finite() { continue; }
+                            lse += (((l - max_l) * inv_t) as f64).exp();
+                        }
+                        let log_p_b = ((row[d_idx] - max_l) * inv_t) as f64
+                            - lse.ln();
+                        let log_q = drafter_log_q
+                            .get(i)
+                            .copied()
+                            .unwrap_or(f32::NEG_INFINITY)
+                            as f64;
+                        let log_accept = (log_p_b - log_q + bias_env).min(0.0);
+                        let u = next_u01().max(1e-300);
+                        let log_u = u.ln();
+                        if log_u <= log_accept {
+                            accept_len += 1;
+                            continue;
+                        }
+                    }
+                }
+                break;
             }
 
             // Stats.
