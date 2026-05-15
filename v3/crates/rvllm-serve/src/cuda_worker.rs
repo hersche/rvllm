@@ -1433,8 +1433,23 @@ fn run_one(
 
     let result = unsafe {
         if spec_cfg.enabled {
+            let batched = std::env::var("RVLLM_GEMMA4_SPEC_BATCHED").as_deref() == Ok("1");
             let iterative = std::env::var("RVLLM_GEMMA4_SPEC_ITERATIVE").as_deref() == Ok("1");
-            if iterative {
+            if batched {
+                bringup.run_generate_speculative_batched(
+                    kernels.fn_embed,
+                    kernels.fn_argmax,
+                    &req.prompt_ids,
+                    req.max_new_tokens as usize,
+                    &req.stop_token_ids,
+                    spec_cfg.k,
+                    sampling_cfg,
+                    Some(req.cancelled.as_ref()),
+                    Some(&mut on_token),
+                    &vision_splice,
+                    &audio_splice,
+                )
+            } else if iterative {
                 bringup.run_generate_speculative_iterative(
                     kernels.fn_embed,
                     kernels.fn_argmax,
