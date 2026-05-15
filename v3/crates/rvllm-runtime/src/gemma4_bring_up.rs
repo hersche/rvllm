@@ -4159,6 +4159,34 @@ impl Gemma4Bringup {
             let drafter = guard.as_ref().expect("checked above");
             drafter.prepare_pre_projection_input(&step, &workspace, stream)?;
             self.run_drafter_pre_projection(drafter, &workspace)?;
+            // Commit 31h: probe pre_projection output (= workspace.hidden
+            // after pre_projection GEMM + cast). This is layer 0's input
+            // residual; if it's bad, the whole drafter forward inherits
+            // garbage.
+            if k_step == 0
+                && std::env::var("RVLLM_SPEC_DEBUG_Q_BISECT").as_deref() == Ok("1")
+            {
+                let _ = self.stream.fence();
+                let hidden_sz = drafter.arch.hidden_size;
+                let mut buf = vec![0u16; hidden_sz];
+                let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut _, workspace.hidden, hidden_sz * 2);
+                let mut max_abs = 0f32;
+                let mut sum_sq = 0f64;
+                for &b in &buf {
+                    let v = half::f16::from_bits(b).to_f32();
+                    if v.is_finite() {
+                        if v.abs() > max_abs { max_abs = v.abs(); }
+                        sum_sq += (v * v) as f64;
+                    }
+                }
+                let rms = (sum_sq / hidden_sz as f64).sqrt() as f32;
+                let head8: Vec<f32> = buf.iter().take(8)
+                    .map(|&b| half::f16::from_bits(b).to_f32()).collect();
+                eprintln!(
+                    "[spec-qbisect] post_pre_projection(hidden) max={:.3} rms={:.4} head8={:?}",
+                    max_abs, rms, head8);
+            }
 
             // Commits 7-14: drive all 4 drafter layers. Each layer
             // shares the same Q-side helper + an attn-finisher +
@@ -4957,6 +4985,34 @@ impl Gemma4Bringup {
             }
         }
 
+        // Commit 31h: Q-bisect probe.
+        let q_bisect = layer_idx == 0
+            && std::env::var("RVLLM_SPEC_DEBUG_Q_BISECT").as_deref() == Ok("1");
+        let q_probe = |label: &str, ptr: u64, n: usize| {
+            if !q_bisect { return; }
+            let _ = self.stream.fence();
+            let mut buf = vec![0u16; n];
+            unsafe {
+                let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut _, ptr, n * 2);
+            }
+            let mut max_abs = 0f32;
+            let mut sum_sq = 0f64;
+            for &b in &buf {
+                let v = half::f16::from_bits(b).to_f32();
+                if v.is_finite() {
+                    if v.abs() > max_abs { max_abs = v.abs(); }
+                    sum_sq += (v * v) as f64;
+                }
+            }
+            let rms = (sum_sq / n as f64).sqrt() as f32;
+            let head8: Vec<f32> = buf.iter().take(8)
+                .map(|&b| half::f16::from_bits(b).to_f32()).collect();
+            eprintln!("[spec-qbisect] {} max={:.3} rms={:.4} head8={:?}",
+                      label, max_abs, rms, head8);
+        };
+        q_probe("pre_inputln(hidden)", workspace.hidden, hidden);
+
         // Step 1: input_layernorm on workspace.hidden, in place.
         rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: 1,
@@ -4969,6 +5025,7 @@ impl Gemma4Bringup {
             layer.input_layernorm,
             stream,
         )?;
+        q_probe("post_inputln(hidden)", workspace.hidden, hidden);
 
         // Step 2: q_proj = hidden @ Wq^T  → f32 GEMM scratch.
         //   Wq shape on disk: [q_rows, hidden] BF16->F16.
@@ -4991,6 +5048,7 @@ impl Gemma4Bringup {
             workspace.q,
             q_rows as i32,
         )?;
+        q_probe("post_q_proj(q)", workspace.q, q_rows);
 
         // Step 4: per-head q_norm. Treats each of `num_heads` heads
         // of length `effective_head_dim` as a separate "token" so
@@ -5007,6 +5065,7 @@ impl Gemma4Bringup {
             layer.self_attn_q_norm,
             stream,
         )?;
+        q_probe("post_q_norm(q)", workspace.q, q_rows);
 
 
         // Step 5: partial NeoX RoPE on Q. Layer 0..2 are sliding
