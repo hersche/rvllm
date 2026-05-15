@@ -846,6 +846,15 @@ pub struct Gemma4Bringup {
     /// reads from it as the drafter's `base_hidden_last_step` for
     /// the `pre_projection` input concat.
     pub base_last_hidden_ptr: std::sync::atomic::AtomicU64,
+    /// Spec-decode commit 18: per-request one-shot gate for the
+    /// `run_generate` hook above. `run_generate_speculative` sets
+    /// this to `true` BEFORE calling `run_generate`; the hook
+    /// captures the first hidden it sees (= post-prefill, last
+    /// prompt token) and clears the flag so subsequent decode-step
+    /// fires don't overwrite. Without this, max_new > 1 left the
+    /// buffer holding the post-last-decode hidden — wrong position
+    /// for drafter step 1 → accept_rate stuck near 0.
+    pub base_last_hidden_snapshot_pending: std::sync::atomic::AtomicBool,
     /// Session-level prefix cache. Populated lazily on first
     /// `run_generate` call; kept across subsequent calls so the
     /// KV cache survives the worker's scratch-checkpoint restore.
@@ -1623,6 +1632,8 @@ impl Gemma4Bringup {
             assistant_kv_sources,
             drafter: std::sync::Mutex::new(None),
             base_last_hidden_ptr: std::sync::atomic::AtomicU64::new(0),
+            base_last_hidden_snapshot_pending:
+                std::sync::atomic::AtomicBool::new(false),
             prefix_cache: std::sync::Mutex::new(None),
             // (assistant_kv_sources is set above; drafter slot stays
             // empty until commit 7 calls `ensure_drafter` from the
@@ -3532,6 +3543,16 @@ impl Gemma4Bringup {
         // first call).
         self.init_prefix_cache()?;
 
+        // Commit 18: arm the one-shot base_last_hidden snapshot
+        // BEFORE calling run_generate. The hook inside run_generate
+        // consumes this flag on the FIRST final_norm fire (= after
+        // prefill, last prompt token), and ignores subsequent
+        // decode-step fires. Without this gate, max_new>1 left the
+        // captured buffer holding the wrong position's hidden and
+        // dragged accept_rate to ~0.
+        self.base_last_hidden_snapshot_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+
         // Step (b): run base prefill. `max_new=1` is the smallest
         // legal value (run_generate rejects 0). The one decode
         // step costs ~30 ms; the resulting token is discarded.
@@ -3624,23 +3645,36 @@ impl Gemma4Bringup {
             block_tables_region.copy_from_host(&bt_host)?;
         }
 
-        // context_lens i32[1] = base committed length the drafter
-        // cross-attn should attend to. After run_generate(max_new=1)
-        // the base committed `prompt_len + 1` tokens to the KV
-        // cache; the drafter is predicting the token AT that
-        // position, so it attends to all `prompt_len + 1` prior
-        // K/V slots.
-        let ctx_len_val: i32 = (prompt_ids.len() as i32) + 1;
+        // Commit 18: position-align all three drafter inputs at
+        // the LAST PROMPT TOKEN (position prompt_len - 1), so the
+        // drafter predicts position prompt_len — directly
+        // comparable to base's first argmax `_base_first_tok[0]`.
+        //
+        //   base_hidden_last_step ← snapshot (post-prefill,
+        //                          pre-any-decode) = hidden at
+        //                          position prompt_len - 1.
+        //   last_token_embed      ← embed(prompt_ids.last()).
+        //   step.position         ← prompt_len (where the drafter
+        //                          predicts).
+        //   verify target         ← _base_first_tok[0].
+        //
+        // Commit 18 (refined): bound context_lens to the PROMPT
+        // only, not prompt + base's decoded tokens. The drafter is
+        // predicting "what comes after the prompt", so its
+        // cross-attention should see prompt K/V slots and nothing
+        // else — matching the HF candidate_generator convention of
+        // running the drafter on the last-prompt-token position.
+        let ctx_len_val: i32 = prompt_ids.len() as i32;
         let context_lens_region = arena.region("spec_ctx_lens", 4, 16)?;
         context_lens_region.copy_from_host(&ctx_len_val.to_le_bytes())?;
 
-        // last_token_embed: embed the LAST-COMMITTED base token. For
-        // the first MTP step that's `_base_first_tok[0]` (base's
-        // argmax at the next position). Falls back to prompt's last
-        // id if the base output is empty (defensive).
-        let last_committed_tok: u32 = _base_first_tok
-            .last().copied()
-            .unwrap_or_else(|| *prompt_ids.last().unwrap_or(&0));
+        // last_token_embed = embed of the LAST PROMPT TOKEN (NOT
+        // base's max_new'th decode). This is the input the drafter
+        // pairs with `base_hidden_last_step` at position prompt_len
+        // - 1 → predict position prompt_len.
+        let last_committed_tok: u32 = *prompt_ids
+            .last()
+            .expect("prompt_ids non-empty checked above");
         let token_ids_region = arena.region("spec_tok_ids", 4, 16)?;
         token_ids_region.copy_from_host(&last_committed_tok.to_le_bytes())?;
         let last_token_embed = arena.region(
@@ -3730,11 +3764,14 @@ impl Gemma4Bringup {
             "allocated Gemma 4 speculative drafter one-step workspace",
         );
 
-        // Commit 16: position is the absolute slot the drafter is
-        // predicting next. After run_generate(max_new=1) base has
-        // committed prompt_len + 1 tokens, so the next prediction
-        // slot is prompt_len + 1.
-        let drafter_position: u32 = (prompt_ids.len() as u32) + 1;
+        // Commit 18 (refined): HF candidate_generator.py:1370 uses
+        // `position_ids = [[input_ids.shape[1] - 1]]` — the
+        // drafter's RoPE position is the position OF the prompt's
+        // last token (= prompt_len - 1), not the next slot. The
+        // drafter's MTP head then maps that latent to "what comes
+        // next" via `masked_embedding`, which is compared against
+        // base's argmax `_base_first_tok[0]`.
+        let drafter_position: u32 = (prompt_ids.len() as u32).saturating_sub(1);
         let step = crate::gemma4_drafter::DrafterForwardStep {
             base_hidden_last_step: base_hidden_last_step_real,
             last_token_embed: last_token_embed.device_ptr(),
@@ -3934,8 +3971,11 @@ impl Gemma4Bringup {
         }
         let drafter_tok: i32 = i32::from_le_bytes(drafter_tok_host);
         let drafter_tok_u: u32 = drafter_tok.max(0) as u32;
+        // Commit 18: verify against base's FIRST argmax (position
+        // prompt_len) — that's the slot the drafter just predicted
+        // with position-aligned inputs.
         let base_tok: u32 = _base_first_tok
-            .last().copied()
+            .first().copied()
             .unwrap_or(0);
 
         // K=1 accept-rate measurement at step 1 only. The drafter's
@@ -6490,19 +6530,35 @@ impl Gemma4Bringup {
             rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: hidden }
                 .launch(kernels.bf16_to_f16_sat, residual_ptr, residual_ptr, stream)?;
         }
-        // Spec-decode commit 16: when ensure_drafter has allocated
-        // the base-last-hidden capture buffer (only when
-        // ServerConfig::spec_decode is on), snapshot the normalized
-        // pre-lm-head hidden of the last prompt token (or last
-        // accepted decode token) here. Drafter's pre_projection
-        // input concat reads this buffer.
-        // Zero-pointer guard makes this a single atomic load on the
-        // default (non-spec) path.
+        // Spec-decode commits 16 + 18: one-shot snapshot of the
+        // normalized pre-lm-head hidden.
+        //
+        // The caller (`run_generate_speculative`) sets
+        // `base_last_hidden_snapshot_pending = true` BEFORE invoking
+        // run_generate. The first hook fire (= post-PREFILL
+        // final_norm, last prompt token's hidden) consumes the flag
+        // and copies; subsequent decode-step fires see the flag
+        // cleared and skip.
+        //
+        // Without this gating, max_new>1 left the buffer holding the
+        // hidden at position prompt_len + max_new - 1, which is
+        // off-position vs. the drafter's step 1 input (which wants
+        // position prompt_len, i.e. the LAST PROMPT TOKEN's hidden).
+        // The off-position state systematically suppressed accept
+        // rate.
+        //
+        // Three-way gate: ptr != 0 (buffer allocated) && pending
+        // (caller asked) && load_then_swap (one-shot semantics).
+        // Default non-spec runs: ptr==0 so an atomic load + branch.
         {
             let dst = self
                 .base_last_hidden_ptr
                 .load(std::sync::atomic::Ordering::Acquire);
-            if dst != 0 {
+            if dst != 0
+                && self
+                    .base_last_hidden_snapshot_pending
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
                 let rc = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
                     dst,
                     residual_ptr,
