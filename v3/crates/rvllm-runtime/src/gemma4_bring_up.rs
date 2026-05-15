@@ -3551,18 +3551,25 @@ impl Gemma4Bringup {
         };
 
         // Real-pointer plumbing exercise: pre-projection input concat
-        // + pre_projection GEMM + cast to f16. Outputs are discarded
+        // + pre_projection GEMM + cast to f16 + layer 0 Q-side
+        // (input_layernorm + q_proj + q_norm). Outputs are discarded
         // — the per-call arena restore at the end of the worker
-        // request handler reclaims the scratch.
+        // request handler reclaims the scratch. Cross-attention and
+        // MaskedEmbedder remain pending so we still return
+        // FeatureNotAvailable below.
         {
             let guard = self.drafter.lock().unwrap();
             let drafter = guard.as_ref().expect("checked above");
             drafter.prepare_pre_projection_input(&step, &workspace, stream)?;
             self.run_drafter_pre_projection(drafter, &workspace)?;
+            // Commit 7: layer 0 Q-side. Other layers + cross-attn
+            // come in subsequent commits.
+            self.run_drafter_layer_q_side(drafter, &workspace, 0)?;
         }
         tracing::debug!(
-            "Gemma 4 speculative path: pre_projection exercised on real \
-             pointers; cross-attn + MaskedEmbedder still pending"
+            "Gemma 4 speculative path: pre_projection + layer 0 Q-side \
+             exercised on real pointers; cross-attn + MaskedEmbedder \
+             still pending"
         );
 
         // Avoid an unused-binding warning on `max_new` for now —
@@ -3639,6 +3646,113 @@ impl Gemma4Bringup {
             hidden,
             pre_in,
             "completed Gemma 4 speculative drafter pre_projection",
+        );
+        Ok(())
+    }
+
+    /// Spec-decode commit 7: Q-side of one drafter layer's forward.
+    /// Runs `input_layernorm → q_proj → q_norm` on the existing
+    /// `DrafterStepWorkspace`. No new CUDA kernels — reuses
+    /// `RmsnormInplaceLaunch`, `cublaslt.f16_gemm_f32`, and the
+    /// shared `launch_cast_f32_to_f16` helper.
+    ///
+    /// Output: `workspace.q` holds f16 `[num_heads * effective_head_dim]`
+    /// Q with per-head RMSNorm applied. RoPE and the cross-attention
+    /// against the base's source-layer K/V remain pending — the
+    /// caller (`run_generate_speculative`) returns
+    /// `FeatureNotAvailable` after invoking this helper.
+    ///
+    /// Safe to call multiple times during one forward (e.g. per
+    /// layer), but in commit 7 only layer 0 is exercised from the
+    /// spec path.
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    unsafe fn run_drafter_layer_q_side(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        layer_idx: usize,
+    ) -> Result<()> {
+        let hidden = drafter.arch.hidden_size;
+        let num_heads = drafter.arch.num_attention_heads;
+        let layer = drafter.layers.get(layer_idx).ok_or_else(|| {
+            rvllm_core::RvllmError::Loader {
+                err: rvllm_core::LoaderError::Corrupt {
+                    detail: format!(
+                        "run_drafter_layer_q_side: layer_idx {layer_idx} \
+                         out of range (drafter has {} layers)",
+                        drafter.layers.len()
+                    ),
+                },
+                ctx: rvllm_core::LoaderCtx {
+                    path: drafter.shard_path.clone(),
+                    tensor: None,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            }
+        })?;
+        let eff_hd = layer.effective_head_dim;
+        let q_rows = num_heads * eff_hd;
+        let stream = self.stream.raw();
+        let eps = drafter.arch.rms_norm_eps;
+
+        // Step 1: input_layernorm on workspace.hidden, in place.
+        rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: 1,
+            hidden: hidden as u32,
+            eps,
+        }
+        .launch(
+            self.fused.fn_rmsnorm,
+            workspace.hidden,
+            layer.input_layernorm,
+            stream,
+        )?;
+
+        // Step 2: q_proj = hidden @ Wq^T  → f32 GEMM scratch.
+        //   Wq shape on disk: [q_rows, hidden] BF16->F16.
+        //   m=1, n=q_rows, k=hidden.
+        self.cublaslt.f16_gemm_f32(
+            workspace.hidden,
+            layer.self_attn_q_proj,
+            workspace.gemm_f32,
+            1,
+            q_rows as i32,
+            hidden as i32,
+            stream,
+        )?;
+
+        // Step 3: cast f32 → f16 → workspace.q.
+        launch_cast_f32_to_f16(
+            &self.stream,
+            self.fused.fn_cast_f32_to_f16,
+            workspace.gemm_f32,
+            workspace.q,
+            q_rows as i32,
+        )?;
+
+        // Step 4: per-head q_norm. Treats each of `num_heads` heads
+        // of length `effective_head_dim` as a separate "token" so
+        // the existing inplace RMSNorm launcher fans out cleanly
+        // (gamma is shared across heads, shape [effective_head_dim]).
+        rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: num_heads as u32,
+            hidden: eff_hd as u32,
+            eps,
+        }
+        .launch(
+            self.fused.fn_rmsnorm,
+            workspace.q,
+            layer.self_attn_q_norm,
+            stream,
+        )?;
+
+        tracing::trace!(
+            layer_idx,
+            num_heads,
+            effective_head_dim = eff_hd,
+            "completed Gemma 4 speculative drafter layer Q-side \
+             (input_layernorm + q_proj + q_norm)",
         );
         Ok(())
     }
