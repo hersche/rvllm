@@ -1721,6 +1721,17 @@ impl Gemma4Bringup {
                 .get_function("gemma4_masked_embedder_argmax_f16_kernel")?;
             rt.attach_masked_embedder_kernel(module, entry);
         }
+        // Commit 11: load the paged-decode FA-2 f16io kernel so the
+        // assistant cross-attention launcher can fire against the
+        // F16 shadow KV without going through the base attention
+        // backend (which holds Fp8/NVFP4-specific policy state).
+        #[cfg(feature = "cuda")]
+        {
+            let module = self.kernels.load_ptx("flash_attention")?;
+            let entry = module
+                .get_function("flash_attention_2_decode_f16io_kernel")?;
+            rt.attach_flash_attention_kernel(module, entry);
+        }
         // Commit 9: allocate F16 shadow KV at the two base source
         // layers (sliding source = layer 22, full source = layer 23
         // on E4B). Sizing mirrors the base's paged-decode expectation
@@ -3660,6 +3671,55 @@ impl Gemma4Bringup {
             // RoPE a no-op (cos=1, sin=0). Still exercises the
             // launch path on real device memory.
             self.run_drafter_layer_q_side(drafter, &workspace, 0, step.position)?;
+
+            // Commit 10+11: populate the drafter's F16 shadow KV
+            // from the BASE's source-layer K/V, then launch the
+            // assistant cross-attention against it.
+            //
+            // The shadow_kv was allocated zeroed during
+            // ensure_drafter at sizes computed from `base.arch +
+            // RVLLM_NUM_BLOCKS`. Here we use the SAME arithmetic
+            // the spec_kv allocator above used so the layer-bytes
+            // match.
+            let shadow = drafter.shadow_kv.expect(
+                "shadow_kv attached by ensure_drafter when spec_decode is on"
+            );
+            let sliding_li = sources.sliding_source_layer as usize;
+            let full_li = sources.full_source_layer as usize;
+            // spec_kv K-half ptr for a source layer = base + layer_offset.
+            // V-half offset within a layer is (layer_elems / 2) on the
+            // F16 path, mirroring source_view() above. The view
+            // already encodes the layout so we reuse it.
+            let sliding_view = source_view(sources.sliding_source_layer);
+            let full_view = source_view(sources.full_source_layer);
+            drafter.populate_shadow_kv_from_base(
+                sliding_view.k_cache,
+                sliding_view.v_cache,
+                full_view.k_cache,
+                full_view.v_cache,
+                kv_dtype_per_layer[sliding_li],
+                shadow.sliding_layer_bytes,
+                shadow.full_layer_bytes,
+                stream,
+            )?;
+            let _ = full_li; // already accounted for via full_view above.
+            // Cross-attention for layer 0 (sliding source).
+            // attn_out goes into workspace.attn_out (f16 [num_heads
+            // * head_dim]). Output is discarded — full forward
+            // (o_proj + MLP + remaining layers + final_norm +
+            // MaskedEmbedder) lands in subsequent commits.
+            let head_dim_sliding = drafter.arch.head_dim_sliding as f32;
+            let scale = 1.0_f32 / head_dim_sliding.sqrt();
+            let sliding_window = self.arch.sliding_window_size as i32;
+            drafter.launch_cross_attn_sliding(
+                workspace.attn_out,
+                workspace.q,
+                block_tables_region.device_ptr(),
+                context_lens_region.device_ptr(),
+                scale,
+                sliding_window,
+                stream,
+            )?;
         }
         tracing::debug!(
             "Gemma 4 speculative path: pre_projection + layer 0 Q-side \

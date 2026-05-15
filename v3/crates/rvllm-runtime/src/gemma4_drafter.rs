@@ -227,6 +227,15 @@ pub struct Gemma4DrafterRuntime {
     /// for the non-cuda mock build (or until `attach_shadow_kv` is
     /// called).
     pub shadow_kv: Option<DrafterShadowKv>,
+    /// Spec-decode commit 11: paged f16-IO FA-2 decode kernel,
+    /// loaded from `kernels/sm_121/flash_attention.ptx`. The
+    /// assistant's cross-attention reads from `shadow_kv` (which is
+    /// stored in the f16io paged-decode layout) using this same
+    /// kernel as the base path. Lazy-attached by
+    /// `Gemma4Bringup::ensure_drafter` so the PTX is only loaded
+    /// when spec-decode is on.
+    pub flash_attention_mod: Option<rvllm_kernels::LoadedModule>,
+    pub fn_flash_attention_2_decode_f16io: Option<rvllm_kernels::KernelFn>,
 }
 
 /// F16 shadow KV regions used by the assistant cross-attention. One
@@ -502,6 +511,8 @@ impl Gemma4DrafterRuntime {
             masked_embedder_mod: None,
             fn_masked_embedder_argmax_f16: None,
             shadow_kv: None,
+            flash_attention_mod: None,
+            fn_flash_attention_2_decode_f16io: None,
         })
     }
 
@@ -534,6 +545,252 @@ impl Gemma4DrafterRuntime {
         );
     }
 
+    /// Spec-decode commit 11: install the paged-decode FA-2 f16io
+    /// kernel handle that the cross-attention launcher uses to read
+    /// from the shadow KV. Mirrors `attach_masked_embedder_kernel`.
+    pub fn attach_flash_attention_kernel(
+        &mut self,
+        module: rvllm_kernels::LoadedModule,
+        entry: rvllm_kernels::KernelFn,
+    ) {
+        self.flash_attention_mod = Some(module);
+        self.fn_flash_attention_2_decode_f16io = Some(entry);
+    }
+
+    /// Spec-decode commit 10: copy base source-layer K/V into the
+    /// drafter's F16 shadow regions.
+    ///
+    /// **F16 fast path only** — when the base allocates its KV in
+    /// F16 dtype, this is a plain `cuMemcpyDtoDAsync` for each of
+    /// (sliding K, sliding V, full K, full V). The four copies are
+    /// scheduled on `stream` and the kernel pipeline can be reused
+    /// without a host fence.
+    ///
+    /// **FP8 / NVFP4 base** — returns `FeatureNotAvailable`. A
+    /// dedicated dequant kernel lands in a follow-up commit; until
+    /// then spec-decode on a non-F16 KV profile fails clearly at
+    /// this point rather than silently feeding garbage through
+    /// cross-attention.
+    ///
+    /// `sliding_bytes` / `full_bytes` are the per-buffer (K or V)
+    /// sizes the caller has already computed for the active spec
+    /// request — must match `shadow_kv.{sliding,full}_layer_bytes`.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn populate_shadow_kv_from_base(
+        &self,
+        base_sliding_k: u64,
+        base_sliding_v: u64,
+        base_full_k: u64,
+        base_full_v: u64,
+        base_kv_dtype: crate::gemma4_layer_exec::KvDtype,
+        sliding_bytes: usize,
+        full_bytes: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if !matches!(base_kv_dtype, crate::gemma4_layer_exec::KvDtype::F16) {
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    op: "Gemma4DrafterRuntime::populate_shadow_kv_from_base: \
+                         non-F16 base KV (FP8 / NVFP4) requires a dequant \
+                         kernel — pending follow-up commit",
+                    backend: "Gemma4Drafter",
+                },
+                ctx: AttnCtx {
+                    op: "populate_shadow_kv_from_base",
+                    stream,
+                    num_seqs: 1,
+                    head_dim: self.arch.head_dim_global as u32,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let shadow = self.shadow_kv.as_ref().ok_or_else(|| RvllmError::Attention {
+            err: AttentionError::FeatureNotAvailable {
+                op: "populate_shadow_kv_from_base: shadow_kv not attached",
+                backend: "Gemma4Drafter",
+            },
+            ctx: AttnCtx {
+                op: "populate_shadow_kv_from_base",
+                stream,
+                num_seqs: 1,
+                head_dim: self.arch.head_dim_global as u32,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        })?;
+        if sliding_bytes != shadow.sliding_layer_bytes
+            || full_bytes != shadow.full_layer_bytes
+        {
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    op: "populate_shadow_kv_from_base: \
+                         caller layer-bytes mismatch shadow layout",
+                    backend: "Gemma4Drafter",
+                },
+                ctx: AttnCtx {
+                    op: "populate_shadow_kv_from_base",
+                    stream,
+                    num_seqs: 1,
+                    head_dim: self.arch.head_dim_global as u32,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        use cudarc::driver::sys::*;
+        let do_copy = |dst: u64, src: u64, n: usize, op: &'static str| -> Result<()> {
+            let rc = cuMemcpyDtoDAsync_v2(dst, src, n, stream as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::Cuda {
+                    kind: rvllm_core::CudaErrorKind::MemcpyFailed,
+                    op: "drafter_shadow_kv_dtoD",
+                    ctx: rvllm_core::CudaCtx {
+                        stream,
+                        kernel: op,
+                        launch: None,
+                        device: 0,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+            Ok(())
+        };
+        do_copy(shadow.sliding_k_ptr, base_sliding_k, sliding_bytes, "sliding_k")?;
+        do_copy(shadow.sliding_v_ptr, base_sliding_v, sliding_bytes, "sliding_v")?;
+        do_copy(shadow.full_k_ptr,    base_full_k,    full_bytes,    "full_k")?;
+        do_copy(shadow.full_v_ptr,    base_full_v,    full_bytes,    "full_v")?;
+        Ok(())
+    }
+
+    /// Spec-decode commit 11: launch the assistant's cross-attention
+    /// for a sliding-source layer. Wraps the shared
+    /// `flash_attention_2_decode_f16io_kernel` against the drafter's
+    /// F16 shadow K/V — no new attention kernel.
+    ///
+    /// Arguments:
+    /// * `query` — drafter post-RoPE Q, f16
+    ///   `[num_heads * head_dim]` = workspace.q.
+    /// * `output` — f16 `[num_heads * head_dim]` for the attention
+    ///   output (= workspace.attn_out).
+    /// * `block_tables` / `context_lens` — same shapes the base
+    ///   path expects (identity table + i32[1] ctx_len).
+    /// * `sliding_window` — sliding-window size on the source
+    ///   layer (positive), or `-1` for the future global-layer
+    ///   variant.
+    ///
+    /// # Safety
+    /// `query` / `output` / `block_tables` / `context_lens` must be
+    /// valid device pointers of the stated shape. The shadow region
+    /// pointers come from `self.shadow_kv` and were initialised by
+    /// `ensure_drafter`.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_cross_attn_sliding(
+        &self,
+        output: u64,
+        query: u64,
+        block_tables: u64,
+        context_lens: u64,
+        scale: f32,
+        sliding_window: i32,
+        stream: u64,
+    ) -> Result<()> {
+        let shadow = self.shadow_kv.as_ref().ok_or_else(|| RvllmError::Attention {
+            err: AttentionError::FeatureNotAvailable {
+                op: "launch_cross_attn_sliding: shadow_kv not attached",
+                backend: "Gemma4Drafter",
+            },
+            ctx: AttnCtx {
+                op: "launch_cross_attn_sliding",
+                stream,
+                num_seqs: 1,
+                head_dim: self.arch.head_dim_sliding as u32,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        })?;
+        let fn_decode = self.fn_flash_attention_2_decode_f16io.ok_or_else(|| {
+            RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    op: "launch_cross_attn_sliding: flash_attention_2_decode_f16io \
+                         kernel not attached",
+                    backend: "Gemma4Drafter",
+                },
+                ctx: AttnCtx {
+                    op: "launch_cross_attn_sliding",
+                    stream,
+                    num_seqs: 1,
+                    head_dim: self.arch.head_dim_sliding as u32,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            }
+        })?;
+        use cudarc::driver::sys::*;
+        const FA2_THREADS: i32 = 128;
+        const FA2_BC: i32 = 32;
+        let num_heads = self.arch.num_attention_heads as i32;
+        let num_kv_heads = shadow.sliding_num_kv_heads as i32;
+        let head_dim = shadow.sliding_head_dim as i32;
+        let smem_bytes =
+            2 * FA2_BC * head_dim * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+        if smem_bytes as u32 >= 48 * 1024 {
+            let rc = cuFuncSetAttribute(
+                fn_decode.raw() as CUfunction,
+                CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                smem_bytes,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "launch_cross_attn_sliding: cuFuncSetAttribute",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let mut a_out = output;
+        let mut a_q = query;
+        let mut a_k = shadow.sliding_k_ptr;
+        let mut a_v = shadow.sliding_v_ptr;
+        let mut a_bt = block_tables;
+        let mut a_cl = context_lens;
+        let mut a_scale = scale;
+        let mut a_nh = num_heads;
+        let mut a_nkvh = num_kv_heads;
+        let mut a_hd = head_dim;
+        let mut a_bs = shadow.block_size as i32;
+        let mut a_mbps = shadow.max_blocks_per_seq as i32;
+        let mut a_win: i32 = sliding_window;
+        let args: [*mut core::ffi::c_void; 13] = [
+            &mut a_out  as *mut _ as *mut _,
+            &mut a_q    as *mut _ as *mut _,
+            &mut a_k    as *mut _ as *mut _,
+            &mut a_v    as *mut _ as *mut _,
+            &mut a_bt   as *mut _ as *mut _,
+            &mut a_cl   as *mut _ as *mut _,
+            &mut a_scale as *mut _ as *mut _,
+            &mut a_nh   as *mut _ as *mut _,
+            &mut a_nkvh as *mut _ as *mut _,
+            &mut a_hd   as *mut _ as *mut _,
+            &mut a_bs   as *mut _ as *mut _,
+            &mut a_mbps as *mut _ as *mut _,
+            &mut a_win  as *mut _ as *mut _,
+        ];
+        let rc = cuLaunchKernel(
+            fn_decode.raw() as CUfunction,
+            1, num_heads as u32, 1,
+            FA2_THREADS as u32, 1, 1,
+            smem_bytes as u32,
+            stream as CUstream,
+            args.as_ptr() as *mut *mut core::ffi::c_void,
+            core::ptr::null_mut(),
+        );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "launch_cross_attn_sliding: flash_attention_2_decode_f16io",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Non-cuda build stub. Linkable but the path is unreachable
     /// without the `cuda` feature. The runtime is gated by
     /// `ServerConfig::spec_decode`, which is itself unreachable from
@@ -562,6 +819,8 @@ impl Gemma4DrafterRuntime {
             masked_embedder_mod: None,
             fn_masked_embedder_argmax_f16: None,
             shadow_kv: None,
+            flash_attention_mod: None,
+            fn_flash_attention_2_decode_f16io: None,
         })
     }
 
