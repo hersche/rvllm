@@ -5538,8 +5538,13 @@ impl Gemma4Bringup {
             // 1024 threads is the __launch_bounds__ ceiling; cap at
             // intermediate so we don't over-spawn for tiny dims.
             let block: u32 = 1024u32.min(intermediate as u32).max(1);
+            // Commit 33: was `fn_gelu_mul` — that handle resolves to
+            // `fused_gelu_mul_fp8_quant_kernel` (4-arg ABI:
+            // output_fp8, output_scales, gate_up, intermediate). The
+            // drafter MLP passes 3 args (output_f16, gate_up,
+            // intermediate) so it needs the f16 variant.
             let rc = cuLaunchKernel(
-                self.fused.fn_gelu_mul.raw() as CUfunction,
+                self.fused.fn_fused_gelu_mul_f16.raw() as CUfunction,
                 1, 1, 1,
                 block, 1, 1,
                 0,
