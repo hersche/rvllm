@@ -4104,23 +4104,42 @@ impl Gemma4Bringup {
         }
         } // end for k_step
 
-        // Verify D0 against base's first-decode argmax. Commit 23
-        // does not yet do K>1 batched verify on the base — that
-        // lands in commit 24. The reported accept_rate here is
-        // therefore still the K=1 D0-only measure.
-        let base_tok: u32 = _base_first_tok
-            .first().copied()
-            .unwrap_or(0);
-        let d0: u32 = drafter_tokens.first().copied().unwrap_or(0);
-        let accept_rate: f32 = if d0 == base_tok { 1.0 } else { 0.0 };
+        // Commit 24: K-prefix verify against base's actual decode
+        // sequence. `_base_first_tok` already holds the full
+        // greedy-decoded base sequence (max_new tokens) from the
+        // initial `run_generate` call. accept_len is the longest
+        // prefix where drafter and base agree token-for-token.
+        //
+        // This is "sequential verify" — base ran K sequential
+        // decode steps regardless, so we get accept_rate
+        // observability but no decode-time speedup yet. Real
+        // speedup requires a batched-prefill entry point that
+        // runs K verify tokens in one base forward; that's a
+        // separate session (needs new base API surface).
+        let kmax = drafter_tokens.len().min(_base_first_tok.len());
+        let mut accept_len: usize = 0;
+        for i in 0..kmax {
+            if drafter_tokens[i] == _base_first_tok[i] {
+                accept_len += 1;
+            } else {
+                break;
+            }
+        }
+        let base_prefix: Vec<u32> = _base_first_tok.iter().take(kmax).copied().collect();
+        let accept_rate: f32 = if drafter_tokens.is_empty() {
+            0.0
+        } else {
+            accept_len as f32 / drafter_tokens.len() as f32
+        };
         tracing::info!(
             spec_k,
             drafter_tokens = ?drafter_tokens,
-            base_tok,
+            base_tokens = ?base_prefix,
+            accept_len,
             accept_rate,
-            base_tokens = _base_first_tok.len(),
-            "Gemma 4 speculative K-chain (D0 vs base accept-rate only; \
-             batched verify pending commit 24)"
+            base_total_tokens = _base_first_tok.len(),
+            "Gemma 4 speculative K-prefix verify (sequential; base ran K \
+             sequential decodes — batched-verify speedup deferred)"
         );
         Ok(_base_first_tok)
     }
