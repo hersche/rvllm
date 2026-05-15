@@ -5549,6 +5549,59 @@ impl Gemma4Bringup {
                 "Gemma 4 BATCHED-verify spec-decode (single batched-prefill of K drafts + lm_head M=K)"
             );
 
+            // Commit 42 — KV-cache rollback half of option (b).
+            //
+            // The verify call wrote (P + drafter_tokens.len()) tokens
+            // worth of K/V slots into the persistent KV cache and
+            // updated prefix_cache.last_tokens / committed_prefix_len
+            // as if all K drafts were committed. In reality only
+            // accept_len of them are; the divergence/bonus token at
+            // position P+accept_len has NO K/V written yet (it was a
+            // pure argmax of a stored hidden, never fed through the
+            // base layer stack).
+            //
+            // Gated by RVLLM_GEMMA4_SPEC_BATCHED_ROLLBACK=1; default
+            // OFF. When on, truncates the prefix-cache metadata to
+            // (prompt_ids.len() + accept_len) tokens so the next
+            // iter's prefix-match doesn't reuse stale slots beyond
+            // the truly committed boundary.
+            //
+            // Note: this is metadata-only. The KV cache PHYSICAL
+            // slots beyond the new boundary still contain stale
+            // bytes; the next iter's prefill at those positions
+            // overwrites them. The rollback exists so a prefix-cache
+            // HIT on the truncated boundary correctly indicates how
+            // many tokens are safe to reuse.
+            if std::env::var("RVLLM_GEMMA4_SPEC_BATCHED_ROLLBACK").as_deref()
+                == Ok("1")
+            {
+                if let Ok(mut guard) = self.prefix_cache.lock() {
+                    if let Some(pc) = guard.as_mut() {
+                        let target_len = prompt_ids.len() + accept_len;
+                        if pc.last_tokens.len() > target_len {
+                            pc.last_tokens.truncate(target_len);
+                        }
+                        let chunk_size: u32 = std::env::var("RVLLM_PREFILL_CHUNK_SIZE")
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let batch_prefill =
+                            parse_truthy_env("RVLLM_BATCH_PREFILL").unwrap_or(false);
+                        let target_u32 = target_len as u32;
+                        pc.committed_prefix_len = if batch_prefill && chunk_size == 0 {
+                            0
+                        } else if batch_prefill && chunk_size > 0 {
+                            (target_u32 / chunk_size) * chunk_size
+                        } else {
+                            target_u32
+                        };
+                        tracing::debug!(
+                            target_len,
+                            committed = pc.committed_prefix_len,
+                            "spec batched rollback: prefix-cache rewound"
+                        );
+                    }
+                }
+            }
+
             // Reclaim scratch (above-scratch K-buffer + base_last_hidden
             // survive). Host-side `emitted` already populated.
             unsafe { self.arena.restore(arena_ck_at_entry); }
