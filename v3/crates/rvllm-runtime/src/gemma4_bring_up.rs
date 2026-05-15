@@ -4879,6 +4879,27 @@ impl Gemma4Bringup {
             accepted: accept_len as u32,
             cumulative_decoded: _base_first_tok.len() as u32,
         });
+        // Commit 35: when RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED=1, emit the
+        // accepted drafter prefix + 1 base bonus token instead of the
+        // full base sequence. This makes the response text actually
+        // reflect accepted drafts — proves the wire works end-to-end.
+        // Quality tradeoff: with bias>0 the drafter tokens may differ
+        // from base argmax (we accept them via typical-acceptance),
+        // so output text DIFFERS from plain greedy. The ~speedup
+        // however only materializes once batched-verify replaces the
+        // current sequential base decode path (= task #2 proper).
+        if std::env::var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED").as_deref() == Ok("1")
+            && accept_len > 0
+        {
+            let mut emitted: Vec<u32> = drafter_tokens.iter()
+                .take(accept_len).copied().collect();
+            // Append 1 bonus base token at position accept_len (base's
+            // own argmax at the divergence point).
+            if let Some(&b) = _base_first_tok.get(accept_len) {
+                emitted.push(b);
+            }
+            return Ok(emitted);
+        }
         Ok(_base_first_tok)
     }
 
