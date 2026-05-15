@@ -163,6 +163,77 @@ pub fn decode_graph_eligible_for_generation(
 }
 
 #[cfg(test)]
+mod spec_decode_session_tests {
+    use super::SpecDecodeSession;
+
+    #[test]
+    fn open_seeds_committed_zero_with_prompt_tokens() {
+        let prompt = vec![1u32, 2, 3, 4];
+        let s = SpecDecodeSession::open(&prompt, 0xDEAD_BEEF);
+        assert_eq!(s.committed_len, 0);
+        assert_eq!(s.tokens, prompt);
+        assert_eq!(s.last_base_hidden_ptr, 0xDEAD_BEEF);
+        assert_eq!(s.next_base_argmax, u32::MAX);
+        assert_eq!(s.iter_count, 0);
+        assert_eq!(s.last_committed_token(), None);
+    }
+
+    #[test]
+    fn warmup_seed_marks_full_prompt_committed() {
+        let mut s = SpecDecodeSession::open(&[10u32, 20, 30], 0x1000);
+        s.seed_from_warmup(3, 99);
+        assert_eq!(s.committed_len, 3);
+        assert_eq!(s.next_base_argmax, 99);
+        assert_eq!(s.last_committed_token(), Some(30));
+        assert_eq!(s.drafter_input_position(), 2); // = committed_len - 1
+    }
+
+    #[test]
+    fn commit_drafts_advances_correctly_under_partial_accept() {
+        let mut s = SpecDecodeSession::open(&[1u32, 2, 3], 0);
+        s.seed_from_warmup(3, 100);
+        let drafts = vec![500u32, 600, 700, 800];
+        // accept_len = 2 of 4. Bonus token = 999 (the divergence).
+        s.commit_drafts(&drafts, 2, 999);
+        // tokens = original + accepted[..2]; committed_len bumps by 2.
+        assert_eq!(s.tokens, vec![1, 2, 3, 500, 600]);
+        assert_eq!(s.committed_len, 5);
+        assert_eq!(s.next_base_argmax, 999);
+        assert_eq!(s.iter_count, 1);
+        assert_eq!(s.last_committed_token(), Some(600));
+        assert_eq!(s.drafter_input_position(), 4);
+    }
+
+    #[test]
+    fn commit_drafts_accept_zero_is_a_noop_on_tokens() {
+        let mut s = SpecDecodeSession::open(&[1u32, 2], 0);
+        s.seed_from_warmup(2, 42);
+        s.commit_drafts(&[500u32, 600], 0, 7);
+        // accept_len=0: no drafts committed; only next_base_argmax + iter bumped.
+        assert_eq!(s.tokens, vec![1, 2]);
+        assert_eq!(s.committed_len, 2);
+        assert_eq!(s.next_base_argmax, 7);
+        assert_eq!(s.iter_count, 1);
+    }
+
+    #[test]
+    fn rewind_truncates_metadata_only() {
+        let mut s = SpecDecodeSession::open(&[1u32, 2, 3], 0);
+        s.seed_from_warmup(3, 100);
+        s.commit_drafts(&[500, 600, 700], 3, 42);
+        assert_eq!(s.committed_len, 6);
+        assert_eq!(s.tokens.len(), 6);
+        s.rewind_to(4);
+        assert_eq!(s.committed_len, 4);
+        assert_eq!(s.tokens, vec![1, 2, 3, 500]);
+        // rewind past current is a no-op
+        s.rewind_to(10);
+        assert_eq!(s.committed_len, 4);
+        assert_eq!(s.tokens.len(), 4);
+    }
+}
+
+#[cfg(test)]
 mod decode_graph_eligibility_tests {
     use super::{decode_graph_eligible_for_generation, effective_partition_size};
 
@@ -647,6 +718,167 @@ pub struct Gemma4FusedModules {
 /// Covers the common zeroclaw pattern (identical 15k-token persona
 /// on every request) at a cost of ~100 LOC of plumbing. Full
 /// multi-sequence prefix caching is future work.
+/// Per-request speculative-decoding state, owned by the spec
+/// inner loop and distinct from the cross-request `PrefixCacheState`.
+///
+/// Codex review (priority 1) flagged that the previous batched-verify
+/// path leaked spec-internal token-by-token state into
+/// `prefix_cache.last_tokens` / `committed_prefix_len`. With
+/// `RVLLM_PREFILL_CHUNK_SIZE=2048` the cross-request cache's
+/// committed-len is floored to chunk boundaries, so any spec iter
+/// on a short prompt re-prefilled the entire prompt every loop —
+/// killing wall-clock even when verify itself was correct.
+///
+/// `SpecDecodeSession` carries the spec-only state explicitly:
+///   * `committed_len`: how many TOKENS of base K/V are valid at the
+///     start of this iter (not chunk-aligned — strictly the actually-
+///     written boundary).
+///   * `last_base_hidden_ptr`: device ptr to the POST-final-norm
+///     hidden at position `committed_len - 1`, owned upstream
+///     (`ensure_drafter` pre-allocates `base_last_hidden_ptr`).
+///   * `next_base_argmax`: base's prediction at position
+///     `committed_len` from the most recent verify pass (so the next
+///     iter's i=0 verify check has its target without re-running
+///     warmup).
+///   * `tokens`: full committed token sequence (prompt + accepted
+///     drafts), for slot_mapping invariants.
+///
+/// Rollback (`rewind_to(target_len)`) is the explicit operation
+/// the new path uses after each verify pass — replacing the
+/// metadata-truncate-of-prefix_cache hack from commit 42/46.
+///
+/// Lifecycle (Phase C wiring):
+///   1. `open(prompt_ids)` at request start. `committed_len` = 0;
+///      session is empty.
+///   2. After the FIRST warmup base prefill of the full prompt:
+///      `advance_committed(prompt_len, last_hidden, first_argmax)`.
+///   3. Per spec iter:
+///        - drafter produces K drafts conditioned on
+///          `last_base_hidden_ptr`
+///        - `verify_batched_from_state(drafts, committed_len)` writes
+///          K K/V slots at positions committed_len..committed_len+K
+///          and returns K argmaxes + K hiddens
+///        - accept_len computed from drafts vs argmaxes
+///        - `commit_drafts(accept_len, K-buffer)` advances
+///          `committed_len += accept_len`, sets last_hidden to
+///          K-buffer[accept_len-1] (or to warmup hidden for
+///          accept_len = 0 — fallback case)
+///        - implicit rollback: positions
+///          [committed_len+accept_len..committed_len+K) are still
+///          PHYSICALLY in the KV cache but no longer logically
+///          committed; next iter overwrites them.
+///   4. `close()` at request end: optionally publish accumulated
+///      tokens into `prefix_cache.last_tokens` for cross-request
+///      reuse (chunk-aligned committed_len rule from the existing
+///      run_generate end-of-request path).
+#[derive(Debug)]
+pub struct SpecDecodeSession {
+    /// Tokens whose base K/V slots are guaranteed populated in the
+    /// persistent KV cache. Strictly per-token; not chunk-aligned.
+    pub committed_len: u32,
+    /// Per-iter snapshot of committed tokens (prompt prefix +
+    /// accepted drafts so far). Used for slot_mapping and emit.
+    pub tokens: Vec<u32>,
+    /// Device ptr to POST-final-norm hidden at position
+    /// `committed_len - 1`. Owned by `Gemma4Bringup::base_last_hidden_ptr`
+    /// (pre-allocated above scratch by `ensure_drafter`); this field
+    /// is a logical re-binding for clarity, not a separate allocation.
+    pub last_base_hidden_ptr: u64,
+    /// Base's argmax at position `committed_len` from the most
+    /// recent verify pass (= the token base wants emitted next).
+    /// Equal to `_base_first_tok[0]` from the legacy warmup, but
+    /// carried forward from the previous iter's verify so the
+    /// upcoming iter's i=0 verify check has its target without
+    /// re-running base prefill. `u32::MAX` is the sentinel "no
+    /// value yet" (= use warmup result on first iter).
+    pub next_base_argmax: u32,
+    /// Bumped on every commit. Lets debug / metrics distinguish
+    /// iterations across one request.
+    pub iter_count: u32,
+}
+
+impl SpecDecodeSession {
+    /// Open an empty session. Caller must populate
+    /// `last_base_hidden_ptr` from the per-bringup pre-allocated
+    /// buffer before the first verify call.
+    pub fn open(prompt_ids: &[u32], last_base_hidden_ptr: u64) -> Self {
+        Self {
+            committed_len: 0,
+            tokens: prompt_ids.to_vec(),
+            last_base_hidden_ptr,
+            next_base_argmax: u32::MAX,
+            iter_count: 0,
+        }
+    }
+
+    /// Called once after the warmup base prefill of the full
+    /// prompt. Marks committed_len = prompt_len (all P tokens have
+    /// base K/V) and seeds next_base_argmax = base's first decode
+    /// argmax (= what was previously `_base_first_tok[0]`).
+    pub fn seed_from_warmup(
+        &mut self,
+        prompt_len: u32,
+        first_base_argmax: u32,
+    ) {
+        self.committed_len = prompt_len;
+        self.next_base_argmax = first_base_argmax;
+    }
+
+    /// Commit `accept_len` accepted drafts onto the session.
+    /// committed_len advances by accept_len (NOT accept_len + 1 —
+    /// the divergence/bonus token has no base K/V yet; the next
+    /// iter's verify pass writes its slot from scratch).
+    ///
+    /// `new_next_argmax` is the base's argmax to use as the next
+    /// iter's i=0 verify target. For accept_len == K: base's
+    /// prediction at position committed_len+K from the just-finished
+    /// verify pass. For accept_len < K: base's prediction at
+    /// position committed_len+accept_len (the divergence) which
+    /// IS emitted as the bonus token.
+    pub fn commit_drafts(
+        &mut self,
+        drafts: &[u32],
+        accept_len: usize,
+        new_next_argmax: u32,
+    ) {
+        debug_assert!(accept_len <= drafts.len());
+        self.tokens.extend_from_slice(&drafts[..accept_len]);
+        self.committed_len = self
+            .committed_len
+            .saturating_add(accept_len as u32);
+        self.next_base_argmax = new_next_argmax;
+        self.iter_count = self.iter_count.saturating_add(1);
+    }
+
+    /// Explicit rollback. Truncates `tokens` to `target_len` and
+    /// sets `committed_len = target_len`. PHYSICAL K/V slots beyond
+    /// the new boundary are NOT erased — the contract is that the
+    /// next verify pass overwrites them.
+    pub fn rewind_to(&mut self, target_len: u32) {
+        let t = target_len as usize;
+        if t <= self.tokens.len() {
+            self.tokens.truncate(t);
+        }
+        if target_len < self.committed_len {
+            self.committed_len = target_len;
+        }
+    }
+
+    /// Snapshot for the drafter's next K-step forward.
+    /// Position is `committed_len - 1` (the most recent committed
+    /// token's position; drafter predicts position `committed_len`).
+    pub fn drafter_input_position(&self) -> u32 {
+        self.committed_len.saturating_sub(1)
+    }
+
+    /// Last committed token id, for the drafter's input embed.
+    /// Returns None if the session has no committed tokens (first
+    /// drafter step before warmup completes).
+    pub fn last_committed_token(&self) -> Option<u32> {
+        self.tokens.get((self.committed_len as usize).saturating_sub(1)).copied()
+    }
+}
+
 /// Maximum spec-K for the batched-verify K-hidden capture buffer.
 /// Pre-allocated once at ensure_drafter time (above the scratch
 /// checkpoint), so the buffer must fit the largest `spec_k` the
