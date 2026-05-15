@@ -32,17 +32,39 @@
 #include <cstdint>
 #include "nvfp4_utils.cuh"
 
+// Per-(slot, kv_head) scaled FP8 dequant.
+//
+// The base's FP8 KV cache is NOT a plain E4M3 byte stream. Each
+// (slot, kv_head) pair carries its own f32 scale in a companion
+// `k_scale_cache` / `v_scale_cache` buffer of shape
+// `[num_slots * num_kv_heads]` (computed in
+// `fused_rope_partial_fp8kv.cu` as `amax_of_that_head / 448`).
+// To reconstruct: `f16 = decode_e4m3(byte) * scale[slot * nkvh + kv_head]`.
+//
+// Element layout in the K (or V) half:
+//   `[num_slots, num_kv_heads, head_dim]` row-major, total `n` elems.
+// For element `i`:
+//   `slot_idx     = i / (nkvh * head_dim)`
+//   `kv_head_idx  = (i / head_dim) % nkvh`
+//   `scale_offset = slot_idx * nkvh + kv_head_idx`
 extern "C" __global__ void gemma4_drafter_dequant_fp8_to_f16_kernel(
     const __nv_fp8_e4m3* __restrict__ src,
+    const float*         __restrict__ scales,
     __half*              __restrict__ dst,
+    int nkvh,
+    int head_dim,
     long long n
 ) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        // E4M3 → f32 via the device cast operator, then narrow to
-        // f16. Matches `fp8e4m3_bytes_to_f16_bytes` in the loader
-        // path so the on-disk → device round-trip is consistent.
-        float v = (float)src[idx];
+        long long elem_per_slot = (long long)nkvh * (long long)head_dim;
+        long long slot_idx = idx / elem_per_slot;
+        long long within = idx % elem_per_slot;
+        long long kv_head = within / (long long)head_dim;
+        float s = (scales != nullptr)
+            ? scales[slot_idx * (long long)nkvh + kv_head]
+            : 1.0f;
+        float v = (float)src[idx] * s;
         dst[idx] = __float2half(v);
     }
 }

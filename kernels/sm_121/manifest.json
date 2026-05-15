@@ -382,9 +382,9 @@
       "sha256": "8b92aac7b7f966562374d035f50bdaa4c4804eb2c63453bcbaee2ecceb89cc86"
     },
     "gemma4_drafter_dequant": {
-      "bytes": 4410,
+      "bytes": 5948,
       "path": "gemma4_drafter_dequant.ptx",
-      "sha256": "156a5c07a1429ba06a7b6f709b5377fa41567d82d2e1f7d9bc7d8d481a522f9f"
+      "sha256": "a5e8a05264ccef83dccbd8df27f3ebae95e18b689ce1429fbc145c809496fc6d"
     },
     "gemma4_masked_embedder": {
       "bytes": 31581,
@@ -957,5 +957,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "3924b0c"
+  "revision": "7683eb8"
 }

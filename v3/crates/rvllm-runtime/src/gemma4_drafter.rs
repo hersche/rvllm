@@ -718,16 +718,29 @@ impl Gemma4DrafterRuntime {
                         bt: std::backtrace::Backtrace::capture(),
                     }
                 })?;
-                let _ = (base_sliding_k_scale, base_sliding_v_scale,
-                         base_full_k_scale, base_full_v_scale);
+                // Commit 19: pass per-(slot, kv_head) f32 scale
+                // buffers. Per-layer shape arguments come from
+                // `shadow_kv` (which was sized off the base arch).
+                let sliding_nkvh = shadow.sliding_num_kv_heads as i32;
+                let sliding_hd = shadow.sliding_head_dim as i32;
+                let full_nkvh = shadow.full_num_kv_heads as i32;
+                let full_hd = shadow.full_head_dim as i32;
                 self.launch_fp8_dequant_to_shadow(
-                    fn_fp8, base_sliding_k, shadow.sliding_k_ptr, sliding_elems, stream)?;
+                    fn_fp8, base_sliding_k, base_sliding_k_scale,
+                    shadow.sliding_k_ptr, sliding_nkvh, sliding_hd,
+                    sliding_elems, stream)?;
                 self.launch_fp8_dequant_to_shadow(
-                    fn_fp8, base_sliding_v, shadow.sliding_v_ptr, sliding_elems, stream)?;
+                    fn_fp8, base_sliding_v, base_sliding_v_scale,
+                    shadow.sliding_v_ptr, sliding_nkvh, sliding_hd,
+                    sliding_elems, stream)?;
                 self.launch_fp8_dequant_to_shadow(
-                    fn_fp8, base_full_k, shadow.full_k_ptr, full_elems, stream)?;
+                    fn_fp8, base_full_k, base_full_k_scale,
+                    shadow.full_k_ptr, full_nkvh, full_hd,
+                    full_elems, stream)?;
                 self.launch_fp8_dequant_to_shadow(
-                    fn_fp8, base_full_v, shadow.full_v_ptr, full_elems, stream)?;
+                    fn_fp8, base_full_v, base_full_v_scale,
+                    shadow.full_v_ptr, full_nkvh, full_hd,
+                    full_elems, stream)?;
                 Ok(())
             }
             crate::gemma4_layer_exec::KvDtype::Nvfp4 => {
@@ -766,12 +779,22 @@ impl Gemma4DrafterRuntime {
 
     /// Shared launch glue for `gemma4_drafter_dequant_fp8_to_f16_kernel`.
     /// 256 threads/block, grid covers `n` elements.
+    ///
+    /// Commit 19: now passes the per-(slot, kv_head) f32 scale buffer
+    /// that the base wrote in `fused_rope_partial_fp8kv`. Without it
+    /// the dequant produced raw E4M3 mantissas with all per-slot
+    /// scales = 1.0 — every drafter cross-attn K/V read was off by
+    /// the missing scale factor, dragging accept_rate to 0.
     #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn launch_fp8_dequant_to_shadow(
         &self,
         kernel: rvllm_kernels::KernelFn,
         src: u64,
+        scales: u64,
         dst: u64,
+        nkvh: i32,
+        head_dim: i32,
         n_elems: i64,
         stream: u64,
     ) -> Result<()> {
@@ -782,12 +805,18 @@ impl Gemma4DrafterRuntime {
         let block: u32 = 256;
         let grid: u32 = ((n_elems + block as i64 - 1) / block as i64) as u32;
         let mut a_src = src;
+        let mut a_scales = scales;
         let mut a_dst = dst;
+        let mut a_nkvh = nkvh;
+        let mut a_hd = head_dim;
         let mut a_n = n_elems;
-        let args: [*mut core::ffi::c_void; 3] = [
-            &mut a_src as *mut _ as *mut _,
-            &mut a_dst as *mut _ as *mut _,
-            &mut a_n   as *mut _ as *mut _,
+        let args: [*mut core::ffi::c_void; 6] = [
+            &mut a_src    as *mut _ as *mut _,
+            &mut a_scales as *mut _ as *mut _,
+            &mut a_dst    as *mut _ as *mut _,
+            &mut a_nkvh   as *mut _ as *mut _,
+            &mut a_hd     as *mut _ as *mut _,
+            &mut a_n      as *mut _ as *mut _,
         ];
         let rc = cuLaunchKernel(
             kernel.raw() as CUfunction,
