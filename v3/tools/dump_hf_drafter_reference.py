@@ -85,6 +85,14 @@ def main() -> None:
     input_ids = tok.apply_chat_template(
         msgs, add_generation_prompt=True, return_tensors="pt"
     )
+    # transformers 5.x returns BatchEncoding here in some versions —
+    # extract the tensor robustly.
+    if hasattr(input_ids, "input_ids"):
+        input_ids = input_ids["input_ids"]
+    if not isinstance(input_ids, torch.Tensor):
+        input_ids = torch.tensor(input_ids)
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
     print(f"[hf-ref] prompt tokenized to {input_ids.shape[-1]} ids: {input_ids[0].tolist()}")
 
     # ----------------------------------------------------------
@@ -111,18 +119,22 @@ def main() -> None:
     if layer_types:
         print(f"[hf-ref] base: layer types around shared start: {layer_types[first_shared-2:first_shared+4]}")
 
-    # Source layers = first sliding + first global in the shared-tail
+    # Source layers = LAST sliding + LAST full BEFORE the shared tail.
+    # In E4B: 42 layers, last 18 share KV, so tail starts at 24. The
+    # sources are typically 22 (sliding) and 23 (full) — i.e. the last
+    # layers that actually compute K/V before the tail reuses them.
     sliding_src = None
     full_src = None
     if layer_types:
-        for li in range(first_shared, n_layers):
+        for li in range(first_shared - 1, -1, -1):
             if sliding_src is None and layer_types[li] == "sliding_attention":
                 sliding_src = li
             if full_src is None and layer_types[li] == "full_attention":
                 full_src = li
             if sliding_src is not None and full_src is not None:
                 break
-    print(f"[hf-ref] base shared-KV source layers: sliding={sliding_src} full={full_src}")
+    print(f"[hf-ref] base shared-KV source layers (last before tail): "
+          f"sliding={sliding_src} full={full_src}")
 
     # Capture base's K/V at source layers + final hidden via hooks.
     captured = {}
@@ -179,14 +191,20 @@ def main() -> None:
                       f"K {tuple(k_thd.shape)} V {tuple(v_thd.shape)}")
 
     # last_token_embed used by drafter (= embed_tokens(last) * sqrt(hidden))
-    embed_tokens = base.model.embed_tokens
+    # Use get_input_embeddings() to be robust across transformers versions
+    # and nested model structures (Gemma4ForCausalLM wraps Gemma4Model).
+    embed_tokens = base.get_input_embeddings()
     last_tok = input_ids[0, -1].item()
     last_token_embed_raw = embed_tokens(torch.tensor([last_tok], device=base.device))[0]
-    sqrt_h = (text_cfg.hidden_size ** 0.5)
+    raw_rms = (last_token_embed_raw.float()**2).mean().sqrt().item()
+    # Use the base's text-config hidden_size as the embed scale factor.
+    h_size = int(text_cfg.hidden_size)
+    sqrt_h = float(h_size) ** 0.5
     last_token_embed_scaled = last_token_embed_raw * sqrt_h
     np.save(args.out / "last_token_embed.npy", to_f32_np(last_token_embed_scaled))
     print(f"[hf-ref] saved last_token_embed (id={last_tok}): "
-          f"rms={(last_token_embed_scaled.float()**2).mean().sqrt().item():.4f}")
+          f"raw_rms={raw_rms:.4f} hidden={h_size} sqrt_h={sqrt_h:.4f} "
+          f"scaled_rms={(last_token_embed_scaled.float()**2).mean().sqrt().item():.4f}")
 
     del base
     torch.cuda.empty_cache()
@@ -195,12 +213,34 @@ def main() -> None:
     # Assistant drafter forward — hook every Q-pipeline submodule
     # ----------------------------------------------------------
     print("[hf-ref] loading assistant drafter...")
-    assist = AutoModelForCausalLM.from_pretrained(
-        args.assist, local_files_only=True,
-        dtype=torch.bfloat16, device_map="cuda",
-        trust_remote_code=False,
-    )
-    assist.eval()
+    try:
+        assist = AutoModelForCausalLM.from_pretrained(
+            args.assist, local_files_only=True,
+            dtype=torch.bfloat16, device_map="cuda",
+            trust_remote_code=True,
+        )
+        assist.eval()
+    except Exception as e:
+        print(f"[hf-ref] WARNING: cannot load assistant via AutoModel: {e}")
+        print(f"[hf-ref] transformers version doesn't know gemma4_assistant.")
+        print(f"[hf-ref] We have enough data already (base side); skipping drafter forward.")
+        # Write manifest with what we have
+        manifest = {
+            "prompt": args.prompt,
+            "prompt_token_ids": input_ids[0].tolist(),
+            "prompt_len": int(input_ids.shape[-1]),
+            "base_dir": str(args.base),
+            "base_argmax_first": int(base_argmax),
+            "sliding_source_layer": sliding_src,
+            "full_source_layer": full_src,
+            "files": sorted(p.name for p in args.out.glob("*.npy")),
+            "drafter_forward_attempted": False,
+            "drafter_skipped_reason": str(e),
+        }
+        with open(args.out / "manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"[hf-ref] manifest written. {len(manifest['files'])} files dumped.")
+        return
 
     # Identify the model.model attribute (Gemma4AssistantModel wrapping
     # decoder layers, embed, norms, pre/post_projection, masked_embedding).

@@ -4158,6 +4158,46 @@ impl Gemma4Bringup {
             let guard = self.drafter.lock().unwrap();
             let drafter = guard.as_ref().expect("checked above");
             drafter.prepare_pre_projection_input(&step, &workspace, stream)?;
+            // Commit 32: per HF/vLLM Gemma4MTP reference, the
+            // `inputs_embeds` half of pre_projection input must be
+            // multiplied by sqrt(backbone_hidden_size) on top of the
+            // base embedding's pre-scale. The drafter was trained
+            // with this scaling. Without it, embed-half RMS ≈ 1.0
+            // (vs. correct ≈ 51.6 for hidden=2560), pre_projection
+            // sees an imbalanced [embed, hidden] concat where hidden
+            // dominates by 5x instead of embed dominating by 10x,
+            // and Q gets the wrong direction → softmax uniform →
+            // accept_rate stuck at 0. Verified via manual PyTorch
+            // reference dump at v3/tools/manual_drafter_reference.py.
+            {
+                use cudarc::driver::sys::*;
+                let backbone = drafter.arch.backbone_hidden_size as i32;
+                let sqrt_bb: f32 = (backbone as f32).sqrt();
+                let mut x = workspace.pre_projection_in; // first-half base ptr
+                let mut s = sqrt_bb;
+                let mut n: i32 = backbone;
+                let args = [
+                    (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s) as *mut f32 as *mut core::ffi::c_void,
+                    (&mut n) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid: u32 = ((n as u32 + block - 1) / block).max(1);
+                let rc = cuLaunchKernel(
+                    self.fused.fn_scale_inplace_f16.raw() as CUfunction,
+                    grid, 1, 1, block, 1, 1, 0,
+                    stream as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "drafter pre_projection embed half sqrt(backbone) scale",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
             self.run_drafter_pre_projection(drafter, &workspace)?;
             // Commit 31h: probe pre_projection output (= workspace.hidden
             // after pre_projection GEMM + cast). This is layer 0's input
