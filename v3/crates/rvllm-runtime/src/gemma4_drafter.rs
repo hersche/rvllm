@@ -171,6 +171,13 @@ pub struct Gemma4DrafterLayerPtrs {
     pub pre_feedforward_layernorm: u64,
     pub post_feedforward_layernorm: u64,
     pub layer_scalar: u64,
+    /// Codex review item #5: cached host-side f32 of `layer_scalar`
+    /// (single bf16 / f16 value per drafter layer). Populated once at
+    /// drafter-load time so the per-spec-step MLP finisher can launch
+    /// `scale_inplace_f16` without a per-layer `stream.fence()` +
+    /// `cuMemcpyDtoH_v2`. With 4 drafter layers × K spec steps, the
+    /// legacy DtoH path cost 4K sync points per outer iter.
+    pub layer_scalar_f32: f32,
     pub mlp_gate_proj: u64,
     pub mlp_up_proj: u64,
     pub mlp_down_proj: u64,
@@ -494,6 +501,24 @@ impl Gemma4DrafterRuntime {
             let q_rows = arch.num_attention_heads * eff_hd;
             let q_norm_dim = eff_hd;
             let prefix = format!("layer_{li}");
+            // Codex review item #5: cache layer_scalar host-side as f32
+            // so the per-spec-step MLP finisher can skip its
+            // `stream.fence()` + `cuMemcpyDtoH_v2(2 bytes)` and just
+            // launch `scale_inplace_f16(_, &scalar_f32, hidden)` with
+            // the pre-computed value. With 4 drafter layers × K spec
+            // steps the legacy DtoH cost 4K sync points per outer iter.
+            let layer_scalar_f32: f32 = {
+                let start = lo.layer_scalar as usize;
+                let end = start + 2;
+                if end > mmap_bytes.len() {
+                    return Err(corrupt(&shard_path, format!(
+                        "layer_{li}.layer_scalar offset {start} past file len {}",
+                        mmap_bytes.len(),
+                    )));
+                }
+                let bf16_bits = u16::from_le_bytes([mmap_bytes[start], mmap_bytes[start + 1]]);
+                half::bf16::from_bits(bf16_bits).to_f32()
+            };
             layers.push(Gemma4DrafterLayerPtrs {
                 input_layernorm: upload_bf16(
                     &format!("{prefix}.input_layernorm.weight"),
@@ -510,6 +535,7 @@ impl Gemma4DrafterRuntime {
                 layer_scalar: upload_bf16(
                     &format!("{prefix}.layer_scalar"),
                     lo.layer_scalar, 1)?,
+                layer_scalar_f32,
                 mlp_gate_proj: upload_bf16(
                     &format!("{prefix}.mlp.gate_proj.weight"),
                     lo.mlp_gate_proj, inter * hidden)?,
@@ -1262,6 +1288,7 @@ impl Gemma4DrafterRuntime {
                 input_layernorm: 0, post_attention_layernorm: 0,
                 pre_feedforward_layernorm: 0, post_feedforward_layernorm: 0,
                 layer_scalar: 0,
+                layer_scalar_f32: 1.0,
                 mlp_gate_proj: 0, mlp_up_proj: 0, mlp_down_proj: 0,
                 self_attn_q_proj: 0, self_attn_q_norm: 0, self_attn_o_proj: 0,
                 effective_head_dim: lo.effective_head_dim,

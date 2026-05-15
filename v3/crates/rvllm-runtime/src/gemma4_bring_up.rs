@@ -647,6 +647,14 @@ pub struct Gemma4FusedModules {
 /// Covers the common zeroclaw pattern (identical 15k-token persona
 /// on every request) at a cost of ~100 LOC of plumbing. Full
 /// multi-sequence prefix caching is future work.
+/// Maximum spec-K for the batched-verify K-hidden capture buffer.
+/// Pre-allocated once at ensure_drafter time (above the scratch
+/// checkpoint), so the buffer must fit the largest `spec_k` the
+/// server will ever see in a request. Config validation rejects
+/// `spec_k > MAX_SPEC_K` at startup so the capture hook can rely
+/// on `k_requested <= MAX_SPEC_K`.
+pub const MAX_SPEC_K: usize = 16;
+
 pub struct PrefixCacheState {
     pub last_tokens: Vec<u32>,
     pub kv_cache_ptr: u64,
@@ -1883,7 +1891,6 @@ impl Gemma4Bringup {
                 == 0
             {
                 let h = self.arch.hidden_size;
-                const MAX_SPEC_K: usize = 16;
                 let bytes = MAX_SPEC_K * h * 2;
                 let region = self.arena.region(
                     "gemma4_base_last_k_hidden", bytes, 16,
@@ -6685,22 +6692,12 @@ impl Gemma4Bringup {
         // matches the assistant's layer epilogue semantics.
         {
             use cudarc::driver::sys::*;
-            self.stream.fence()?;
-            let mut scalar_bytes: [u8; 2] = [0; 2];
-            let rc = cuMemcpyDtoH_v2(
-                scalar_bytes.as_mut_ptr() as *mut _,
-                layer.layer_scalar,
-                2,
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "drafter_mlp_finisher layer_scalar DtoH",
-                    rvllm_core::CudaErrorKind::MemcpyFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
-            let scalar_bits = u16::from_le_bytes(scalar_bytes);
-            let scalar_f32 = half::f16::from_bits(scalar_bits).to_f32();
+            // Codex review item #5: layer_scalar is cached host-side
+            // at drafter-load time (`Gemma4DrafterLayerPtrs::layer_scalar_f32`).
+            // No per-step `stream.fence()` + `cuMemcpyDtoH_v2(2 bytes)`.
+            // Saves 4×K sync points per outer spec iter (= 24 syncs
+            // at K=6).
+            let scalar_f32 = layer.layer_scalar_f32;
 
             if std::env::var("RVLLM_SPEC_DEBUG").as_deref() == Ok("1") {
                 let mut h = vec![0u16; hidden as usize];
@@ -8591,6 +8588,18 @@ impl Gemma4Bringup {
                     let k_requested = self
                         .base_last_k_count
                         .load(std::sync::atomic::Ordering::Acquire);
+                    if (k_requested as usize) > MAX_SPEC_K {
+                        return Err(rvllm_core::RvllmError::Config {
+                            err: rvllm_core::ConfigError::InvalidField {
+                                name: "RVLLM_GEMMA4_SPEC_K",
+                                reason: format!(
+                                    "{} exceeds MAX_SPEC_K={} (compile-time buffer cap)",
+                                    k_requested, MAX_SPEC_K,
+                                ).into(),
+                            },
+                            field: "RVLLM_GEMMA4_SPEC_K",
+                        });
+                    }
                     let k: u32 = k_requested.min(new_q);
                     if k > 0 {
                         let row_bytes = (hidden as usize) * 2;

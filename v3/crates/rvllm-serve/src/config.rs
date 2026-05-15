@@ -188,6 +188,17 @@ impl ServerConfig {
             if self.spec_k == 0 {
                 return Err(ConfigError::InvalidSpecK);
             }
+            // Codex review item #6: spec_k must fit the pre-allocated
+            // K-hidden capture buffer (MAX_SPEC_K rows × hidden f16),
+            // otherwise the capture hook overruns device memory.
+            const MAX_SPEC_K: u32 =
+                rvllm_runtime::gemma4_bring_up::MAX_SPEC_K as u32;
+            if self.spec_k > MAX_SPEC_K {
+                return Err(ConfigError::SpecKTooLarge {
+                    requested: self.spec_k,
+                    max: MAX_SPEC_K,
+                });
+            }
         }
         Ok(())
     }
@@ -215,6 +226,8 @@ pub enum ConfigError {
     SpecDrafterDirMissing(PathBuf),
     #[error("RVLLM_GEMMA4_SPEC_K must be >= 1")]
     InvalidSpecK,
+    #[error("RVLLM_GEMMA4_SPEC_K={requested} exceeds MAX_SPEC_K={max}; recompile with a larger cap or reduce spec_k")]
+    SpecKTooLarge { requested: u32, max: u32 },
 }
 
 #[cfg(test)]
