@@ -1732,6 +1732,18 @@ impl Gemma4Bringup {
                 .get_function("flash_attention_2_decode_f16io_kernel")?;
             rt.attach_flash_attention_kernel(module, entry);
         }
+        // Commits 10b/10c: load the shadow-KV dequant kernels (FP8
+        // → F16 and NVFP4-packed → F16). Same lazy gate as the rest
+        // of the drafter PTX bundle.
+        #[cfg(feature = "cuda")]
+        {
+            let module = self.kernels.load_ptx("gemma4_drafter_dequant")?;
+            let fp8_entry = module
+                .get_function("gemma4_drafter_dequant_fp8_to_f16_kernel")?;
+            let nvfp4_entry = module
+                .get_function("gemma4_drafter_dequant_nvfp4_to_f16_kernel")?;
+            rt.attach_drafter_dequant_kernels(module, fp8_entry, nvfp4_entry);
+        }
         // Commit 9: allocate F16 shadow KV at the two base source
         // layers (sliding source = layer 22, full source = layer 23
         // on E4B). Sizing mirrors the base's paged-decode expectation
@@ -3697,6 +3709,10 @@ impl Gemma4Bringup {
                 sliding_view.v_cache,
                 full_view.k_cache,
                 full_view.v_cache,
+                sliding_view.k_scale_cache,
+                sliding_view.v_scale_cache,
+                full_view.k_scale_cache,
+                full_view.v_scale_cache,
                 kv_dtype_per_layer[sliding_li],
                 shadow.sliding_layer_bytes,
                 shadow.full_layer_bytes,

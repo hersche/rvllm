@@ -236,6 +236,14 @@ pub struct Gemma4DrafterRuntime {
     /// when spec-decode is on.
     pub flash_attention_mod: Option<rvllm_kernels::LoadedModule>,
     pub fn_flash_attention_2_decode_f16io: Option<rvllm_kernels::KernelFn>,
+    /// Spec-decode commit 10b/10c: shadow-KV dequant kernels. Loaded
+    /// from `kernels/sm_121/gemma4_drafter_dequant.ptx` by
+    /// `Gemma4Bringup::ensure_drafter`. The two entries handle FP8
+    /// E4M3 base KV and packed-4-bit NVFP4 base KV respectively;
+    /// `populate_shadow_kv_from_base` dispatches on `base_kv_dtype`.
+    pub drafter_dequant_mod: Option<rvllm_kernels::LoadedModule>,
+    pub fn_drafter_dequant_fp8_to_f16: Option<rvllm_kernels::KernelFn>,
+    pub fn_drafter_dequant_nvfp4_to_f16: Option<rvllm_kernels::KernelFn>,
 }
 
 /// F16 shadow KV regions used by the assistant cross-attention. One
@@ -513,6 +521,9 @@ impl Gemma4DrafterRuntime {
             shadow_kv: None,
             flash_attention_mod: None,
             fn_flash_attention_2_decode_f16io: None,
+            drafter_dequant_mod: None,
+            fn_drafter_dequant_fp8_to_f16: None,
+            fn_drafter_dequant_nvfp4_to_f16: None,
         })
     }
 
@@ -557,20 +568,35 @@ impl Gemma4DrafterRuntime {
         self.fn_flash_attention_2_decode_f16io = Some(entry);
     }
 
-    /// Spec-decode commit 10: copy base source-layer K/V into the
-    /// drafter's F16 shadow regions.
+    /// Spec-decode commit 10b/10c: install the two shadow-KV dequant
+    /// kernel handles (FP8 → F16 and NVFP4 → F16). Caller passes a
+    /// single `LoadedModule` plus both entry handles so the RAII
+    /// lifetime is tied to one drop.
+    pub fn attach_drafter_dequant_kernels(
+        &mut self,
+        module: rvllm_kernels::LoadedModule,
+        fp8_entry: rvllm_kernels::KernelFn,
+        nvfp4_entry: rvllm_kernels::KernelFn,
+    ) {
+        self.drafter_dequant_mod = Some(module);
+        self.fn_drafter_dequant_fp8_to_f16 = Some(fp8_entry);
+        self.fn_drafter_dequant_nvfp4_to_f16 = Some(nvfp4_entry);
+    }
+
+    /// Spec-decode commit 10 (+10b/10c): copy/dequant base
+    /// source-layer K/V into the drafter's F16 shadow regions.
     ///
-    /// **F16 fast path only** — when the base allocates its KV in
-    /// F16 dtype, this is a plain `cuMemcpyDtoDAsync` for each of
-    /// (sliding K, sliding V, full K, full V). The four copies are
-    /// scheduled on `stream` and the kernel pipeline can be reused
-    /// without a host fence.
-    ///
-    /// **FP8 / NVFP4 base** — returns `FeatureNotAvailable`. A
-    /// dedicated dequant kernel lands in a follow-up commit; until
-    /// then spec-decode on a non-F16 KV profile fails clearly at
-    /// this point rather than silently feeding garbage through
-    /// cross-attention.
+    /// * **F16 base** — plain `cuMemcpyDtoDAsync` ×4 (sliding K/V,
+    ///   full K/V). Zero-kernel fast path.
+    /// * **FP8 base** — `gemma4_drafter_dequant_fp8_to_f16_kernel`
+    ///   ×4. Element count = `shadow_layer_bytes / 2`. Reads E4M3
+    ///   bytes, writes f16; bit-equivalent to the loader's
+    ///   `fp8e4m3_bytes_to_f16_bytes` host helper.
+    /// * **NVFP4 base** — `gemma4_drafter_dequant_nvfp4_to_f16_kernel`
+    ///   ×4. Reads packed 4-bit + per-16-elem E4M3 microscales.
+    ///   Decoder matches the production `fp4_decode` table used by
+    ///   the NVFP4 paged-decode kernel set so the round-trip is
+    ///   bit-equivalent to what FA-2 NVFP4 sees internally.
     ///
     /// `sliding_bytes` / `full_bytes` are the per-buffer (K or V)
     /// sizes the caller has already computed for the active spec
@@ -582,28 +608,15 @@ impl Gemma4DrafterRuntime {
         base_sliding_v: u64,
         base_full_k: u64,
         base_full_v: u64,
+        base_sliding_k_scale: u64,
+        base_sliding_v_scale: u64,
+        base_full_k_scale: u64,
+        base_full_v_scale: u64,
         base_kv_dtype: crate::gemma4_layer_exec::KvDtype,
         sliding_bytes: usize,
         full_bytes: usize,
         stream: u64,
     ) -> Result<()> {
-        if !matches!(base_kv_dtype, crate::gemma4_layer_exec::KvDtype::F16) {
-            return Err(RvllmError::Attention {
-                err: AttentionError::FeatureNotAvailable {
-                    op: "Gemma4DrafterRuntime::populate_shadow_kv_from_base: \
-                         non-F16 base KV (FP8 / NVFP4) requires a dequant \
-                         kernel — pending follow-up commit",
-                    backend: "Gemma4Drafter",
-                },
-                ctx: AttnCtx {
-                    op: "populate_shadow_kv_from_base",
-                    stream,
-                    num_seqs: 1,
-                    head_dim: self.arch.head_dim_global as u32,
-                },
-                bt: std::backtrace::Backtrace::capture(),
-            });
-        }
         let shadow = self.shadow_kv.as_ref().ok_or_else(|| RvllmError::Attention {
             err: AttentionError::FeatureNotAvailable {
                 op: "populate_shadow_kv_from_base: shadow_kv not attached",
@@ -635,28 +648,201 @@ impl Gemma4DrafterRuntime {
                 bt: std::backtrace::Backtrace::capture(),
             });
         }
-        use cudarc::driver::sys::*;
-        let do_copy = |dst: u64, src: u64, n: usize, op: &'static str| -> Result<()> {
-            let rc = cuMemcpyDtoDAsync_v2(dst, src, n, stream as CUstream);
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(RvllmError::Cuda {
-                    kind: rvllm_core::CudaErrorKind::MemcpyFailed,
-                    op: "drafter_shadow_kv_dtoD",
-                    ctx: rvllm_core::CudaCtx {
-                        stream,
-                        kernel: op,
-                        launch: None,
-                        device: 0,
-                    },
-                    bt: std::backtrace::Backtrace::capture(),
-                });
+        // F16 element counts in the shadow (one buffer = K or V).
+        let sliding_elems = (sliding_bytes / 2) as i64;
+        let full_elems = (full_bytes / 2) as i64;
+        match base_kv_dtype {
+            crate::gemma4_layer_exec::KvDtype::F16 => {
+                let _ = (base_sliding_k_scale, base_sliding_v_scale,
+                         base_full_k_scale, base_full_v_scale);
+                use cudarc::driver::sys::*;
+                let do_copy = |dst: u64, src: u64, n: usize, op: &'static str|
+                    -> Result<()> {
+                    let rc = cuMemcpyDtoDAsync_v2(dst, src, n, stream as CUstream);
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(RvllmError::Cuda {
+                            kind: rvllm_core::CudaErrorKind::MemcpyFailed,
+                            op: "drafter_shadow_kv_dtoD",
+                            ctx: rvllm_core::CudaCtx {
+                                stream,
+                                kernel: op,
+                                launch: None,
+                                device: 0,
+                            },
+                            bt: std::backtrace::Backtrace::capture(),
+                        });
+                    }
+                    Ok(())
+                };
+                do_copy(shadow.sliding_k_ptr, base_sliding_k, sliding_bytes, "sliding_k")?;
+                do_copy(shadow.sliding_v_ptr, base_sliding_v, sliding_bytes, "sliding_v")?;
+                do_copy(shadow.full_k_ptr,    base_full_k,    full_bytes,    "full_k")?;
+                do_copy(shadow.full_v_ptr,    base_full_v,    full_bytes,    "full_v")?;
+                Ok(())
             }
-            Ok(())
-        };
-        do_copy(shadow.sliding_k_ptr, base_sliding_k, sliding_bytes, "sliding_k")?;
-        do_copy(shadow.sliding_v_ptr, base_sliding_v, sliding_bytes, "sliding_v")?;
-        do_copy(shadow.full_k_ptr,    base_full_k,    full_bytes,    "full_k")?;
-        do_copy(shadow.full_v_ptr,    base_full_v,    full_bytes,    "full_v")?;
+            crate::gemma4_layer_exec::KvDtype::Fp8 => {
+                let fn_fp8 = self.fn_drafter_dequant_fp8_to_f16.ok_or_else(|| {
+                    RvllmError::Attention {
+                        err: AttentionError::FeatureNotAvailable {
+                            op: "populate_shadow_kv_from_base: \
+                                 FP8 dequant kernel not attached",
+                            backend: "Gemma4Drafter",
+                        },
+                        ctx: AttnCtx {
+                            op: "populate_shadow_kv_from_base(fp8)",
+                            stream,
+                            num_seqs: 1,
+                            head_dim: self.arch.head_dim_global as u32,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    }
+                })?;
+                let _ = (base_sliding_k_scale, base_sliding_v_scale,
+                         base_full_k_scale, base_full_v_scale);
+                self.launch_fp8_dequant_to_shadow(
+                    fn_fp8, base_sliding_k, shadow.sliding_k_ptr, sliding_elems, stream)?;
+                self.launch_fp8_dequant_to_shadow(
+                    fn_fp8, base_sliding_v, shadow.sliding_v_ptr, sliding_elems, stream)?;
+                self.launch_fp8_dequant_to_shadow(
+                    fn_fp8, base_full_k, shadow.full_k_ptr, full_elems, stream)?;
+                self.launch_fp8_dequant_to_shadow(
+                    fn_fp8, base_full_v, shadow.full_v_ptr, full_elems, stream)?;
+                Ok(())
+            }
+            crate::gemma4_layer_exec::KvDtype::Nvfp4 => {
+                let fn_nvfp4 = self.fn_drafter_dequant_nvfp4_to_f16.ok_or_else(|| {
+                    RvllmError::Attention {
+                        err: AttentionError::FeatureNotAvailable {
+                            op: "populate_shadow_kv_from_base: \
+                                 NVFP4 dequant kernel not attached",
+                            backend: "Gemma4Drafter",
+                        },
+                        ctx: AttnCtx {
+                            op: "populate_shadow_kv_from_base(nvfp4)",
+                            stream,
+                            num_seqs: 1,
+                            head_dim: self.arch.head_dim_global as u32,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    }
+                })?;
+                self.launch_nvfp4_dequant_to_shadow(
+                    fn_nvfp4, base_sliding_k, base_sliding_k_scale,
+                    shadow.sliding_k_ptr, sliding_elems, stream)?;
+                self.launch_nvfp4_dequant_to_shadow(
+                    fn_nvfp4, base_sliding_v, base_sliding_v_scale,
+                    shadow.sliding_v_ptr, sliding_elems, stream)?;
+                self.launch_nvfp4_dequant_to_shadow(
+                    fn_nvfp4, base_full_k, base_full_k_scale,
+                    shadow.full_k_ptr, full_elems, stream)?;
+                self.launch_nvfp4_dequant_to_shadow(
+                    fn_nvfp4, base_full_v, base_full_v_scale,
+                    shadow.full_v_ptr, full_elems, stream)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Shared launch glue for `gemma4_drafter_dequant_fp8_to_f16_kernel`.
+    /// 256 threads/block, grid covers `n` elements.
+    #[cfg(feature = "cuda")]
+    unsafe fn launch_fp8_dequant_to_shadow(
+        &self,
+        kernel: rvllm_kernels::KernelFn,
+        src: u64,
+        dst: u64,
+        n_elems: i64,
+        stream: u64,
+    ) -> Result<()> {
+        if n_elems <= 0 {
+            return Ok(());
+        }
+        use cudarc::driver::sys::*;
+        let block: u32 = 256;
+        let grid: u32 = ((n_elems + block as i64 - 1) / block as i64) as u32;
+        let mut a_src = src;
+        let mut a_dst = dst;
+        let mut a_n = n_elems;
+        let args: [*mut core::ffi::c_void; 3] = [
+            &mut a_src as *mut _ as *mut _,
+            &mut a_dst as *mut _ as *mut _,
+            &mut a_n   as *mut _ as *mut _,
+        ];
+        let rc = cuLaunchKernel(
+            kernel.raw() as CUfunction,
+            grid, 1, 1,
+            block, 1, 1,
+            0,
+            stream as CUstream,
+            args.as_ptr() as *mut *mut core::ffi::c_void,
+            core::ptr::null_mut(),
+        );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(RvllmError::Cuda {
+                kind: rvllm_core::CudaErrorKind::LaunchFailed,
+                op: "gemma4_drafter_dequant_fp8_to_f16",
+                ctx: rvllm_core::CudaCtx {
+                    stream,
+                    kernel: "gemma4_drafter_dequant_fp8_to_f16_kernel",
+                    launch: None,
+                    device: 0,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Shared launch glue for `gemma4_drafter_dequant_nvfp4_to_f16_kernel`.
+    /// Same 256-thread block; passes packed + scales + dst + n.
+    #[cfg(feature = "cuda")]
+    unsafe fn launch_nvfp4_dequant_to_shadow(
+        &self,
+        kernel: rvllm_kernels::KernelFn,
+        packed: u64,
+        scales: u64,
+        dst: u64,
+        n_elems: i64,
+        stream: u64,
+    ) -> Result<()> {
+        if n_elems <= 0 {
+            return Ok(());
+        }
+        use cudarc::driver::sys::*;
+        let block: u32 = 256;
+        let grid: u32 = ((n_elems + block as i64 - 1) / block as i64) as u32;
+        let mut a_packed = packed;
+        let mut a_scales = scales;
+        let mut a_dst = dst;
+        let mut a_n = n_elems;
+        let args: [*mut core::ffi::c_void; 4] = [
+            &mut a_packed as *mut _ as *mut _,
+            &mut a_scales as *mut _ as *mut _,
+            &mut a_dst    as *mut _ as *mut _,
+            &mut a_n      as *mut _ as *mut _,
+        ];
+        let rc = cuLaunchKernel(
+            kernel.raw() as CUfunction,
+            grid, 1, 1,
+            block, 1, 1,
+            0,
+            stream as CUstream,
+            args.as_ptr() as *mut *mut core::ffi::c_void,
+            core::ptr::null_mut(),
+        );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(RvllmError::Cuda {
+                kind: rvllm_core::CudaErrorKind::LaunchFailed,
+                op: "gemma4_drafter_dequant_nvfp4_to_f16",
+                ctx: rvllm_core::CudaCtx {
+                    stream,
+                    kernel: "gemma4_drafter_dequant_nvfp4_to_f16_kernel",
+                    launch: None,
+                    device: 0,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
         Ok(())
     }
 
@@ -821,6 +1007,9 @@ impl Gemma4DrafterRuntime {
             shadow_kv: None,
             flash_attention_mod: None,
             fn_flash_attention_2_decode_f16io: None,
+            drafter_dequant_mod: None,
+            fn_drafter_dequant_fp8_to_f16: None,
+            fn_drafter_dequant_nvfp4_to_f16: None,
         })
     }
 
