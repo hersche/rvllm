@@ -4033,13 +4033,14 @@ impl Gemma4Bringup {
                     layer.layer_type,
                     rvllm_loader::gemma4_drafter::DrafterLayerType::Full
                 );
-                // Standard 1/sqrt(head_dim) scaling. See commit 27 + 27a
-                // notes for the (failed) attempt at vLLM-MTP scale=1.0;
-                // codex's diagnosis turned out to be wrong here — the
-                // ~50-logit drafter/base gap survives whether scaling
-                // is moved between Q-side and kernel-side, because
-                // these are mathematically equivalent. The real
-                // accept-rate gap is something else.
+                // Standard 1/sqrt(head_dim). Commit 27/27b retried
+                // scale=1.0 (per vLLM Gemma4MTPAttention.scaling=1.0,
+                // documented as "should work" per codex web search of
+                // HF model card + ~77% accept rate in public reports)
+                // but our FA-2 f16io cross-attn kernel crashes
+                // asynchronously at scale=1.0 even with online-softmax
+                // stabilization on paper. Root cause unknown without
+                // GPU-side instrumentation. Stays at standard for now.
                 let eff_hd = layer.effective_head_dim as f32;
                 let scale = 1.0_f32 / eff_hd.sqrt();
                 self.run_drafter_layer_q_side(
