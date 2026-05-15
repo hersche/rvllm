@@ -874,6 +874,19 @@ pub struct Gemma4Bringup {
     /// set the `X-RVLLM-Accept-Rate` response header. Idle when
     /// spec-decode is off.
     pub last_spec_stats: std::sync::Mutex<Option<LastSpecStats>>,
+    /// Commit 26: per-decode-step base logits captured during
+    /// `run_generate` when the spec-decode path needs them for the
+    /// lossy-greedy acceptance check. Layout: row-major
+    /// `[K+1, vocab]` f32. Allocated lazily when capture is first
+    /// requested; reused across requests. Stays empty when
+    /// `spec_logits_capture_active == false`.
+    pub spec_decode_step_logits: std::sync::Mutex<Vec<f32>>,
+    /// Commit 26: capture gate for the decode-loop logits export.
+    /// `run_generate_speculative` flips this on before its
+    /// `run_generate` call (when lossy greedy mode is enabled) and
+    /// off after, so non-spec engines pay zero cost. Reads in the
+    /// decode loop are a single relaxed atomic load.
+    pub spec_logits_capture_active: std::sync::atomic::AtomicBool,
     /// Session-level prefix cache. Populated lazily on first
     /// `run_generate` call; kept across subsequent calls so the
     /// KV cache survives the worker's scratch-checkpoint restore.
@@ -1654,6 +1667,9 @@ impl Gemma4Bringup {
             base_last_hidden_snapshot_pending:
                 std::sync::atomic::AtomicBool::new(false),
             last_spec_stats: std::sync::Mutex::new(None),
+            spec_decode_step_logits: std::sync::Mutex::new(Vec::new()),
+            spec_logits_capture_active:
+                std::sync::atomic::AtomicBool::new(false),
             prefix_cache: std::sync::Mutex::new(None),
             // (assistant_kv_sources is set above; drafter slot stays
             // empty until commit 7 calls `ensure_drafter` from the
@@ -3573,6 +3589,30 @@ impl Gemma4Bringup {
         self.base_last_hidden_snapshot_pending
             .store(true, std::sync::atomic::Ordering::Release);
 
+        // Commit 26: activate per-step logits capture if lossy-greedy
+        // acceptance is enabled. Allocates `max_new * vocab` f32 in
+        // the engine-wide buffer; capture happens inside run_generate
+        // at the prefill argmax + decode-loop argmax sites.
+        let lossy_threshold: f32 = std::env::var("RVLLM_GEMMA4_SPEC_LOSSY_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(0.0);
+        let want_capture = lossy_threshold > 0.0;
+        if want_capture {
+            let vocab_sz = arch.vocab_size as usize;
+            let needed = max_new.saturating_mul(vocab_sz);
+            let mut buf = self.spec_decode_step_logits.lock().unwrap();
+            if buf.len() < needed {
+                buf.resize(needed, 0.0);
+            } else {
+                for v in buf.iter_mut().take(needed) { *v = 0.0; }
+            }
+            drop(buf);
+            self.spec_logits_capture_active
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // Step (b): run base prefill. `max_new=1` is the smallest
         // legal value (run_generate rejects 0). The one decode
         // step costs ~30 ms; the resulting token is discarded.
@@ -4124,27 +4164,62 @@ impl Gemma4Bringup {
         }
         } // end for k_step
 
-        // Commit 24: K-prefix verify against base's actual decode
-        // sequence. `_base_first_tok` already holds the full
-        // greedy-decoded base sequence (max_new tokens) from the
-        // initial `run_generate` call. accept_len is the longest
-        // prefix where drafter and base agree token-for-token.
+        // Commit 24 + 26: K-prefix verify. accept_len is the longest
+        // prefix where drafter agrees with base, either via:
+        //   - strict greedy match (drafter[i] == base[i]) — always on
+        //   - LOSSY GREEDY ratio test (when env
+        //     `RVLLM_GEMMA4_SPEC_LOSSY_THRESHOLD` is set to a value
+        //     in (0,1]): accept if p_base(D_i) / p_base(B_i) >= T.
+        //     Implemented via captured per-step base logits in
+        //     `spec_decode_step_logits` (commit 26).
         //
-        // This is "sequential verify" — base ran K sequential
-        // decode steps regardless, so we get accept_rate
-        // observability but no decode-time speedup yet. Real
-        // speedup requires a batched-prefill entry point that
-        // runs K verify tokens in one base forward; that's a
-        // separate session (needs new base API surface).
+        // Important: lossy greedy changes the model output relative
+        // to plain greedy decode. It trades some quality for higher
+        // accept rate. Default is strict (threshold = 0).
+        if want_capture {
+            self.spec_logits_capture_active
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         let kmax = drafter_tokens.len().min(_base_first_tok.len());
         let mut accept_len: usize = 0;
+        let captured = if want_capture {
+            Some(self.spec_decode_step_logits.lock().unwrap())
+        } else {
+            None
+        };
+        let vocab_sz = arch.vocab_size as usize;
         for i in 0..kmax {
-            if drafter_tokens[i] == _base_first_tok[i] {
+            let d = drafter_tokens[i] as usize;
+            let b = _base_first_tok[i] as usize;
+            if d == b {
                 accept_len += 1;
-            } else {
-                break;
+                continue;
             }
+            // Lossy greedy ratio test (env-gated).
+            if lossy_threshold > 0.0 {
+                if let Some(buf) = captured.as_ref() {
+                    let row_off = i * vocab_sz;
+                    if buf.len() >= row_off + vocab_sz && d < vocab_sz && b < vocab_sz {
+                        let row = &buf[row_off..row_off + vocab_sz];
+                        let l_d = row[d];
+                        let l_b = row[b];
+                        let ratio = (l_d - l_b).exp();
+                        if std::env::var("RVLLM_SPEC_DEBUG").as_deref() == Ok("1") {
+                            eprintln!(
+                                "[spec-lossy] i={} D={} B={} l_D={:.3} l_B={:.3} ratio={:.6e} threshold={:.3}",
+                                i, d, b, l_d, l_b, ratio, lossy_threshold,
+                            );
+                        }
+                        if ratio.is_finite() && ratio >= lossy_threshold {
+                            accept_len += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            break;
         }
+        drop(captured);
         let base_prefix: Vec<u32> = _base_first_tok.iter().take(kmax).copied().collect();
         let accept_rate: f32 = if drafter_tokens.is_empty() {
             0.0
@@ -6953,6 +7028,22 @@ impl Gemma4Bringup {
                 stream
             );
         }
+        // Commit 26: spec-decode logits capture, prefill argmax row (row 0).
+        // Mirrors RVLLM_DUMP_TOPK_LOGITS below but writes into the
+        // engine-wide buffer instead of stdout. Cost: ~1 MiB DtoH per
+        // captured row when the gate is on; zero when off.
+        if self.spec_logits_capture_active.load(std::sync::atomic::Ordering::Relaxed) {
+            self.stream.fence()?;
+            let mut buf = self.spec_decode_step_logits.lock().unwrap();
+            let v = vocab as usize;
+            if buf.len() >= v {
+                let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut _,
+                    logits_f32.device_ptr(),
+                    v * 4,
+                );
+            }
+        }
         // Cycle 53 step 5: top-K logit dump at first decode step. Gated by
         // RVLLM_DUMP_TOPK_LOGITS=1. Cost: 1 MiB DtoH + partial-sort vocab
         // entries (host-side). Compares logit distribution shape across
@@ -7570,6 +7661,23 @@ impl Gemma4Bringup {
                     "argmax_sample_token_dtoh_decode_loop",
                     stream
                 );
+            }
+            // Commit 26: spec-decode decode-loop logits capture
+            // (rows 1..). Row index = decode_step + 1 (row 0 was the
+            // prefill argmax site above). Gated identically.
+            if self.spec_logits_capture_active.load(std::sync::atomic::Ordering::Relaxed) {
+                self.stream.fence()?;
+                let row_idx = (decode_step + 1) as usize;
+                let v = vocab as usize;
+                let row_off = row_idx * v;
+                let mut buf = self.spec_decode_step_logits.lock().unwrap();
+                if buf.len() >= row_off + v {
+                    let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        buf[row_off..].as_mut_ptr() as *mut _,
+                        logits_f32.device_ptr(),
+                        v * 4,
+                    );
+                }
             }
             let next_id = host_tok[0] as u32;
             // Round-20 finding #2: EOS check BEFORE push + callback so
