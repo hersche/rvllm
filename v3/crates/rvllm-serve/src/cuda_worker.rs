@@ -52,6 +52,19 @@ pub struct CudaWorkerConfig {
     /// `Qwen36` / `Gemma4` short-circuit to the matching bring-up
     /// without re-probing.
     pub family: ModelFamily,
+    /// Optional Gemma 4 E4B assistant-drafter speculative decode.
+    /// Default-off; when enabled the drafter is loaded before the
+    /// arena scratch checkpoint so its resident weights survive
+    /// per-request arena restores.
+    pub spec_decode: bool,
+    pub spec_drafter_dir: PathBuf,
+    pub spec_k: u32,
+}
+
+#[derive(Clone, Debug)]
+struct WorkerSpecDecode {
+    enabled: bool,
+    k: u32,
 }
 
 /// Spawn the CUDA worker on a dedicated OS thread.
@@ -77,10 +90,30 @@ pub async fn spawn_cuda_worker(
     let (req_tx, mut req_rx) = mpsc::channel::<GenerateRequest>(channel_buf);
     let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
-    let CudaWorkerConfig { paths, arena_bytes, family, .. } = cfg;
+    let CudaWorkerConfig {
+        paths,
+        arena_bytes,
+        family,
+        spec_decode,
+        spec_drafter_dir,
+        spec_k,
+        ..
+    } = cfg;
+    let spec_cfg = WorkerSpecDecode {
+        enabled: spec_decode,
+        k: spec_k,
+    };
     let join = std::thread::Builder::new()
         .name("rvllm-serve-cuda-worker".into())
         .spawn(move || {
+            if spec_decode && !matches!(family, ModelFamily::Gemma4) {
+                let _ = ready_tx.send(Err(format!(
+                    "RVLLM_GEMMA4_SPEC_DECODE=1 is only supported for Gemma 4 E4B; \
+                     resolved model family is {}",
+                    family.as_str()
+                )));
+                return;
+            }
             // Mistral 3.5: parse arch + validate inventory + assert
             // CUTLASS NVFP4 symbols present, then refuse per-request
             // generation cleanly until the GPU forward path is wired.
@@ -1055,6 +1088,38 @@ pub async fn spawn_cuda_worker(
             }
             // === END DIAGNOSTIC ===
 
+            // Spec-decode resident state must be allocated before the
+            // scratch checkpoint. If the lazy upload happened inside a
+            // request after `scratch_ck`, the worker's post-request
+            // `arena.restore(scratch_ck)` would mark the drafter weights
+            // as free while `bringup.drafter` still holds their device
+            // pointers. That is the same lifetime contract as the
+            // prefix-cache / hadamard / shadow allocations below.
+            if spec_decode {
+                if spec_k == 0 {
+                    let _ = ready_tx.send(Err(
+                        "RVLLM_GEMMA4_SPEC_K must be >= 1".to_string(),
+                    ));
+                    return;
+                }
+                match bringup.ensure_drafter(&spec_drafter_dir) {
+                    Ok(()) => {
+                        tracing::info!(
+                            drafter_dir = %spec_drafter_dir.display(),
+                            spec_k,
+                            "Gemma 4 speculative drafter uploaded above scratch checkpoint",
+                        );
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "ensure_drafter({}): {e:?}",
+                            spec_drafter_dir.display()
+                        )));
+                        return;
+                    }
+                }
+            }
+
             // Pre-allocate persistent NVFP4 helper buffers BEFORE the
             // scratch checkpoint. The lazy allocation paths inside
             // `run_generate` had a fatal lifetime bug: they ran
@@ -1159,7 +1224,7 @@ pub async fn spawn_cuda_worker(
                     ));
                     continue;
                 }
-                run_one(&bringup, &kernels_ctx, req);
+                run_one(&bringup, &kernels_ctx, &spec_cfg, req);
                 // SAFETY: `run_one` fully consumes the `Region`s it
                 // allocated inside `bringup.run_generate` — they're
                 // function-local there and drop before we return.
@@ -1209,7 +1274,12 @@ fn resolve_generate_kernels(
     Ok(GenerateKernels { fn_embed, fn_argmax, _embed_mod: embed_mod })
 }
 
-fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequest) {
+fn run_one(
+    bringup: &Gemma4Bringup,
+    kernels: &GenerateKernels,
+    spec_cfg: &WorkerSpecDecode,
+    req: GenerateRequest,
+) {
     let prompt_len = req.prompt_ids.len() as u32;
 
     if req.cancelled.load(Ordering::Relaxed) {
@@ -1225,7 +1295,8 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
         request_id = %req.request_id,
         prompt_tokens = req.prompt_ids.len(),
         max_new = req.max_new_tokens,
-        "calling run_generate",
+        spec_decode = spec_cfg.enabled,
+        "calling Gemma generate",
     );
     let sampling_cfg = match req.sampling {
         crate::sampling::SamplingDecision::Greedy => {
@@ -1361,27 +1432,43 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
         .collect();
 
     let result = unsafe {
-        bringup.run_generate(
-            kernels.fn_embed,
-            kernels.fn_argmax,
-            &req.prompt_ids,
-            req.max_new_tokens as usize,
-            &req.stop_token_ids,
-            // shadow_requested: per-request header was removed; gate on
-            // the env var directly so cycle-26 ShadowDumper analysis can
-            // fire without needing to restore the header path.
-            env_truthy("RVLLM_NVFP4_SHADOW_F16"),
-            sampling_cfg,
-            // Forward the request-level cancellation flag. The HTTP
-            // handler sets this on client disconnect / wall-clock
-            // timeout; the runtime breaks out of the decode loop on
-            // the next step so the worker thread does not stay
-            // blocked rendering tokens nobody will read.
-            Some(req.cancelled.as_ref()),
-            Some(&mut on_token),
-            &vision_splice,
-            &audio_splice,
-        )
+        if spec_cfg.enabled {
+            bringup.run_generate_speculative(
+                kernels.fn_embed,
+                kernels.fn_argmax,
+                &req.prompt_ids,
+                req.max_new_tokens as usize,
+                &req.stop_token_ids,
+                spec_cfg.k,
+                sampling_cfg,
+                Some(req.cancelled.as_ref()),
+                Some(&mut on_token),
+                &vision_splice,
+                &audio_splice,
+            )
+        } else {
+            bringup.run_generate(
+                kernels.fn_embed,
+                kernels.fn_argmax,
+                &req.prompt_ids,
+                req.max_new_tokens as usize,
+                &req.stop_token_ids,
+                // shadow_requested: per-request header was removed; gate on
+                // the env var directly so cycle-26 ShadowDumper analysis can
+                // fire without needing to restore the header path.
+                env_truthy("RVLLM_NVFP4_SHADOW_F16"),
+                sampling_cfg,
+                // Forward the request-level cancellation flag. The HTTP
+                // handler sets this on client disconnect / wall-clock
+                // timeout; the runtime breaks out of the decode loop on
+                // the next step so the worker thread does not stay
+                // blocked rendering tokens nobody will read.
+                Some(req.cancelled.as_ref()),
+                Some(&mut on_token),
+                &vision_splice,
+                &audio_splice,
+            )
+        }
     };
 
     match result {

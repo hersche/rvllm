@@ -1671,6 +1671,42 @@ impl Gemma4Bringup {
         let layout = rvllm_loader::gemma4_drafter::Gemma4DrafterWeightLayout::from_dir(
             drafter_dir,
         )?;
+        if layout.arch.backbone_hidden_size != self.arch.hidden_size {
+            return Err(RvllmError::Loader {
+                err: LoaderError::Corrupt {
+                    detail: format!(
+                        "drafter backbone_hidden_size={} != base hidden_size={}",
+                        layout.arch.backbone_hidden_size, self.arch.hidden_size
+                    ),
+                },
+                ctx: LoaderCtx { path: drafter_dir.to_path_buf(), tensor: None },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        if layout.arch.vocab_size != self.arch.vocab_size {
+            return Err(RvllmError::Loader {
+                err: LoaderError::Corrupt {
+                    detail: format!(
+                        "drafter vocab_size={} != base vocab_size={}",
+                        layout.arch.vocab_size, self.arch.vocab_size
+                    ),
+                },
+                ctx: LoaderCtx { path: drafter_dir.to_path_buf(), tensor: None },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        if layout.arch.pre_projection_in_dim != 2 * self.arch.hidden_size {
+            return Err(RvllmError::Loader {
+                err: LoaderError::Corrupt {
+                    detail: format!(
+                        "drafter pre_projection_in_dim={} != 2 * base hidden_size={}",
+                        layout.arch.pre_projection_in_dim, self.arch.hidden_size
+                    ),
+                },
+                ctx: LoaderCtx { path: drafter_dir.to_path_buf(), tensor: None },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
         #[cfg(feature = "cuda")]
         let rt = crate::gemma4_drafter::Gemma4DrafterRuntime::load(&layout, &self.arena)?;
         #[cfg(not(feature = "cuda"))]
@@ -3194,6 +3230,407 @@ impl Gemma4Bringup {
             total_nll,
             n_evaluated,
         })
+    }
+
+    /// Greedy Gemma 4 E4B assistant-drafter speculative decode entry
+    /// point. This is intentionally separate from [`Self::run_generate`]
+    /// so the default path stays source-stable while the spec path is
+    /// filled in.
+    ///
+    /// Current status: request/lifecycle plumbing and resident drafter
+    /// upload are wired. The actual assistant one-step forward still
+    /// returns `FeatureNotAvailable` until the cross-attention and
+    /// MaskedEmbedder kernels land. Keeping this as a runtime method
+    /// gives the server a real gated call site and prevents
+    /// `RVLLM_GEMMA4_SPEC_DECODE=1` from silently falling back to
+    /// baseline generation.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn run_generate_speculative(
+        &self,
+        fn_embed: rvllm_kernels::KernelFn,
+        _fn_argmax: rvllm_kernels::KernelFn,
+        prompt_ids: &[u32],
+        max_new: usize,
+        _eos_ids: &[u32],
+        spec_k: u32,
+        sampling: SamplingConfig,
+        _cancel: Option<&std::sync::atomic::AtomicBool>,
+        _on_token: Option<&mut dyn FnMut(u32) -> bool>,
+        vision_splice: &[(usize, &[u8])],
+        audio_splice: &[(usize, &[u8])],
+    ) -> Result<Vec<u32>> {
+        if max_new == 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "max_new",
+                    reason: "must be >= 1; max_new=0 underflows the decode loop".into(),
+                },
+                field: "max_new",
+            });
+        }
+        if spec_k == 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "RVLLM_GEMMA4_SPEC_K",
+                    reason: "must be >= 1".into(),
+                },
+                field: "RVLLM_GEMMA4_SPEC_K",
+            });
+        }
+        if !matches!(sampling, SamplingConfig::Greedy) {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "sampling",
+                    reason: "Gemma 4 speculative decode is currently greedy-only".into(),
+                },
+                field: "sampling",
+            });
+        }
+        if !vision_splice.is_empty() || !audio_splice.is_empty() {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "modalities",
+                    reason: "Gemma 4 speculative decode is text-only until assistant one-step parity is validated".into(),
+                },
+                field: "modalities",
+            });
+        }
+        if self.assistant_kv_sources.is_none() {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "model",
+                    reason: "assistant drafter requires an E4B-style Gemma 4 model with shared-KV source layers".into(),
+                },
+                field: "model",
+            });
+        }
+        if self.drafter.lock().unwrap().is_none() {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "drafter",
+                    reason: "drafter is not resident; call ensure_drafter before run_generate_speculative".into(),
+                },
+                field: "drafter",
+            });
+        }
+
+        if prompt_ids.is_empty() {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "prompt_ids",
+                    reason: "speculative decode requires a non-empty prompt".into(),
+                },
+                field: "prompt_ids",
+            });
+        }
+
+        // Commit 5a: build the minimum real base metadata needed to
+        // exercise drafter.prepare_pre_projection_input +
+        // bringup.run_drafter_pre_projection without touching the
+        // baseline `run_generate` path.
+        //
+        // We mirror the per-call arena allocation arithmetic from
+        // `run_generate`'s non-prefix-cache branch (see lines
+        // 3858-3907 of this file) — same `block_size = 32`,
+        // `num_blocks_total = env or 1024`, same per-layer dtype
+        // selection — so the KV-cache + scale region we hand to
+        // the drafter has byte-identical layout to what base prefill
+        // would produce. No real prefill runs here yet: KV bytes are
+        // zero, and `base_hidden_last_step` is a zero buffer. The
+        // resulting `pre_projection_in = [last_token_embed; 0]` runs
+        // through `run_drafter_pre_projection` to validate the
+        // GEMM + cast plumbing end-to-end on real device pointers;
+        // its OUTPUT is intentionally discarded because we still
+        // return `FeatureNotAvailable` below (cross-attn +
+        // MaskedEmbedder pending).
+        let arch = &self.arch;
+        let hidden_u = arch.hidden_size as u32;
+        let vocab_u = arch.vocab_size as u32;
+        let stream = self.stream.raw();
+        let arena = &self.arena;
+
+        let block_size: u32 = 32;
+        let num_blocks_total: u32 = std::env::var("RVLLM_NUM_BLOCKS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        let max_blocks_per_seq = num_blocks_total;
+        let sliding_blocks = num_blocks_total;
+
+        // Per-layer KV layout — duplicated arithmetic from the
+        // per-call fallback in `run_generate`. Kept inline rather
+        // than refactored so the baseline stays byte-for-byte.
+        let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_scale_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_dtype_per_layer: Vec<crate::gemma4_layer_exec::KvDtype> =
+            Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_total_bytes: u64 = 0;
+        let mut kv_scale_total_bytes: u64 = 0;
+        for l in 0..arch.num_hidden_layers {
+            kv_layer_offsets.push(kv_total_bytes);
+            kv_scale_layer_offsets.push(kv_scale_total_bytes);
+            let is_global = arch.layer_types[l]
+                == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+            let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+            let hd = arch.head_dim_for_layer(l) as u32;
+            let layer_elems =
+                2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
+            let kv_dtype_l = crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(
+                arch.layer_types[l], l, false);
+            kv_dtype_per_layer.push(kv_dtype_l);
+            kv_total_bytes += match kv_dtype_l {
+                crate::gemma4_layer_exec::KvDtype::F16 => layer_elems * 2,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 2,
+            };
+            let layer_scale_slots =
+                2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64;
+            kv_scale_total_bytes += match kv_dtype_l {
+                crate::gemma4_layer_exec::KvDtype::F16 => 0,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_scale_slots * 4,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 16,
+            };
+        }
+        let kv_region = arena.region("spec_kv", kv_total_bytes.max(16) as usize, 256)?;
+        cuda_check!(
+            cudarc::driver::sys::cuMemsetD8_v2(
+                kv_region.device_ptr(), 0, kv_total_bytes as usize),
+            "spec_kv_zero", 0u64);
+        let kv_scale_region = arena.region(
+            "spec_kv_scale", kv_scale_total_bytes.max(16) as usize, 16)?;
+        cuda_check!(
+            cudarc::driver::sys::cuMemsetD8_v2(
+                kv_scale_region.device_ptr(), 0, kv_scale_total_bytes as usize),
+            "spec_kv_scale_zero", 0u64);
+
+        // Persistent identity block-tables [0..num_blocks_total) i32,
+        // matching the layout the FA-2 decode launcher walks.
+        let block_tables_region = arena.region(
+            "spec_block_tables", (num_blocks_total as usize) * 4, 16)?;
+        {
+            let mut bt_host: Vec<u8> = Vec::with_capacity((num_blocks_total as usize) * 4);
+            for b in 0..num_blocks_total {
+                bt_host.extend_from_slice(&(b as i32).to_le_bytes());
+            }
+            block_tables_region.copy_from_host(&bt_host)?;
+        }
+
+        // context_lens i32[1] = number of committed base tokens.
+        // For this commit we have no committed base tokens (prefill
+        // hasn't run yet); the prompt itself is what the future
+        // prefill will consume.
+        let context_lens_region = arena.region("spec_ctx_lens", 4, 16)?;
+        let ctx_len_host: i32 = 0;
+        context_lens_region.copy_from_host(&ctx_len_host.to_le_bytes())?;
+
+        // Token-ids region + last-prompt-token embedding (the
+        // assistant's "input embedding for next position").
+        let token_ids_region = arena.region("spec_tok_ids", 4, 16)?;
+        let last_tok_id: u32 = *prompt_ids.last().expect("prompt_ids non-empty above");
+        token_ids_region.copy_from_host(&last_tok_id.to_le_bytes())?;
+        let last_token_embed = arena.region(
+            "spec_last_tok_embed", (hidden_u as usize) * 2, 16)?;
+        rvllm_fused::EmbeddingGatherLaunch { num_tokens: 1, hidden: hidden_u, vocab: vocab_u }
+            .launch(
+                fn_embed,
+                last_token_embed.device_ptr(),
+                self.model.embedding.offset_bytes,
+                token_ids_region.device_ptr(),
+                stream,
+            )?;
+
+        // Placeholder base-final-hidden buffer — zero-initialised.
+        // Filled by real base prefill in commit 7; for now the
+        // discard-output drafter pre_projection drives valid HBM.
+        let base_hidden_last_step = arena.region(
+            "spec_base_hidden_last_step", (hidden_u as usize) * 2, 16)?;
+        cuda_check!(
+            cudarc::driver::sys::cuMemsetD8_v2(
+                base_hidden_last_step.device_ptr(), 0, (hidden_u as usize) * 2),
+            "spec_base_hidden_last_step_zero", 0u64);
+
+        // Source-layer K/V pointers + per-(slot, kv_head) scale
+        // pointers per `assistant_kv_sources`. Each source layer's
+        // K/V live as a contiguous `[2 (K+V), num_blocks, block_size,
+        // num_kv_heads, head_dim]` region; the V half starts at
+        // `+ layer_elems_byte_size / 2` from the K half — same
+        // accounting the FA-2 paged decode launcher already expects.
+        let sources = self.assistant_kv_sources
+            .expect("guarded above by assistant_kv_sources.is_none()");
+        let kv_base_ptr = kv_region.device_ptr();
+        let kv_scale_base_ptr = kv_scale_region.device_ptr();
+        let kv_dtype_root = crate::gemma4_layer_exec::KvDtype::from_env(false);
+
+        let source_view = |layer_idx: u32| -> crate::gemma4_drafter::DrafterBaseKvView {
+            let li = layer_idx as usize;
+            let off = kv_layer_offsets[li];
+            let scale_off = kv_scale_layer_offsets[li];
+            let is_global = arch.layer_types[li]
+                == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+            let nkvh = arch.num_kv_heads_for_layer(li) as u32;
+            let hd = arch.head_dim_for_layer(li) as u32;
+            let layer_elems =
+                2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
+            let dtype = kv_dtype_per_layer[li];
+            let k_v_half_bytes = match dtype {
+                crate::gemma4_layer_exec::KvDtype::F16 => layer_elems,       // *2 / 2
+                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems / 2,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 4,
+            };
+            let scale_half_slots =
+                layer_blocks as u64 * block_size as u64 * nkvh as u64;
+            let scale_half_bytes = match dtype {
+                crate::gemma4_layer_exec::KvDtype::F16 => 0,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => scale_half_slots * 4,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 32,
+            };
+            let k_cache = kv_base_ptr + off;
+            let v_cache = k_cache + k_v_half_bytes;
+            let (k_scale_cache, v_scale_cache) = if dtype
+                == crate::gemma4_layer_exec::KvDtype::F16
+            {
+                (0u64, 0u64)
+            } else {
+                let k_s = kv_scale_base_ptr + scale_off;
+                (k_s, k_s + scale_half_bytes)
+            };
+            crate::gemma4_drafter::DrafterBaseKvView {
+                k_cache,
+                v_cache,
+                k_scale_cache,
+                v_scale_cache,
+                q_scale_cache: 0,
+                block_tables: block_tables_region.device_ptr(),
+                context_lens: context_lens_region.device_ptr(),
+                block_size,
+                max_blocks_per_seq,
+                num_blocks_total,
+                kv_dtype: dtype,
+            }
+        };
+
+        let sliding_kv = source_view(sources.sliding_source_layer);
+        let full_kv = source_view(sources.full_source_layer);
+
+        let _ = kv_dtype_root; // env snapshot for future logging.
+
+        // Allocate workspace + build DrafterForwardStep. Position 0
+        // is the placeholder position — commit 7 will thread the
+        // real "last accepted position" through.
+        let workspace = {
+            let guard = self.drafter.lock().unwrap();
+            let drafter = guard.as_ref().expect("checked above");
+            drafter.alloc_step_workspace(arena)?
+        };
+        tracing::debug!(
+            spec_k,
+            workspace_bytes = workspace.bytes,
+            "allocated Gemma 4 speculative drafter one-step workspace",
+        );
+
+        let step = crate::gemma4_drafter::DrafterForwardStep {
+            base_hidden_last_step: base_hidden_last_step.device_ptr(),
+            last_token_embed: last_token_embed.device_ptr(),
+            sliding_kv,
+            full_kv,
+            position: 0,
+            out_logits: workspace.centroid_logits,
+            out_hidden: workspace.out_hidden,
+            out_token_id: workspace.out_token_id,
+        };
+
+        // Real-pointer plumbing exercise: pre-projection input concat
+        // + pre_projection GEMM + cast to f16. Outputs are discarded
+        // — the per-call arena restore at the end of the worker
+        // request handler reclaims the scratch.
+        {
+            let guard = self.drafter.lock().unwrap();
+            let drafter = guard.as_ref().expect("checked above");
+            drafter.prepare_pre_projection_input(&step, &workspace, stream)?;
+            self.run_drafter_pre_projection(drafter, &workspace)?;
+        }
+        tracing::debug!(
+            "Gemma 4 speculative path: pre_projection exercised on real \
+             pointers; cross-attn + MaskedEmbedder still pending"
+        );
+
+        // Avoid an unused-binding warning on `max_new` for now —
+        // commit 7 actually drives a K-step draft loop.
+        let _ = max_new;
+
+        Err(rvllm_core::RvllmError::Attention {
+            err: rvllm_core::AttentionError::FeatureNotAvailable {
+                op: "Gemma4Bringup::run_generate_speculative (assistant one-step forward pending: cross-attn + MaskedEmbedder)",
+                backend: "Gemma4SpecDecode",
+            },
+            ctx: rvllm_core::AttnCtx {
+                op: "Gemma4Bringup::run_generate_speculative",
+                stream,
+                num_seqs: 1,
+                head_dim: self.arch.max_head_dim() as u32,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    unsafe fn run_drafter_pre_projection(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+    ) -> Result<()> {
+        let hidden = drafter.arch.hidden_size;
+        let pre_in = drafter.arch.pre_projection_in_dim;
+        let stream = self.stream.raw();
+
+        let require_ptr = |name: &'static str, ptr: u64| -> Result<()> {
+            if ptr != 0 {
+                return Ok(());
+            }
+            Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    op: name,
+                    backend: "Gemma4SpecDecode",
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: name,
+                    stream,
+                    num_seqs: 1,
+                    head_dim: drafter.arch.head_dim_global as u32,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            })
+        };
+
+        require_ptr("drafter.pre_projection_in", workspace.pre_projection_in)?;
+        require_ptr("drafter.pre_projection.weight", drafter.top.pre_projection)?;
+        require_ptr("drafter.gemm_f32", workspace.gemm_f32)?;
+        require_ptr("drafter.hidden", workspace.hidden)?;
+
+        self.cublaslt.f16_gemm_f32(
+            workspace.pre_projection_in,
+            drafter.top.pre_projection,
+            workspace.gemm_f32,
+            1,
+            hidden as i32,
+            pre_in as i32,
+            stream,
+        )?;
+        launch_cast_f32_to_f16(
+            &self.stream,
+            self.fused.fn_cast_f32_to_f16,
+            workspace.gemm_f32,
+            workspace.hidden,
+            hidden as i32,
+        )?;
+        tracing::trace!(
+            hidden,
+            pre_in,
+            "completed Gemma 4 speculative drafter pre_projection",
+        );
+        Ok(())
     }
 
     #[cfg(feature = "cuda")]

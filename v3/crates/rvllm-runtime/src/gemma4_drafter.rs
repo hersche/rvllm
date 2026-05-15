@@ -39,6 +39,113 @@ use rvllm_loader::gemma4_drafter::{
 #[cfg(feature = "cuda")]
 use rvllm_mem::HbmArena;
 
+/// Base-model K/V cache view exposed to the assistant cross-attention
+/// layer. The assistant has Q-only attention weights, so its K/V comes
+/// from Gemma 4 E4B's shared-KV source layers.
+#[derive(Clone, Copy, Debug)]
+pub struct DrafterBaseKvView {
+    /// F16 / FP8 / NVFP4 K cache for the chosen source layer.
+    pub k_cache: u64,
+    /// F16 / FP8 / NVFP4 V cache for the chosen source layer.
+    pub v_cache: u64,
+    /// FP8/NVFP4 K scale cache for the same layer; zero for F16 KV.
+    pub k_scale_cache: u64,
+    /// FP8/NVFP4 V scale cache for the same layer; zero for F16 KV.
+    pub v_scale_cache: u64,
+    /// Per-token Q scale cache used by FP8/NVFP4 attention launchers;
+    /// zero for an eventual pure-F16 assistant cross-attn kernel.
+    pub q_scale_cache: u64,
+    /// Paged-cache block table for the active sequence.
+    pub block_tables: u64,
+    /// Device i32[1] containing committed base context length.
+    pub context_lens: u64,
+    pub block_size: u32,
+    pub max_blocks_per_seq: u32,
+    pub num_blocks_total: u32,
+    /// Matches `crate::gemma4_layer_exec::KvDtype` without making this
+    /// module own cache-policy decisions.
+    pub kv_dtype: crate::gemma4_layer_exec::KvDtype,
+}
+
+/// One assistant MTP step. All pointers are device addresses and are
+/// single-sequence today, matching `Gemma4Bringup::run_generate`.
+#[derive(Clone, Copy, Debug)]
+pub struct DrafterForwardStep {
+    /// Base final-normalized hidden for the last accepted token:
+    /// f16[backbone_hidden_size].
+    pub base_hidden_last_step: u64,
+    /// Base embedding row for the last accepted token:
+    /// f16[backbone_hidden_size].
+    pub last_token_embed: u64,
+    pub sliding_kv: DrafterBaseKvView,
+    pub full_kv: DrafterBaseKvView,
+    /// Absolute position of the token being drafted. Used for RoPE.
+    pub position: u32,
+    /// Output f32 logits or sparse-logit workspace, owned by caller.
+    pub out_logits: u64,
+    /// Output f16[backbone_hidden_size] post_projection hidden for
+    /// chaining the next MTP step.
+    pub out_hidden: u64,
+    /// Output i32[1] assistant argmax token after MaskedEmbedder.
+    pub out_token_id: u64,
+}
+
+/// Per-request scratch for one assistant draft step. The resident
+/// weights live in [`Gemma4DrafterRuntime`]; these buffers are safe to
+/// allocate below the server scratch checkpoint and restore after each
+/// request.
+#[derive(Clone, Debug)]
+pub struct DrafterStepWorkspace {
+    /// f16[2 * backbone_hidden_size] concat of
+    /// `[last_token_embed; base_hidden_last_step]`.
+    pub pre_projection_in: u64,
+    /// f16[hidden_size] assistant hidden stream.
+    pub hidden: u64,
+    /// f32 scratch for GEMM outputs. Sized for the largest assistant
+    /// projection row count used by q_proj/gate/up/down/pre/post.
+    pub gemm_f32: u64,
+    /// f16 scratch for projection outputs that feed elementwise kernels.
+    pub proj_f16: u64,
+    /// f16[num_attention_heads * global_head_dim] query scratch.
+    pub q: u64,
+    /// f16[num_attention_heads * global_head_dim] attention output.
+    pub attn_out: u64,
+    /// f16[intermediate_size] MLP gate scratch.
+    pub mlp_gate: u64,
+    /// f16[intermediate_size] MLP up scratch.
+    pub mlp_up: u64,
+    /// f16[backbone_hidden_size] post_projection output for chaining.
+    pub out_hidden: u64,
+    /// f32[num_centroids] centroid scores before top-k expansion.
+    pub centroid_logits: u64,
+    /// i32[centroid_intermediate_top_k] selected centroid ids.
+    pub top_centroid_ids: u64,
+    /// f32[centroid_intermediate_top_k] selected centroid scores.
+    pub top_centroid_scores: u64,
+    /// i32[1] selected token id.
+    pub out_token_id: u64,
+    pub bytes: usize,
+}
+
+fn validate_ptr(name: &'static str, ptr: u64, stream: u64, head_dim: u32) -> Result<()> {
+    if ptr != 0 {
+        return Ok(());
+    }
+    Err(RvllmError::Attention {
+        err: AttentionError::FeatureNotAvailable {
+            op: name,
+            backend: "Gemma4Drafter",
+        },
+        ctx: AttnCtx {
+            op: name,
+            stream,
+            num_seqs: 1,
+            head_dim,
+        },
+        bt: std::backtrace::Backtrace::capture(),
+    })
+}
+
 /// Per-layer device pointers (F16 weights, one element-pair per
 /// 2 bytes). All offsets are absolute device pointers — no
 /// per-layer base subtraction needed.
@@ -99,6 +206,62 @@ pub struct Gemma4DrafterRuntime {
 }
 
 impl Gemma4DrafterRuntime {
+    /// Allocate transient buffers for one assistant draft step.
+    #[cfg(feature = "cuda")]
+    pub fn alloc_step_workspace(
+        &self,
+        arena: &HbmArena<'_>,
+    ) -> Result<DrafterStepWorkspace> {
+        let a = &self.arch;
+        let max_q_rows = a.num_attention_heads * a.head_dim_global;
+        let max_projection = [
+            a.pre_projection_in_dim,
+            a.hidden_size,
+            a.intermediate_size,
+            max_q_rows,
+            a.backbone_hidden_size,
+            a.num_centroids,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(a.backbone_hidden_size);
+
+        let mut bytes = 0usize;
+        let mut region = |name: &'static str, nbytes: usize, align: usize| -> Result<u64> {
+            bytes += nbytes;
+            Ok(arena.region(name, nbytes.max(16), align)?.device_ptr())
+        };
+
+        Ok(DrafterStepWorkspace {
+            pre_projection_in: region(
+                "drafter_preproj_in",
+                a.pre_projection_in_dim * 2,
+                16,
+            )?,
+            hidden: region("drafter_hidden", a.hidden_size * 2, 16)?,
+            gemm_f32: region("drafter_gemm_f32", max_projection * 4, 16)?,
+            proj_f16: region("drafter_proj_f16", max_projection * 2, 16)?,
+            q: region("drafter_q", max_q_rows * 2, 16)?,
+            attn_out: region("drafter_attn_out", max_q_rows * 2, 16)?,
+            mlp_gate: region("drafter_mlp_gate", a.intermediate_size * 2, 16)?,
+            mlp_up: region("drafter_mlp_up", a.intermediate_size * 2, 16)?,
+            out_hidden: region("drafter_out_hidden", a.backbone_hidden_size * 2, 16)?,
+            centroid_logits: region("drafter_centroid_logits", a.num_centroids * 4, 16)?,
+            top_centroid_ids: region(
+                "drafter_top_centroid_ids",
+                a.centroid_intermediate_top_k * 4,
+                16,
+            )?,
+            top_centroid_scores: region(
+                "drafter_top_centroid_scores",
+                a.centroid_intermediate_top_k * 4,
+                16,
+            )?,
+            out_token_id: region("drafter_out_token_id", 4, 4)?,
+            bytes,
+        })
+    }
+
     /// Read the safetensors shard described by `layout`, convert
     /// BF16 → F16 (and pass I64 through), upload each tensor to
     /// `arena`. Returns the populated runtime.
@@ -327,36 +490,23 @@ impl Gemma4DrafterRuntime {
     ///     → MaskedEmbedder(hidden, embed_tokens.weight)
     ///   → (vocab logits, post_projection(hidden))
     ///
-    /// Inputs (signature pinned to the eventual real call):
-    /// - `base_hidden_last_step`: [backbone_hidden] f16 — the base's
-    ///   final-norm output at the last accepted token.
-    /// - `last_token_embed`: [backbone_hidden] f16 — the base's
-    ///   `embed_tokens` row for the last accepted token id.
-    /// - `base_sliding_kv_ptr` / `base_full_kv_ptr`: device pointers
-    ///   to the source-layer K/V in the base's paged cache (from
-    ///   `Gemma4Bringup::assistant_kv_sources` + the per-request
-    ///   layer-offset table).
-    /// - `base_ctx_len_dev_ptr`: i32 [1] context length (number of
-    ///   committed base tokens) for the cross-attn mask.
+    /// Inputs are grouped in [`DrafterForwardStep`] so the real
+    /// implementation has the full paged-cache view needed by
+    /// cross-attention. The previous stub only carried raw K/V base
+    /// pointers, which was insufficient for block-table lookup and
+    /// FP8/NVFP4 scale handling.
     /// - `stream`: CUDA stream id.
-    /// - `_out_logits_ptr` / `_out_hidden_ptr`: device-side outputs
-    ///   for the next MTP step's `post_projection` chain.
     pub unsafe fn forward_step(
         &self,
-        _base_hidden_last_step: u64,
-        _last_token_embed: u64,
-        _base_sliding_kv_ptr: u64,
-        _base_full_kv_ptr: u64,
-        _base_ctx_len_dev_ptr: u64,
+        step: DrafterForwardStep,
+        workspace: &DrafterStepWorkspace,
         stream: u64,
-        _out_logits_ptr: u64,
-        _out_hidden_ptr: u64,
     ) -> Result<()> {
+        self.prepare_pre_projection_input(&step, workspace, stream)?;
         Err(RvllmError::Attention {
             err: AttentionError::FeatureNotAvailable {
                 op: "Gemma4DrafterRuntime::forward_step \
-                     (commit 4 stub — cross-attn + MaskedEmbedder kernels \
-                     land in commits 5-6)",
+                     (pre_projection + cross-attn + MaskedEmbedder pending)",
                 backend: "Gemma4Drafter",
             },
             ctx: AttnCtx {
@@ -367,6 +517,73 @@ impl Gemma4DrafterRuntime {
             },
             bt: std::backtrace::Backtrace::capture(),
         })
+    }
+
+    /// Build the assistant pre-projection input:
+    ///
+    /// ```text
+    /// pre_projection_in = [last_token_embed ; base_hidden_last_step]
+    /// ```
+    ///
+    /// Both halves are base-hidden-width f16 device vectors. This is
+    /// intentionally implemented with DtoD copies instead of a custom
+    /// CUDA kernel, so the first real drafter operation is simple and
+    /// easy to validate before we add the cross-attention and
+    /// MaskedEmbedder kernels.
+    pub unsafe fn prepare_pre_projection_input(
+        &self,
+        step: &DrafterForwardStep,
+        workspace: &DrafterStepWorkspace,
+        stream: u64,
+    ) -> Result<()> {
+        let hd = self.arch.head_dim_global as u32;
+        validate_ptr("drafter.last_token_embed", step.last_token_embed, stream, hd)?;
+        validate_ptr("drafter.base_hidden_last_step", step.base_hidden_last_step, stream, hd)?;
+        validate_ptr("drafter.pre_projection_in", workspace.pre_projection_in, stream, hd)?;
+
+        #[cfg(feature = "cuda")]
+        {
+            let half_bytes = self.arch.backbone_hidden_size * 2;
+            let r0 = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                workspace.pre_projection_in,
+                step.last_token_embed,
+                half_bytes,
+                stream as cudarc::driver::sys::CUstream,
+            );
+            if r0 != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::Cuda {
+                    kind: rvllm_core::CudaErrorKind::MemcpyFailed,
+                    op: "drafter_pre_projection_last_token_dtoD",
+                    ctx: rvllm_core::CudaCtx {
+                        stream,
+                        kernel: "cuMemcpyDtoDAsync_v2",
+                        launch: None,
+                        device: 0,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+            let r1 = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                workspace.pre_projection_in + half_bytes as u64,
+                step.base_hidden_last_step,
+                half_bytes,
+                stream as cudarc::driver::sys::CUstream,
+            );
+            if r1 != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::Cuda {
+                    kind: rvllm_core::CudaErrorKind::MemcpyFailed,
+                    op: "drafter_pre_projection_base_hidden_dtoD",
+                    ctx: rvllm_core::CudaCtx {
+                        stream,
+                        kernel: "cuMemcpyDtoDAsync_v2",
+                        launch: None,
+                        device: 0,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+        }
+        Ok(())
     }
 }
 

@@ -168,7 +168,7 @@ async fn main() -> anyhow_compat::Result<()> {
     resolved.log_summary(&cli.model_dir);
     let vision_arch = resolved.vision_arch;
 
-    let (worker, _join) = spawn_worker(&cli, config.max_queue_depth, resolved.family).await?;
+    let (worker, _join) = spawn_worker(&cli, &config, resolved.family).await?;
 
     let started_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -255,7 +255,7 @@ async fn forced_drain_watchdog(
 #[cfg(feature = "cuda")]
 async fn spawn_worker(
     cli: &Cli,
-    queue_depth: usize,
+    config: &ServerConfig,
     family: ModelFamily,
 ) -> anyhow_compat::Result<(
     rvllm_serve::WorkerHandle,
@@ -284,8 +284,11 @@ async fn spawn_worker(
     let cfg = cuda_worker::CudaWorkerConfig {
         paths,
         arena_bytes: (cli.arena_gb as usize) * 1024 * 1024 * 1024,
-        queue_depth,
+        queue_depth: config.max_queue_depth,
         family,
+        spec_decode: config.spec_decode,
+        spec_drafter_dir: config.spec_drafter_dir.clone(),
+        spec_k: config.spec_k,
     };
     cuda_worker::spawn_cuda_worker(cfg)
         .await
@@ -295,7 +298,7 @@ async fn spawn_worker(
 #[cfg(not(feature = "cuda"))]
 async fn spawn_worker(
     _cli: &Cli,
-    queue_depth: usize,
+    config: &ServerConfig,
     _family: ModelFamily,
 ) -> anyhow_compat::Result<(
     rvllm_serve::WorkerHandle,
@@ -304,7 +307,7 @@ async fn spawn_worker(
     tracing::warn!(
         "built without --features cuda — using mock worker (canned tokens, no real inference)",
     );
-    Ok(rvllm_serve::worker::spawn_mock_worker(queue_depth))
+    Ok(rvllm_serve::worker::spawn_mock_worker(config.max_queue_depth))
 }
 
 async fn shutdown_signal() {
