@@ -212,6 +212,50 @@ pub struct Gemma4DrafterRuntime {
     /// `None` and the cuda build asserts presence at call time.
     pub masked_embedder_mod: Option<rvllm_kernels::LoadedModule>,
     pub fn_masked_embedder_argmax_f16: Option<rvllm_kernels::KernelFn>,
+    /// Spec-decode commit 9: F16 shadow KV regions used by the
+    /// assistant cross-attention. The drafter has no K/V projections
+    /// of its own — at attention time it consumes the base's
+    /// last-non-shared-layer K/V (sliding source = layer 22 on E4B,
+    /// full source = layer 23). To keep the cross-attention launcher
+    /// uniformly F16 regardless of what dtype the base allocates its
+    /// own KV in (F16 / FP8 / NVFP4), we maintain a small F16 mirror
+    /// at those two source layers and populate it explicitly from
+    /// the base side during spec-decode prefill (deferred to a
+    /// follow-up commit).
+    ///
+    /// `Some` on a fully-armed `ensure_drafter` cuda path; `None`
+    /// for the non-cuda mock build (or until `attach_shadow_kv` is
+    /// called).
+    pub shadow_kv: Option<DrafterShadowKv>,
+}
+
+/// F16 shadow KV regions used by the assistant cross-attention. One
+/// pair per source layer (`sliding` + `full`). Layout matches the
+/// base's paged-decode expectation:
+///
+///   `[num_blocks_total * block_size * num_kv_heads * head_dim]` f16
+///
+/// — same shape as `flash_attention_2_decode_f16io_kernel`'s
+/// `key_cache` / `value_cache` arguments, so the existing launcher
+/// can read these regions directly without a new kernel.
+#[derive(Clone, Copy, Debug)]
+pub struct DrafterShadowKv {
+    pub sliding_k_ptr: u64,
+    pub sliding_v_ptr: u64,
+    pub full_k_ptr: u64,
+    pub full_v_ptr: u64,
+    /// Bytes per (K or V) buffer per layer type — exposed so the
+    /// populator can compute slot offsets and the launcher can
+    /// derive `max_blocks_per_seq`.
+    pub sliding_layer_bytes: usize,
+    pub full_layer_bytes: usize,
+    pub block_size: u32,
+    pub num_blocks_total: u32,
+    pub max_blocks_per_seq: u32,
+    pub sliding_num_kv_heads: u32,
+    pub sliding_head_dim: u32,
+    pub full_num_kv_heads: u32,
+    pub full_head_dim: u32,
 }
 
 impl Gemma4DrafterRuntime {
@@ -457,6 +501,7 @@ impl Gemma4DrafterRuntime {
             arch, top, layers, bytes_resident, shard_path,
             masked_embedder_mod: None,
             fn_masked_embedder_argmax_f16: None,
+            shadow_kv: None,
         })
     }
 
@@ -472,6 +517,21 @@ impl Gemma4DrafterRuntime {
     ) {
         self.masked_embedder_mod = Some(module);
         self.fn_masked_embedder_argmax_f16 = Some(entry);
+    }
+
+    /// Spec-decode commit 9: install F16 shadow KV pointers. Caller
+    /// (`Gemma4Bringup::ensure_drafter`) sizes the four regions from
+    /// the BASE arch (not the drafter) — `num_kv_heads_for_layer` +
+    /// `head_dim_for_layer` of the two source layers — and allocates
+    /// them above the scratch checkpoint via the engine's arena.
+    /// Once installed, the cross-attention launcher (follow-up
+    /// commit) reads these device pointers in place of the base's
+    /// own KV regions.
+    pub fn attach_shadow_kv(&mut self, shadow: DrafterShadowKv) {
+        self.shadow_kv = Some(shadow);
+        self.bytes_resident += 2 * (
+            shadow.sliding_layer_bytes + shadow.full_layer_bytes
+        );
     }
 
     /// Non-cuda build stub. Linkable but the path is unreachable
@@ -501,6 +561,7 @@ impl Gemma4DrafterRuntime {
             shard_path: layout.shard_path.clone(),
             masked_embedder_mod: None,
             fn_masked_embedder_argmax_f16: None,
+            shadow_kv: None,
         })
     }
 

@@ -1721,6 +1721,97 @@ impl Gemma4Bringup {
                 .get_function("gemma4_masked_embedder_argmax_f16_kernel")?;
             rt.attach_masked_embedder_kernel(module, entry);
         }
+        // Commit 9: allocate F16 shadow KV at the two base source
+        // layers (sliding source = layer 22, full source = layer 23
+        // on E4B). Sizing mirrors the base's paged-decode expectation
+        // — `[num_blocks_total * block_size * num_kv_heads *
+        // head_dim] f16` per K and per V buffer — so the existing
+        // `flash_attention_2_decode_f16io_kernel` can read directly
+        // from these regions (no new kernel needed). Allocation
+        // happens ABOVE the scratch checkpoint so per-request
+        // `arena.restore` never reclaims it.
+        //
+        // Population (copy/dequant from base's actual KV) is wired
+        // in a follow-up commit; the launcher wiring follows that.
+        // For now the regions are zero-initialised and resident.
+        #[cfg(feature = "cuda")]
+        {
+            let sources = self
+                .assistant_kv_sources
+                .expect("checked above (asistant_kv_sources.is_none())");
+            let sliding_li = sources.sliding_source_layer as usize;
+            let full_li = sources.full_source_layer as usize;
+            let block_size: u32 = 32;
+            let num_blocks_total: u32 = std::env::var("RVLLM_NUM_BLOCKS")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+
+            let sliding_nkvh = self.arch.num_kv_heads_for_layer(sliding_li) as u32;
+            let sliding_hd = self.arch.head_dim_for_layer(sliding_li) as u32;
+            let full_nkvh = self.arch.num_kv_heads_for_layer(full_li) as u32;
+            let full_hd = self.arch.head_dim_for_layer(full_li) as u32;
+
+            // bytes = num_blocks_total * block_size * nkvh * hd * 2
+            //         (sizeof f16 = 2)
+            let sliding_layer_bytes = (num_blocks_total as usize)
+                * (block_size as usize)
+                * (sliding_nkvh as usize)
+                * (sliding_hd as usize)
+                * 2;
+            let full_layer_bytes = (num_blocks_total as usize)
+                * (block_size as usize)
+                * (full_nkvh as usize)
+                * (full_hd as usize)
+                * 2;
+
+            let alloc_zeroed = |name: &'static str, bytes: usize| -> Result<u64> {
+                let region = self.arena.region(name, bytes.max(16), 256)?;
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let rc = cuMemsetD8_v2(region.device_ptr(), 0, bytes);
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "drafter shadow KV zero-init",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                Ok(region.device_ptr())
+            };
+
+            let sliding_k_ptr = alloc_zeroed("drafter_shadow_k_sliding", sliding_layer_bytes)?;
+            let sliding_v_ptr = alloc_zeroed("drafter_shadow_v_sliding", sliding_layer_bytes)?;
+            let full_k_ptr    = alloc_zeroed("drafter_shadow_k_full",    full_layer_bytes)?;
+            let full_v_ptr    = alloc_zeroed("drafter_shadow_v_full",    full_layer_bytes)?;
+
+            let shadow = crate::gemma4_drafter::DrafterShadowKv {
+                sliding_k_ptr,
+                sliding_v_ptr,
+                full_k_ptr,
+                full_v_ptr,
+                sliding_layer_bytes,
+                full_layer_bytes,
+                block_size,
+                num_blocks_total,
+                max_blocks_per_seq: num_blocks_total,
+                sliding_num_kv_heads: sliding_nkvh,
+                sliding_head_dim: sliding_hd,
+                full_num_kv_heads: full_nkvh,
+                full_head_dim: full_hd,
+            };
+            let total_mib = (2 * (sliding_layer_bytes + full_layer_bytes)) as f64
+                / (1024.0 * 1024.0);
+            eprintln!(
+                "[gemma4-drafter] shadow KV allocated above scratch: \
+                 sliding=layer {sliding_li} ({sliding_nkvh}×{sliding_hd} \
+                 hd, {:.1} MiB K+V), full=layer {full_li} ({full_nkvh}×\
+                 {full_hd} hd, {:.1} MiB K+V), total {:.1} MiB f16",
+                2.0 * sliding_layer_bytes as f64 / (1024.0 * 1024.0),
+                2.0 * full_layer_bytes as f64 / (1024.0 * 1024.0),
+                total_mib,
+            );
+            rt.attach_shadow_kv(shadow);
+        }
         let mut slot = self.drafter.lock().unwrap();
         // Re-check inside the lock — another thread may have raced.
         if slot.is_none() {
