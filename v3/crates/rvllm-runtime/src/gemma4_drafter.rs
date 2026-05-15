@@ -203,6 +203,15 @@ pub struct Gemma4DrafterRuntime {
     pub bytes_resident: usize,
     /// Path the upload came from. Surfaced in error messages.
     pub shard_path: PathBuf,
+    /// MaskedEmbedder PTX module + entry handle. Loaded lazily by
+    /// `Gemma4Bringup::ensure_drafter` from
+    /// `kernels/sm_121/gemma4_masked_embedder.ptx`. The `LoadedModule`
+    /// is RAII-dropped only when `Gemma4DrafterRuntime` itself is
+    /// dropped, so the `KernelFn` stays valid for the engine lifetime.
+    /// Wrapped in `Option` so a non-cuda mock build can leave it
+    /// `None` and the cuda build asserts presence at call time.
+    pub masked_embedder_mod: Option<rvllm_kernels::LoadedModule>,
+    pub fn_masked_embedder_argmax_f16: Option<rvllm_kernels::KernelFn>,
 }
 
 impl Gemma4DrafterRuntime {
@@ -444,7 +453,25 @@ impl Gemma4DrafterRuntime {
             arch.num_hidden_layers,
         );
 
-        Ok(Self { arch, top, layers, bytes_resident, shard_path })
+        Ok(Self {
+            arch, top, layers, bytes_resident, shard_path,
+            masked_embedder_mod: None,
+            fn_masked_embedder_argmax_f16: None,
+        })
+    }
+
+    /// Caller (`Gemma4Bringup::ensure_drafter`) loads
+    /// `gemma4_masked_embedder` PTX via the engine's `KernelLoader`
+    /// and hands the resulting module + entry to the drafter. Doing
+    /// this here keeps the PTX load gated on the same spec-decode
+    /// env var as the weight upload — non-spec runs never pay for it.
+    pub fn attach_masked_embedder_kernel(
+        &mut self,
+        module: rvllm_kernels::LoadedModule,
+        entry: rvllm_kernels::KernelFn,
+    ) {
+        self.masked_embedder_mod = Some(module);
+        self.fn_masked_embedder_argmax_f16 = Some(entry);
     }
 
     /// Non-cuda build stub. Linkable but the path is unreachable
@@ -472,6 +499,8 @@ impl Gemma4DrafterRuntime {
             }).collect(),
             bytes_resident: 0,
             shard_path: layout.shard_path.clone(),
+            masked_embedder_mod: None,
+            fn_masked_embedder_argmax_f16: None,
         })
     }
 
@@ -592,6 +621,133 @@ impl Gemma4DrafterRuntime {
 /// Default state is an empty mutex — when `spec_decode` is false the
 /// drafter is never constructed and consumes zero HBM.
 pub type DrafterSlot = Mutex<Option<Gemma4DrafterRuntime>>;
+
+/// Launch the MaskedEmbedder fused kernel
+/// (`kernels/gemma4_masked_embedder.cu`). One CTA, 256 threads,
+/// single-token argmax over a sparse `top_k * per_centroid` candidate
+/// set (4096 tokens on E4B default sizing). The kernel is loaded
+/// through the standard `KernelLoader::load_ptx` path; pass the
+/// resolved `KernelFn` in.
+///
+/// # Pointers
+///   * `hidden` — f16 [hidden_size], the assistant's pre-lm-head
+///     hidden state for the position being scored.
+///   * `centroids` — f16 [num_centroids, hidden_size].
+///   * `token_ordering` — i64 [vocab].
+///   * `lm_head` — f16 [vocab, hidden_size]. Tied to
+///     `model.embed_tokens.weight` per HF.
+///   * `out_token_id` — i32 [1], filled with the argmax token id.
+///   * `out_logit` — f32 [1] or 0 to skip writing the top logit.
+///
+/// # Safety
+/// All non-null pointers must be valid device addresses of the stated
+/// dtype + length. Kernel performs no bounds checks beyond the
+/// `tok < 0 || tok >= vocab` guard on `token_ordering` reads.
+///
+/// # Smem
+/// Sized as
+///   `hidden_size*4 + num_centroids*4 + top_k*4 + 8*4 + 8*4` bytes.
+/// At E4B defaults (hidden=256, n_cent=2048, top_k=32) that's 9408
+/// bytes — fits in the default 48 KiB allowance without
+/// `cuFuncSetAttribute`.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_masked_embedder_argmax_f16(
+    fn_masked: rvllm_kernels::KernelFn,
+    hidden: u64,
+    centroids: u64,
+    token_ordering: u64,
+    lm_head: u64,
+    hidden_size: i32,
+    n_centroids: i32,
+    top_k: i32,
+    per_centroid: i32,
+    vocab: i32,
+    out_token_id: u64,
+    out_logit: u64,
+    stream: u64,
+) -> Result<()> {
+    if hidden_size <= 0 || n_centroids <= 0 || top_k <= 0
+        || per_centroid <= 0 || vocab <= 0
+    {
+        return Err(RvllmError::Attention {
+            err: AttentionError::FeatureNotAvailable {
+                op: "launch_masked_embedder_argmax_f16: \
+                     non-positive dimension argument",
+                backend: "Gemma4Drafter",
+            },
+            ctx: AttnCtx {
+                op: "launch_masked_embedder_argmax_f16",
+                stream,
+                num_seqs: 1,
+                head_dim: hidden_size.max(0) as u32,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
+    // The kernel hard-codes 8 warp-best slots in smem (see
+    // `warp_best_logits + 8` and `warp_best_ids + 8` in the .cu).
+    // Block sizes that produce more than 8 warps would overrun the
+    // smem reservation; refuse to launch.
+    const BLOCK: u32 = 256;
+    let num_warps = BLOCK / 32;
+    debug_assert!(num_warps <= 8);
+
+    let smem_bytes: u32 = (hidden_size as u32 * 4)
+        + (n_centroids as u32 * 4)
+        + (top_k as u32 * 4)
+        + (num_warps * 4)   // warp_best_logits
+        + (num_warps * 4);  // warp_best_ids
+
+    use cudarc::driver::sys::*;
+    let mut a_hidden = hidden;
+    let mut a_cent = centroids;
+    let mut a_tok_ord = token_ordering;
+    let mut a_lm = lm_head;
+    let mut a_hs = hidden_size;
+    let mut a_nc = n_centroids;
+    let mut a_tk = top_k;
+    let mut a_pc = per_centroid;
+    let mut a_vc = vocab;
+    let mut a_out_id = out_token_id;
+    let mut a_out_lg = out_logit;
+    let args: [*mut core::ffi::c_void; 11] = [
+        &mut a_hidden  as *mut _ as *mut _,
+        &mut a_cent    as *mut _ as *mut _,
+        &mut a_tok_ord as *mut _ as *mut _,
+        &mut a_lm      as *mut _ as *mut _,
+        &mut a_hs      as *mut _ as *mut _,
+        &mut a_nc      as *mut _ as *mut _,
+        &mut a_tk      as *mut _ as *mut _,
+        &mut a_pc      as *mut _ as *mut _,
+        &mut a_vc      as *mut _ as *mut _,
+        &mut a_out_id  as *mut _ as *mut _,
+        &mut a_out_lg  as *mut _ as *mut _,
+    ];
+    let rc = cuLaunchKernel(
+        fn_masked.raw() as CUfunction,
+        1, 1, 1,
+        BLOCK, 1, 1,
+        smem_bytes,
+        stream as CUstream,
+        args.as_ptr() as *mut *mut core::ffi::c_void,
+        core::ptr::null_mut(),
+    );
+    if rc != CUresult::CUDA_SUCCESS {
+        return Err(RvllmError::Cuda {
+            kind: rvllm_core::CudaErrorKind::LaunchFailed,
+            op: "gemma4_masked_embedder_argmax_f16",
+            ctx: rvllm_core::CudaCtx {
+                stream,
+                kernel: "gemma4_masked_embedder_argmax_f16_kernel",
+                launch: None,
+                device: 0,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
+    Ok(())
+}
 
 /// Eager BF16 → F16 element-wise conversion. Each input pair of
 /// bytes is a single BF16 (1 sign / 8 exp / 7 mantissa); each output

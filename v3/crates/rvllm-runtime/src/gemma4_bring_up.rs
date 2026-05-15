@@ -1708,9 +1708,19 @@ impl Gemma4Bringup {
             });
         }
         #[cfg(feature = "cuda")]
-        let rt = crate::gemma4_drafter::Gemma4DrafterRuntime::load(&layout, &self.arena)?;
+        let mut rt = crate::gemma4_drafter::Gemma4DrafterRuntime::load(&layout, &self.arena)?;
         #[cfg(not(feature = "cuda"))]
-        let rt = crate::gemma4_drafter::Gemma4DrafterRuntime::load_mock(&layout)?;
+        let mut rt = crate::gemma4_drafter::Gemma4DrafterRuntime::load_mock(&layout)?;
+        // Commit 6: load the MaskedEmbedder PTX kernel and attach it to
+        // the drafter runtime. The kernel is only built when this code
+        // path runs, so a non-spec engine never pays the PTX load.
+        #[cfg(feature = "cuda")]
+        {
+            let module = self.kernels.load_ptx("gemma4_masked_embedder")?;
+            let entry = module
+                .get_function("gemma4_masked_embedder_argmax_f16_kernel")?;
+            rt.attach_masked_embedder_kernel(module, entry);
+        }
         let mut slot = self.drafter.lock().unwrap();
         // Re-check inside the lock — another thread may have raced.
         if slot.is_none() {
