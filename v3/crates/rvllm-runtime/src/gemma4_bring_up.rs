@@ -3575,6 +3575,169 @@ impl Gemma4Bringup {
     /// baseline generation.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
+    /// Commit 37 — task #2 final landing.
+    ///
+    /// Iterative outer wrapper around `run_generate_speculative`.
+    /// Calls the existing single-step speculative function in a loop,
+    /// extending the prompt by `accept_len + 1` tokens per iteration.
+    /// The internal `run_generate(max_new = spec_k + 1)` call in each
+    /// iteration's body uses the prefix-cache to skip re-prefilling
+    /// the unchanged prompt prefix; only the few newly committed
+    /// tokens trigger fresh prefill on each iteration.
+    ///
+    /// This delivers the CORRECT iterative spec-decode structure:
+    /// per-iter K drafter forwards + K+1 base decodes + emit
+    /// accept_len+1 tokens. Per-iter wall time:
+    ///   - 1 prefill of ~accept_len+1 tokens (cheap via prefix cache)
+    ///   - K+1 sequential base decodes (~30-40 ms × (K+1) on E4B)
+    ///   - K drafter forwards (~150 μs × K)
+    ///
+    /// No wall-clock SPEEDUP until the inner `run_generate(K+1)` is
+    /// replaced with a single batched-verify call producing K logit
+    /// rows in one base prefill — but that swap is now a localized
+    /// surgery inside `run_generate_speculative`, not a full
+    /// architectural rewrite. The outer loop is sound.
+    ///
+    /// Gated by `RVLLM_GEMMA4_SPEC_ITERATIVE=1`. Default off — the
+    /// non-iterative single-step path remains the primary entry to
+    /// avoid regressing any in-flight tests.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn run_generate_speculative_iterative(
+        &self,
+        fn_embed: rvllm_kernels::KernelFn,
+        fn_argmax: rvllm_kernels::KernelFn,
+        prompt_ids: &[u32],
+        max_new: usize,
+        eos_ids: &[u32],
+        spec_k: u32,
+        sampling: SamplingConfig,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        mut on_token: Option<&mut dyn FnMut(u32) -> bool>,
+        vision_splice: &[(usize, &[u8])],
+        audio_splice: &[(usize, &[u8])],
+    ) -> Result<Vec<u32>> {
+        if max_new == 0 || spec_k == 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "max_new/spec_k",
+                    reason: "must be >= 1".into(),
+                },
+                field: "max_new",
+            });
+        }
+
+        // Each iter emits at most `spec_k + 1` tokens (accept_len up
+        // to spec_k, plus one bonus base token at divergence).
+        let max_emit_per_iter = (spec_k as usize) + 1;
+
+        let mut emitted: Vec<u32> = Vec::with_capacity(max_new);
+        let mut current_prompt: Vec<u32> = prompt_ids.to_vec();
+        let mut iter_count: u32 = 0;
+        let mut total_drafted: u32 = 0;
+        let mut total_accepted: u32 = 0;
+
+        // Force the inner spec function to emit accepted-prefix
+        // tokens, not the full base sequence. We need this so the
+        // outer loop's emit is bounded by spec_k+1 per iteration.
+        // The original env knob remains user-controllable; we set
+        // it inline here for the iterative path's correctness.
+        let prev_emit_env = std::env::var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED").ok();
+        std::env::set_var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED", "1");
+
+        let mut result = Ok::<Vec<u32>, rvllm_core::RvllmError>(Vec::new());
+        'outer: while emitted.len() < max_new {
+            // Cancel check between iterations — cheap atomic load.
+            if let Some(c) = cancel {
+                if c.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
+            let want = (max_new - emitted.len()).min(max_emit_per_iter);
+            let inner_max_new = want.min(max_emit_per_iter);
+
+            // Per-iteration spec call: returns accept_len + 1 tokens
+            // (or 1 token if no acceptance). Vision/audio splice only
+            // legal on the FIRST iteration (the inner function still
+            // rejects them; we pass empty after iter 0).
+            let (vs, as_) = if iter_count == 0 {
+                (vision_splice, audio_splice)
+            } else {
+                (&[] as &[(usize, &[u8])], &[] as &[(usize, &[u8])])
+            };
+
+            // The on_token callback only fires from base's decode loop;
+            // pass `None` to avoid double-emission. We'll deliver
+            // accepted tokens to the worker via the return value.
+            let chunk = match self.run_generate_speculative(
+                fn_embed,
+                fn_argmax,
+                &current_prompt,
+                inner_max_new,
+                eos_ids,
+                spec_k,
+                sampling,
+                cancel,
+                None,
+                vs,
+                as_,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    result = Err(e);
+                    break 'outer;
+                }
+            };
+            if chunk.is_empty() {
+                // Defensive: nothing emitted — break to avoid infinite loop.
+                break;
+            }
+            if let Some(stats) = self.take_last_spec_stats() {
+                total_drafted = total_drafted.saturating_add(stats.drafted);
+                total_accepted = total_accepted.saturating_add(stats.accepted);
+            }
+
+            // Deliver each emitted token to the streaming callback
+            // and accumulate; honor EOS + cancel.
+            for &tok in &chunk {
+                if emitted.len() >= max_new { break 'outer; }
+                if eos_ids.contains(&tok) {
+                    emitted.push(tok);
+                    break 'outer;
+                }
+                emitted.push(tok);
+                if let Some(cb) = on_token.as_mut() {
+                    if !cb(tok) { break 'outer; }
+                }
+            }
+            // Extend prompt with what we just emitted so the next
+            // iter's prefix-cache lookup hits the right state.
+            current_prompt.extend_from_slice(&chunk);
+            iter_count = iter_count.saturating_add(1);
+        }
+        // Restore prior env state.
+        match prev_emit_env {
+            Some(v) => std::env::set_var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED", v),
+            None => std::env::remove_var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED"),
+        }
+        // Refresh aggregated stats for header / event emission.
+        *self.last_spec_stats.lock().unwrap() = Some(LastSpecStats {
+            drafted: total_drafted,
+            accepted: total_accepted,
+            cumulative_decoded: emitted.len() as u32,
+        });
+        tracing::info!(
+            iter_count,
+            total_drafted,
+            total_accepted,
+            emitted = emitted.len(),
+            max_new,
+            "Gemma 4 speculative iterative wrapper complete"
+        );
+        result?;
+        Ok(emitted)
+    }
+
     pub unsafe fn run_generate_speculative(
         &self,
         fn_embed: rvllm_kernels::KernelFn,
