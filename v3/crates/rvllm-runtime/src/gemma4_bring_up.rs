@@ -3693,16 +3693,17 @@ impl Gemma4Bringup {
         self.base_last_hidden_snapshot_pending
             .store(true, std::sync::atomic::Ordering::Release);
 
-        // Commit 26: activate per-step logits capture if lossy-greedy
-        // acceptance is enabled. Allocates `max_new * vocab` f32 in
-        // the engine-wide buffer; capture happens inside run_generate
-        // at the prefill argmax + decode-loop argmax sites.
+        // Commit 26 + 29: activate per-step logits capture if either
+        // lossy-greedy OR typical-acceptance (commit 29 quick-check)
+        // is enabled. Allocates max_new * vocab f32; capture happens
+        // inside run_generate at the prefill + decode-loop argmax
+        // sites.
         let lossy_threshold: f32 = std::env::var("RVLLM_GEMMA4_SPEC_LOSSY_THRESHOLD")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v > 0.0)
             .unwrap_or(0.0);
-        let want_capture = lossy_threshold > 0.0;
+        let want_capture = lossy_threshold > 0.0 || typical_mode;
         if want_capture {
             let vocab_sz = arch.vocab_size as usize;
             let needed = max_new.saturating_mul(vocab_sz);
@@ -4371,12 +4372,74 @@ impl Gemma4Bringup {
             None
         };
         let vocab_sz = arch.vocab_size as usize;
+        // Commit 29 (quick-check): typical-acceptance temperature.
+        // Read from the user's sampling config when typical mode is
+        // on; ignored otherwise.
+        let typical_temp: f32 = if typical_mode {
+            match sampling {
+                SamplingConfig::Stochastic { temperature, .. } => temperature.max(1e-6),
+                SamplingConfig::Greedy => 1.0,
+            }
+        } else { 0.0 };
+        // Simple xorshift for the per-position acceptance Us. Keep
+        // it independent of the drafter sampling LCG so reseeding
+        // one doesn't perturb the other.
+        let mut accept_rng_state: u64 = next_rand_f32_spec
+            .wrapping_add(0x517C_C1B7_2722_0A95);
+        let mut next_u01 = || -> f64 {
+            accept_rng_state ^= accept_rng_state << 13;
+            accept_rng_state ^= accept_rng_state >> 7;
+            accept_rng_state ^= accept_rng_state << 17;
+            ((accept_rng_state >> 33) as f64) / ((1u64 << 31) as f64)
+        };
         for i in 0..kmax {
             let d = drafter_tokens[i] as usize;
             let b = _base_first_tok[i] as usize;
             if d == b {
                 accept_len += 1;
                 continue;
+            }
+            // Commit 29 (quick-check): typical-acceptance via
+            // modified-rejection-sampling in log space.
+            //
+            // Important caveat: this uses base logits that are
+            // BASE-SELF-CONDITIONED (row i was computed assuming base
+            // sampled its own argmax at position i-1, NOT D_{i-1}).
+            // That's not the strict Leviathan/Kalman procedure — for
+            // mathematically correct typical-acceptance the base
+            // logits must be DRAFT-CONDITIONED, which needs a new
+            // step-and-get-logits base API (deferred). This
+            // quick-check gives an upper bound on accept rate so we
+            // can decide whether the full plumbing is worth the
+            // additional session.
+            if typical_mode {
+                if let Some(buf) = captured.as_ref() {
+                    let row_off = i * vocab_sz;
+                    if buf.len() >= row_off + vocab_sz && d < vocab_sz {
+                        let row = &buf[row_off..row_off + vocab_sz];
+                        // log p_base(D_i) at this temperature.
+                        let inv_t = 1.0f32 / typical_temp;
+                        let mut max_l = f32::NEG_INFINITY;
+                        for &l in row { if l.is_finite() && l > max_l { max_l = l; } }
+                        let mut lse: f64 = 0.0;
+                        for &l in row {
+                            if !l.is_finite() { continue; }
+                            lse += (((l - max_l) * inv_t) as f64).exp();
+                        }
+                        let log_p_b = ((row[d] - max_l) * inv_t) as f64
+                            - lse.ln();
+                        let log_q = drafter_log_q
+                            .get(i).copied().unwrap_or(f32::NEG_INFINITY) as f64;
+                        // log_accept = min(0, log p_b - log q)
+                        let log_accept = (log_p_b - log_q).min(0.0);
+                        let u = next_u01().max(1e-300);
+                        let log_u = u.ln();
+                        if log_u <= log_accept {
+                            accept_len += 1;
+                            continue;
+                        }
+                    }
+                }
             }
             // Lossy greedy ratio test (env-gated).
             if lossy_threshold > 0.0 {
