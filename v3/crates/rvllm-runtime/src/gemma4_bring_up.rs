@@ -3439,7 +3439,7 @@ impl Gemma4Bringup {
         spec_k: u32,
         sampling: SamplingConfig,
         _cancel: Option<&std::sync::atomic::AtomicBool>,
-        _on_token: Option<&mut dyn FnMut(u32) -> bool>,
+        mut _on_token: Option<&mut dyn FnMut(u32) -> bool>,
         vision_splice: &[(usize, &[u8])],
         audio_splice: &[(usize, &[u8])],
     ) -> Result<Vec<u32>> {
@@ -3540,12 +3540,12 @@ impl Gemma4Bringup {
             fn_embed,
             self.fused.fn_argmax,
             prompt_ids,
-            /* max_new */ 1,
-            /* eos_ids */ &[],
+            max_new,
+            _eos_ids,
             /* shadow_requested */ false,
             SamplingConfig::Greedy,
-            None,
-            None,
+            _cancel,
+            _on_token.take(),
             /* vision_splice */ &[],
             /* audio_splice */ &[],
         )?;
@@ -3896,30 +3896,65 @@ impl Gemma4Bringup {
                 drafter.arch.backbone_hidden_size as i32,
             )?;
         }
-        tracing::debug!(
-            "Gemma 4 speculative path: one full drafter MTP step \
-             exercised on real pointers; K-draft loop + base verify \
-             + acceptance still pending"
+        // Commit 17: K=1 verify + acceptance. Read the drafter's
+        // argmax token id (workspace.out_token_id, i32[1]) back to
+        // host and compare against the BASE's first-decode argmax
+        // (= `_base_first_tok[0]`, the token base committed at
+        // position prompt_len during the initial
+        // `run_generate(max_new=1)`).
+        //
+        // K=1 path is mathematically equivalent to non-speculative
+        // greedy decode (base always wins on mismatch), so it
+        // provides correctness without speedup. K>1 speculative
+        // decoding (chained drafter + batched verify on base) is the
+        // next bounded follow-up.
+        //
+        // Host stream fence so the DtoH copy reads the actual kernel
+        // result, not stale memory.
+        self.stream.fence()?;
+        let mut drafter_tok_host: [u8; 4] = [0; 4];
+        {
+            let guard = self.drafter.lock().unwrap();
+            let drafter = guard.as_ref().expect("checked above");
+            let _ = drafter; // kept resident; only need workspace ptr
+        }
+        // The workspace stays alive until arena.restore() at request
+        // end. Reading workspace.out_token_id (i32[1]) is safe.
+        let rc = cudarc::driver::sys::cuMemcpyDtoH_v2(
+            drafter_tok_host.as_mut_ptr() as *mut _,
+            workspace.out_token_id,
+            4,
         );
+        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "run_generate_speculative: DtoH drafter token id",
+                rvllm_core::CudaErrorKind::MemcpyFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        let drafter_tok: i32 = i32::from_le_bytes(drafter_tok_host);
+        let drafter_tok_u: u32 = drafter_tok.max(0) as u32;
+        let base_tok: u32 = _base_first_tok
+            .last().copied()
+            .unwrap_or(0);
 
-        // Avoid an unused-binding warning on `max_new` for now —
-        // a follow-up commit drives a real K-step draft loop and
-        // returns the accepted tokens.
-        let _ = max_new;
-
-        Err(rvllm_core::RvllmError::Attention {
-            err: rvllm_core::AttentionError::FeatureNotAvailable {
-                op: "Gemma4Bringup::run_generate_speculative (full drafter MTP step runs; K-draft loop + base verify + acceptance pending)",
-                backend: "Gemma4SpecDecode",
-            },
-            ctx: rvllm_core::AttnCtx {
-                op: "Gemma4Bringup::run_generate_speculative",
-                stream,
-                num_seqs: 1,
-                head_dim: self.arch.max_head_dim() as u32,
-            },
-            bt: std::backtrace::Backtrace::capture(),
-        })
+        // K=1 accept-rate measurement at step 1 only. The drafter's
+        // d0 is compared against the BASE's first-decode argmax
+        // (= `_base_first_tok[0]`). The full base sequence is
+        // returned unchanged — this commit lands the wire contract
+        // and accept-rate observability; real K>=2 acceleration with
+        // chained drafter + batched base verify is the follow-up.
+        let accept_rate: f32 = if drafter_tok_u == base_tok { 1.0 } else { 0.0 };
+        tracing::info!(
+            spec_k,
+            drafter_tok = drafter_tok_u,
+            base_tok,
+            accept_rate,
+            base_tokens = _base_first_tok.len(),
+            "Gemma 4 speculative K=1 verify (accept-rate only; full base \
+             sequence returned)"
+        );
+        Ok(_base_first_tok)
     }
 
     #[cfg(feature = "cuda")]
