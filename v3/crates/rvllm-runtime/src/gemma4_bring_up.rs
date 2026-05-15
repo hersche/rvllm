@@ -3980,11 +3980,12 @@ impl Gemma4Bringup {
         // layer. If one slot dominates magnitude → that explains the
         // saturated wrong-K argmax that's invariant to Q-RoPE.
         if std::env::var("RVLLM_SPEC_FA_DEBUG").as_deref() == Ok("1") {
-            let (shadow_k, nkvh, hd): (u64, usize, usize) = {
+            let (shadow_k, shadow_v, nkvh, hd): (u64, u64, usize, usize) = {
                 let guard = self.drafter.lock().unwrap();
                 let d = guard.as_ref().expect("drafter resident");
                 let s = d.shadow_kv.expect("shadow_kv populated");
                 (s.sliding_k_ptr,
+                 s.sliding_v_ptr,
                  s.sliding_num_kv_heads as usize,
                  s.sliding_head_dim as usize)
             };
@@ -4015,6 +4016,65 @@ impl Gemma4Bringup {
                 eprintln!(
                     "[spec-kprobe] slot={} max_abs={:.3} mean_abs={:.4}",
                     s, max_abs, mean_abs,
+                );
+            }
+            // Commit 31e: V cache magnitudes per slot. If V values
+            // are uniform across slots → mean(V) ≈ V_attended →
+            // Q-blind FA output is "explained by V uniformity, not
+            // FA kernel bug." If V varies per slot → FA kernel
+            // really IS ignoring Q.
+            let mut vbuf = vec![0u16; total_bytes / 2];
+            let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                vbuf.as_mut_ptr() as *mut _,
+                shadow_v,
+                total_bytes,
+            );
+            // Compute pairwise cosine sim of head0's V across slots
+            // to test uniformity directly.
+            let extract = |slot: usize| -> Vec<f32> {
+                let off = slot * (nkvh * hd);
+                vbuf[off..off + hd].iter()
+                    .map(|&b| half::f16::from_bits(b).to_f32())
+                    .collect()
+            };
+            for s in 0..n_probe {
+                let off = s * (nkvh * hd);
+                let slice = &vbuf[off..off + (nkvh * hd)];
+                let mut max_abs = 0f32;
+                let mut sum_abs = 0f64;
+                let mut sum_sq = 0f64;
+                for &b in slice {
+                    let v = half::f16::from_bits(b).to_f32();
+                    if v.is_finite() {
+                        sum_abs += v.abs() as f64;
+                        sum_sq += (v * v) as f64;
+                        if v.abs() > max_abs { max_abs = v.abs(); }
+                    }
+                }
+                let mean_abs = (sum_abs / slice.len() as f64) as f32;
+                let rms = (sum_sq / slice.len() as f64).sqrt() as f32;
+                eprintln!(
+                    "[spec-vprobe] slot={} max_abs={:.3} mean_abs={:.4} rms={:.4}",
+                    s, max_abs, mean_abs, rms,
+                );
+            }
+            // Cosine similarity between V[slot=0] and V[slot=N-1] —
+            // if highly uniform (>0.95) V cache hypothesis confirmed.
+            if n_probe >= 2 {
+                let v0 = extract(0);
+                let vn = extract(n_probe - 1);
+                let mut dot = 0f64;
+                let mut n0 = 0f64;
+                let mut nn = 0f64;
+                for i in 0..hd {
+                    dot += (v0[i] * vn[i]) as f64;
+                    n0 += (v0[i] * v0[i]) as f64;
+                    nn += (vn[i] * vn[i]) as f64;
+                }
+                let cos = dot / (n0.sqrt() * nn.sqrt() + 1e-30);
+                eprintln!(
+                    "[spec-vprobe] cosine(V[slot=0], V[slot={}]) = {:.4}",
+                    n_probe - 1, cos,
                 );
             }
             // Probe drafter layer 0 layernorm gammas — if these are
@@ -4194,9 +4254,11 @@ impl Gemma4Bringup {
                         else if v.is_infinite() { inf_count += 1; }
                         else if v.abs() > max_abs { max_abs = v.abs(); }
                     }
+                    let head8: Vec<f32> = h.iter().take(8)
+                        .map(|&b| half::f16::from_bits(b).to_f32()).collect();
                     eprintln!(
-                        "[spec-fa] li={} {} fence_ok={} dtoh_ok={} nan={} inf={} max_abs={:.3}",
-                        li, label, fence_ok, dtoh_ok, nan_count, inf_count, max_abs,
+                        "[spec-fa] li={} {} fence_ok={} dtoh_ok={} nan={} inf={} max_abs={:.3} head8={:?}",
+                        li, label, fence_ok, dtoh_ok, nan_count, inf_count, max_abs, head8,
                     );
                 };
                 let q_rows = drafter.arch.num_attention_heads * layer.effective_head_dim;
