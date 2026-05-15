@@ -3975,6 +3975,85 @@ impl Gemma4Bringup {
             let _ = (sliding_view, full_view);
         }
 
+        // Commit 31c: per-slot K cache probe. Dumps max_abs per slot
+        // for the first N prompt positions in the shadow's sliding K
+        // layer. If one slot dominates magnitude → that explains the
+        // saturated wrong-K argmax that's invariant to Q-RoPE.
+        if std::env::var("RVLLM_SPEC_FA_DEBUG").as_deref() == Ok("1") {
+            let (shadow_k, nkvh, hd): (u64, usize, usize) = {
+                let guard = self.drafter.lock().unwrap();
+                let d = guard.as_ref().expect("drafter resident");
+                let s = d.shadow_kv.expect("shadow_kv populated");
+                (s.sliding_k_ptr,
+                 s.sliding_num_kv_heads as usize,
+                 s.sliding_head_dim as usize)
+            };
+            let n_probe = 16usize.min(prompt_ids.len());
+            let head_bytes = hd * 2;
+            let slot_bytes = nkvh * head_bytes;
+            let total_bytes = n_probe * slot_bytes;
+            let mut buf = vec![0u16; total_bytes / 2];
+            let _ = self.stream.fence();
+            let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut _,
+                shadow_k,
+                total_bytes,
+            );
+            for s in 0..n_probe {
+                let off = s * (nkvh * hd);
+                let slice = &buf[off..off + (nkvh * hd)];
+                let mut max_abs = 0f32;
+                let mut sum_abs = 0f64;
+                for &b in slice {
+                    let v = half::f16::from_bits(b).to_f32();
+                    if v.is_finite() {
+                        sum_abs += v.abs() as f64;
+                        if v.abs() > max_abs { max_abs = v.abs(); }
+                    }
+                }
+                let mean_abs = (sum_abs / (slice.len() as f64)) as f32;
+                eprintln!(
+                    "[spec-kprobe] slot={} max_abs={:.3} mean_abs={:.4}",
+                    s, max_abs, mean_abs,
+                );
+            }
+            // Probe drafter layer 0 layernorm gammas — if these are
+            // anomalously large, they're scaling the residual past
+            // the cross-attn signal magnitude.
+            let (l0_input_g, l0_post_attn_g, l0_pre_ff_g, l0_post_ff_g, hidden_sz) = {
+                let guard = self.drafter.lock().unwrap();
+                let d = guard.as_ref().expect("drafter resident");
+                let l = &d.layers[0];
+                (l.input_layernorm, l.post_attention_layernorm,
+                 l.pre_feedforward_layernorm, l.post_feedforward_layernorm,
+                 d.arch.hidden_size)
+            };
+            let mut probe_norm = |ptr: u64, label: &str| {
+                let mut buf = vec![0u16; hidden_sz];
+                let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut _, ptr, hidden_sz * 2);
+                let mut max_abs = 0f32;
+                let mut sum_abs = 0f64;
+                for &b in &buf {
+                    let v = half::f16::from_bits(b).to_f32();
+                    if v.is_finite() {
+                        sum_abs += v.abs() as f64;
+                        if v.abs() > max_abs { max_abs = v.abs(); }
+                    }
+                }
+                let head4: Vec<f32> = buf.iter().take(4)
+                    .map(|&b| half::f16::from_bits(b).to_f32()).collect();
+                eprintln!(
+                    "[spec-gamma] L0 {:>20} max={:.3} mean={:.4} head4={:?}",
+                    label, max_abs, sum_abs / hidden_sz as f64, head4,
+                );
+            };
+            probe_norm(l0_input_g, "input_layernorm");
+            probe_norm(l0_post_attn_g, "post_attn_layernorm");
+            probe_norm(l0_pre_ff_g, "pre_ff_layernorm");
+            probe_norm(l0_post_ff_g, "post_ff_layernorm");
+        }
+
         // K-iteration drafter loop. Collects up to spec_k candidate
         // tokens. At commit 23 the return value still uses the BASE's
         // first decode token — verify + accept land in commits 24/25.
