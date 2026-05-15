@@ -3918,6 +3918,119 @@ impl Gemma4Bringup {
                 stream,
             )?;
 
+            // Commit 21: RVLLM_SPEC_DEBUG=1 — run a CPU reference of
+            // the MaskedEmbedder against the same inputs and compare
+            // to the GPU result. If CPU and GPU agree on the argmax
+            // token, the MaskedEmbedder kernel is correct and the
+            // accept_rate=0 bug is upstream (pre_projection, layer
+            // stack, or hidden snapshot). If they disagree, the
+            // kernel is wrong. Either way we get a concrete answer.
+            if std::env::var("RVLLM_SPEC_DEBUG").as_deref() == Ok("1") {
+                self.stream.fence()?;
+                let hidden_sz = drafter.arch.hidden_size as usize;
+                let n_cent = drafter.arch.num_centroids as usize;
+                let vocab_sz = drafter.arch.vocab_size as usize;
+                let pc = per_centroid as usize;
+                let tk = top_k as usize;
+                // DtoH copies.
+                let mut h_hidden = vec![0u16; hidden_sz];
+                let mut h_centroids = vec![0u16; n_cent * hidden_sz];
+                let mut h_token_ordering = vec![0i64; vocab_sz];
+                let mut h_embed = vec![0u16; vocab_sz * hidden_sz];
+                let mut h_last_emb = vec![0u16; drafter.arch.backbone_hidden_size];
+                let mut h_base_hid = vec![0u16; drafter.arch.backbone_hidden_size];
+                let copy = |dst: *mut u8, src: u64, n: usize, what: &str| {
+                    let rc = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        dst as *mut _, src, n);
+                    if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                        eprintln!("[spec-debug] DtoH {} FAILED rc={:?}",
+                                  what, rc);
+                    }
+                };
+                copy(h_hidden.as_mut_ptr() as *mut u8,
+                     workspace.hidden, hidden_sz * 2, "hidden");
+                copy(h_centroids.as_mut_ptr() as *mut u8,
+                     drafter.top.centroids, n_cent * hidden_sz * 2, "centroids");
+                copy(h_token_ordering.as_mut_ptr() as *mut u8,
+                     drafter.top.token_ordering, vocab_sz * 8, "token_ordering");
+                copy(h_embed.as_mut_ptr() as *mut u8,
+                     drafter.top.embed_tokens, vocab_sz * hidden_sz * 2, "embed_tokens");
+                copy(h_last_emb.as_mut_ptr() as *mut u8,
+                     step.last_token_embed,
+                     drafter.arch.backbone_hidden_size * 2, "last_token_embed");
+                copy(h_base_hid.as_mut_ptr() as *mut u8,
+                     step.base_hidden_last_step,
+                     drafter.arch.backbone_hidden_size * 2, "base_hidden");
+
+                // Helper: f16 bits -> f32.
+                let f16_to_f32 = |bits: u16| -> f32 {
+                    half::f16::from_bits(bits).to_f32()
+                };
+                // RMS helper for sanity check.
+                let rms = |v: &[u16]| -> f32 {
+                    let mut s = 0f64;
+                    for &b in v { let x = f16_to_f32(b) as f64; s += x*x; }
+                    ((s / v.len() as f64).sqrt()) as f32
+                };
+                let head8 = |v: &[u16]| -> Vec<f32> {
+                    v.iter().take(8).map(|&b| f16_to_f32(b)).collect()
+                };
+                eprintln!("[spec-debug] last_token_embed head8={:?} rms={:.4}",
+                          head8(&h_last_emb), rms(&h_last_emb));
+                eprintln!("[spec-debug] base_hidden       head8={:?} rms={:.4}",
+                          head8(&h_base_hid), rms(&h_base_hid));
+                eprintln!("[spec-debug] drafter_hidden    head8={:?} rms={:.4}",
+                          head8(&h_hidden), rms(&h_hidden));
+
+                // CPU MaskedEmbedder reference.
+                let hidden_f32: Vec<f32> = h_hidden.iter().map(|&b| f16_to_f32(b)).collect();
+                // Phase 2: centroid logits.
+                let mut cent_logits = vec![0f32; n_cent];
+                for c in 0..n_cent {
+                    let row_off = c * hidden_sz;
+                    let mut acc = 0f32;
+                    for k in 0..hidden_sz {
+                        acc += hidden_f32[k] * f16_to_f32(h_centroids[row_off + k]);
+                    }
+                    cent_logits[c] = acc;
+                }
+                // Phase 3: top-k.
+                let mut idx_sorted: Vec<usize> = (0..n_cent).collect();
+                idx_sorted.sort_by(|a, b| cent_logits[*b]
+                    .partial_cmp(&cent_logits[*a]).unwrap_or(std::cmp::Ordering::Equal));
+                let cpu_top: Vec<usize> = idx_sorted.iter().take(tk).copied().collect();
+                eprintln!("[spec-debug] CPU top-8 centroids={:?} logits={:?}",
+                          &cpu_top[..8.min(cpu_top.len())],
+                          cpu_top.iter().take(8)
+                              .map(|&i| cent_logits[i]).collect::<Vec<_>>());
+                // Phase 4: 4096 candidate token dot products.
+                let mut best = f32::NEG_INFINITY;
+                let mut best_id: i32 = -1;
+                for &c in &cpu_top {
+                    for sub in 0..pc {
+                        let t = h_token_ordering[c * pc + sub];
+                        if t < 0 || (t as usize) >= vocab_sz { continue; }
+                        let tu = t as usize;
+                        let row_off = tu * hidden_sz;
+                        let mut acc = 0f32;
+                        for k in 0..hidden_sz {
+                            acc += hidden_f32[k] * f16_to_f32(h_embed[row_off + k]);
+                        }
+                        if acc > best { best = acc; best_id = tu as i32; }
+                    }
+                }
+                // Read back GPU result.
+                let mut gpu_tok: [u8; 4] = [0; 4];
+                let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    gpu_tok.as_mut_ptr() as *mut _,
+                    workspace.out_token_id, 4);
+                let gpu_tok_i = i32::from_le_bytes(gpu_tok);
+                eprintln!(
+                    "[spec-debug] CPU drafter_tok={} logit={:.4} | GPU drafter_tok={} | agree={}",
+                    best_id, best, gpu_tok_i, best_id == gpu_tok_i,
+                );
+            }
+
             // Commit 14: post_projection → workspace.out_hidden. Feeds
             // the NEXT MTP step's `pre_projection` input chain.
             // Output is captured but unused at this commit since the
