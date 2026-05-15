@@ -3772,34 +3772,19 @@ impl Gemma4Bringup {
         // next" via `masked_embedding`, which is compared against
         // base's argmax `_base_first_tok[0]`.
         let drafter_position: u32 = (prompt_ids.len() as u32).saturating_sub(1);
-        let step = crate::gemma4_drafter::DrafterForwardStep {
-            base_hidden_last_step: base_hidden_last_step_real,
-            last_token_embed: last_token_embed.device_ptr(),
-            sliding_kv,
-            full_kv,
-            position: drafter_position,
-            out_logits: workspace.centroid_logits,
-            out_hidden: workspace.out_hidden,
-            out_token_id: workspace.out_token_id,
-        };
 
-        // Real-pointer plumbing exercise: pre-projection input concat
-        // + pre_projection GEMM + cast to f16 + layer 0 Q-side
-        // (input_layernorm + q_proj + q_norm). Outputs are discarded
-        // — the per-call arena restore at the end of the worker
-        // request handler reclaims the scratch. Cross-attention and
-        // MaskedEmbedder remain pending so we still return
-        // FeatureNotAvailable below.
+        // Commit 23: K>1 chained drafter. Populate shadow KV ONCE
+        // outside the iteration loop (it's a function of base K/V at
+        // the source layers, which doesn't change across drafter
+        // steps). Then loop spec_k times, feeding each step's
+        // post_projection output back as the next step's
+        // `base_hidden_last_step` and embed(D_{i-1}) as the next
+        // `last_token_embed`. Per HF/vLLM Gemma4Assistant chaining
+        // contract.
+        let sliding_window = self.arch.sliding_window_size as i32;
         {
             let guard = self.drafter.lock().unwrap();
             let drafter = guard.as_ref().expect("checked above");
-            drafter.prepare_pre_projection_input(&step, &workspace, stream)?;
-            self.run_drafter_pre_projection(drafter, &workspace)?;
-            // Commit 10+11: populate the drafter's F16 shadow KV
-            // from the BASE's source-layer K/V. Done ONCE before the
-            // layer loop — both source layers' K/V are needed by the
-            // 4 drafter layers (3 sliding read from sliding shadow,
-            // layer 3 reads from full shadow).
             let shadow = drafter.shadow_kv.expect(
                 "shadow_kv attached by ensure_drafter when spec_decode is on"
             );
@@ -3807,10 +3792,6 @@ impl Gemma4Bringup {
             let full_li = sources.full_source_layer as usize;
             let sliding_view = source_view(sources.sliding_source_layer);
             let full_view = source_view(sources.full_source_layer);
-            // Commit 20: hybrid configs (e.g. NVFP4 sliding + FP8 global)
-            // give the two source layers different KV dtypes. Pass each
-            // layer's dtype independently; the populator dispatches per
-            // layer rather than once for both.
             drafter.populate_shadow_kv_from_base(
                 sliding_view.k_cache,
                 sliding_view.v_cache,
@@ -3826,7 +3807,32 @@ impl Gemma4Bringup {
                 shadow.full_layer_bytes,
                 stream,
             )?;
-            let sliding_window = self.arch.sliding_window_size as i32;
+            let _ = (sliding_view, full_view);
+        }
+
+        // K-iteration drafter loop. Collects up to spec_k candidate
+        // tokens. At commit 23 the return value still uses the BASE's
+        // first decode token — verify + accept land in commits 24/25.
+        let mut drafter_tokens: Vec<u32> = Vec::with_capacity(spec_k.max(1) as usize);
+        let mut current_base_hidden: u64 = base_hidden_last_step_real;
+        for k_step in 0..(spec_k.max(1) as usize) {
+        let step = crate::gemma4_drafter::DrafterForwardStep {
+            base_hidden_last_step: current_base_hidden,
+            last_token_embed: last_token_embed.device_ptr(),
+            sliding_kv,
+            full_kv,
+            position: drafter_position + k_step as u32,
+            out_logits: workspace.centroid_logits,
+            out_hidden: workspace.out_hidden,
+            out_token_id: workspace.out_token_id,
+        };
+
+        // Inner block: borrow the drafter to run one forward step.
+        {
+            let guard = self.drafter.lock().unwrap();
+            let drafter = guard.as_ref().expect("checked above");
+            drafter.prepare_pre_projection_input(&step, &workspace, stream)?;
+            self.run_drafter_pre_projection(drafter, &workspace)?;
 
             // Commits 7-14: drive all 4 drafter layers. Each layer
             // shares the same Q-side helper + an attn-finisher +
@@ -4051,67 +4057,70 @@ impl Gemma4Bringup {
                 workspace.out_hidden,
                 drafter.arch.backbone_hidden_size as i32,
             )?;
-        }
-        // Commit 17: K=1 verify + acceptance. Read the drafter's
-        // argmax token id (workspace.out_token_id, i32[1]) back to
-        // host and compare against the BASE's first-decode argmax
-        // (= `_base_first_tok[0]`, the token base committed at
-        // position prompt_len during the initial
-        // `run_generate(max_new=1)`).
-        //
-        // K=1 path is mathematically equivalent to non-speculative
-        // greedy decode (base always wins on mismatch), so it
-        // provides correctness without speedup. K>1 speculative
-        // decoding (chained drafter + batched verify on base) is the
-        // next bounded follow-up.
-        //
-        // Host stream fence so the DtoH copy reads the actual kernel
-        // result, not stale memory.
+        } // end inner drafter-forward block (lock guard scope)
+
+        // Read the drafter's predicted token id (i32[1]) per
+        // iteration so we can both (a) feed its embedding back as
+        // next-step input and (b) accumulate the K-draft Vec for
+        // the commit-24 batched verify pass.
         self.stream.fence()?;
-        let mut drafter_tok_host: [u8; 4] = [0; 4];
-        {
-            let guard = self.drafter.lock().unwrap();
-            let drafter = guard.as_ref().expect("checked above");
-            let _ = drafter; // kept resident; only need workspace ptr
-        }
-        // The workspace stays alive until arena.restore() at request
-        // end. Reading workspace.out_token_id (i32[1]) is safe.
-        let rc = cudarc::driver::sys::cuMemcpyDtoH_v2(
-            drafter_tok_host.as_mut_ptr() as *mut _,
+        let mut tok_host_iter: [u8; 4] = [0; 4];
+        let rc_t = cudarc::driver::sys::cuMemcpyDtoH_v2(
+            tok_host_iter.as_mut_ptr() as *mut _,
             workspace.out_token_id,
             4,
         );
-        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        if rc_t != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
             return Err(rvllm_core::RvllmError::cuda(
-                "run_generate_speculative: DtoH drafter token id",
+                "run_generate_speculative: per-iter DtoH drafter token id",
                 rvllm_core::CudaErrorKind::MemcpyFailed,
                 rvllm_core::CudaCtx::setup(),
             ));
         }
-        let drafter_tok: i32 = i32::from_le_bytes(drafter_tok_host);
-        let drafter_tok_u: u32 = drafter_tok.max(0) as u32;
-        // Commit 18: verify against base's FIRST argmax (position
-        // prompt_len) — that's the slot the drafter just predicted
-        // with position-aligned inputs.
+        let tok_iter_u: u32 = i32::from_le_bytes(tok_host_iter).max(0) as u32;
+        drafter_tokens.push(tok_iter_u);
+
+        // Prepare inputs for the next K-step if there is one:
+        //   last_token_embed ← embed(D_k_step) (base embedding table,
+        //                       pre-scaled by sqrt(backbone_hidden))
+        //   current_base_hidden ← workspace.out_hidden (the
+        //                          post_projection just written above)
+        //   position increments naturally via k_step+1 next iter.
+        if k_step + 1 < (spec_k.max(1) as usize) {
+            token_ids_region.copy_from_host(&tok_iter_u.to_le_bytes())?;
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens: 1,
+                hidden: hidden_u,
+                vocab: vocab_u,
+            }
+            .launch(
+                fn_embed,
+                last_token_embed.device_ptr(),
+                self.model.embedding.offset_bytes,
+                token_ids_region.device_ptr(),
+                stream,
+            )?;
+            current_base_hidden = workspace.out_hidden;
+        }
+        } // end for k_step
+
+        // Verify D0 against base's first-decode argmax. Commit 23
+        // does not yet do K>1 batched verify on the base — that
+        // lands in commit 24. The reported accept_rate here is
+        // therefore still the K=1 D0-only measure.
         let base_tok: u32 = _base_first_tok
             .first().copied()
             .unwrap_or(0);
-
-        // K=1 accept-rate measurement at step 1 only. The drafter's
-        // d0 is compared against the BASE's first-decode argmax
-        // (= `_base_first_tok[0]`). The full base sequence is
-        // returned unchanged — this commit lands the wire contract
-        // and accept-rate observability; real K>=2 acceleration with
-        // chained drafter + batched base verify is the follow-up.
-        let accept_rate: f32 = if drafter_tok_u == base_tok { 1.0 } else { 0.0 };
+        let d0: u32 = drafter_tokens.first().copied().unwrap_or(0);
+        let accept_rate: f32 = if d0 == base_tok { 1.0 } else { 0.0 };
         tracing::info!(
             spec_k,
-            drafter_tok = drafter_tok_u,
+            drafter_tokens = ?drafter_tokens,
             base_tok,
             accept_rate,
             base_tokens = _base_first_tok.len(),
-            "Gemma 4 speculative K=1 verify (accept-rate only; full base \
-             sequence returned)"
+            "Gemma 4 speculative K-chain (D0 vs base accept-rate only; \
+             batched verify pending commit 24)"
         );
         Ok(_base_first_tok)
     }
