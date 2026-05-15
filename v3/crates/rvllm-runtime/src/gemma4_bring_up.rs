@@ -3562,9 +3562,13 @@ impl Gemma4Bringup {
             let drafter = guard.as_ref().expect("checked above");
             drafter.prepare_pre_projection_input(&step, &workspace, stream)?;
             self.run_drafter_pre_projection(drafter, &workspace)?;
-            // Commit 7: layer 0 Q-side. Other layers + cross-attn
-            // come in subsequent commits.
-            self.run_drafter_layer_q_side(drafter, &workspace, 0)?;
+            // Commit 7+8: layer 0 Q-side, now including RoPE on Q.
+            // `step.position` is 0 at this commit (no real base
+            // prefill yet — see the comment above where
+            // `DrafterForwardStep.position` is built), which makes
+            // RoPE a no-op (cos=1, sin=0). Still exercises the
+            // launch path on real device memory.
+            self.run_drafter_layer_q_side(drafter, &workspace, 0, step.position)?;
         }
         tracing::debug!(
             "Gemma 4 speculative path: pre_projection + layer 0 Q-side \
@@ -3650,21 +3654,30 @@ impl Gemma4Bringup {
         Ok(())
     }
 
-    /// Spec-decode commit 7: Q-side of one drafter layer's forward.
-    /// Runs `input_layernorm → q_proj → q_norm` on the existing
-    /// `DrafterStepWorkspace`. No new CUDA kernels — reuses
-    /// `RmsnormInplaceLaunch`, `cublaslt.f16_gemm_f32`, and the
-    /// shared `launch_cast_f32_to_f16` helper.
+    /// Spec-decode commit 7+8: Q-side of one drafter sliding layer's
+    /// forward. Runs `input_layernorm → q_proj → q_norm → RoPE` on
+    /// the existing `DrafterStepWorkspace`. No new CUDA kernels —
+    /// reuses `RmsnormInplaceLaunch`, `cublaslt.f16_gemm_f32`,
+    /// `launch_cast_f32_to_f16`, and `fused_rope_partial_f16kv` with
+    /// `num_kv_heads=0` so the K/V branch is dead-code and null KV
+    /// pointers are safe.
     ///
     /// Output: `workspace.q` holds f16 `[num_heads * effective_head_dim]`
-    /// Q with per-head RMSNorm applied. RoPE and the cross-attention
-    /// against the base's source-layer K/V remain pending — the
-    /// caller (`run_generate_speculative`) returns
+    /// Q after per-head RMSNorm + partial NeoX RoPE. The cross-
+    /// attention against the base's source-layer K/V remains pending
+    /// — the caller (`run_generate_speculative`) returns
     /// `FeatureNotAvailable` after invoking this helper.
     ///
-    /// Safe to call multiple times during one forward (e.g. per
-    /// layer), but in commit 7 only layer 0 is exercised from the
-    /// spec path.
+    /// **Layer-type restriction (commit 8 scope)**: only sliding
+    /// drafter layers are supported here. The global layer (layer 3
+    /// on E4B) uses partial-factor RoPE; that path lands with the
+    /// cross-attn integration to keep this commit narrow.
+    ///
+    /// `position` is the absolute base-side position the drafter is
+    /// scoring (i.e. the position at which the next token would be
+    /// emitted). In commit 5a the spec path still seeds this as 0
+    /// because real base prefill hasn't run — that's an intentional
+    /// no-op at the RoPE level (`cos=1`, `sin=0`).
     #[cfg(feature = "cuda")]
     #[allow(dead_code)]
     unsafe fn run_drafter_layer_q_side(
@@ -3672,6 +3685,7 @@ impl Gemma4Bringup {
         drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
         workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
         layer_idx: usize,
+        position: u32,
     ) -> Result<()> {
         let hidden = drafter.arch.hidden_size;
         let num_heads = drafter.arch.num_attention_heads;
@@ -3747,12 +3761,102 @@ impl Gemma4Bringup {
             stream,
         )?;
 
+        // Step 5: partial NeoX RoPE on Q. Layer 0..2 are sliding
+        // with rotary_dim == effective_head_dim (full rotation per
+        // the drafter config). The shared `fused_rope_partial_f16kv`
+        // kernel rotates Q in place and skips the K/V branch entirely
+        // when `num_kv_heads == 0` is passed — its inner guard is
+        // `if (head_idx < num_kv_heads)`, dead-code with the count
+        // zeroed, so the null K/V pointers below are never
+        // dereferenced.
+        if !matches!(
+            layer.layer_type,
+            rvllm_loader::gemma4_drafter::DrafterLayerType::Sliding
+        ) {
+            // Commit 8 scope: global layer (partial rotary factor) is
+            // wired alongside cross-attention in a follow-up.
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    op: "Gemma4Bringup::run_drafter_layer_q_side: \
+                         global drafter layer requires partial-factor \
+                         RoPE — pending with cross-attn integration",
+                    backend: "Gemma4SpecDecode",
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "run_drafter_layer_q_side(global)",
+                    stream,
+                    num_seqs: 1,
+                    head_dim: eff_hd as u32,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let pos_region = self.arena.region("spec_drafter_q_rope_pos", 4, 16)?;
+        let pos_host: i32 = position as i32;
+        pos_region.copy_from_host(&pos_host.to_le_bytes())?;
+        {
+            use cudarc::driver::sys::*;
+            let mut q_in: u64 = workspace.q;
+            let mut k_in: u64 = 0;
+            let mut v_in: u64 = 0;
+            let mut q_out: u64 = workspace.q;
+            let mut key_cache: u64 = 0;
+            let mut value_cache: u64 = 0;
+            let mut cos_table: u64 = self.model.rope_cos_sliding.offset_bytes;
+            let mut sin_table: u64 = self.model.rope_sin_sliding.offset_bytes;
+            let mut positions_ptr: u64 = pos_region.device_ptr();
+            let mut slot_mapping_ptr: u64 = 0;
+            let mut num_tokens_arg: i32 = 1;
+            let mut num_heads_arg: i32 = num_heads as i32;
+            let mut num_kv_heads_arg: i32 = 0;
+            let mut head_dim_arg: i32 = eff_hd as i32;
+            let mut rotary_dim_arg: i32 = eff_hd as i32; // full rotation for sliding
+            let args: [*mut core::ffi::c_void; 15] = [
+                &mut q_in           as *mut _ as *mut _,
+                &mut k_in           as *mut _ as *mut _,
+                &mut v_in           as *mut _ as *mut _,
+                &mut q_out          as *mut _ as *mut _,
+                &mut key_cache      as *mut _ as *mut _,
+                &mut value_cache    as *mut _ as *mut _,
+                &mut cos_table      as *mut _ as *mut _,
+                &mut sin_table      as *mut _ as *mut _,
+                &mut positions_ptr  as *mut _ as *mut _,
+                &mut slot_mapping_ptr as *mut _ as *mut _,
+                &mut num_tokens_arg as *mut _ as *mut _,
+                &mut num_heads_arg  as *mut _ as *mut _,
+                &mut num_kv_heads_arg as *mut _ as *mut _,
+                &mut head_dim_arg   as *mut _ as *mut _,
+                &mut rotary_dim_arg as *mut _ as *mut _,
+            ];
+            // Grid: (num_tokens, max(num_heads, num_kv_heads), 1).
+            // With num_kv_heads=0 grid_y collapses to num_heads.
+            // Block: (head_dim / 2). Each thread covers a (low, high)
+            // pair within its head.
+            let rc = cuLaunchKernel(
+                self.fused.fn_fused_rope_partial_f16kv.raw() as CUfunction,
+                1, num_heads as u32, 1,
+                (eff_hd as u32) / 2, 1, 1,
+                0,
+                stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "fused_rope_partial_f16kv launch (drafter Q-only)",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
         tracing::trace!(
             layer_idx,
             num_heads,
             effective_head_dim = eff_hd,
+            position,
             "completed Gemma 4 speculative drafter layer Q-side \
-             (input_layernorm + q_proj + q_norm)",
+             (input_layernorm + q_proj + q_norm + RoPE)",
         );
         Ok(())
     }
