@@ -3736,6 +3736,9 @@ impl Gemma4Bringup {
                 sliding_window,
                 stream,
             )?;
+            // Commit 12: fold attn_out back into the residual stream
+            // via o_proj + post_attention_layernorm + residual add.
+            self.run_drafter_layer_attn_finisher(drafter, &workspace, 0)?;
         }
         tracing::debug!(
             "Gemma 4 speculative path: pre_projection + layer 0 Q-side \
@@ -3821,13 +3824,21 @@ impl Gemma4Bringup {
         Ok(())
     }
 
-    /// Spec-decode commit 7+8: Q-side of one drafter sliding layer's
-    /// forward. Runs `input_layernorm → q_proj → q_norm → RoPE` on
-    /// the existing `DrafterStepWorkspace`. No new CUDA kernels —
-    /// reuses `RmsnormInplaceLaunch`, `cublaslt.f16_gemm_f32`,
-    /// `launch_cast_f32_to_f16`, and `fused_rope_partial_f16kv` with
-    /// `num_kv_heads=0` so the K/V branch is dead-code and null KV
-    /// pointers are safe.
+    /// Spec-decode commit 7+8 (+12 attn finisher): Q-side and
+    /// attention-side close-out of one drafter sliding layer.
+    /// Runs `input_layernorm → q_proj → q_norm → RoPE`, then
+    /// expects the CALLER to fire `populate_shadow_kv_from_base` +
+    /// `launch_cross_attn_sliding` (which write into
+    /// `workspace.attn_out`). After this helper, the caller may
+    /// invoke `run_drafter_layer_attn_finisher` to fold attn_out
+    /// back into `workspace.hidden` via `o_proj +
+    /// post_attention_layernorm + residual` — kept as a separate
+    /// method to keep the cross-attn dispatch site visible.
+    ///
+    /// No new CUDA kernels — reuses `RmsnormInplaceLaunch`,
+    /// `cublaslt.f16_gemm_f32`, `launch_cast_f32_to_f16`, and
+    /// `fused_rope_partial_f16kv` with `num_kv_heads=0` so the K/V
+    /// branch is dead-code and null KV pointers are safe.
     ///
     /// Output: `workspace.q` holds f16 `[num_heads * effective_head_dim]`
     /// Q after per-head RMSNorm + partial NeoX RoPE. The cross-
@@ -4024,6 +4035,138 @@ impl Gemma4Bringup {
             position,
             "completed Gemma 4 speculative drafter layer Q-side \
              (input_layernorm + q_proj + q_norm + RoPE)",
+        );
+        Ok(())
+    }
+
+    /// Spec-decode commit 12: attention-side close-out for one
+    /// drafter layer. Runs `o_proj → post_attention_layernorm →
+    /// residual_1` (`workspace.hidden += post_norm(o_proj(attn_out))`).
+    ///
+    /// Inputs:
+    ///   * `workspace.attn_out` — f16 `[num_heads * effective_head_dim]`,
+    ///     freshly written by `launch_cross_attn_sliding`.
+    ///   * `workspace.hidden` — the rolling residual stream
+    ///     (= drafter's "x" before this layer).
+    ///   * `workspace.proj_f16` — hidden-sized scratch for the
+    ///     o_proj output; mutated in place by the norm before the
+    ///     residual add.
+    ///
+    /// Output:
+    ///   * `workspace.hidden` ← hidden + post_attention_layernorm(o_proj(attn_out))
+    ///
+    /// No new CUDA kernels — three launches that reuse
+    /// `cublaslt.f16_gemm_f32`, `launch_cast_f32_to_f16`,
+    /// `RmsnormInplaceLaunch`, and `fn_vector_add`.
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    unsafe fn run_drafter_layer_attn_finisher(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        layer_idx: usize,
+    ) -> Result<()> {
+        let hidden = drafter.arch.hidden_size;
+        let num_heads = drafter.arch.num_attention_heads;
+        let layer = drafter.layers.get(layer_idx).ok_or_else(|| {
+            rvllm_core::RvllmError::Loader {
+                err: rvllm_core::LoaderError::Corrupt {
+                    detail: format!(
+                        "run_drafter_layer_attn_finisher: layer_idx \
+                         {layer_idx} out of range (drafter has {} layers)",
+                        drafter.layers.len()
+                    ),
+                },
+                ctx: rvllm_core::LoaderCtx {
+                    path: drafter.shard_path.clone(),
+                    tensor: None,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            }
+        })?;
+        let eff_hd = layer.effective_head_dim;
+        let q_rows = num_heads * eff_hd;
+        let stream = self.stream.raw();
+        let eps = drafter.arch.rms_norm_eps;
+
+        // Step 1: o_proj = attn_out @ Wo^T  → f32 GEMM scratch.
+        //   Wo shape on disk: [hidden, q_rows] BF16->F16.
+        //   m=1, n=hidden, k=q_rows.
+        self.cublaslt.f16_gemm_f32(
+            workspace.attn_out,
+            layer.self_attn_o_proj,
+            workspace.gemm_f32,
+            1,
+            hidden as i32,
+            q_rows as i32,
+            stream,
+        )?;
+
+        // Step 2: cast f32 → f16 → workspace.proj_f16.
+        launch_cast_f32_to_f16(
+            &self.stream,
+            self.fused.fn_cast_f32_to_f16,
+            workspace.gemm_f32,
+            workspace.proj_f16,
+            hidden as i32,
+        )?;
+
+        // Step 3: post_attention_layernorm on workspace.proj_f16 in
+        //   place. HF semantics:
+        //     residual + post_attention_layernorm(self_attn_out)
+        //   — so the norm is applied to the o_proj output BEFORE
+        //   the residual add, not after the sum.
+        rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: 1,
+            hidden: hidden as u32,
+            eps,
+        }
+        .launch(
+            self.fused.fn_rmsnorm,
+            workspace.proj_f16,
+            layer.post_attention_layernorm,
+            stream,
+        )?;
+
+        // Step 4: residual_1: workspace.hidden += workspace.proj_f16
+        //   via vector_add_f16(dst, src, n). Same ABI the audio /
+        //   PLE paths use elsewhere in this file.
+        {
+            use cudarc::driver::sys::*;
+            let mut dst = workspace.hidden;
+            let mut src = workspace.proj_f16;
+            let mut n: i32 = hidden as i32;
+            let args = [
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                (&mut n)   as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((n as u32 + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                self.fused.fn_vector_add.raw() as CUfunction,
+                grid, 1, 1,
+                block, 1, 1,
+                0,
+                stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "drafter_layer_attn_finisher residual_1 vector_add",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        tracing::trace!(
+            layer_idx,
+            hidden,
+            q_rows,
+            "completed Gemma 4 speculative drafter layer attn-finisher \
+             (o_proj + post_attention_layernorm + residual_1)",
         );
         Ok(())
     }
