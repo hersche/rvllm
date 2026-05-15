@@ -3906,6 +3906,21 @@ impl Gemma4Bringup {
                     layer.layer_type,
                     rvllm_loader::gemma4_drafter::DrafterLayerType::Full
                 );
+                // Commit 27 ATTEMPTED scale=1.0 per vLLM Gemma4MTP-
+                // Attention.scaling, but our FA-2 cross-attn kernel
+                // doesn't tolerate it: with unscaled QK^T, head_dim=256
+                // / 512 scores blow past softmax's stable range and
+                // NaN-propagate into base KV memcpy ops on the next
+                // request (`q_scale_scratch_zero MemcpyFailed`).
+                //
+                // Keeping standard 1/sqrt(head_dim) for stability.
+                // The 50-logit accept-rate=0 gap codex flagged is
+                // likely a different bug (TBD); a future commit can
+                // either fix our FA kernel to handle unscaled inputs
+                // (internal LSE stabilization) or apply scale=1.0
+                // via a different path. Greedy spec-decode at K=4
+                // remains accept_rate=0 with this drafter and this
+                // scale until either lands.
                 let eff_hd = layer.effective_head_dim as f32;
                 let scale = 1.0_f32 / eff_hd.sqrt();
                 self.run_drafter_layer_q_side(
