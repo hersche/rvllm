@@ -3464,6 +3464,105 @@ impl Gemma4Bringup {
 
     /// Greedy Gemma 4 E4B assistant-drafter speculative decode entry
     /// point. This is intentionally separate from [`Self::run_generate`]
+    #[doc(hidden)] fn __c28_anchor() {}
+}
+
+/// Commit 28: sparse-table softmax + categorical sample for the
+/// Gemma 4 MTP drafter's typical-acceptance mode.
+///
+/// Inputs:
+///   - `ids[N]`     — i32 candidate token IDs (-1 = sentinel, skip)
+///   - `logits[N]`  — f32 candidate logits (-INFINITY = sentinel, skip)
+///   - `temperature` — 0 == argmax; >0 == sample with stable softmax
+///   - `rng_state`  — LCG state advanced in place
+///
+/// Returns `(sampled_id, log_q)` where `log_q` is `log(p_drafter(sampled_id))`
+/// computed over the sparse-table normalization. On empty/degenerate
+/// input returns `(-1, f32::NEG_INFINITY)`.
+fn sparse_sample_with_temp(
+    ids: &[i32],
+    logits: &[f32],
+    temperature: f32,
+    rng_state: &mut u64,
+) -> (i32, f32) {
+    assert_eq!(ids.len(), logits.len());
+    if ids.is_empty() {
+        return (-1, f32::NEG_INFINITY);
+    }
+    // Strict greedy: argmax over the table; log_q = 0 (degenerate;
+    // typical-acceptance is gated on temp > 0 in callers).
+    if temperature <= 0.0 {
+        let mut best = f32::NEG_INFINITY;
+        let mut best_id: i32 = -1;
+        for i in 0..ids.len() {
+            if ids[i] < 0 || !logits[i].is_finite() { continue; }
+            if logits[i] > best {
+                best = logits[i];
+                best_id = ids[i];
+            }
+        }
+        return (best_id, 0.0);
+    }
+    // Stable softmax: subtract max, scale by 1/T, exp, normalize.
+    let inv_t = 1.0_f32 / temperature.max(1e-6);
+    let mut max_l = f32::NEG_INFINITY;
+    for i in 0..ids.len() {
+        if ids[i] >= 0 && logits[i].is_finite() && logits[i] > max_l {
+            max_l = logits[i];
+        }
+    }
+    if !max_l.is_finite() {
+        return (-1, f32::NEG_INFINITY);
+    }
+    let mut sum: f64 = 0.0;
+    let mut probs: Vec<f64> = Vec::with_capacity(ids.len());
+    for i in 0..ids.len() {
+        if ids[i] < 0 || !logits[i].is_finite() {
+            probs.push(0.0);
+            continue;
+        }
+        let e = ((logits[i] - max_l) * inv_t) as f64;
+        let p = e.exp();
+        probs.push(p);
+        sum += p;
+    }
+    if !(sum > 0.0 && sum.is_finite()) {
+        return (-1, f32::NEG_INFINITY);
+    }
+    // LCG advance: same constants as glibc's drand48 in the simpler form.
+    *rng_state = rng_state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let r01 = ((*rng_state >> 33) as f64) / ((1u64 << 31) as f64);
+    let u = r01.clamp(0.0, 1.0_f64 - 1e-9) * sum;
+    let mut acc: f64 = 0.0;
+    for i in 0..ids.len() {
+        acc += probs[i];
+        if u <= acc {
+            let p = probs[i] / sum;
+            return (ids[i], (p.max(1e-30).ln()) as f32);
+        }
+    }
+    // Numerical fallback: return last positive-prob entry.
+    for i in (0..ids.len()).rev() {
+        if probs[i] > 0.0 {
+            let p = probs[i] / sum;
+            return (ids[i], (p.max(1e-30).ln()) as f32);
+        }
+    }
+    (-1, f32::NEG_INFINITY)
+}
+
+impl Gemma4Bringup {
+    #[doc(hidden)] fn __c28_anchor_end() {}
+    /// (Placeholder kept so the methods after `__c28_anchor` remain in
+    /// the same impl block. This is intentional — the file has many
+    /// methods and we did not want to refactor module-level layout
+    /// just to insert a free function.)
+    ///
+    /// Greedy/typical Gemma 4 E4B assistant-drafter speculative decode
+    /// entry point. This is intentionally separate from
+    /// [`Self::run_generate`]
     /// so the default path stays source-stable while the spec path is
     /// filled in.
     ///
@@ -3508,11 +3607,16 @@ impl Gemma4Bringup {
                 field: "RVLLM_GEMMA4_SPEC_K",
             });
         }
-        if !matches!(sampling, SamplingConfig::Greedy) {
+        // Commit 28: allow non-greedy when typical-acceptance mode is
+        // opted in via env. Greedy stays the default; non-greedy
+        // without the env flag still errors so the production path
+        // is unchanged.
+        let typical_mode = std::env::var("RVLLM_GEMMA4_SPEC_TYPICAL").as_deref() == Ok("1");
+        if !matches!(sampling, SamplingConfig::Greedy) && !typical_mode {
             return Err(rvllm_core::RvllmError::Config {
                 err: rvllm_core::ConfigError::InvalidField {
                     name: "sampling",
-                    reason: "Gemma 4 speculative decode is currently greedy-only".into(),
+                    reason: "Gemma 4 speculative decode is greedy-only unless RVLLM_GEMMA4_SPEC_TYPICAL=1".into(),
                 },
                 field: "sampling",
             });
@@ -3874,6 +3978,28 @@ impl Gemma4Bringup {
         // tokens. At commit 23 the return value still uses the BASE's
         // first decode token — verify + accept land in commits 24/25.
         let mut drafter_tokens: Vec<u32> = Vec::with_capacity(spec_k.max(1) as usize);
+        // Commit 28: cache drafter masked-embedder dimensions outside
+        // the locked drafter scope so the typical-mode host sampler
+        // can size the DtoH at the per-iter checkpoint.
+        let (spec_top_k_h, spec_per_centroid_h): (usize, usize) = {
+            let guard = self.drafter.lock().unwrap();
+            let d = guard.as_ref().expect("drafter resident");
+            let tk = d.arch.centroid_intermediate_top_k;
+            let nc = d.arch.num_centroids;
+            let vc = d.arch.vocab_size;
+            (tk, if nc > 0 { vc / nc } else { 0 })
+        };
+        // log_q[i] = drafter sampling log-probability of
+        // drafter_tokens[i]. Populated only in typical mode.
+        let mut drafter_log_q: Vec<f32> = Vec::with_capacity(spec_k.max(1) as usize);
+        // Simple LCG state for typical-mode host sampling. Seed from
+        // sampling config when available, else fall back to a fixed
+        // pseudo-deterministic seed so accept-rate measurements are
+        // reproducible across runs.
+        let mut next_rand_f32_spec: u64 = match sampling {
+            SamplingConfig::Stochastic { seed, .. } => seed.wrapping_add(0x9E37_79B9_7F4A_7C15),
+            SamplingConfig::Greedy => 0xDEAD_BEEF_CAFE_BABE,
+        };
         let mut current_base_hidden: u64 = base_hidden_last_step_real;
         for k_step in 0..(spec_k.max(1) as usize) {
         let step = crate::gemma4_drafter::DrafterForwardStep {
@@ -3975,6 +4101,15 @@ impl Gemma4Bringup {
             let fn_masked = drafter
                 .fn_masked_embedder_argmax_f16
                 .expect("MaskedEmbedder kernel attached in ensure_drafter");
+            // Commit 28: feed sparse candidate buffers when typical
+            // mode is on so the host sampler has the full top_k *
+            // per_centroid table. In greedy mode pass 0 to keep the
+            // kernel on its existing fast path (no sparse writes).
+            let (sp_ids_ptr, sp_lg_ptr) = if typical_mode {
+                (workspace.sparse_ids, workspace.sparse_logits)
+            } else {
+                (0u64, 0u64)
+            };
             crate::gemma4_drafter::launch_masked_embedder_argmax_f16(
                 fn_masked,
                 workspace.hidden,
@@ -3988,6 +4123,8 @@ impl Gemma4Bringup {
                 vocab,
                 workspace.out_token_id,
                 /* out_logit */ 0,
+                sp_ids_ptr,
+                sp_lg_ptr,
                 stream,
             )?;
 
@@ -4144,7 +4281,46 @@ impl Gemma4Bringup {
                 rvllm_core::CudaCtx::setup(),
             ));
         }
-        let tok_iter_u: u32 = i32::from_le_bytes(tok_host_iter).max(0) as u32;
+        let mut tok_iter_u: u32 = i32::from_le_bytes(tok_host_iter).max(0) as u32;
+
+        // Commit 28: typical-acceptance — host samples from the
+        // 4096-candidate sparse distribution at user temperature.
+        // Replaces the kernel argmax for this step. Records log_q
+        // (drafter probability of the sampled token) for commit 29's
+        // rejection criterion. Greedy mode bypasses this entirely.
+        if typical_mode {
+            let sparse_len = spec_top_k_h * spec_per_centroid_h;
+            let mut h_ids = vec![-1i32; sparse_len];
+            let mut h_lg = vec![f32::NEG_INFINITY; sparse_len];
+            let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                h_ids.as_mut_ptr() as *mut _,
+                workspace.sparse_ids,
+                sparse_len * 4,
+            );
+            let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                h_lg.as_mut_ptr() as *mut _,
+                workspace.sparse_logits,
+                sparse_len * 4,
+            );
+            let temp: f32 = match sampling {
+                SamplingConfig::Greedy => 0.0,
+                SamplingConfig::Stochastic { temperature, .. } => temperature,
+            };
+            let (sampled_id, log_q_sampled) =
+                sparse_sample_with_temp(&h_ids, &h_lg, temp, &mut next_rand_f32_spec);
+            if sampled_id >= 0 {
+                tok_iter_u = sampled_id as u32;
+            }
+            drafter_log_q.push(log_q_sampled);
+            tracing::debug!(
+                k_step,
+                sampled_token = tok_iter_u,
+                log_q = log_q_sampled,
+                temperature = temp,
+                "Gemma 4 drafter typical-mode sparse sample",
+            );
+        }
+
         drafter_tokens.push(tok_iter_u);
 
         // Prepare inputs for the next K-step if there is one:

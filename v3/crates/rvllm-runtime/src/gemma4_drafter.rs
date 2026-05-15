@@ -132,6 +132,13 @@ pub struct DrafterStepWorkspace {
     pub top_centroid_scores: u64,
     /// i32[1] selected token id.
     pub out_token_id: u64,
+    /// Commit 28: i32[top_k * per_centroid] sparse candidate token
+    /// IDs from MaskedEmbedder. Used by host-side typical-acceptance
+    /// sampler (no-op when typical mode is off — kernel ignores the
+    /// pointers when host doesn't request).
+    pub sparse_ids: u64,
+    /// Commit 28: f32[top_k * per_centroid] matching candidate logits.
+    pub sparse_logits: u64,
     pub bytes: usize,
 }
 
@@ -344,6 +351,16 @@ impl Gemma4DrafterRuntime {
                 16,
             )?,
             out_token_id: region("drafter_out_token_id", 4, 4)?,
+            sparse_ids: region(
+                "drafter_sparse_ids",
+                a.centroid_intermediate_top_k * (a.vocab_size / a.num_centroids) * 4,
+                16,
+            )?,
+            sparse_logits: region(
+                "drafter_sparse_logits",
+                a.centroid_intermediate_top_k * (a.vocab_size / a.num_centroids) * 4,
+                16,
+            )?,
             bytes,
         })
     }
@@ -1413,6 +1430,7 @@ pub type DrafterSlot = Mutex<Option<Gemma4DrafterRuntime>>;
 /// `cuFuncSetAttribute`.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_masked_embedder_argmax_f16(
     fn_masked: rvllm_kernels::KernelFn,
     hidden: u64,
@@ -1426,6 +1444,12 @@ pub unsafe fn launch_masked_embedder_argmax_f16(
     vocab: i32,
     out_token_id: u64,
     out_logit: u64,
+    // Commit 28: optional sparse outputs. When non-zero, the kernel
+    // writes the full top_k * per_centroid candidate (id, logit) table
+    // into these buffers (sized `top_k * per_centroid` each). Used by
+    // the host-side typical-acceptance sampler.
+    out_sparse_ids: u64,
+    out_sparse_logits: u64,
     stream: u64,
 ) -> Result<()> {
     if hidden_size <= 0 || n_centroids <= 0 || top_k <= 0
@@ -1472,7 +1496,9 @@ pub unsafe fn launch_masked_embedder_argmax_f16(
     let mut a_vc = vocab;
     let mut a_out_id = out_token_id;
     let mut a_out_lg = out_logit;
-    let args: [*mut core::ffi::c_void; 11] = [
+    let mut a_sp_ids = out_sparse_ids;
+    let mut a_sp_lg  = out_sparse_logits;
+    let args: [*mut core::ffi::c_void; 13] = [
         &mut a_hidden  as *mut _ as *mut _,
         &mut a_cent    as *mut _ as *mut _,
         &mut a_tok_ord as *mut _ as *mut _,
@@ -1484,6 +1510,8 @@ pub unsafe fn launch_masked_embedder_argmax_f16(
         &mut a_vc      as *mut _ as *mut _,
         &mut a_out_id  as *mut _ as *mut _,
         &mut a_out_lg  as *mut _ as *mut _,
+        &mut a_sp_ids  as *mut _ as *mut _,
+        &mut a_sp_lg   as *mut _ as *mut _,
     ];
     let rc = cuLaunchKernel(
         fn_masked.raw() as CUfunction,

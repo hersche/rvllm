@@ -45,6 +45,12 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 
+// Commit 28: optional sparse output. When `out_sparse_ids` /
+// `out_sparse_logits` are non-null, writes the full top_k *
+// per_centroid candidate table (~4096 entries on E4B / assistant)
+// to host-allocated buffers. Host then samples with temperature
+// for typical-acceptance spec-decode. Greedy argmax path is
+// unchanged when these pointers are null.
 extern "C" __global__ void gemma4_masked_embedder_argmax_f16_kernel(
     const __half*  __restrict__ hidden,
     const __half*  __restrict__ centroids,
@@ -56,7 +62,9 @@ extern "C" __global__ void gemma4_masked_embedder_argmax_f16_kernel(
     int per_centroid,
     int vocab,
     int*   __restrict__ out_token_id,
-    float* __restrict__ out_logit
+    float* __restrict__ out_logit,
+    int*   __restrict__ out_sparse_ids,
+    float* __restrict__ out_sparse_logits
 ) {
     extern __shared__ float smem_buf[];
 
@@ -72,6 +80,18 @@ extern "C" __global__ void gemma4_masked_embedder_argmax_f16_kernel(
     const int lane      = tid & 31;
     const int warp_id   = tid >> 5;
     const int num_warps = blockDim.x >> 5;
+
+    // === Phase 0: initialize sparse outputs (only if requested) ===========
+    // Sparse slots that the main loop never visits (c<0 / out-of-vocab)
+    // keep these sentinels so the host sampler can mask them.
+    if (out_sparse_ids != nullptr) {
+        const int total_sparse = top_k * per_centroid;
+        for (int i = tid; i < total_sparse; i += blockDim.x) {
+            out_sparse_ids[i]    = -1;
+            out_sparse_logits[i] = -INFINITY;
+        }
+        __syncthreads();
+    }
 
     // === Phase 1: hidden f16 → smem f32 ====================================
     for (int i = tid; i < hidden_size; i += blockDim.x) {
@@ -148,6 +168,19 @@ extern "C" __global__ void gemma4_masked_embedder_argmax_f16_kernel(
         if (lane == 0 && acc > my_best) {
             my_best    = acc;
             my_best_id = token_id;
+        }
+        // Commit 28: write sparse candidate (id, logit) for the
+        // host-side typical-acceptance sampler. Lane-0 only — `acc`
+        // post-shuffle is identical across the warp's lanes for
+        // this one (idx, token_id), so a single write per warp
+        // is correct. Slot index `idx` in the flat [top_k *
+        // per_centroid] output buffer; the lane filtering for
+        // `c < 0` / out-of-vocab below either skips the write
+        // (sentinel -1 / -INFINITY) so the host sampler can mask
+        // them out.
+        if (lane == 0 && out_sparse_ids != nullptr) {
+            out_sparse_ids[idx]    = token_id;
+            out_sparse_logits[idx] = acc;
         }
     }
 
