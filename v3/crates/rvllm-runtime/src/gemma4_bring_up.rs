@@ -4033,16 +4033,19 @@ impl Gemma4Bringup {
                     layer.layer_type,
                     rvllm_loader::gemma4_drafter::DrafterLayerType::Full
                 );
-                // Standard 1/sqrt(head_dim). Commit 27/27b retried
-                // scale=1.0 (per vLLM Gemma4MTPAttention.scaling=1.0,
-                // documented as "should work" per codex web search of
-                // HF model card + ~77% accept rate in public reports)
-                // but our FA-2 f16io cross-attn kernel crashes
-                // asynchronously at scale=1.0 even with online-softmax
-                // stabilization on paper. Root cause unknown without
-                // GPU-side instrumentation. Stays at standard for now.
+                // Commit 31: scale=1.0 is the vLLM-documented value
+                // (Gemma4MTPAttention.scaling=1.0). RVLLM_SPEC_FA_SCALE
+                // overrides for debugging: "stable" uses
+                // 1/sqrt(head_dim); "mtp" uses 1.0. Default is "mtp"
+                // when typical mode is on, else "stable".
                 let eff_hd = layer.effective_head_dim as f32;
-                let scale = 1.0_f32 / eff_hd.sqrt();
+                let scale_mode = std::env::var("RVLLM_SPEC_FA_SCALE")
+                    .unwrap_or_else(|_| if typical_mode { "mtp".into() } else { "stable".into() });
+                let scale = if scale_mode == "mtp" {
+                    1.0_f32
+                } else {
+                    1.0_f32 / eff_hd.sqrt()
+                };
                 self.run_drafter_layer_q_side(
                     drafter, &workspace, li, step.position)?;
                 if is_global {
@@ -4068,8 +4071,39 @@ impl Gemma4Bringup {
                         stream,
                     )?;
                 }
+                let probe_fn = |label: &str, ptr: u64, n_f16: usize| {
+                    if std::env::var("RVLLM_SPEC_FA_DEBUG").as_deref() != Ok("1") { return; }
+                    let fence_ok = self.stream.fence().is_ok();
+                    let mut h = vec![0u16; n_f16];
+                    let rc = unsafe {
+                        cudarc::driver::sys::cuMemcpyDtoH_v2(
+                            h.as_mut_ptr() as *mut _, ptr, n_f16 * 2)
+                    };
+                    let dtoh_ok = rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS;
+                    let mut max_abs = 0f32;
+                    let mut nan_count = 0usize;
+                    let mut inf_count = 0usize;
+                    for &b in &h {
+                        let v = half::f16::from_bits(b).to_f32();
+                        if v.is_nan() { nan_count += 1; }
+                        else if v.is_infinite() { inf_count += 1; }
+                        else if v.abs() > max_abs { max_abs = v.abs(); }
+                    }
+                    eprintln!(
+                        "[spec-fa] li={} {} fence_ok={} dtoh_ok={} nan={} inf={} max_abs={:.3}",
+                        li, label, fence_ok, dtoh_ok, nan_count, inf_count, max_abs,
+                    );
+                };
+                let q_rows = drafter.arch.num_attention_heads * layer.effective_head_dim;
+                if li == 0 {
+                    probe_fn("layer0_entry(hidden)", workspace.hidden, 32);
+                }
+                probe_fn("after_xattn(attn_out)", workspace.attn_out, q_rows.min(32));
                 self.run_drafter_layer_attn_finisher(drafter, &workspace, li)?;
+                probe_fn("after_attn_finisher(hidden)", workspace.hidden, 32);
                 self.run_drafter_layer_mlp_finisher(drafter, &workspace, li)?;
+                probe_fn("after_mlp_finisher(hidden)", workspace.hidden, 32);
+                let _ = is_global;
             }
 
             // Commit 14: `model.norm` final RMSNorm — single launch
