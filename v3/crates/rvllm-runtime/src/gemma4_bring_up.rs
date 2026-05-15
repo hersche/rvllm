@@ -5609,7 +5609,8 @@ impl Gemma4Bringup {
                 "Gemma 4 BATCHED-verify spec-decode (single batched-prefill of K drafts + lm_head M=K)"
             );
 
-            // Commit 42 — KV-cache rollback half of option (b).
+            // Commit 46 (Codex review item #3+#4) — rollback is now
+            // STRUCTURALLY MANDATORY in the batched verify path.
             //
             // The verify call wrote (P + drafter_tokens.len()) tokens
             // worth of K/V slots into the persistent KV cache and
@@ -5620,20 +5621,19 @@ impl Gemma4Bringup {
             // pure argmax of a stored hidden, never fed through the
             // base layer stack).
             //
-            // Gated by RVLLM_GEMMA4_SPEC_BATCHED_ROLLBACK=1; default
-            // OFF. When on, truncates the prefix-cache metadata to
-            // (prompt_ids.len() + accept_len) tokens so the next
-            // iter's prefix-match doesn't reuse stale slots beyond
-            // the truly committed boundary.
+            // Was env-gated (RVLLM_GEMMA4_SPEC_BATCHED_ROLLBACK=1)
+            // until commit 46. Codex review item #3 flagged this as
+            // a correctness hazard: without rollback the next iter's
+            // prefix-cache match can hit a stale rejected-draft slot
+            // and silently corrupt drafter input. Item #4 made the
+            // same argument: rollback is not optional tuning —
+            // structurally required by the algorithm. So it's now
+            // unconditional inside this branch.
             //
             // Note: this is metadata-only. The KV cache PHYSICAL
             // slots beyond the new boundary still contain stale
             // bytes; the next iter's prefill at those positions
-            // overwrites them. The rollback exists so a prefix-cache
-            // HIT on the truncated boundary correctly indicates how
-            // many tokens are safe to reuse.
-            if std::env::var("RVLLM_GEMMA4_SPEC_BATCHED_ROLLBACK").as_deref()
-                == Ok("1")
+            // overwrites them.
             {
                 if let Ok(mut guard) = self.prefix_cache.lock() {
                     if let Some(pc) = guard.as_mut() {
