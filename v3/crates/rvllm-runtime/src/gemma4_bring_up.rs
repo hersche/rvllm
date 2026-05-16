@@ -5740,24 +5740,38 @@ impl Gemma4Bringup {
                 // Shadow KV for the bonus's slot.
                 let bonus_slot = old_committed + accept_len as u32;
                 let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
-                let guard = self.drafter.lock().unwrap();
-                let d = guard.as_ref().expect("drafter resident");
-                d.populate_shadow_kv_range_from_base(
-                    sliding_k, sliding_v,
-                    full_k, full_v,
-                    sliding_ks, sliding_vs,
-                    full_ks, full_vs,
-                    kv_dtype_per_layer[sliding_li],
-                    kv_dtype_per_layer[full_li],
-                    shadow_sliding_bytes,
-                    shadow_full_bytes,
-                    /* slot_start */ bonus_slot,
-                    /* slot_count */ 1,
-                    stream,
-                )?;
+                {
+                    let guard = self.drafter.lock().unwrap();
+                    let d = guard.as_ref().expect("drafter resident");
+                    d.populate_shadow_kv_range_from_base(
+                        sliding_k, sliding_v,
+                        full_k, full_v,
+                        sliding_ks, sliding_vs,
+                        full_ks, full_vs,
+                        kv_dtype_per_layer[sliding_li],
+                        kv_dtype_per_layer[full_li],
+                        shadow_sliding_bytes,
+                        shadow_full_bytes,
+                        /* slot_start */ bonus_slot,
+                        /* slot_count */ 1,
+                        stream,
+                    )?;
+                }
                 if perf_trace {
                     self.stream.fence()?;
                     sum_shadow_us += t0.unwrap().elapsed().as_micros() as u64;
+                }
+
+                // Classical accept_len + 1 emit: now that the bonus's
+                // base K/V and shadow K/V are both committed, push the
+                // bonus to emitted. Round 9 #2 commit-before-emit
+                // invariant: commit happened above, emit happens here.
+                // EOS / max_new were checked before the commit.
+                emitted.push(bonus);
+                if let Some(cb) = on_token.as_mut() {
+                    if !cb(bonus) {
+                        break 'outer;
+                    }
                 }
             } else {
                 // accept_len == 0: emit the deferred bonus
