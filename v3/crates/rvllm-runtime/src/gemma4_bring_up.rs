@@ -4716,6 +4716,17 @@ impl Gemma4Bringup {
             && self
                 .skip_next_warmup
                 .swap(false, std::sync::atomic::Ordering::AcqRel);
+        // Commit 50 (Phase C-1): also skip prefix-cache publish on
+        // the warmup. The warmup's prompt-length K/V write is per-
+        // request work; publishing committed_prefix_len = floor(P /
+        // 2048) * 2048 for short prompts (= 0 for ~30-token chats)
+        // is what triggers the verify-call full re-prefill loop the
+        // codex review priority-1 flagged. Skipping here means the
+        // cross-request cache only updates on NON-spec requests.
+        if batched_verify_mode {
+            self.skip_prefix_cache_publish
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         let _base_first_tok: Vec<u32> = if skip_warmup_active {
             let cached = self
                 .saved_warmup_b_p
@@ -5798,9 +5809,31 @@ impl Gemma4Bringup {
             prompt_and_drafts.extend_from_slice(prompt_ids);
             prompt_and_drafts.extend_from_slice(&drafter_tokens);
 
-            // Second base call: batched-prefill K drafts + 1 decode.
-            // Greedy + no callbacks; prefix-cache makes the prompt
-            // prefill a no-op after the first iter.
+            // Commit 50 (Phase C-1) — codex review priority 1 fix.
+            //
+            // Arm the prefix-cache override hooks (added in commit 49)
+            // so this verify call doesn't re-prefill the full prompt
+            // under RVLLM_PREFILL_CHUNK_SIZE=2048's chunk_size cap.
+            //
+            //   * force_common_prefix_override = prompt_ids.len():
+            //     bypass the token-match + chunk_size cap. The
+            //     warmup base prefill above already wrote
+            //     prompt-length K/V slots, so the spec contract
+            //     says those P slots are valid. With the override
+            //     active, new_q = (prompt_len + K) - prompt_len = K
+            //     (NOT new_q = prompt_len + K with prefix=0 under
+            //     the chunk cap, which was the bug).
+            //
+            //   * skip_prefix_cache_publish = true: spec-internal
+            //     state doesn't pollute the cross-request cache.
+            //
+            // This is the substantive codex-priority-1 fix: short-
+            // prompt spec iterations now prefill ONLY the K drafts
+            // per verify call, not the whole prompt + K.
+            self.force_common_prefix_override
+                .store(prompt_ids.len() as u32, std::sync::atomic::Ordering::Release);
+            self.skip_prefix_cache_publish
+                .store(true, std::sync::atomic::Ordering::Release);
             let bonus_tok_vec = self.run_generate(
                 fn_embed,
                 self.fused.fn_argmax,
