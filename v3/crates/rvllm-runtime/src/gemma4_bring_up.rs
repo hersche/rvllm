@@ -4694,22 +4694,40 @@ impl Gemma4Bringup {
                 let guard = self.drafter.lock().unwrap();
                 let drafter = guard.as_ref().expect("drafter resident");
                 drafter.prepare_pre_projection_input(&step, &workspace, stream)?;
-                // Codex Round 6 (final): HF
+                // Codex Round 6 (final): for the E4B drafter (which
+                // ships `use_ordered_embeddings=true`), HF
                 // `MultiTokenPredictionCandidateGenerator.get_candidates`
                 // at candidate_generator.py:1383 builds
                 //   `inputs_embeds = cat([last_token_embedding,
                 //                         last_hidden_state], dim=-1)`
-                // with NO sqrt(hidden_size) scaling on the embed half.
-                // The earlier `apply_pre_projection_embed_scale` call
-                // applied sqrt(2560), which inflated the embed half by
-                // ~50x and dragged the drafter into a degenerate
-                // prediction mode (always token 140 = "    " spaces).
-                // After removing it: drafter at the same input predicts
-                // "**" with the correct "Die" token at #2 — i.e., the
-                // drafter now actually contributes useful candidates.
-                // Verified against HF transformers source for
-                // gemma4_assistant + the MTP candidate generator.
-                let _ = drafter.arch.backbone_hidden_size; // intentionally unused
+                // with NO additional sqrt(hidden_size) scaling on the
+                // embed half — the previously-applied
+                // `apply_pre_projection_embed_scale(sqrt(2560))`
+                // inflated the embed half ~50x and dragged the E4B
+                // drafter into a degenerate prediction mode.
+                //
+                // For the 31B drafter (`use_ordered_embeddings=false`)
+                // empirical evidence (accept_rate=0.0, degenerate
+                // drafts repeating token 2313) plus the layer-trace
+                // showing cross-attn output is too weak relative to
+                // residual suggests the opposite calibration: the
+                // 31B drafter was trained expecting the sqrt(backbone)
+                // scale on the embed half. Apply it for the 31B
+                // path only. Override via
+                // RVLLM_GEMMA4_SPEC_EMBED_SCALE_31B=0 to disable for
+                // bisecting if this hypothesis is wrong.
+                let apply_embed_scale_for_31b =
+                    !drafter.arch.use_ordered_embeddings
+                    && std::env::var("RVLLM_GEMMA4_SPEC_EMBED_SCALE_31B")
+                        .as_deref() != Ok("0");
+                if apply_embed_scale_for_31b {
+                    self.apply_pre_projection_embed_scale(
+                        &workspace,
+                        drafter.arch.backbone_hidden_size as i32,
+                        stream,
+                    )?;
+                }
+                let _ = drafter.arch.backbone_hidden_size; // intentionally unused (E4B branch)
                 self.run_drafter_pre_projection(drafter, &workspace)?;
 
                 let num_layers = drafter.layers.len();
@@ -4762,6 +4780,32 @@ impl Gemma4Bringup {
                     drafter.top.final_norm,
                     stream,
                 )?;
+
+                // Layer-trace probe: final-norm output that goes into
+                // the drafter LM head. Together with the per-layer
+                // attn+mlp probes this localises where the 31B
+                // degeneration enters the chain.
+                if std::env::var("RVLLM_GEMMA4_SPEC_LAYER_TRACE").as_deref() == Ok("1") {
+                    let _ = self.stream.fence();
+                    let h = drafter.arch.hidden_size;
+                    let mut buf = vec![0u16; h];
+                    let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        buf.as_mut_ptr() as *mut _, workspace.hidden, h * 2);
+                    let mut max_abs = 0f32;
+                    let mut sum_sq = 0f64;
+                    for &b in &buf {
+                        let v = half::f16::from_bits(b).to_f32();
+                        if v.is_finite() {
+                            if v.abs() > max_abs { max_abs = v.abs(); }
+                            sum_sq += (v * v) as f64;
+                        }
+                    }
+                    let rms = (sum_sq / h as f64).sqrt() as f32;
+                    let head8: Vec<f32> = buf.iter().take(8)
+                        .map(|&b| half::f16::from_bits(b).to_f32()).collect();
+                    eprintln!("[layer-trace post_final_norm(hidden)] max={:.3} rms={:.4} head8={:?}",
+                              max_abs, rms, head8);
+                }
 
                 let n_centroids = drafter.arch.num_centroids as i32;
                 let top_k = drafter.arch.centroid_intermediate_top_k as i32;
@@ -8627,6 +8671,38 @@ impl Gemma4Bringup {
         let stream = self.stream.raw();
         let eps = drafter.arch.rms_norm_eps;
 
+        // Layer-trace probe: RVLLM_GEMMA4_SPEC_LAYER_TRACE=1 dumps
+        // {attn_out (cross-attn output), proj_f16 (post o_proj+norm),
+        //  hidden (post residual_1)} rms+max+head8 for every drafter
+        // layer to localise where the degenerate-output regression
+        // on 31B comes from.
+        let layer_trace = std::env::var("RVLLM_GEMMA4_SPEC_LAYER_TRACE")
+            .as_deref() == Ok("1");
+        let probe = |label: &str, ptr: u64, n: usize| {
+            if !layer_trace { return; }
+            let _ = self.stream.fence();
+            let mut buf = vec![0u16; n];
+            unsafe {
+                let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut _, ptr, n * 2);
+            }
+            let mut max_abs = 0f32;
+            let mut sum_sq = 0f64;
+            for &b in &buf {
+                let v = half::f16::from_bits(b).to_f32();
+                if v.is_finite() {
+                    if v.abs() > max_abs { max_abs = v.abs(); }
+                    sum_sq += (v * v) as f64;
+                }
+            }
+            let rms = (sum_sq / n as f64).sqrt() as f32;
+            let head8: Vec<f32> = buf.iter().take(8)
+                .map(|&b| half::f16::from_bits(b).to_f32()).collect();
+            eprintln!("[layer-trace L{} {}] max={:.3} rms={:.4} head8={:?}",
+                      layer_idx, label, max_abs, rms, head8);
+        };
+        probe("attn_out(pre_oproj)", workspace.attn_out, q_rows);
+
         // Step 1: o_proj = attn_out @ Wo^T  → f32 GEMM scratch.
         //   Wo shape on disk: [hidden, q_rows] BF16->F16.
         //   m=1, n=hidden, k=q_rows.
@@ -8720,6 +8796,8 @@ impl Gemma4Bringup {
                 ));
             }
         }
+
+        probe("post_residual1(hidden)", workspace.hidden, hidden);
 
         tracing::trace!(
             layer_idx,
@@ -9047,6 +9125,32 @@ impl Gemma4Bringup {
                     rvllm_core::CudaCtx::setup(),
                 ));
             }
+        }
+
+        // Layer-trace probe: gated by RVLLM_GEMMA4_SPEC_LAYER_TRACE=1
+        // so the same flag dumps both attn-finisher and mlp-finisher
+        // outputs per layer.
+        if std::env::var("RVLLM_GEMMA4_SPEC_LAYER_TRACE").as_deref() == Ok("1") {
+            let _ = self.stream.fence();
+            let mut buf = vec![0u16; hidden];
+            unsafe {
+                let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut _, workspace.hidden, hidden * 2);
+            }
+            let mut max_abs = 0f32;
+            let mut sum_sq = 0f64;
+            for &b in &buf {
+                let v = half::f16::from_bits(b).to_f32();
+                if v.is_finite() {
+                    if v.abs() > max_abs { max_abs = v.abs(); }
+                    sum_sq += (v * v) as f64;
+                }
+            }
+            let rms = (sum_sq / hidden as f64).sqrt() as f32;
+            let head8: Vec<f32> = buf.iter().take(8)
+                .map(|&b| half::f16::from_bits(b).to_f32()).collect();
+            eprintln!("[layer-trace L{} post_mlp(hidden)] max={:.3} rms={:.4} head8={:?}",
+                      layer_idx, max_abs, rms, head8);
         }
 
         tracing::trace!(
