@@ -4890,9 +4890,19 @@ impl Gemma4Bringup {
         let outer_ck = self.arena.checkpoint();
         let call_result: Result<u32> = (|| {
             let mut hook_guard = SpecHookGuard::new(self);
-            let _ = &mut hook_guard; // suppress unused-mut on read-only path
-            self.force_common_prefix_override
-                .store(start_pos, std::sync::atomic::Ordering::Release);
+            let _ = &mut hook_guard;
+            // Codex Round 6: do NOT set force_common_prefix_override.
+            // The warmup's max_new=1 decode step wrote per-token-decode
+            // K/V into slot P; chunk-prefill K/V via override produces
+            // slightly different bytes for the same input, and the
+            // downstream decode reads from that mismatched slot and
+            // diverges. Use the natural prefix-cache token-id match
+            // path: prefix_cache.last_tokens already holds the prompt,
+            // and the appended bonus is the only new token — run_generate
+            // will detect new_q = 1 and prefill it via the same code
+            // path the warmup decode used. skip_prefix_cache_publish
+            // still keeps spec-internal state out of the cross-request
+            // cache.
             self.skip_prefix_cache_publish
                 .store(true, std::sync::atomic::Ordering::Release);
             self.base_last_hidden_snapshot_pending
