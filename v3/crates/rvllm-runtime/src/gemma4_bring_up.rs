@@ -9224,21 +9224,23 @@ impl Gemma4Bringup {
         let max_blocks_per_seq = num_blocks_total;
 
         let prompt_len = prompt_ids.len() as u32;
-        // Codex Round 8 perf #1: when `force_common_prefix_override`
-        // is set (spec-decode invocation), the chunked-prefill body
-        // processes only `prompt_len - override` new tokens. Sizing
-        // scratch to `prompt_len` allocates O(prompt_len) bytes per
-        // region across 15 regions — for a 150-token session with
-        // K=4 new tokens, that's ~37× more arena bytes than needed.
-        // Peek the atomic non-destructively (Acquire load) so we can
-        // size scratch correctly; the actual swap-consume still
-        // happens below at the existing site, preserving the
-        // one-shot semantics.
-        let override_peek = self
+        // Codex round 10 fix: consume `force_common_prefix_override`
+        // EXACTLY ONCE at the top via swap. The prior load-then-later-
+        // swap pattern was unsafe under hook-leak: if a spec call set
+        // the override and errored before consuming it, the leaked
+        // value survived until the next run_generate. If that next
+        // call was non-spec, the leaked override was consumed at the
+        // late swap site (~line 9280) and used as common_prefix_len,
+        // skipping real prompt tokens → garbage output. Consuming
+        // here pins the value to ONE local variable used by both
+        // max_tokens sizing AND the prefix-cache branch.
+        let forced_prefix_override = self
             .force_common_prefix_override
-            .load(std::sync::atomic::Ordering::Acquire);
-        let max_tokens = if override_peek != u32::MAX && (override_peek as usize) < prompt_ids.len() {
-            (prompt_len - override_peek).max(1)
+            .swap(u32::MAX, std::sync::atomic::Ordering::AcqRel);
+        let max_tokens = if forced_prefix_override != u32::MAX
+            && (forced_prefix_override as usize) < prompt_ids.len()
+        {
+            (prompt_len - forced_prefix_override).max(1)
         } else {
             prompt_len.max(1)
         };
@@ -9269,17 +9271,11 @@ impl Gemma4Bringup {
         // arena allocation — no cache hit available in that case.
         let sliding_blocks = num_blocks_total;
         let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(false);
-        // Codex review priority 1 (commit 49 — Phase B-2):
-        // verify_batched_from_state arms this AtomicU32 with the
-        // session's committed_len. When non-sentinel, the prefix-
-        // cache match (token-id loop + chunk_size cap) is bypassed:
-        // we use the forced value directly as common_prefix_len.
-        // This eliminates the "RVLLM_PREFILL_CHUNK_SIZE=2048 forces
-        // full re-prefill on short prompts" failure mode that was
-        // killing wall-clock for spec-decode.
-        let forced_prefix_override = self
-            .force_common_prefix_override
-            .swap(u32::MAX, std::sync::atomic::Ordering::AcqRel);
+        // `forced_prefix_override` was consumed at the top of this
+        // function via swap (codex round 10 fix). Re-using the local
+        // here. When non-sentinel, the prefix-cache match (token-id
+        // loop + chunk_size cap) is bypassed and the forced value is
+        // used directly as common_prefix_len.
         let (kv_cache_ptr, kv_scale_ptr, kv_layer_offsets, kv_scale_layer_offsets,
              kv_total_bytes, kv_scale_total_bytes, common_prefix_len_raw) = {
             let guard = self.prefix_cache.lock().unwrap();
@@ -10734,28 +10730,22 @@ impl Gemma4Bringup {
                 chunk_idx += 1;
             } // end chunk loop
 
-            // Codex Round 3 #1: diag capture is only consumed by the
-            // diag_compare `else` branch below (lines ~10379-10384
-            // `stats()` calls). Gating the fence + 2 hidden-sized
-            // DtoH behind the same flag removes an unconditional
-            // host-readback from the batch-prefill hot path. The
-            // K-hidden capture above doesn't need this fence — its
-            // DtoD is stream-ordered with the downstream argmax
-            // DtoH the spec-verify path already issues.
+            // Codex round 10 revert of Codex Round 3 #1: the fence
+            // was originally unconditional. Removing it from the
+            // non-diag path broke the base output on E4B (tokens
+            // get dropped/substituted, e.g. "Paris" → "**"). The
+            // host fence after the chunk loop is load-bearing; do
+            // not gate it behind diag_compare.
+            self.stream.fence()?;
             let mut prefill_first: Vec<u16> = Vec::new();
             let mut prefill_last: Vec<u16> = Vec::new();
             if diag_compare {
-                self.stream.fence()?;
                 prefill_first = vec![0u16; hidden as usize];
                 cudarc::driver::sys::cuMemcpyDtoH_v2(
                     prefill_first.as_mut_ptr() as *mut _,
                     residual_ptr,
                     (hidden * 2) as _,
                 );
-                // The residual buffer holds `new_q` rows after the
-                // layer loop (prefix-cached slots are not re-prefilled).
-                // Row `new_q - 1` is the last prompt token regardless
-                // of how many tokens were cached.
                 prefill_last = vec![0u16; hidden as usize];
                 let last_off_diag = (new_q - 1) as u64 * hidden as u64 * 2;
                 cudarc::driver::sys::cuMemcpyDtoH_v2(

@@ -1510,11 +1510,28 @@ fn run_one(
                 )
             }
         } else {
-            // Defensive: clear the flag (no-op unless a prior request
-            // armed it and somehow bypassed the post-call clear).
+            // Codex round 10 fix: defensively disarm ALL spec-decode
+            // hook atomics before a non-spec run_generate call. Prior
+            // sessions only cleared force_batched_verify here; the
+            // other hooks (force_common_prefix_override,
+            // force_prefill_only, skip_prefix_cache_publish, the two
+            // base_last_*_snapshot_pending flags) could leak across
+            // requests from an errored spec path and corrupt the next
+            // non-spec request — e.g. force_common_prefix_override
+            // makes run_generate skip real prompt tokens, reading
+            // stale KV slots and producing garbage like
+            // "Die,\n\n        *,\n\n        *,...".
+            use std::sync::atomic::Ordering::Release;
+            bringup.force_batched_verify.store(false, Release);
             bringup
-                .force_batched_verify
-                .store(false, std::sync::atomic::Ordering::Release);
+                .force_common_prefix_override
+                .store(u32::MAX, Release);
+            bringup.force_prefill_only.store(false, Release);
+            bringup.skip_prefix_cache_publish.store(false, Release);
+            bringup.base_last_k_snapshot_pending.store(false, Release);
+            bringup
+                .base_last_hidden_snapshot_pending
+                .store(false, Release);
             bringup.run_generate(
                 kernels.fn_embed,
                 kernels.fn_argmax,
