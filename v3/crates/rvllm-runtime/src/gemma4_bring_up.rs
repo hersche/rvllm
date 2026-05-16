@@ -5711,15 +5711,20 @@ impl Gemma4Bringup {
                     )?;
                 }
 
-                // Emit the bonus token (= base's prediction at position
-                // old_committed + accept_len, computed by verify pass).
+                // Codex Round 9 #2: commit-before-emit invariant.
+                // Bonus's base K/V and shadow K/V must be committed
+                // BEFORE the token is exposed via emitted.push +
+                // on_token callback. If the callback aborts (cb()
+                // returns false) or max_new/EOS triggers mid-emit, the
+                // internal session state is then exactly the
+                // externally-visible state — no "emitted token whose
+                // base K/V isn't in the cache" tail.
+                //
+                // Early bail-outs *before* the commit (max_new full,
+                // bonus is EOS) must skip both the commit AND the
+                // emit, so they're checked first.
                 if emitted.len() >= max_new { break 'outer; }
                 if eos_ids.contains(&bonus) { break 'outer; }
-                emitted.push(bonus);
-                if let Some(cb) = on_token.as_mut() {
-                    if !cb(bonus) { break 'outer; }
-                }
-                if emitted.len() >= max_new { break 'outer; }
 
                 // Commit the bonus's base K/V + capture its
                 // POST-final-norm hidden for the next iter's drafter.
