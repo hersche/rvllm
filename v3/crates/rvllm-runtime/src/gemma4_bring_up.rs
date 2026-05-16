@@ -10730,16 +10730,15 @@ impl Gemma4Bringup {
                 chunk_idx += 1;
             } // end chunk loop
 
-            // Codex round 10 revert of Codex Round 3 #1: the fence
-            // was originally unconditional. Removing it from the
-            // non-diag path broke the base output on E4B (tokens
-            // get dropped/substituted, e.g. "Paris" → "**"). The
-            // host fence after the chunk loop is load-bearing; do
-            // not gate it behind diag_compare.
-            self.stream.fence()?;
+            // Codex Round 3 #1: diag capture is only consumed by the
+            // diag_compare `else` branch below; gating the fence + 2
+            // hidden-sized DtoH behind the same flag removes an
+            // unconditional host-readback from the batch-prefill hot
+            // path.
             let mut prefill_first: Vec<u16> = Vec::new();
             let mut prefill_last: Vec<u16> = Vec::new();
             if diag_compare {
+                self.stream.fence()?;
                 prefill_first = vec![0u16; hidden as usize];
                 cudarc::driver::sys::cuMemcpyDtoH_v2(
                     prefill_first.as_mut_ptr() as *mut _,
