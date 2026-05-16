@@ -711,58 +711,6 @@ impl Gemma4DrafterRuntime {
         valid_len_slots: u32,
         stream: u64,
     ) -> Result<()> {
-        // Back-compat path: delegate to the range variant covering
-        // [0, valid_len_slots). The session-driven spec-decode loop
-        // uses `populate_shadow_kv_range_from_base` directly for
-        // incremental updates.
-        self.populate_shadow_kv_range_from_base(
-            base_sliding_k, base_sliding_v,
-            base_full_k, base_full_v,
-            base_sliding_k_scale, base_sliding_v_scale,
-            base_full_k_scale, base_full_v_scale,
-            sliding_kv_dtype, full_kv_dtype,
-            sliding_bytes, full_bytes,
-            0, valid_len_slots, stream,
-        )
-    }
-
-    /// Range variant of `populate_shadow_kv_from_base`: dequant/copy
-    /// base K/V slots `[slot_start, slot_start + slot_count)` into the
-    /// drafter's shadow buffer at the same offsets. Used by the
-    /// session-driven spec-decode loop to do INCREMENTAL shadow
-    /// updates after acceptance — only the newly-committed slots are
-    /// pulled in, instead of redoing the entire prefix every
-    /// iteration.
-    ///
-    /// `slot_count == 0` is a no-op. `slot_start == 0` with
-    /// `slot_count == valid_len_slots` reproduces the legacy
-    /// "populate first N slots" behaviour exactly.
-    ///
-    /// NVFP4 invariant: each slot contributes `nkvh * head_dim`
-    /// elements (= multiples of 16 for the configurations this code
-    /// supports), so the per-element offsets are 16-aligned and the
-    /// packed-byte / scale-byte offsets are well-defined. The check
-    /// is asserted at call time.
-    #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn populate_shadow_kv_range_from_base(
-        &self,
-        base_sliding_k: u64,
-        base_sliding_v: u64,
-        base_full_k: u64,
-        base_full_v: u64,
-        base_sliding_k_scale: u64,
-        base_sliding_v_scale: u64,
-        base_full_k_scale: u64,
-        base_full_v_scale: u64,
-        sliding_kv_dtype: crate::gemma4_layer_exec::KvDtype,
-        full_kv_dtype: crate::gemma4_layer_exec::KvDtype,
-        sliding_bytes: usize,
-        full_bytes: usize,
-        slot_start: u32,
-        slot_count: u32,
-        stream: u64,
-    ) -> Result<()> {
         let shadow = self.shadow_kv.as_ref().ok_or_else(|| RvllmError::Attention {
             err: AttentionError::FeatureNotAvailable {
                 op: "populate_shadow_kv_from_base: shadow_kv not attached",
@@ -798,39 +746,30 @@ impl Gemma4DrafterRuntime {
         let sliding_max_elems = (sliding_bytes / 2) as i64;
         let full_max_elems = (full_bytes / 2) as i64;
 
-        // Both kernels and the F16 DtoD use the contiguous
-        // `[num_slots, nkvh, head_dim]` layout, so element index i
-        // for slot s is `s * nkvh * head_dim .. (s+1) * nkvh * head_dim`.
+        // Commit 57: derive the truncated work range from
+        // `valid_len_slots`. Both kernels and the F16 DtoD use the
+        // contiguous `[num_slots, nkvh, head_dim]` layout, so element
+        // index i < valid_len_slots * nkvh * head_dim covers exactly
+        // the active-context slots. `valid_len_slots == 0` keeps the
+        // legacy full-buffer behaviour for callers that haven't
+        // been ported.
         let sliding_per_slot_elems =
             (shadow.sliding_num_kv_heads as i64) * (shadow.sliding_head_dim as i64);
         let full_per_slot_elems =
             (shadow.full_num_kv_heads as i64) * (shadow.full_head_dim as i64);
-
-        // Legacy sentinel: `slot_start == 0 && slot_count == 0`
-        // means "populate the full shadow buffer". Kept so the
-        // back-compat wrapper `populate_shadow_kv_from_base` can pass
-        // `valid_len_slots == 0` through.
-        let legacy_full = slot_start == 0 && slot_count == 0;
-        if !legacy_full && slot_count == 0 {
-            // Strict-range no-op.
-            return Ok(());
-        }
-
-        let (sliding_elem_off, sliding_elems) = if legacy_full {
-            (0i64, sliding_max_elems)
+        let (sliding_elems, sliding_dst_bytes) = if valid_len_slots == 0 {
+            (sliding_max_elems, sliding_bytes)
         } else {
-            let off = (slot_start as i64) * sliding_per_slot_elems;
-            let want = (slot_count as i64) * sliding_per_slot_elems;
-            let clamped = want.min(sliding_max_elems.saturating_sub(off).max(0));
-            (off, clamped)
+            let want = (valid_len_slots as i64) * sliding_per_slot_elems;
+            let clamped = want.min(sliding_max_elems);
+            (clamped, (clamped as usize) * 2)
         };
-        let (full_elem_off, full_elems) = if legacy_full {
-            (0i64, full_max_elems)
+        let (full_elems, full_dst_bytes) = if valid_len_slots == 0 {
+            (full_max_elems, full_bytes)
         } else {
-            let off = (slot_start as i64) * full_per_slot_elems;
-            let want = (slot_count as i64) * full_per_slot_elems;
-            let clamped = want.min(full_max_elems.saturating_sub(off).max(0));
-            (off, clamped)
+            let want = (valid_len_slots as i64) * full_per_slot_elems;
+            let clamped = want.min(full_max_elems);
+            (clamped, (clamped as usize) * 2)
         };
 
         // Sliding source layer (K + V).
@@ -843,7 +782,7 @@ impl Gemma4DrafterRuntime {
             base_sliding_v_scale,
             shadow.sliding_num_kv_heads as i32,
             shadow.sliding_head_dim as i32,
-            sliding_elem_off,
+            sliding_dst_bytes,
             sliding_elems,
             sliding_kv_dtype,
             "sliding",
@@ -860,7 +799,7 @@ impl Gemma4DrafterRuntime {
             base_full_v_scale,
             shadow.full_num_kv_heads as i32,
             shadow.full_head_dim as i32,
-            full_elem_off,
+            full_dst_bytes,
             full_elems,
             full_kv_dtype,
             "full",
@@ -885,33 +824,16 @@ impl Gemma4DrafterRuntime {
         base_v_scale: u64,
         nkvh: i32,
         head_dim: i32,
-        elem_offset: i64,
+        layer_bytes: usize,
         n_elems: i64,
         kv_dtype: crate::gemma4_layer_exec::KvDtype,
         which: &'static str,
         stream: u64,
     ) -> Result<()> {
-        if n_elems <= 0 {
-            return Ok(());
-        }
-        // Per-slot element count (= nkvh * head_dim).
-        let per_slot_elems = (nkvh as i64) * (head_dim as i64);
-        // Slot the element-offset aligns to (used for FP8 scale offset).
-        // The caller's `elem_offset` is always slot-aligned because
-        // it derives from `slot_start * per_slot_elems`.
-        debug_assert!(per_slot_elems > 0);
-        debug_assert!(elem_offset % per_slot_elems == 0,
-            "populate_one_source_layer: elem_offset {} not slot-aligned (per_slot={})",
-            elem_offset, per_slot_elems);
-        let slot_offset = elem_offset / per_slot_elems;
-
         match kv_dtype {
             crate::gemma4_layer_exec::KvDtype::F16 => {
-                let _ = (base_k_scale, base_v_scale);
+                let _ = (base_k_scale, base_v_scale, nkvh, head_dim);
                 use cudarc::driver::sys::*;
-                let src_byte_off = (elem_offset as u64) * 2;
-                let dst_byte_off = src_byte_off;
-                let n_bytes = (n_elems as usize) * 2;
                 let do_copy = |dst: u64, src: u64, n: usize, op: &'static str|
                     -> Result<()> {
                     let rc = cuMemcpyDtoDAsync_v2(dst, src, n, stream as CUstream);
@@ -932,8 +854,8 @@ impl Gemma4DrafterRuntime {
                 };
                 let k_op = if which == "sliding" { "sliding_k" } else { "full_k" };
                 let v_op = if which == "sliding" { "sliding_v" } else { "full_v" };
-                do_copy(shadow_k + dst_byte_off, base_k + src_byte_off, n_bytes, k_op)?;
-                do_copy(shadow_v + dst_byte_off, base_v + src_byte_off, n_bytes, v_op)?;
+                do_copy(shadow_k, base_k, layer_bytes, k_op)?;
+                do_copy(shadow_v, base_v, layer_bytes, v_op)?;
                 Ok(())
             }
             crate::gemma4_layer_exec::KvDtype::Fp8 => {
@@ -953,24 +875,12 @@ impl Gemma4DrafterRuntime {
                         bt: std::backtrace::Backtrace::capture(),
                     }
                 })?;
-                // FP8 src: 1 byte/elem. F16 dst: 2 bytes/elem.
-                // Scales: f32 per (slot, kv_head) row-major → byte
-                // offset = slot_offset * nkvh * 4.
-                let src_byte_off = elem_offset as u64;
-                let dst_byte_off = (elem_offset as u64) * 2;
-                let scale_byte_off = (slot_offset as u64) * (nkvh as u64) * 4;
                 self.launch_fp8_dequant_to_shadow(
-                    fn_fp8,
-                    base_k + src_byte_off,
-                    base_k_scale + scale_byte_off,
-                    shadow_k + dst_byte_off,
-                    nkvh, head_dim, n_elems, stream)?;
+                    fn_fp8, base_k, base_k_scale,
+                    shadow_k, nkvh, head_dim, n_elems, stream)?;
                 self.launch_fp8_dequant_to_shadow(
-                    fn_fp8,
-                    base_v + src_byte_off,
-                    base_v_scale + scale_byte_off,
-                    shadow_v + dst_byte_off,
-                    nkvh, head_dim, n_elems, stream)?;
+                    fn_fp8, base_v, base_v_scale,
+                    shadow_v, nkvh, head_dim, n_elems, stream)?;
                 let _ = which;
                 Ok(())
             }
@@ -991,41 +901,12 @@ impl Gemma4DrafterRuntime {
                         bt: std::backtrace::Backtrace::capture(),
                     }
                 })?;
-                // NVFP4 packed: 4-bit/elem → 2 elems/byte. Scale: 1
-                // E4M3 byte per 16 elems. F16 dst: 2 bytes/elem.
-                // Slot stride per_slot_elems must be 16-aligned (and
-                // even) for offsetting to be well-defined; assert.
-                if per_slot_elems % 16 != 0 || (per_slot_elems % 2) != 0 {
-                    return Err(RvllmError::Attention {
-                        err: AttentionError::FeatureNotAvailable {
-                            op: "populate_shadow_kv_range(nvfp4): \
-                                 per_slot_elems not 16-aligned",
-                            backend: "Gemma4Drafter",
-                        },
-                        ctx: AttnCtx {
-                            op: "populate_shadow_kv_range(nvfp4)",
-                            stream,
-                            num_seqs: 1,
-                            head_dim: head_dim as u32,
-                        },
-                        bt: std::backtrace::Backtrace::capture(),
-                    });
-                }
-                let src_byte_off = (elem_offset as u64) / 2;
-                let dst_byte_off = (elem_offset as u64) * 2;
-                let scale_byte_off = (elem_offset as u64) / 16;
                 self.launch_nvfp4_dequant_to_shadow(
-                    fn_nvfp4,
-                    base_k + src_byte_off,
-                    base_k_scale + scale_byte_off,
-                    shadow_k + dst_byte_off,
-                    n_elems, stream)?;
+                    fn_nvfp4, base_k, base_k_scale,
+                    shadow_k, n_elems, stream)?;
                 self.launch_nvfp4_dequant_to_shadow(
-                    fn_nvfp4,
-                    base_v + src_byte_off,
-                    base_v_scale + scale_byte_off,
-                    shadow_v + dst_byte_off,
-                    n_elems, stream)?;
+                    fn_nvfp4, base_v, base_v_scale,
+                    shadow_v, n_elems, stream)?;
                 let _ = (nkvh, head_dim, which);
                 Ok(())
             }

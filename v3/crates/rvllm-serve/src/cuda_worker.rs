@@ -1455,18 +1455,16 @@ fn run_one(
             // for debugging the legacy sequential-decode verify; not
             // a production path.
             let iterative = std::env::var("RVLLM_GEMMA4_SPEC_ITERATIVE").as_deref() == Ok("1");
+            // Arm the force_batched_verify atomic so the inner spec
+            // function takes the batched-verify branch unconditionally
+            // when reached from the batched wrapper. Replaces an
+            // earlier draft that env::set_var'd RVLLM_GEMMA4_SPEC_BATCHED
+            // (= the same anti-pattern codex priority 2 flagged).
+            bringup
+                .force_batched_verify
+                .store(true, std::sync::atomic::Ordering::Release);
             let batched = !legacy_debug && !iterative;
             if batched {
-                // Codex Round 9 #4: arm the force_batched_verify atomic
-                // ONLY for the batched wrapper, and clear it after the
-                // call so the flag cannot leak into a subsequent
-                // non-batched request handled by the same worker.
-                // Earlier the store(true) was unconditionally above
-                // the branch, which armed the flag even for the
-                // legacy / iterative paths.
-                bringup
-                    .force_batched_verify
-                    .store(true, std::sync::atomic::Ordering::Release);
                 bringup.run_generate_speculative_batched(
                     kernels.fn_embed,
                     kernels.fn_argmax,
@@ -1510,11 +1508,6 @@ fn run_one(
                 )
             }
         } else {
-            // Defensive: clear the flag (no-op unless a prior request
-            // armed it and somehow bypassed the post-call clear).
-            bringup
-                .force_batched_verify
-                .store(false, std::sync::atomic::Ordering::Release);
             bringup.run_generate(
                 kernels.fn_embed,
                 kernels.fn_argmax,
@@ -1538,13 +1531,6 @@ fn run_one(
             )
         }
     };
-
-    // Codex Round 9 #4: clear force_batched_verify after the spec call
-    // returns so the flag cannot leak into the next request handled
-    // by this worker. No-op when the flag was never set.
-    bringup
-        .force_batched_verify
-        .store(false, std::sync::atomic::Ordering::Release);
 
     match result {
         Ok(generated_ids) => {
