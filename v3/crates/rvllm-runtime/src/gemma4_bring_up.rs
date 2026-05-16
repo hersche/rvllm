@@ -2073,12 +2073,57 @@ impl Gemma4Bringup {
         let assistant_kv_sources = arch
             .assistant_shared_kv_sources()
             .map(|(s, f)| {
-                eprintln!(
-                    "[gemma4] assistant-drafter shared-KV sources: \
-                     sliding=layer {s}, full=layer {f} \
-                     (num_hidden_layers={}, num_kv_shared_layers={:?})",
-                    arch.num_hidden_layers, arch.num_kv_shared_layers
-                );
+                // RVLLM_GEMMA4_SPEC_SOURCE_PAIR=<sliding>,<full>
+                // debug override — for bisecting the
+                // accept_rate=0 case on 31B. Values must point at a
+                // SlidingAttention and a GlobalAttention layer
+                // respectively; anything else is treated as a
+                // configuration error at startup.
+                let (s, f) = match std::env::var("RVLLM_GEMMA4_SPEC_SOURCE_PAIR") {
+                    Ok(v) => {
+                        let parts: Vec<&str> = v.split(',').collect();
+                        if parts.len() != 2 {
+                            panic!("RVLLM_GEMMA4_SPEC_SOURCE_PAIR=\"{v}\" \
+                                must be <sliding>,<full>");
+                        }
+                        let ovs: usize = parts[0].trim().parse().unwrap_or_else(|_|
+                            panic!("RVLLM_GEMMA4_SPEC_SOURCE_PAIR sliding={:?} \
+                                not parseable as usize", parts[0]));
+                        let ovf: usize = parts[1].trim().parse().unwrap_or_else(|_|
+                            panic!("RVLLM_GEMMA4_SPEC_SOURCE_PAIR full={:?} \
+                                not parseable as usize", parts[1]));
+                        if ovs >= arch.num_hidden_layers || ovf >= arch.num_hidden_layers {
+                            panic!("RVLLM_GEMMA4_SPEC_SOURCE_PAIR out of range \
+                                (num_hidden_layers={})", arch.num_hidden_layers);
+                        }
+                        use rvllm_loader::gemma4_arch::Gemma4LayerType;
+                        if arch.layer_types[ovs] != Gemma4LayerType::SlidingAttention {
+                            panic!("RVLLM_GEMMA4_SPEC_SOURCE_PAIR sliding={ovs} \
+                                is not a SlidingAttention layer (got {:?})",
+                                arch.layer_types[ovs]);
+                        }
+                        if arch.layer_types[ovf] != Gemma4LayerType::GlobalAttention {
+                            panic!("RVLLM_GEMMA4_SPEC_SOURCE_PAIR full={ovf} \
+                                is not a GlobalAttention layer (got {:?})",
+                                arch.layer_types[ovf]);
+                        }
+                        eprintln!(
+                            "[gemma4] assistant-drafter shared-KV sources: \
+                             OVERRIDDEN to sliding=layer {ovs}, full=layer {ovf} \
+                             (default would have been ({s}, {f}))"
+                        );
+                        (ovs, ovf)
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "[gemma4] assistant-drafter shared-KV sources: \
+                             sliding=layer {s}, full=layer {f} \
+                             (num_hidden_layers={}, num_kv_shared_layers={:?})",
+                            arch.num_hidden_layers, arch.num_kv_shared_layers
+                        );
+                        (s, f)
+                    }
+                };
                 Gemma4AssistantKvSources {
                     sliding_source_layer: s as u32,
                     full_source_layer: f as u32,
@@ -5693,6 +5738,16 @@ impl Gemma4Bringup {
                 } else {
                     break;
                 }
+            }
+            // r10-trace: log drafts vs base for the first few iters to
+            // diagnose accept_rate=0 cases. Gated to keep production
+            // logs clean.
+            if std::env::var("RVLLM_GEMMA4_SPEC_DRAFT_TRACE").as_deref() == Ok("1") {
+                eprintln!(
+                    "[draft-trace] iter={} next_base_seed={} drafts={:?} base_argmax_k={:?} accept_len={}",
+                    iter_count, session.next_base_argmax,
+                    drafts.tokens, base_argmax_k, accept_len
+                );
             }
             // Codex Round 7 #5: count accepted only after we've actually
             // emitted them. Previously total_accepted was incremented up
