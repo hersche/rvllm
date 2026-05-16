@@ -1181,6 +1181,16 @@ pub struct Gemma4Bringup {
     /// position (= base_argmax_K[accept_len - 1] from prev iter).
     /// `u32::MAX` is the sentinel "no cached value".
     pub saved_warmup_b_p: std::sync::atomic::AtomicU32,
+    /// Commit 53 (Phase D-2): per-request override flag for
+    /// `SpecDecodeRequestConfig::emit_accepted`. Set by the outer
+    /// wrappers (`run_generate_speculative_batched`,
+    /// `run_generate_speculative_iterative`) to force the inner
+    /// spec function to emit accepted-prefix-only, replacing the
+    /// `env::set_var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED", "1")`
+    /// + save/restore pattern (codex review priority 2 "scribbles
+    /// globals"). One-shot: consumed by `SpecDecodeRequestConfig::
+    /// from_env_with_overrides` at fn entry.
+    pub force_emit_accepted: std::sync::atomic::AtomicBool,
     /// Codex review priority 1 (commit 49 — Phase B-2): when
     /// non-`u32::MAX`, overrides the `prefix_cache` token-match +
     /// chunk_size-cap computation inside `run_generate`. The next
@@ -2006,6 +2016,7 @@ impl Gemma4Bringup {
             base_last_k_count: std::sync::atomic::AtomicU32::new(0),
             skip_next_warmup: std::sync::atomic::AtomicBool::new(false),
             saved_warmup_b_p: std::sync::atomic::AtomicU32::new(u32::MAX),
+            force_emit_accepted: std::sync::atomic::AtomicBool::new(false),
             force_common_prefix_override: std::sync::atomic::AtomicU32::new(u32::MAX),
             skip_prefix_cache_publish: std::sync::atomic::AtomicBool::new(false),
             base_last_k_snapshot_pending:
@@ -4391,20 +4402,19 @@ impl Gemma4Bringup {
             //    follow-up that requires refactoring
             //    run_generate_speculative to expose
             //    `run_drafter_step_only()`.
-            let prev_emit_env = std::env::var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED").ok();
-            std::env::set_var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED", "1");
+            // Phase D-2: force emit-accepted via per-bringup atomic
+            // flag, not env::set_var. Consumed by inner spec function
+            // at SpecDecodeRequestConfig assembly. Re-armed per iter
+            // because the atomic is swap(false) on consume.
+            self.force_emit_accepted
+                .store(true, std::sync::atomic::Ordering::Release);
             let want = (max_new - emitted.len()).min(k + 1);
             let chunk = self.run_generate_speculative(
                 fn_embed, fn_argmax,
                 &current_prompt, want.max(1), eos_ids,
                 spec_k, sampling, cancel, None,
                 &[], &[],
-            );
-            match prev_emit_env {
-                Some(v) => std::env::set_var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED", v),
-                None => std::env::remove_var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED"),
-            }
-            let chunk = chunk?;
+            )?;
             if let Some(stats) = self.take_last_spec_stats() {
                 total_drafted = total_drafted.saturating_add(stats.drafted);
                 total_accepted = total_accepted.saturating_add(stats.accepted);
@@ -4503,14 +4513,10 @@ impl Gemma4Bringup {
         let mut total_drafted: u32 = 0;
         let mut total_accepted: u32 = 0;
 
-        // Force the inner spec function to emit accepted-prefix
-        // tokens, not the full base sequence. We need this so the
-        // outer loop's emit is bounded by spec_k+1 per iteration.
-        // The original env knob remains user-controllable; we set
-        // it inline here for the iterative path's correctness.
-        let prev_emit_env = std::env::var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED").ok();
-        std::env::set_var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED", "1");
-
+        // Phase D-2: force emit-accepted on each inner call via the
+        // per-bringup atomic flag (replaces env::set_var scribble).
+        // Re-armed at the top of each loop body since the inner
+        // function consumes the flag with swap(false).
         let mut result = Ok::<Vec<u32>, rvllm_core::RvllmError>(Vec::new());
         'outer: while emitted.len() < max_new {
             // Cancel check between iterations — cheap atomic load.
@@ -4535,6 +4541,9 @@ impl Gemma4Bringup {
             // The on_token callback only fires from base's decode loop;
             // pass `None` to avoid double-emission. We'll deliver
             // accepted tokens to the worker via the return value.
+            // Phase D-2: arm force_emit_accepted before each inner call.
+            self.force_emit_accepted
+                .store(true, std::sync::atomic::Ordering::Release);
             let chunk = match self.run_generate_speculative(
                 fn_embed,
                 fn_argmax,
@@ -4581,11 +4590,10 @@ impl Gemma4Bringup {
             current_prompt.extend_from_slice(&chunk);
             iter_count = iter_count.saturating_add(1);
         }
-        // Restore prior env state.
-        match prev_emit_env {
-            Some(v) => std::env::set_var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED", v),
-            None => std::env::remove_var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED"),
-        }
+        // Phase D-2: defensive — clear the atomic in case we
+        // bailed out of the loop without consuming an armed flag.
+        self.force_emit_accepted
+            .store(false, std::sync::atomic::Ordering::Release);
         // Refresh aggregated stats for header / event emission.
         *self.last_spec_stats.lock().unwrap() = Some(LastSpecStats {
             drafted: total_drafted,
@@ -4646,7 +4654,19 @@ impl Gemma4Bringup {
         // env knobs at function entry. Codex review priority 6 — no
         // more env reads in the K-prefix verify loop (per-row
         // RVLLM_GEMMA4_SPEC_ACCEPT_BIAS was redundant overhead).
-        let spec_cfg = SpecDecodeRequestConfig::from_env();
+        //
+        // Commit 53 (Phase D-2): also consume the
+        // `force_emit_accepted` atomic flag set by the outer wrappers
+        // (replaces the env::set_var scribble pattern codex priority
+        // 2 called out).
+        let mut spec_cfg = SpecDecodeRequestConfig::from_env();
+        if self
+            .force_emit_accepted
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            spec_cfg.emit_accepted = true;
+        }
+        let spec_cfg = spec_cfg;
         let batched_verify_mode = spec_cfg.batched_verify_mode;
         let typical_mode = spec_cfg.typical_mode;
         if !matches!(sampling, SamplingConfig::Greedy) && !typical_mode {
