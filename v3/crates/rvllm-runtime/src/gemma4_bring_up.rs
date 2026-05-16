@@ -2065,8 +2065,11 @@ impl Gemma4Bringup {
 
         // Spec-decode commit 3: pre-compute the source-layer indices
         // the Gemma 4 assistant-drafter will consume at draft time.
-        // `None` on archs without `num_kv_shared_layers` (e.g. 31B);
-        // populated on E4B-it as `(22, 23)`.
+        // E4B-it (num_kv_shared_layers=18, 42 layers): (22, 23) —
+        // last sliding + last full in the non-shared prefix [0, 24).
+        // 31B-it (num_kv_shared_layers=0, 60 layers): (58, 59) —
+        // last sliding + last full across the full layer range.
+        // `None` only when one of the two layer types is absent.
         let assistant_kv_sources = arch
             .assistant_shared_kv_sources()
             .map(|(s, f)| {
@@ -2164,9 +2167,13 @@ impl Gemma4Bringup {
                 err: LoaderError::Corrupt {
                     detail:
                         "ensure_drafter: base model has no \
-                         assistant_kv_sources (num_kv_shared_layers \
-                         unset). The Gemma 4 assistant drafter requires \
-                         an E4B-style model with a shared-KV tail."
+                         assistant_kv_sources — assistant_shared_kv_sources \
+                         could not resolve a (sliding, full) pair of \
+                         source layers. The Gemma 4 assistant drafter \
+                         cross-attends to one base layer of each type. \
+                         E4B-it resolves to (22, 23), 31B-it resolves to \
+                         (58, 59); an arch missing either layer type is \
+                         not assistant-compatible."
                             .into(),
                 },
                 ctx: LoaderCtx { path: drafter_dir.to_path_buf(), tensor: None },
@@ -4717,31 +4724,91 @@ impl Gemma4Bringup {
                 let per_centroid: i32 = if n_centroids > 0 {
                     vocab / n_centroids
                 } else { 0 };
-                let fn_masked = drafter
-                    .fn_masked_embedder_argmax_f16
-                    .expect("MaskedEmbedder kernel attached in ensure_drafter");
-                let (sp_ids_ptr, sp_lg_ptr) = if typical_mode {
-                    (workspace.sparse_ids, workspace.sparse_logits)
+                // E4B drafter (`use_ordered_embeddings=true`) ships
+                // centroid masked-embedding tensors → take the
+                // centroid → top-K-vocab fast path. 31B drafter
+                // (`use_ordered_embeddings=false`) does NOT ship
+                // those tensors; per HF
+                // `Gemma4AssistantForCausalLM.forward()`, the
+                // decoder falls back to a full-vocab tied LM head:
+                // `lm_head = model.embed_tokens.weight`, then
+                // f16_gemm + argmax_f32 over the full vocab.
+                if drafter.arch.use_ordered_embeddings {
+                    let fn_masked = drafter
+                        .fn_masked_embedder_argmax_f16
+                        .expect("MaskedEmbedder kernel attached in ensure_drafter");
+                    let (sp_ids_ptr, sp_lg_ptr) = if typical_mode {
+                        (workspace.sparse_ids, workspace.sparse_logits)
+                    } else {
+                        (0u64, 0u64)
+                    };
+                    let centroids_ptr = drafter.top.centroids
+                        .expect("centroids uploaded when use_ordered_embeddings=true");
+                    let token_ordering_ptr = drafter.top.token_ordering
+                        .expect("token_ordering uploaded when use_ordered_embeddings=true");
+                    crate::gemma4_drafter::launch_masked_embedder_argmax_f16(
+                        fn_masked,
+                        workspace.hidden,
+                        centroids_ptr,
+                        token_ordering_ptr,
+                        drafter.top.embed_tokens,
+                        drafter.arch.hidden_size as i32,
+                        n_centroids,
+                        top_k,
+                        per_centroid,
+                        vocab,
+                        workspace.out_token_id,
+                        0,
+                        sp_ids_ptr,
+                        sp_lg_ptr,
+                        stream,
+                    )?;
                 } else {
-                    (0u64, 0u64)
-                };
-                crate::gemma4_drafter::launch_masked_embedder_argmax_f16(
-                    fn_masked,
-                    workspace.hidden,
-                    drafter.top.centroids,
-                    drafter.top.token_ordering,
-                    drafter.top.embed_tokens,
-                    drafter.arch.hidden_size as i32,
-                    n_centroids,
-                    top_k,
-                    per_centroid,
-                    vocab,
-                    workspace.out_token_id,
-                    0,
-                    sp_ids_ptr,
-                    sp_lg_ptr,
-                    stream,
-                )?;
+                    // Full-vocab tied LM head. workspace.gemm_f32 is
+                    // sized to `max_projection * 4` where
+                    // max_projection = max(vocab, ...) — vocab=262144
+                    // dominates so f32 logits fit.
+                    self.cublaslt.f16_gemm_f32(
+                        workspace.hidden,
+                        drafter.top.embed_tokens,
+                        workspace.gemm_f32,
+                        1,
+                        vocab,
+                        drafter.arch.hidden_size as i32,
+                        stream,
+                    )?;
+                    // Argmax over f32 vocab logits → out_token_id
+                    // (i32 written as 4 bytes; the caller reads it
+                    // back as u32). Same kernel the base path uses
+                    // for its post-LM-head argmax.
+                    rvllm_fused::ArgmaxLaunch {
+                        num_tokens: 1,
+                        vocab: vocab as u32,
+                    }
+                    .launch(
+                        self.fused.fn_argmax,
+                        workspace.gemm_f32,
+                        workspace.out_token_id,
+                        stream,
+                    )?;
+                    if typical_mode {
+                        // Typical-acceptance with the full-vocab
+                        // head is not implemented yet (the path
+                        // currently in production is greedy-only;
+                        // see config validation in
+                        // `run_generate_speculative_batched`).
+                        return Err(rvllm_core::RvllmError::Config {
+                            err: rvllm_core::ConfigError::InvalidField {
+                                name: "sampling",
+                                reason: "typical-acceptance with \
+                                    use_ordered_embeddings=false (31B \
+                                    drafter) is not implemented yet — \
+                                    greedy only.".into(),
+                            },
+                            field: "sampling",
+                        });
+                    }
+                }
 
                 self.cublaslt.f16_gemm_f32(
                     workspace.hidden,
@@ -7046,11 +7113,32 @@ impl Gemma4Bringup {
             } else {
                 (0u64, 0u64)
             };
+            // The legacy/iterative spec path remains masked-
+            // embedding-only; the 31B drafter
+            // (`use_ordered_embeddings=false`) is wired through the
+            // batched session-loop instead. Return a clean error so
+            // operators see the gate explicitly instead of
+            // .expect()-ing a centroid pointer that's absent.
+            let centroids_ptr = drafter.top.centroids.ok_or_else(|| {
+                rvllm_core::RvllmError::Config {
+                    err: rvllm_core::ConfigError::InvalidField {
+                        name: "drafter",
+                        reason: "legacy/iterative spec path is \
+                            masked-embedding-only; the 31B drafter \
+                            (use_ordered_embeddings=false) only runs \
+                            under the batched session loop \
+                            (RVLLM_GEMMA4_SPEC_BATCHED=1, default)".into(),
+                    },
+                    field: "drafter",
+                }
+            })?;
+            let token_ordering_ptr = drafter.top.token_ordering
+                .expect("token_ordering uploaded when centroids uploaded");
             crate::gemma4_drafter::launch_masked_embedder_argmax_f16(
                 fn_masked,
                 workspace.hidden,
-                drafter.top.centroids,
-                drafter.top.token_ordering,
+                centroids_ptr,
+                token_ordering_ptr,
                 drafter.top.embed_tokens,
                 drafter.arch.hidden_size as i32,
                 n_centroids,
@@ -7095,10 +7183,17 @@ impl Gemma4Bringup {
                 };
                 copy(h_hidden.as_mut_ptr() as *mut u8,
                      workspace.hidden, hidden_sz * 2, "hidden");
+                // RVLLM_SPEC_DEBUG dump is meaningful only when the
+                // masked-embedding path is in use. The Ok-branch
+                // above already errored out for use_ordered_embeddings
+                // = false before reaching this debug block, so both
+                // optional pointers are guaranteed Some here.
                 copy(h_centroids.as_mut_ptr() as *mut u8,
-                     drafter.top.centroids, n_cent * hidden_sz * 2, "centroids");
+                     drafter.top.centroids.expect("centroids present in legacy path"),
+                     n_cent * hidden_sz * 2, "centroids");
                 copy(h_token_ordering.as_mut_ptr() as *mut u8,
-                     drafter.top.token_ordering, vocab_sz * 8, "token_ordering");
+                     drafter.top.token_ordering.expect("token_ordering present in legacy path"),
+                     vocab_sz * 8, "token_ordering");
                 copy(h_embed.as_mut_ptr() as *mut u8,
                      drafter.top.embed_tokens, vocab_sz * hidden_sz * 2, "embed_tokens");
                 copy(h_last_emb.as_mut_ptr() as *mut u8,

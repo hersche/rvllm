@@ -94,6 +94,17 @@ pub struct Gemma4DrafterArch {
     /// Width of the `pre_projection` input — `[hidden_size, this]`.
     /// 5120 on E4B drafter (= 2 × `backbone_hidden_size`).
     pub pre_projection_in_dim: usize,
+    /// Top-level `use_ordered_embeddings` flag from the drafter's
+    /// `config.json`. When `true` (e.g. E4B-it assistant) the drafter
+    /// ships `masked_embedding.centroids.weight` +
+    /// `masked_embedding.token_ordering` and the decoder runs the
+    /// centroid → top-K-vocab masked-embedding head. When `false`
+    /// (e.g. 31B-it assistant) those tensors are absent and the
+    /// decoder runs a full-vocab tied LM head against
+    /// `model.embed_tokens.weight` directly. Mirrors HF
+    /// `Gemma4AssistantForCausalLM.forward()` which only constructs
+    /// `masked_embedding` when this flag is set.
+    pub use_ordered_embeddings: bool,
 }
 
 /// One drafter layer's tensor offsets in the safetensors shard.
@@ -121,8 +132,12 @@ pub struct Gemma4DrafterLayerOffsets {
 /// Top-level tensor offsets (everything not in a per-layer block).
 #[derive(Clone, Debug)]
 pub struct Gemma4DrafterTopOffsets {
-    pub centroids: u64,         // masked_embedding.centroids.weight
-    pub token_ordering: u64,    // masked_embedding.token_ordering (i64!)
+    /// `masked_embedding.centroids.weight` — present iff
+    /// `arch.use_ordered_embeddings == true`. `None` on 31B drafter.
+    pub centroids: Option<u64>,
+    /// `masked_embedding.token_ordering` (i64!) — present iff
+    /// `arch.use_ordered_embeddings == true`. `None` on 31B drafter.
+    pub token_ordering: Option<u64>,
     pub embed_tokens: u64,      // model.embed_tokens.weight
     pub pre_projection: u64,    // pre_projection.weight
     pub post_projection: u64,   // post_projection.weight
@@ -211,6 +226,16 @@ impl Gemma4DrafterArch {
         // E4B-it). Validated against the actual shard in
         // `Gemma4DrafterWeightLayout::from_dir`.
         let pre_projection_in_dim = 2 * backbone_hidden_size;
+        // Top-level `use_ordered_embeddings` selects the decoder
+        // head (centroid masked-embedding vs full-vocab tied LM
+        // head). E4B drafter ships `true`; 31B drafter ships
+        // `false`. Default conservatively to `true` for legacy
+        // checkpoints that omit the field — those would already be
+        // E4B-style by virtue of shipping the masked-embedding
+        // tensors.
+        let use_ordered_embeddings = v.get("use_ordered_embeddings")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true);
 
         Ok(Self {
             hidden_size, intermediate_size, num_hidden_layers,
@@ -220,6 +245,7 @@ impl Gemma4DrafterArch {
             layer_types,
             num_centroids, centroid_intermediate_top_k,
             backbone_hidden_size, pre_projection_in_dim,
+            use_ordered_embeddings,
         })
     }
 }
@@ -260,13 +286,25 @@ impl Gemma4DrafterWeightLayout {
         let n_cent = arch.num_centroids;
         let backbone = arch.backbone_hidden_size;
 
+        // 31B drafter (`use_ordered_embeddings=false`) does not ship
+        // the centroid masked-embedding tensors; only require them
+        // when the config flag asks for the masked-embedding head.
+        let (centroids, token_ordering) = if arch.use_ordered_embeddings {
+            (
+                Some(require(
+                    "masked_embedding.centroids.weight",
+                    DType::Bf16, &[n_cent, hidden])?),
+                Some(require(
+                    "masked_embedding.token_ordering",
+                    DType::I64, &[vocab])?),
+            )
+        } else {
+            (None, None)
+        };
+
         let top = Gemma4DrafterTopOffsets {
-            centroids: require(
-                "masked_embedding.centroids.weight",
-                DType::Bf16, &[n_cent, hidden])?,
-            token_ordering: require(
-                "masked_embedding.token_ordering",
-                DType::I64, &[vocab])?,
+            centroids,
+            token_ordering,
             embed_tokens: require(
                 "model.embed_tokens.weight",
                 DType::Bf16, &[vocab, hidden])?,

@@ -194,11 +194,14 @@ pub struct Gemma4DrafterLayerPtrs {
 #[derive(Clone, Debug)]
 pub struct Gemma4DrafterTopPtrs {
     /// `masked_embedding.centroids.weight` [num_centroids, hidden] F16.
-    pub centroids: u64,
+    /// `None` when `arch.use_ordered_embeddings == false` (31B
+    /// drafter); the decoder takes the full-vocab tied LM-head path
+    /// against `embed_tokens` directly.
+    pub centroids: Option<u64>,
     /// `masked_embedding.token_ordering` [vocab] **I64**, uploaded
-    /// as-is (no F16 conversion). The MaskedEmbedder kernel (commit
-    /// 6) reads it as `int64_t*`.
-    pub token_ordering: u64,
+    /// as-is (no F16 conversion). `None` when
+    /// `arch.use_ordered_embeddings == false`.
+    pub token_ordering: Option<u64>,
     /// `model.embed_tokens.weight` [vocab, hidden] F16. Also serves
     /// as the `lm_head` weight per HF
     /// `_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}`.
@@ -313,6 +316,14 @@ impl Gemma4DrafterRuntime {
     ) -> Result<DrafterStepWorkspace> {
         let a = &self.arch;
         let max_q_rows = a.num_attention_heads * a.head_dim_global;
+        // When `use_ordered_embeddings=false` (31B drafter) the
+        // drafter LM head emits full-vocab f32 logits into
+        // `gemm_f32`; bump max_projection to cover that.
+        let lm_head_out = if a.use_ordered_embeddings {
+            0
+        } else {
+            a.vocab_size
+        };
         let max_projection = [
             a.pre_projection_in_dim,
             a.hidden_size,
@@ -320,6 +331,7 @@ impl Gemma4DrafterRuntime {
             max_q_rows,
             a.backbone_hidden_size,
             a.num_centroids,
+            lm_head_out,
         ]
         .into_iter()
         .max()
@@ -457,17 +469,28 @@ impl Gemma4DrafterRuntime {
         let backbone = arch.backbone_hidden_size;
         let pre_in = arch.pre_projection_in_dim;
 
-        let top = Gemma4DrafterTopPtrs {
-            centroids: upload_bf16(
+        // 31B drafter (`use_ordered_embeddings=false`) has no
+        // centroid masked-embedding tensors → only upload them when
+        // the loader saw them.
+        let centroids_ptr = match layout.top.centroids {
+            Some(off) => Some(upload_bf16(
                 "masked_embedding.centroids.weight",
-                layout.top.centroids,
+                off,
                 n_cent * hidden,
-            )?,
-            token_ordering: upload_i64(
+            )?),
+            None => None,
+        };
+        let token_ordering_ptr = match layout.top.token_ordering {
+            Some(off) => Some(upload_i64(
                 "masked_embedding.token_ordering",
-                layout.top.token_ordering,
+                off,
                 vocab,
-            )?,
+            )?),
+            None => None,
+        };
+        let top = Gemma4DrafterTopPtrs {
+            centroids: centroids_ptr,
+            token_ordering: token_ordering_ptr,
             embed_tokens: upload_bf16(
                 "model.embed_tokens.weight",
                 layout.top.embed_tokens,
@@ -490,10 +513,15 @@ impl Gemma4DrafterRuntime {
             )?,
         };
 
+        // Centroid tensors are conditional on use_ordered_embeddings.
+        let centroid_bytes = if arch.use_ordered_embeddings {
+            2 * n_cent * hidden + 8 * vocab
+        } else {
+            0
+        };
         bytes_resident += 2 * (
-            n_cent * hidden + vocab * hidden +
-            hidden * pre_in + backbone * hidden + hidden
-        ) + 8 * vocab;
+            vocab * hidden + hidden * pre_in + backbone * hidden + hidden
+        ) + centroid_bytes;
 
         let mut layers = Vec::with_capacity(arch.num_hidden_layers);
         for (li, lo) in layout.layers.iter().enumerate() {
@@ -1438,7 +1466,7 @@ impl Gemma4DrafterRuntime {
         Ok(Self {
             arch: layout.arch.clone(),
             top: Gemma4DrafterTopPtrs {
-                centroids: 0, token_ordering: 0, embed_tokens: 0,
+                centroids: None, token_ordering: None, embed_tokens: 0,
                 pre_projection: 0, post_projection: 0, final_norm: 0,
             },
             layers: layout.layers.iter().map(|lo| Gemma4DrafterLayerPtrs {

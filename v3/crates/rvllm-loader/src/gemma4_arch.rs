@@ -515,27 +515,32 @@ impl Gemma4Arch {
     /// `shared_kv_states = {"sliding_attention": (K, V),
     /// "full_attention": (K, V)}` — and per HF
     /// `modeling_gemma4.py:1181-1187`, these K/V tensors come from the
-    /// LATEST layer of each `layer_type` within the non-shared prefix
-    /// (i.e. before the `num_kv_shared_layers` tail begins). On E4B-it
-    /// with `num_hidden_layers = 42` and `num_kv_shared_layers = 18`,
-    /// the non-shared prefix is layers `0..23`, and codex confirmed
-    /// the result `(22, 23)` — both layers' K/V satisfy
-    /// `store_full_length_kv = true` in HF's reference.
+    /// LATEST layer of each `layer_type`. For archs WITH a
+    /// `num_kv_shared_layers` tail (e.g. E4B-it: 42 layers, 18
+    /// shared) the source layers are the last of each type within the
+    /// non-shared prefix `[0, 24)` → `(22, 23)`. For archs WITHOUT a
+    /// shared tail (e.g. Gemma 4 31B-it: 60 layers,
+    /// `num_kv_shared_layers = 0`) we fall back to the last of each
+    /// type across the FULL layer range → `(58, 59)`. The
+    /// 31B-assistant checkpoint is trained against exactly that pair.
     ///
-    /// Returns `None` when:
-    ///   * The arch has no `num_kv_shared_layers` set (e.g. 31B) — no
-    ///     "non-shared prefix" boundary exists, so the assistant
-    ///     architecture isn't applicable.
-    ///   * Either layer type is absent from the non-shared prefix.
+    /// Returns `None` only when one of the two layer types is absent
+    /// from the search range — i.e. an arch that genuinely lacks the
+    /// `(sliding, full)` pair the drafter cross-attends to.
     pub fn assistant_shared_kv_sources(&self) -> Option<(usize, usize)> {
-        let shared = self.num_kv_shared_layers? as usize;
-        if shared == 0 {
-            return None;
-        }
-        let first_shared = self.num_hidden_layers.saturating_sub(shared);
+        // Pick the search range: non-shared prefix when a shared tail
+        // exists, else the full layer range.
+        let search_end = match self.num_kv_shared_layers {
+            Some(shared) if (shared as usize) > 0 => self
+                .num_hidden_layers
+                .saturating_sub(shared as usize),
+            // `None` (older archs) or `Some(0)` (31B): no shared tail
+            // → scan the full layer list.
+            _ => self.num_hidden_layers,
+        };
         let mut last_sliding: Option<usize> = None;
         let mut last_full: Option<usize> = None;
-        for j in (0..first_shared).rev() {
+        for j in (0..search_end).rev() {
             match self.layer_types[j] {
                 Gemma4LayerType::SlidingAttention if last_sliding.is_none() => {
                     last_sliding = Some(j);
@@ -993,7 +998,11 @@ mod tests {
     }
 
     #[test]
-    fn assistant_shared_kv_sources_returns_none_without_shared_tail() {
+    fn assistant_shared_kv_sources_returns_none_when_one_type_missing() {
+        // Genuine negative: only one of the two layer types is
+        // present. Drafter cross-attention needs BOTH a sliding and a
+        // full source layer; if either is missing across the entire
+        // model, the assistant arch isn't applicable.
         let arch = Gemma4Arch {
             num_hidden_layers: 6,
             hidden_size: 5376,
@@ -1014,7 +1023,6 @@ mod tests {
             layer_types: vec![Gemma4LayerType::GlobalAttention; 6],
             weight_prefix: "model".into(),
             tie_word_embeddings: true,
-            // 31B-style: no shared tail.
             num_kv_shared_layers: None,
             vision_config: None,
             audio_config: None,
@@ -1023,5 +1031,63 @@ mod tests {
             per_layer_input_scale: 0.0,
         };
         assert_eq!(arch.assistant_shared_kv_sources(), None);
+    }
+
+    #[test]
+    fn assistant_shared_kv_sources_31b_no_shared_tail() {
+        // Gemma 4 31B-it: 60 layers, num_kv_shared_layers = 0,
+        // pattern is 5 sliding then 1 full (i.e. full at indices
+        // 5, 11, 17, ..., 59 = every 6th layer ending at 59).
+        // The 31B assistant checkpoint targets the LAST sliding +
+        // LAST full across the full range, which is (58, 59).
+        let mut layer_types = Vec::with_capacity(60);
+        for i in 0..60 {
+            if (i + 1) % 6 == 0 {
+                layer_types.push(Gemma4LayerType::GlobalAttention);
+            } else {
+                layer_types.push(Gemma4LayerType::SlidingAttention);
+            }
+        }
+        assert_eq!(layer_types.len(), 60);
+        assert_eq!(layer_types[58], Gemma4LayerType::SlidingAttention);
+        assert_eq!(layer_types[59], Gemma4LayerType::GlobalAttention);
+
+        // Local 31B config.json carries
+        // `text_config.num_kv_shared_layers = 0` (Some(0), NOT None);
+        // make sure that path is exercised explicitly.
+        let arch = Gemma4Arch {
+            num_hidden_layers: 60,
+            hidden_size: 5376,
+            num_attention_heads: 32,
+            head_dim_sliding: 256,
+            head_dim_global: 512,
+            num_kv_heads_sliding: 16,
+            num_kv_heads_global: 4,
+            intermediate_size: 21504,
+            vocab_size: 262144,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 262144,
+            sliding_window_size: 1024,
+            rope_theta_sliding: 10000.0,
+            rope_theta_global: 1_000_000.0,
+            partial_rotary_factor_global: 0.25,
+            logit_softcap: 30.0,
+            layer_types,
+            weight_prefix: "model".into(),
+            tie_word_embeddings: true,
+            num_kv_shared_layers: Some(0),
+            vision_config: None,
+            audio_config: None,
+            hidden_size_per_layer_input: None,
+            per_layer_model_projection_scale: 0.0,
+            per_layer_input_scale: 0.0,
+        };
+        assert_eq!(arch.assistant_shared_kv_sources(), Some((58, 59)));
+
+        // Same arch with num_kv_shared_layers = None must produce the
+        // same answer — the legacy path used to return None here.
+        let mut arch_none = arch.clone();
+        arch_none.num_kv_shared_layers = None;
+        assert_eq!(arch_none.assistant_shared_kv_sources(), Some((58, 59)));
     }
 }
