@@ -106,6 +106,188 @@ sudo systemctl restart rvllm-serve
 | Qwen 3.5 27B dense | `qwen35_bring_up.rs` | **wired 2026-05-14** (`mobile-qwen35-rvllm-nvfp4.env`). Five-step landing: KV allocator + dtype field, Qwen-specific `fused_rope_qwen_partial_nvfp4kv` kernel (NeoX partial RoPE with rotary_dim=64, amax6 V policy, no Hadamard), kernel load + Q-side scratch, decode dispatch (per-head FA-2 NVFP4, no GQA cap), prefill via per-token decode fallback. Validated on hardware: text + Qwen3-VL vision. F16 path bit-identical when `RVLLM_NVFP4_KV` is unset. |
 | Qwen 3.6 35B-A3B | `qwen36_bring_up.rs` | **wired 2026-05-15** (`mobile-qwen-rvllm-nvfp4.env`). 4-commit port (~384 LOC, 0dd5d98..d31b8ae): layout plumbing, kernel load, decode dispatch, prefill fallback. Both kernels (`fused_rope_qwen_partial_nvfp4kv` + `flash_attention_2_decode_nvfp4kv_kernel`) reused as-is from the Qwen 3.5 work — only the dispatch wiring is per-family. Per-head decode handles GQA=8 without split-decode. Batched prefill flips to per-token loop on Nvfp4; unified-NVFP4-prefill (PTX exists) is a follow-up. Validated on hardware: text (German ghost joke 31 tok in 1.07s) + Qwen3-VL vision (same caption as F16 baseline). KV memory at 4096 ctx: 20 MiB packed + 2.5 MiB scales vs 80 MiB F16 (3.5× reduction). F16 path bit-identical when the gate is off. |
 
+## Speculative decoding — Gemma 4 family (state as of 2026-05-17)
+
+Active branch: `rusty_sm121_qwen36_26b` (head `2693894`). Not
+yet merged into `rusty_sm121_vision`.
+
+### E4B-it spec — production, 2.46× faster than non-spec
+
+`mobile-e4b-rvllm-spec.env` (or any profile with
+`RVLLM_GEMMA4_SPEC_DECODE=1` +
+`RVLLM_GEMMA4_DRAFTER_DIR=/home/r00t/gemma4-e4b-assistant`,
+`RVLLM_GEMMA4_SPEC_K=4`). Greedy temp=0 only (typical-acceptance
+parked, see commit message of `689fba3`). Hardware-validated:
+
+* 3 factual prompts byte-identical to non-spec E4B
+  ("Die Hauptstadt von Frankreich ist **Paris**.", etc.).
+* 80-token counting prompt: non-spec ~11.0 s vs spec ~4.47 s,
+  `accepted_per_verify=1.5`, `drafter_avg_ms=6.9`,
+  `verify_avg_ms=62.6`, `prefill_one_avg_ms=67.5`.
+* Drafter forward uses the centroid masked-embedding head
+  (drafter ships `use_ordered_embeddings=true`).
+* ZeroClaw config (`~/workspace/data/zeroclaw/config.toml`)
+  is tied to this stack: `default_model=gemma-4-e4b-it`,
+  `default_temperature=0.0` (spec session loop is greedy-only).
+
+Key e4b commits (top → bottom):
+* `689fba3` — fix accept_len>0 branch: classical bonus was being
+  committed (prefill_one + shadow KV) but never pushed to emitted
+  / on_token. After commit, push the bonus. THIS is what unlocked
+  the speedup.
+* `dea6f54` — drop sqrt(hidden_size) embed-half scale (the
+  earlier `apply_pre_projection_embed_scale` call dragged the
+  drafter into degenerate prediction mode for E4B).
+* `6d254b2` — defensive `force_common_prefix_override` swap-at-top
+  in `run_generate` + worker disarms all spec hook atomics on
+  non-spec branch.
+
+### 31B-it spec — wired, drafter accept_rate=0, root cause LIKELY V-cache on `attention_k_eq_v=true` global layers
+
+Profile: `mobile-31b-rvllm-spec.env` (drafter dir
+`/home/r00t/gemma-4-31B-it-assistant`, K=4, perf trace ON).
+What works:
+
+* Resolver `Gemma4Arch::assistant_shared_kv_sources()` returns
+  `(58, 59)` for 31B (last sliding + last full across full layer
+  range; E4B path unchanged → still `(22, 23)`). Tests cover
+  Some(0), None, E4B, one-type-missing variants.
+* Loader: `use_ordered_embeddings` parsed at top-level config;
+  centroid + token_ordering tensors are `Option<u64>` and only
+  required when the flag is true. 31B drafter ships 48 tensors
+  (no centroid tensors) and loads cleanly (895.5 MiB resident,
+  hidden=1024, 4 layers).
+* Runtime: when `use_ordered_embeddings=false` the drafter LM
+  head branches to a full-vocab tied path:
+  `f16_gemm_f32(workspace.hidden, drafter.top.embed_tokens,
+   workspace.gemm_f32, 1, vocab, hidden)` + `ArgmaxLaunch{
+   num_tokens=1, vocab}` over the f32 logits →
+  `workspace.out_token_id`. `max_projection` includes
+  `vocab_size` when the flag is off so `gemm_f32` fits 1 MiB of
+  f32 logits.
+* Hardware: 31B spec produces **correct output** via the
+  verify-fallback path ("Die Hauptstadt von Frankreich ist
+  **Paris**."), but `accepted_per_verify = 0.0` always.
+  Drafter wall: ~28 ms/iter (vs E4B's ~7 ms).
+
+What we ruled out (all `accept_rate=0` regardless):
+* Source-pair: tried `(58,59) (52,53) (58,53) (52,59) (4,5)`
+  via `RVLLM_GEMMA4_SPEC_SOURCE_PAIR=<s>,<f>`. None help.
+* Embed-half scale: tried both with + without
+  `apply_pre_projection_embed_scale(sqrt(backbone))` via
+  `RVLLM_GEMMA4_SPEC_EMBED_SCALE_31B`. With scale: drafter is
+  random varied tokens. Without scale: drafter is degenerate
+  (always token 2313). NEITHER matches. The scale knob is in
+  fact WRONG (codex Q1(b) confirms HF's only embed scale is
+  baked into the loader's `target_model_input_embeddings`, which
+  rvllm already applies via `Gemma embedding scale: sqrt(H)` at
+  load time). The knob double-scales — **default it OFF and
+  retire when the real fix lands**.
+* Q-bisect probe (`RVLLM_SPEC_DEBUG_Q_BISECT=1`): layer-0 Q-side
+  healthy (post_q_norm RMS ≈ 1.02, post_q_proj max ~95).
+* Layer-trace (`RVLLM_GEMMA4_SPEC_LAYER_TRACE=1`): per-drafter-
+  layer `attn_out(pre_oproj)` RMS ~0.5 across ALL 4 layers
+  (varies only ~0.02 between k-steps), `post_residual1` RMS 7-9
+  (residual dominates by 10×+), `post_mlp` RMS 1.4-2.0,
+  `post_final_norm` RMS 5.3 with near-constant direction across
+  iters → LM-head argmax stuck in a narrow vocab region.
+* Trained `layer_scalar` values (non-1.0:
+  31B [0.146, 0.578, 0.613, 0.520], E4B [0.032, 0.205, 0.359,
+  0.164]) are correctly applied via `scale_inplace`.
+* BC=16 flash-attn at head_dim=512 + GQA=8: kernel's
+  `kv_head = head_idx / (num_heads / num_kv_heads)` handles
+  ratio 8 generically; smem at D=512/BC=16 fits sm_121's
+  ~64 KiB budget.
+* My full-vocab LM head: exact same kernel pair the BASE LM head
+  uses; argmax kernel correctly handles `vocab > blockDim.x`.
+
+### Root-cause hypothesis (codex Round 2, 2026-05-17)
+
+For base global layers with `attention_k_eq_v=true` (Gemma 4 31B
+layer 59 is one such layer), HF's reference at
+`models/gemma4/modeling_gemma4.py:1203-1207` and `1241-1254`:
+
+1. computes `key_states` via `k_proj`,
+2. sets `value_states = key_states` (= K **before** any K-norm
+   or RoPE),
+3. applies V's own `value_norm` to `value_states` SEPARATELY,
+4. writes BOTH `K_post_norm_rope` AND `V_post_value_norm` to the
+   KV cache.
+
+K and V in the cache are therefore **NOT byte-identical** even
+though they share a single source projection. rvllm's base path
+likely writes V=K bit-identical (or skips V entirely and aliases
+at read time). When the drafter cross-attends to the FULL source
+layer 59 via `populate_shadow_kv_range_from_base`, it reads
+`v_cache = k_cache + half_bytes` — wrong content → wrong V →
+degenerate drafter output. The cross-attn output is small (~RMS
+0.5) because the K↔V cancellation in softmax(QK)·V never produces
+the right semantic.
+
+This explains ALL the observed symptoms:
+* drafter forward runs structurally, no crashes
+* attn_out RMS is non-zero but tiny + near-constant
+* drafter LM-head input direction is fixed → argmax stuck
+* changing source pair doesn't help (the bug is per-layer V
+  content, not which layer to read)
+* changing embed scale doesn't help (the bug is downstream of
+  the attn stage)
+
+The E4B base has `attention_k_eq_v=true` on its global layers
+too, but the E4B drafter cross-attends to layers (22, 23) — both
+INSIDE the non-shared prefix; we have not independently verified
+whether E4B's V-shadow at layer 23 is HF-faithful (it might be
+the same bug, just compensating in E4B because the drafter is
+smaller and the centroid-masked LM head clips to top-K).
+
+### Active diagnostic env knobs (env-gated, all default OFF)
+
+* `RVLLM_GEMMA4_SPEC_SOURCE_PAIR=<sliding>,<full>` — override the
+  resolver's source-pair choice. Validates both indices land on
+  the right layer types; panics with a clear message otherwise.
+* `RVLLM_GEMMA4_SPEC_DRAFT_TRACE=1` — print one
+  `[draft-trace] iter=N next_base_seed=X drafts=[...]
+   base_argmax_k=[...] accept_len=N` line per iter in the
+  batched session loop.
+* `RVLLM_GEMMA4_SPEC_LAYER_TRACE=1` — per-drafter-layer
+  rms/max/head8 dump of `attn_out(pre_oproj)`,
+  `post_residual1(hidden)`, `post_mlp(hidden)`, plus a
+  `post_final_norm(hidden)` dump at the LM-head input.
+* `RVLLM_SPEC_DEBUG_Q_BISECT=1` (pre-existing) — Q-side stage
+  probes in the drafter's first layer.
+* `RVLLM_GEMMA4_SPEC_EMBED_SCALE_31B=1` — **deprecated, leave
+  off**. Applies `apply_pre_projection_embed_scale(sqrt(backbone))`
+  on the embed half. Per codex Round 2 this is double-scaling on
+  top of the loader's pre-applied sqrt(hidden_size). To be
+  removed once the V-cache fix lands.
+
+### Codex Round 2 answers (cited HF lines)
+
+For the full Q&A see the prompt + response in the conversation
+preceding commit `2693894`. Key citations:
+
+* Drafter input contract:
+  `transformers/generation/candidate_generator.py:1357-1379`,
+  `transformers/models/gemma4_assistant/modeling_gemma4_assistant.py:123-126,169-188`.
+* No embed scale at the assistant; base loader's embed scale is
+  the only one (rvllm already applies it). HF
+  `models/gemma4/modeling_gemma4.py:1579-1582`.
+* Drafter LM head is the tied full-vocab path; no softcap, no
+  extra norm.
+  `gemma4_assistant.py:110-126,185-188`.
+* Source pair for 31B is (58, 59).
+  `models/gemma4/modeling_gemma4.py:1182-1188,1251-1254`.
+* **V-cache write for `attention_k_eq_v=true`**:
+  `models/gemma4/modeling_gemma4.py:1203-1207` (`value_states =
+  key_states` before V-norm), then V-norm + cache update at
+  `:1241-1254`.
+
+### Documents on disk
+
+* This file (rvllm-serve/CLAUDE.md) carries the lasting picture.
+* The conversation history holds the draft-trace evidence and
+  the codex round-2 verbatim reply.
+
 ## Native multimodal vision (Qwen3-VL + Gemma4 + Pixtral)
 
 Three vision towers now run end-to-end as native Rust+CUDA inside
