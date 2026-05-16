@@ -9117,7 +9117,24 @@ impl Gemma4Bringup {
         let max_blocks_per_seq = num_blocks_total;
 
         let prompt_len = prompt_ids.len() as u32;
-        let max_tokens = prompt_len.max(1);
+        // Codex Round 8 perf #1: when `force_common_prefix_override`
+        // is set (spec-decode invocation), the chunked-prefill body
+        // processes only `prompt_len - override` new tokens. Sizing
+        // scratch to `prompt_len` allocates O(prompt_len) bytes per
+        // region across 15 regions — for a 150-token session with
+        // K=4 new tokens, that's ~37× more arena bytes than needed.
+        // Peek the atomic non-destructively (Acquire load) so we can
+        // size scratch correctly; the actual swap-consume still
+        // happens below at the existing site, preserving the
+        // one-shot semantics.
+        let override_peek = self
+            .force_common_prefix_override
+            .load(std::sync::atomic::Ordering::Acquire);
+        let max_tokens = if override_peek != u32::MAX && (override_peek as usize) < prompt_ids.len() {
+            (prompt_len - override_peek).max(1)
+        } else {
+            prompt_len.max(1)
+        };
 
         let hidden_fp8 = arena.region("gen_hidden_fp8", (max_tokens * hidden) as usize, 16)?;
         let hidden_scale = arena.region("gen_hidden_scale", (max_tokens * 4) as usize, 16)?;
