@@ -1191,6 +1191,14 @@ pub struct Gemma4Bringup {
     /// globals"). One-shot: consumed by `SpecDecodeRequestConfig::
     /// from_env_with_overrides` at fn entry.
     pub force_emit_accepted: std::sync::atomic::AtomicBool,
+    /// Commit 55 (codex review priority 0.1): per-request override
+    /// flag forcing `SpecDecodeRequestConfig::batched_verify_mode`
+    /// = true regardless of env. Set by the worker when
+    /// `spec_cfg.enabled` is on and no legacy-debug knob asks
+    /// otherwise. Eliminates the silent fall-through to
+    /// sequential-decode verify that was the actual default when
+    /// users set only RVLLM_GEMMA4_SPEC_DECODE=1.
+    pub force_batched_verify: std::sync::atomic::AtomicBool,
     /// Codex review priority 1 (commit 49 — Phase B-2): when
     /// non-`u32::MAX`, overrides the `prefix_cache` token-match +
     /// chunk_size-cap computation inside `run_generate`. The next
@@ -2017,6 +2025,7 @@ impl Gemma4Bringup {
             skip_next_warmup: std::sync::atomic::AtomicBool::new(false),
             saved_warmup_b_p: std::sync::atomic::AtomicU32::new(u32::MAX),
             force_emit_accepted: std::sync::atomic::AtomicBool::new(false),
+            force_batched_verify: std::sync::atomic::AtomicBool::new(false),
             force_common_prefix_override: std::sync::atomic::AtomicU32::new(u32::MAX),
             skip_prefix_cache_publish: std::sync::atomic::AtomicBool::new(false),
             base_last_k_snapshot_pending:
@@ -4665,6 +4674,19 @@ impl Gemma4Bringup {
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
             spec_cfg.emit_accepted = true;
+        }
+        // Commit 55 (codex priority 0.1): force-batched override
+        // from the worker. Note: NOT swap-consume because the same
+        // request may call run_generate_speculative multiple times
+        // via the outer wrapper's loop, and we want every iter to
+        // see batched_verify_mode = true. The flag is cleared at
+        // request end by the worker (or implicitly reset on next
+        // request since the worker always re-arms).
+        if self
+            .force_batched_verify
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            spec_cfg.batched_verify_mode = true;
         }
         let spec_cfg = spec_cfg;
         let batched_verify_mode = spec_cfg.batched_verify_mode;

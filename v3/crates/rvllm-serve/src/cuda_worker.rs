@@ -1231,6 +1231,13 @@ pub async fn spawn_cuda_worker(
                 // No region reference above the checkpoint survives,
                 // so rewinding the bump pointer is safe.
                 unsafe { bringup.arena.restore(scratch_ck); }
+                // Commit 55: clear the per-request batched-verify
+                // override so a non-spec request (= spec_cfg.enabled
+                // off) sees a clean atomic. Re-armed at the top of
+                // each spec-enabled request.
+                bringup
+                    .force_batched_verify
+                    .store(false, std::sync::atomic::Ordering::Release);
             }
 
             tracing::info!("cuda worker queue closed, exiting");
@@ -1433,8 +1440,30 @@ fn run_one(
 
     let result = unsafe {
         if spec_cfg.enabled {
-            let batched = std::env::var("RVLLM_GEMMA4_SPEC_BATCHED").as_deref() == Ok("1");
+            // Commit 55 (codex review priority 0.1): when SPEC_DECODE
+            // is on, route to the batched-verify path BY DEFAULT.
+            // Previously, without an explicit RVLLM_GEMMA4_SPEC_BATCHED=1,
+            // the worker fell into the legacy `run_generate_speculative`
+            // path which runs warmup_max_new = max_new sequential base
+            // decodes — pure overhead (drafter runs but base is still
+            // sequential). The legacy single-step path is now only
+            // reachable as an explicit opt-out via
+            // RVLLM_GEMMA4_SPEC_LEGACY_DEBUG=1.
+            let legacy_debug =
+                std::env::var("RVLLM_GEMMA4_SPEC_LEGACY_DEBUG").as_deref() == Ok("1");
+            // Iterative wrapper retained as a separate explicit opt-in
+            // for debugging the legacy sequential-decode verify; not
+            // a production path.
             let iterative = std::env::var("RVLLM_GEMMA4_SPEC_ITERATIVE").as_deref() == Ok("1");
+            // Arm the force_batched_verify atomic so the inner spec
+            // function takes the batched-verify branch unconditionally
+            // when reached from the batched wrapper. Replaces an
+            // earlier draft that env::set_var'd RVLLM_GEMMA4_SPEC_BATCHED
+            // (= the same anti-pattern codex priority 2 flagged).
+            bringup
+                .force_batched_verify
+                .store(true, std::sync::atomic::Ordering::Release);
+            let batched = !legacy_debug && !iterative;
             if batched {
                 bringup.run_generate_speculative_batched(
                     kernels.fn_embed,
