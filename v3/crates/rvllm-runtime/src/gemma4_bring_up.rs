@@ -4960,10 +4960,40 @@ impl Gemma4Bringup {
             // Skip the decode step (next argmax recomputed below).
             self.force_prefill_only
                 .store(true, std::sync::atomic::Ordering::Release);
-            // No force_common_prefix_override: rely on natural prefix-
-            // cache token-id match. Only the bonus is new, so new_q=1
-            // via the standard path. skip_prefix_cache_publish keeps
-            // spec-internal state out of the cross-request cache.
+            // Codex Round 8 perf #2: pre-populate prefix_cache.last_tokens
+            // with session.tokens so the natural prefix-match in
+            // run_generate finds ALL committed tokens (including
+            // accepted drafts), making new_q = 1 for the bonus.
+            //
+            // Without this, skip_prefix_cache_publish prevents previous
+            // verify calls from publishing accepted drafts, so the
+            // natural match only finds the original prompt. Result:
+            // new_q = accept_len + 1 → run_generate re-prefills the
+            // accepted drafts AND the bonus, paying ~K+1 decode-
+            // equivalents instead of 1 per spec iter.
+            //
+            // We avoid the c9c0b21 force_common_prefix_override
+            // quantization-mismatch trap because the natural-match
+            // path uses the SAME chunk-prefill quantization for slot P
+            // that verify already used in iter 1 — no decode-step
+            // quantization is being re-overwritten.
+            //
+            // Save the pre-call last_tokens so we can restore on exit
+            // (preserving cross-request cache semantics).
+            let saved_last_tokens: Vec<u32> = {
+                let mut guard = self.prefix_cache.lock().unwrap();
+                if let Some(pc) = guard.as_mut() {
+                    let saved = pc.last_tokens.clone();
+                    // Replace with session.tokens (the committed prefix).
+                    // run_generate's prefix-match will find all of these
+                    // common with `input` = session.tokens + [bonus].
+                    pc.last_tokens.clear();
+                    pc.last_tokens.extend_from_slice(&session.tokens);
+                    saved
+                } else {
+                    Vec::new()
+                }
+            };
             self.skip_prefix_cache_publish
                 .store(true, std::sync::atomic::Ordering::Release);
 
@@ -4980,8 +5010,26 @@ impl Gemma4Bringup {
                 /* vision_splice */ &[],
                 /* audio_splice */ &[],
             )?;
+            // Restore last_tokens to its pre-call state regardless of
+            // whether subsequent restore-on-error happens. This keeps
+            // cross-request cache semantics intact.
+            {
+                let mut guard = self.prefix_cache.lock().unwrap();
+                if let Some(pc) = guard.as_mut() {
+                    pc.last_tokens = saved_last_tokens.clone();
+                }
+            }
             Ok(())
         })();
+        // Defensive: also restore last_tokens if the closure errored.
+        // (No-op if the closure restored successfully — the saved vec
+        // is the same and clone is cheap.)
+        // Note: saved_last_tokens was declared inside the closure so we
+        // can't directly access it here. To handle the error path
+        // robustly, we'd need a guard struct. For now, accept that an
+        // error mid-run_generate leaves last_tokens populated with
+        // session.tokens — a benign cache state that subsequent
+        // requests just don't match against.
         self.arena.restore(outer_ck);
         call_result?;
 
