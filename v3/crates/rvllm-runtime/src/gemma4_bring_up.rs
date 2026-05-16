@@ -4960,40 +4960,27 @@ impl Gemma4Bringup {
             // Skip the decode step (next argmax recomputed below).
             self.force_prefill_only
                 .store(true, std::sync::atomic::Ordering::Release);
-            // Codex Round 8 perf #2: pre-populate prefix_cache.last_tokens
-            // with session.tokens so the natural prefix-match in
-            // run_generate finds ALL committed tokens (including
-            // accepted drafts), making new_q = 1 for the bonus.
+            // Codex Round 9 perf #1: use force_common_prefix_override
+            // instead of pre-populating prefix_cache.last_tokens.
             //
-            // Without this, skip_prefix_cache_publish prevents previous
-            // verify calls from publishing accepted drafts, so the
-            // natural match only finds the original prompt. Result:
-            // new_q = accept_len + 1 → run_generate re-prefills the
-            // accepted drafts AND the bonus, paying ~K+1 decode-
-            // equivalents instead of 1 per spec iter.
+            // The c9c0b21 "override caused corruption" rationale was
+            // valid AT THAT TIME because prefill_one_from_state still
+            // ran the full decode step after the chunk-prefill body,
+            // which wrote decode-step-quantized KV at slot P that
+            // disagreed with the chunk-prefill quantization warmup
+            // had written there earlier (slot mismatch). After
+            // a3e9ea9 set force_prefill_only=true the decode step is
+            // skipped entirely — chunk-prefill is the ONLY writer to
+            // the bonus's slot, so no quantization-mismatch trap can
+            // fire.
             //
-            // We avoid the c9c0b21 force_common_prefix_override
-            // quantization-mismatch trap because the natural-match
-            // path uses the SAME chunk-prefill quantization for slot P
-            // that verify already used in iter 1 — no decode-step
-            // quantization is being re-overwritten.
-            //
-            // Save the pre-call last_tokens so we can restore on exit
-            // (preserving cross-request cache semantics).
-            let saved_last_tokens: Vec<u32> = {
-                let mut guard = self.prefix_cache.lock().unwrap();
-                if let Some(pc) = guard.as_mut() {
-                    let saved = pc.last_tokens.clone();
-                    // Replace with session.tokens (the committed prefix).
-                    // run_generate's prefix-match will find all of these
-                    // common with `input` = session.tokens + [bonus].
-                    pc.last_tokens.clear();
-                    pc.last_tokens.extend_from_slice(&session.tokens);
-                    saved
-                } else {
-                    Vec::new()
-                }
-            };
+            // The override sizes run_generate's per-call scratch to
+            // (input_len - override) = 1 (codex Round 8 perf #1) and
+            // bypasses the prefix_cache mutex + token-match + clones
+            // entirely. That removes both the O(session.tokens.len())
+            // arena bookkeeping and the per-call mutex round-trip.
+            self.force_common_prefix_override
+                .store(start_pos, std::sync::atomic::Ordering::Release);
             self.skip_prefix_cache_publish
                 .store(true, std::sync::atomic::Ordering::Release);
 
@@ -5010,26 +4997,8 @@ impl Gemma4Bringup {
                 /* vision_splice */ &[],
                 /* audio_splice */ &[],
             )?;
-            // Restore last_tokens to its pre-call state regardless of
-            // whether subsequent restore-on-error happens. This keeps
-            // cross-request cache semantics intact.
-            {
-                let mut guard = self.prefix_cache.lock().unwrap();
-                if let Some(pc) = guard.as_mut() {
-                    pc.last_tokens = saved_last_tokens.clone();
-                }
-            }
             Ok(())
         })();
-        // Defensive: also restore last_tokens if the closure errored.
-        // (No-op if the closure restored successfully — the saved vec
-        // is the same and clone is cheap.)
-        // Note: saved_last_tokens was declared inside the closure so we
-        // can't directly access it here. To handle the error path
-        // robustly, we'd need a guard struct. For now, accept that an
-        // error mid-run_generate leaves last_tokens populated with
-        // session.tokens — a benign cache state that subsequent
-        // requests just don't match against.
         self.arena.restore(outer_ck);
         call_result?;
 
