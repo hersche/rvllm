@@ -5390,60 +5390,108 @@ impl Gemma4Bringup {
                     break;
                 }
             }
-            total_accepted = total_accepted.saturating_add(accept_len as u32);
+            // Codex Round 7 #5: count accepted only after we've actually
+            // emitted them. Previously total_accepted was incremented up
+            // front, so a max_new / on_token mid-emit abort over-reported
+            // X-RVLLM-Accept-Rate.
+            let verify_accepted = accept_len;
 
             let old_committed = session.committed_len;
 
             if accept_len > 0 {
                 // Emit accepted drafts.
+                let mut emitted_accepted: usize = 0;
                 for i in 0..accept_len {
-                    if emitted.len() >= max_new { break 'outer; }
+                    if emitted.len() >= max_new {
+                        total_accepted = total_accepted.saturating_add(emitted_accepted as u32);
+                        break 'outer;
+                    }
                     let tok = drafts.tokens[i];
                     // Codex Round 4 #3: EOS-before-push parity with
                     // the non-spec decode path. The special token is
                     // consumed silently — never pushed into `emitted`
                     // and never delivered via on_token.
-                    if eos_ids.contains(&tok) { break 'outer; }
+                    if eos_ids.contains(&tok) {
+                        total_accepted = total_accepted.saturating_add(emitted_accepted as u32);
+                        break 'outer;
+                    }
                     emitted.push(tok);
+                    emitted_accepted += 1;
                     if let Some(cb) = on_token.as_mut() {
-                        if !cb(tok) { break 'outer; }
+                        if !cb(tok) {
+                            total_accepted = total_accepted.saturating_add(emitted_accepted as u32);
+                            break 'outer;
+                        }
                     }
                 }
+                total_accepted = total_accepted.saturating_add(emitted_accepted as u32);
+                let _ = verify_accepted; // verify_accepted == emitted_accepted on normal path
 
-                // DtoD: K-hidden[accept_len - 1] -> session.last_base_hidden_ptr.
-                // verify_batched_from_state has already final-norm'd the
-                // K-buffer in place, so it holds POST-final-norm hiddens.
+                // Codex Round 7 #2: switch from deferred-bonus to
+                // CLASSICAL spec-decode emission. We now ALSO emit
+                // base_argmax_k[accept_len - 1] (the bonus / divergence
+                // token) this iter and commit its base K/V via
+                // prefill_one_from_state. Net per-iter:
+                //   cost  = K (verify) + 1 (bonus commit) = K + 1
+                //   emit  = accept_len + 1
+                //   cost/tok = (K + 1) / (accept_len + 1)
+                // vs deferred-bonus per-iter:
+                //   cost  = K (verify),   emit = accept_len  →
+                //   cost/tok = K / accept_len
+                // Classical is strictly faster at accept_len ∈ (0, K)
+                // and equal at the boundaries. The K-hidden[accept_len -
+                // 1] DtoD into base_last_hidden_ptr is replaced by the
+                // bonus prefill's own POST-final-norm hidden snapshot,
+                // which gives the next iter's drafter the hidden at the
+                // ACTUALLY-emitted last token (i.e. the bonus position),
+                // not the last-accepted-draft position.
+                let bonus = base_argmax_k[accept_len - 1];
+
+                // Commit the accepted prefix to the session now (without
+                // changing next_base_argmax — we set that after the
+                // bonus prefill below). We need to commit BEFORE
+                // prefill_one_from_state so its input = session.tokens +
+                // [bonus] has the right length for the override.
+                session.commit_drafts(&drafts.tokens, accept_len, session.next_base_argmax);
+
+                // Incremental shadow KV for the newly-committed slots
+                // [old_committed, old_committed + accept_len).
                 {
-                    use cudarc::driver::sys::*;
-                    let row_off_bytes =
-                        ((accept_len - 1) as u64) * (hidden_u as u64) * 2;
-                    let dst = session.last_base_hidden_ptr;
-                    let src = k_hidden_buf + row_off_bytes;
-                    let rc = cuMemcpyDtoDAsync_v2(
-                        dst, src,
-                        (hidden_u as usize) * 2,
-                        stream as CUstream,
-                    );
-                    if rc != CUresult::CUDA_SUCCESS {
-                        return Err(rvllm_core::RvllmError::cuda(
-                            "spec_batched_session: K-hidden -> base_last_hidden_ptr",
-                            rvllm_core::CudaErrorKind::MemcpyFailed,
-                            rvllm_core::CudaCtx::setup(),
-                        ));
-                    }
+                    let guard = self.drafter.lock().unwrap();
+                    let d = guard.as_ref().expect("drafter resident");
+                    d.populate_shadow_kv_range_from_base(
+                        sliding_k, sliding_v,
+                        full_k, full_v,
+                        sliding_ks, sliding_vs,
+                        full_ks, full_vs,
+                        kv_dtype_per_layer[sliding_li],
+                        kv_dtype_per_layer[full_li],
+                        shadow_sliding_bytes,
+                        shadow_full_bytes,
+                        /* slot_start */ old_committed,
+                        /* slot_count */ accept_len as u32,
+                        stream,
+                    )?;
                 }
 
-                // Commit + carry next iter's i=0 target. The bonus
-                // (= base_argmax_k[accept_len - 1]) is intentionally
-                // NOT emitted this iter; it's deferred via
-                // session.next_base_argmax and emitted by the next
-                // iter (either accepted as drafts[0] or surfaced via
-                // accept_len==0 path).
-                let new_next = base_argmax_k[accept_len - 1];
-                session.commit_drafts(&drafts.tokens, accept_len, new_next);
+                // Emit the bonus token (= base's prediction at position
+                // old_committed + accept_len, computed by verify pass).
+                if emitted.len() >= max_new { break 'outer; }
+                if eos_ids.contains(&bonus) { break 'outer; }
+                emitted.push(bonus);
+                if let Some(cb) = on_token.as_mut() {
+                    if !cb(bonus) { break 'outer; }
+                }
+                if emitted.len() >= max_new { break 'outer; }
 
-                // Incremental shadow KV: new slots [old_committed,
-                // old_committed + accept_len).
+                // Commit the bonus's base K/V + capture its
+                // POST-final-norm hidden for the next iter's drafter.
+                let new_next = self.prefill_one_from_state(
+                    fn_embed, &mut session, bonus)?;
+                session.next_base_argmax = new_next;
+
+                // Shadow KV for the bonus's slot.
+                let bonus_slot = old_committed + accept_len as u32;
                 let guard = self.drafter.lock().unwrap();
                 let d = guard.as_ref().expect("drafter resident");
                 d.populate_shadow_kv_range_from_base(
@@ -5455,8 +5503,8 @@ impl Gemma4Bringup {
                     kv_dtype_per_layer[full_li],
                     shadow_sliding_bytes,
                     shadow_full_bytes,
-                    /* slot_start */ old_committed,
-                    /* slot_count */ accept_len as u32,
+                    /* slot_start */ bonus_slot,
+                    /* slot_count */ 1,
                     stream,
                 )?;
             } else {
