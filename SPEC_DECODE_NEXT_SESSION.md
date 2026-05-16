@@ -2,7 +2,56 @@
 
 ## State at end of this session
 
-Branch: `rusty_sm121_qwen36_26b` (not pushed). HEAD = `a3e9ea9`.
+Branch: `rusty_sm121_qwen36_26b` (not pushed). HEAD = `6eeefb5`.
+
+Two correctness/safety commits added since `a3e9ea9`:
+
+| Commit | What |
+|---|---|
+| `6eeefb5` | spec-decode: commit-before-emit + force_batched_verify lifetime (codex round 9 #2,#4) — commit 58 |
+
+`6eeefb5` reorders the spec loop body so the bonus's base K/V +
+shadow K/V are committed BEFORE `emitted.push` / `on_token` fires;
+on mid-emit abort the internal state matches the externally-visible
+state. It also scopes `bringup.force_batched_verify=true` to the
+batched branch only and clears it after the spec call returns, so
+the atomic cannot leak into a subsequent non-spec request handled
+by the same worker. No perf impact (correctness/safety only).
+
+## Smaller intermediate option (codex round 9 follow-up)
+
+If the full ~500 LOC `verify_batched_suffix_k_only` extraction is too
+risky to attempt in one session, codex's recommended smaller patch is
+~150-250 LOC: a `SpecRequestContext` plus a `run_generate` fast-spec
+setup bypass. Keep the existing chunked-prefill layer loop body in
+place; factor only the top of `run_generate` so the spec path can skip:
+
+* `prefix_cache.lock()` + `last_tokens` clone / restore (already
+  partially neutralised by `force_common_prefix_override` +
+  `skip_prefix_cache_publish`, but the mutex round-trip + provenance
+  check + clones remain). Add a stronger hook
+  `force_spec_prefix_ctx: Option<&SpecRequestContext>` that lets
+  `run_generate` skip the lock entirely.
+* `pc.kv_layer_offsets.clone()` / `pc.kv_scale_layer_offsets.clone()` —
+  carry borrowed slices in `SpecRequestContext`.
+* `block_tables = (0..max_blocks_per_seq)` HtoD — upload once into
+  `SpecRequestContext`.
+* Repeated `arena.region(...)` checkpoint churn — pre-allocate spec
+  scratch sized at `MAX_SPEC_K` (gen_qkv, gen_q_normed, gen_k_normed,
+  gen_v_normed, gen_q_fp8, gen_attn_out, gen_gate_up, gen_mlp,
+  gen_delta, gen_gemm_f32, gen_pos, gen_slot, gen_ctx, gen_cu_seqlens,
+  gen_tok_ids, gen_residual). Re-use across verify + commit calls.
+* `q_scale`, `kv_scale` HtoD — upload once.
+* For K≤4: build `positions/slot_mapping/context_lens/cu_seqlens` into
+  fixed `[i32; MAX_SPEC_K]` stack arrays, not `Vec`.
+
+Codex's note on NOT doing alone: env-var hoisting, stack-building
+position vecs, prefix-cache token-match skip without the scratch
+hoisting — each by itself is single-digit ms. Bundle them.
+
+Codex's note on unification: treat `prefill_one_from_state` as
+`verify_batched_suffix(K=1)`. Removing its second `run_generate`
+entry + `last_tokens` mutation is the highest-leverage single delete.
 
 5 spec-decode commits land on top of `3b5fb4d`:
 
