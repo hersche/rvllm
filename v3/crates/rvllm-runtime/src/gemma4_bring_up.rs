@@ -718,6 +718,62 @@ pub struct Gemma4FusedModules {
 /// Covers the common zeroclaw pattern (identical 15k-token persona
 /// on every request) at a cost of ~100 LOC of plumbing. Full
 /// multi-sequence prefix caching is future work.
+/// Spec-decode env knobs consolidated into one struct, read ONCE
+/// per request at the top of `run_generate_speculative`. Codex
+/// review priority 6: hot-path env reads (especially the per-row
+/// `RVLLM_GEMMA4_SPEC_ACCEPT_BIAS` read inside the K-prefix verify
+/// loop) were both pure overhead and a hazard for runtime knob
+/// reordering. Now derived once, copied by value into the verify
+/// loop's closure / branches.
+///
+/// Future cleanup: when the legacy `run_generate_speculative` path
+/// is collapsed into a single validated `SpecDecodeMode` (Phase
+/// D-2 / D-3), this struct becomes a passed-in parameter from the
+/// startup-validated worker config, eliminating env reads from
+/// per-request code entirely.
+#[derive(Copy, Clone, Debug)]
+pub struct SpecDecodeRequestConfig {
+    /// `RVLLM_GEMMA4_SPEC_BATCHED=1` — activates the batched-verify
+    /// hot path inside `run_generate_speculative`.
+    pub batched_verify_mode: bool,
+    /// `RVLLM_GEMMA4_SPEC_TYPICAL=1` — enables typical-acceptance
+    /// math on greedy-mismatch (vs strict greedy verify).
+    pub typical_mode: bool,
+    /// `RVLLM_GEMMA4_SPEC_ACCEPT_BIAS=<f64>` — bias on the log-
+    /// acceptance ratio. Positive = loosen (more accept). 0 = strict
+    /// Leviathan/Kalman. Quality tradeoff knob.
+    pub accept_bias: f64,
+    /// `RVLLM_GEMMA4_SPEC_LOSSY_THRESHOLD=<f32>` — when > 0, enables
+    /// lossy greedy ratio test (separate path from typical).
+    pub lossy_threshold: f32,
+    /// `RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED=1` — legacy: emit only the
+    /// accepted prefix + 1 bonus token. Set by the batched wrapper
+    /// before calling into the spec function.
+    pub emit_accepted: bool,
+}
+
+impl SpecDecodeRequestConfig {
+    pub fn from_env() -> Self {
+        Self {
+            batched_verify_mode: std::env::var("RVLLM_GEMMA4_SPEC_BATCHED")
+                .as_deref() == Ok("1"),
+            typical_mode: std::env::var("RVLLM_GEMMA4_SPEC_TYPICAL")
+                .as_deref() == Ok("1"),
+            accept_bias: std::env::var("RVLLM_GEMMA4_SPEC_ACCEPT_BIAS")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0),
+            lossy_threshold: std::env::var("RVLLM_GEMMA4_SPEC_LOSSY_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(0.0),
+            emit_accepted: std::env::var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED")
+                .as_deref() == Ok("1"),
+        }
+    }
+}
+
 /// Per-request speculative-decoding state, owned by the spec
 /// inner loop and distinct from the cross-request `PrefixCacheState`.
 ///
@@ -4586,13 +4642,13 @@ impl Gemma4Bringup {
         // K captured hiddens from a SECOND base call that batched-
         // prefills the K drafts). Without this gate the legacy
         // sequential-decode verify runs (= K+1 base decodes).
-        let batched_verify_mode =
-            std::env::var("RVLLM_GEMMA4_SPEC_BATCHED").as_deref() == Ok("1");
-        // Commit 28: allow non-greedy when typical-acceptance mode is
-        // opted in via env. Greedy stays the default; non-greedy
-        // without the env flag still errors so the production path
-        // is unchanged.
-        let typical_mode = std::env::var("RVLLM_GEMMA4_SPEC_TYPICAL").as_deref() == Ok("1");
+        // Commit 52 (Phase D): consolidated single-read of all spec
+        // env knobs at function entry. Codex review priority 6 — no
+        // more env reads in the K-prefix verify loop (per-row
+        // RVLLM_GEMMA4_SPEC_ACCEPT_BIAS was redundant overhead).
+        let spec_cfg = SpecDecodeRequestConfig::from_env();
+        let batched_verify_mode = spec_cfg.batched_verify_mode;
+        let typical_mode = spec_cfg.typical_mode;
         if !matches!(sampling, SamplingConfig::Greedy) && !typical_mode {
             return Err(rvllm_core::RvllmError::Config {
                 err: rvllm_core::ConfigError::InvalidField {
@@ -4686,11 +4742,8 @@ impl Gemma4Bringup {
         // is enabled. Allocates max_new * vocab f32; capture happens
         // inside run_generate at the prefill + decode-loop argmax
         // sites.
-        let lossy_threshold: f32 = std::env::var("RVLLM_GEMMA4_SPEC_LOSSY_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(0.0);
+        // Phase D: lossy_threshold sourced from SpecDecodeRequestConfig.
+        let lossy_threshold: f32 = spec_cfg.lossy_threshold;
         let want_capture = lossy_threshold > 0.0 || typical_mode;
         if want_capture {
             let vocab_sz = arch.vocab_size as usize;
@@ -6081,10 +6134,8 @@ impl Gemma4Bringup {
                     SamplingConfig::Greedy => 1.0,
                 }
             } else { 0.0 };
-            let bias_env: f64 = std::env::var("RVLLM_GEMMA4_SPEC_ACCEPT_BIAS")
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0);
+            // Phase D: sourced from SpecDecodeRequestConfig.
+            let bias_env: f64 = spec_cfg.accept_bias;
             // Per-iter rng for the acceptance Us. Independent of the
             // drafter sampling rng so the two don't perturb each other.
             let mut accept_rng_state: u64 = {
@@ -6422,19 +6473,10 @@ impl Gemma4Bringup {
                         let log_q = drafter_log_q
                             .get(i).copied().unwrap_or(f32::NEG_INFINITY) as f64;
                         // log_accept = min(0, log p_b - log q)
-                        // Commit 34: env-tunable bias on the acceptance
-                        // ratio. Default 0 = strict Leviathan/Kalman.
-                        // Positive bias loosens (closer to "always
-                        // accept"). Calibration knob for the sparse-
-                        // drafter / full-vocab-base probability scale
-                        // mismatch — drafter's 4096-candidate softmax
-                        // is much sharper than base's 262144-vocab
-                        // softmax, so naive ratio over-rejects.
-                        let bias: f64 = std::env::var("RVLLM_GEMMA4_SPEC_ACCEPT_BIAS")
-                            .ok()
-                            .and_then(|s| s.parse::<f64>().ok())
-                            .unwrap_or(0.0);
-                        let log_accept = (log_p_b - log_q + bias).min(0.0);
+                        // Phase D: bias sourced from
+                        // SpecDecodeRequestConfig (read once at fn entry).
+                        // Was a per-row env::var call — wasted work.
+                        let log_accept = (log_p_b - log_q + spec_cfg.accept_bias).min(0.0);
                         let u = next_u01().max(1e-300);
                         let log_u = u.ln();
                         if log_u <= log_accept {
@@ -6501,7 +6543,12 @@ impl Gemma4Bringup {
         // so output text DIFFERS from plain greedy. The ~speedup
         // however only materializes once batched-verify replaces the
         // current sequential base decode path (= task #2 proper).
-        if std::env::var("RVLLM_GEMMA4_SPEC_EMIT_ACCEPTED").as_deref() == Ok("1")
+        // Phase D: emit_accepted comes from SpecDecodeRequestConfig
+        // (read once at fn entry). Used to be a per-request
+        // env::var lookup here even though the upstream wrappers
+        // had ALREADY set the env to "1" via the scribble-globals
+        // pattern flagged by codex priority 2.
+        if spec_cfg.emit_accepted
             && accept_len > 0
         {
             let mut emitted: Vec<u32> = drafter_tokens.iter()
