@@ -5516,15 +5516,32 @@ impl Gemma4Bringup {
         let mut base_argmax_k: Vec<u32> = Vec::with_capacity(k);
 
         // ---- Main session loop ----
+        // Codex Round 8 perf-investigation: per-iter timing instrumentation
+        // (gated by RVLLM_GEMMA4_SPEC_PERF_TRACE=1) so we can identify
+        // whether the verify/prefill_one wall-time is dominated by GPU
+        // work or host-side overhead. Cheap when off (atomic env_var
+        // check once per iter via a static cache).
+        let perf_trace = std::env::var("RVLLM_GEMMA4_SPEC_PERF_TRACE")
+            .as_deref() == Ok("1");
+        let mut sum_drafter_us: u64 = 0;
+        let mut sum_verify_us: u64 = 0;
+        let mut sum_prefill_one_us: u64 = 0;
+        let mut sum_shadow_us: u64 = 0;
+
         'outer: while emitted.len() < max_new {
             if let Some(c) = cancel {
                 if c.load(std::sync::atomic::Ordering::Relaxed) { break; }
             }
 
             // Step 1: K drafter forwards.
+            let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
             let drafts = self.run_drafter_k_from_state(
                 fn_embed, &session, spec_k, sampling, typical_mode,
             )?;
+            if perf_trace {
+                self.stream.fence()?;
+                sum_drafter_us += t0.unwrap().elapsed().as_micros() as u64;
+            }
             if drafts.tokens.is_empty() { break; }
             let k_actual = drafts.tokens.len();
             total_drafted = total_drafted.saturating_add(k_actual as u32);
@@ -5532,6 +5549,7 @@ impl Gemma4Bringup {
             // Step 2: batched verify -> K base argmaxes + K hiddens.
             base_argmax_k.clear();
             base_argmax_k.resize(k_actual, 0u32);
+            let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
             self.verify_batched_from_state(
                 fn_embed,
                 &drafts.tokens,
@@ -5540,6 +5558,10 @@ impl Gemma4Bringup {
                 k_hidden_buf,
                 &mut base_argmax_k,
             )?;
+            if perf_trace {
+                self.stream.fence()?;
+                sum_verify_us += t0.unwrap().elapsed().as_micros() as u64;
+            }
 
             // Step 3: greedy accept_len.
             // (Typical-acceptance: parked — falls back to greedy here.
@@ -5653,12 +5675,18 @@ impl Gemma4Bringup {
 
                 // Commit the bonus's base K/V + capture its
                 // POST-final-norm hidden for the next iter's drafter.
+                let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
                 let new_next = self.prefill_one_from_state(
                     fn_embed, &mut session, bonus)?;
+                if perf_trace {
+                    self.stream.fence()?;
+                    sum_prefill_one_us += t0.unwrap().elapsed().as_micros() as u64;
+                }
                 session.next_base_argmax = new_next;
 
                 // Shadow KV for the bonus's slot.
                 let bonus_slot = old_committed + accept_len as u32;
+                let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
                 let guard = self.drafter.lock().unwrap();
                 let d = guard.as_ref().expect("drafter resident");
                 d.populate_shadow_kv_range_from_base(
@@ -5674,6 +5702,10 @@ impl Gemma4Bringup {
                     /* slot_count */ 1,
                     stream,
                 )?;
+                if perf_trace {
+                    self.stream.fence()?;
+                    sum_shadow_us += t0.unwrap().elapsed().as_micros() as u64;
+                }
             } else {
                 // accept_len == 0: emit the deferred bonus
                 // (= session.next_base_argmax), then prefill it so its
@@ -5694,11 +5726,17 @@ impl Gemma4Bringup {
                 }
                 if emitted.len() >= max_new { break; }
 
+                let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
                 let new_next = self.prefill_one_from_state(
                     fn_embed, &mut session, bonus)?;
+                if perf_trace {
+                    self.stream.fence()?;
+                    sum_prefill_one_us += t0.unwrap().elapsed().as_micros() as u64;
+                }
                 session.next_base_argmax = new_next;
 
                 // Shadow KV update for the single new committed slot.
+                let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
                 let guard = self.drafter.lock().unwrap();
                 let d = guard.as_ref().expect("drafter resident");
                 d.populate_shadow_kv_range_from_base(
@@ -5714,6 +5752,10 @@ impl Gemma4Bringup {
                     /* slot_count */ 1,
                     stream,
                 )?;
+                if perf_trace {
+                    self.stream.fence()?;
+                    sum_shadow_us += t0.unwrap().elapsed().as_micros() as u64;
+                }
             }
 
             iter_count = iter_count.saturating_add(1);
@@ -5752,6 +5794,18 @@ impl Gemma4Bringup {
             "Gemma 4 batched speculative session loop complete \
              (deferred-bonus policy: bonus accounted to next iter)",
         );
+        if perf_trace {
+            eprintln!(
+                "[spec-perf] iters={} drafter_us_total={} verify_us_total={} \
+                 prefill_one_us_total={} shadow_us_total={} \
+                 drafter_avg_ms={:.2} verify_avg_ms={:.2} prefill_one_avg_ms={:.2}",
+                iter_count, sum_drafter_us, sum_verify_us, sum_prefill_one_us,
+                sum_shadow_us,
+                if iter_count > 0 { sum_drafter_us as f64 / iter_count as f64 / 1000.0 } else { 0.0 },
+                if iter_count > 0 { sum_verify_us as f64 / iter_count as f64 / 1000.0 } else { 0.0 },
+                if iter_count > 0 { sum_prefill_one_us as f64 / iter_count as f64 / 1000.0 } else { 0.0 },
+            );
+        }
         let _ = (k, max_new, sampling);
         Ok(emitted)
     }
