@@ -3905,6 +3905,91 @@ impl Gemma4Bringup {
     ///      conditions on). For full correctness this can be sharpened
     ///      later.
     ///
+    /// Codex review priority 2 — direct verify-batched-from-state API.
+    /// Phase B-1 (commit 48): API surface + contract only.
+    /// Phase B-2 (next commit): real layer-loop body.
+    ///
+    /// THE PRODUCTION SPEC-VERIFY HOTPATH. Replaces the current
+    /// "run_generate(prompt + drafts, max_new=1)" hack. Direct flow:
+    ///
+    ///   1. EmbeddingGather over `drafts[K]` → row 0..K of an
+    ///      arena residual buffer (K rows × hidden f16).
+    ///   2. Build positions[K] = [start_pos .. start_pos + K].
+    ///      Build slot_mapping[K] = same range (= the boundary
+    ///      tokens whose K/V the verify pass will write).
+    ///      context_lens = [start_pos + K] (last query token
+    ///      attends to start_pos+K keys = prompt + previous drafts
+    ///      + this iter's K drafts).
+    ///   3. cu_seqlens_q = [0, K], max_seqlen_q = K, num_seqs = 1
+    ///      → `Gemma4Phase::Prefill { ... }` for the layer loop.
+    ///   4. Run `gemma4_forward_phase` (or equivalent inline) for
+    ///      all 42 base layers, writing K/V slots at positions
+    ///      [start_pos .. start_pos + K) into the existing
+    ///      persistent KV cache. Hadamard / NVFP4 / FP8 dispatch
+    ///      identical to `run_generate`'s prefill path.
+    ///   5. Final RMSNorm on K rows of the residual buffer in place.
+    ///   6. cuBLASLt f16_gemm_f32 (M=K, N=vocab, K=hidden) →
+    ///      f32 logits buffer.
+    ///   7. Apply softcap (f32) on K × vocab.
+    ///   8. ArgmaxLaunch { num_tokens=K, vocab } → device u32 buffer.
+    ///   9. DtoH the K argmaxes. K hiddens stay on device (next iter's
+    ///      drafter input is K-buffer[accept_len - 1]).
+    ///   10. Return the K argmax tokens + the device ptr to the K-row
+    ///       post-final-norm hidden buffer.
+    ///
+    /// What this method does NOT do:
+    ///   - Does NOT call `run_generate`.
+    ///   - Does NOT touch `prefix_cache.last_tokens` /
+    ///     `committed_prefix_len` (`SpecDecodeSession` owns spec-
+    ///     internal committed state).
+    ///   - Does NOT compute a "bonus decode token" — caller decides
+    ///     what to emit at accept_len divergence from the K logits.
+    ///   - Does NOT run drafter forward — caller does that separately
+    ///     using `last_base_hidden_ptr` from the session.
+    ///
+    /// Phase B-1 STATUS: returns `FeatureNotAvailable` until the
+    /// layer-loop body is inlined in B-2. Callers must check + fall
+    /// back to the legacy batched-verify branch until then. This
+    /// commit locks in the API surface so consumers (run_generate
+    /// _speculative_batched in Phase C) can be wired against it
+    /// at compile time independently of B-2's implementation.
+    ///
+    /// Output buffer ownership: caller pre-allocates
+    /// `k_hidden_out_ptr` (K rows × hidden f16, post-final-norm)
+    /// and `k_argmax_host_out` (K u32 slots). This method writes
+    /// to them and returns Ok(()).
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn verify_batched_from_state(
+        &self,
+        _fn_embed: rvllm_kernels::KernelFn,
+        _drafts: &[u32],
+        _start_pos: u32,
+        _session: &SpecDecodeSession,
+        _k_hidden_out_ptr: u64,
+        _k_argmax_host_out: &mut [u32],
+    ) -> Result<()> {
+        // Phase B-1: API surface only. Body lands in B-2.
+        Err(rvllm_core::RvllmError::Attention {
+            err: rvllm_core::AttentionError::FeatureNotAvailable {
+                op: "verify_batched_from_state: Phase B-1 API skeleton; \
+                     real layer-loop body lands in Phase B-2 (commit 49). \
+                     Until then, callers must use the legacy \
+                     run_generate(prompt + drafts, max_new=1) batched-verify \
+                     branch — RVLLM_GEMMA4_SPEC_SESSION=1 will refuse to \
+                     activate the new path.",
+                backend: "Gemma4SpecDecode",
+            },
+            ctx: rvllm_core::AttnCtx {
+                op: "verify_batched_from_state",
+                stream: self.stream.raw(),
+                num_seqs: 1,
+                head_dim: self.arch.max_head_dim() as u32,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        })
+    }
+
     /// Gated by RVLLM_GEMMA4_SPEC_BATCHED=1 (default off).
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
