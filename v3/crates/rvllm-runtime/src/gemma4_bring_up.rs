@@ -5297,46 +5297,15 @@ impl Gemma4Bringup {
             let guard = self.drafter.lock().unwrap();
             let drafter = guard.as_ref().expect("checked above");
             drafter.prepare_pre_projection_input(&step, &workspace, stream)?;
-            // Commit 32: per HF/vLLM Gemma4MTP reference, the
-            // `inputs_embeds` half of pre_projection input must be
-            // multiplied by sqrt(backbone_hidden_size) on top of the
-            // base embedding's pre-scale. The drafter was trained
-            // with this scaling. Without it, embed-half RMS ≈ 1.0
-            // (vs. correct ≈ 51.6 for hidden=2560), pre_projection
-            // sees an imbalanced [embed, hidden] concat where hidden
-            // dominates by 5x instead of embed dominating by 10x,
-            // and Q gets the wrong direction → softmax uniform →
-            // accept_rate stuck at 0. Verified via manual PyTorch
-            // reference dump at v3/tools/manual_drafter_reference.py.
-            {
-                use cudarc::driver::sys::*;
-                let backbone = drafter.arch.backbone_hidden_size as i32;
-                let sqrt_bb: f32 = (backbone as f32).sqrt();
-                let mut x = workspace.pre_projection_in; // first-half base ptr
-                let mut s = sqrt_bb;
-                let mut n: i32 = backbone;
-                let args = [
-                    (&mut x) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut s) as *mut f32 as *mut core::ffi::c_void,
-                    (&mut n) as *mut i32 as *mut core::ffi::c_void,
-                ];
-                let block: u32 = 256;
-                let grid: u32 = ((n as u32 + block - 1) / block).max(1);
-                let rc = cuLaunchKernel(
-                    self.fused.fn_scale_inplace_f16.raw() as CUfunction,
-                    grid, 1, 1, block, 1, 1, 0,
-                    stream as CUstream,
-                    args.as_ptr() as *mut *mut core::ffi::c_void,
-                    core::ptr::null_mut(),
-                );
-                if rc != CUresult::CUDA_SUCCESS {
-                    return Err(rvllm_core::RvllmError::cuda(
-                        "drafter pre_projection embed half sqrt(backbone) scale",
-                        rvllm_core::CudaErrorKind::LaunchFailed,
-                        rvllm_core::CudaCtx::setup(),
-                    ));
-                }
-            }
+            // Commit 54: sqrt(backbone) scale on embed half is now in
+            // `apply_pre_projection_embed_scale`; logic + comment
+            // moved there. Stage 1a of the run_drafter_step_only
+            // extraction (codex review priority 1).
+            self.apply_pre_projection_embed_scale(
+                &workspace,
+                drafter.arch.backbone_hidden_size as i32,
+                stream,
+            )?;
             self.run_drafter_pre_projection(drafter, &workspace)?;
             // Commit 31h: probe pre_projection output (= workspace.hidden
             // after pre_projection GEMM + cast). This is layer 0's input
@@ -6595,6 +6564,56 @@ impl Gemma4Bringup {
 
     #[cfg(feature = "cuda")]
     #[allow(dead_code)]
+    /// Commit 54 (codex priority 1, stage 1a): the sqrt(backbone)
+    /// scale on the embed half of `workspace.pre_projection_in`,
+    /// previously inlined into the K-step body inside
+    /// `run_generate_speculative`. Per HF/vLLM Gemma4MTP reference,
+    /// the drafter was trained with `inputs_embeds` pre-multiplied by
+    /// sqrt(backbone_hidden_size) on top of the base embedding's own
+    /// pre-scale. Without it, embed-half RMS is wildly off and
+    /// pre_projection sees an imbalanced concat → Q direction wrong →
+    /// softmax uniform → accept_rate=0. Verified via the manual
+    /// PyTorch reference in `v3/tools/manual_drafter_reference.py`.
+    ///
+    /// First building block of the larger drafter-step extraction
+    /// codex called out. Used here and in the upcoming
+    /// `forward_one_drafter_step` method.
+    #[cfg(feature = "cuda")]
+    unsafe fn apply_pre_projection_embed_scale(
+        &self,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        backbone_hidden_size: i32,
+        stream: u64,
+    ) -> Result<()> {
+        use cudarc::driver::sys::*;
+        let sqrt_bb: f32 = (backbone_hidden_size as f32).sqrt();
+        let mut x = workspace.pre_projection_in; // first-half base ptr
+        let mut s = sqrt_bb;
+        let mut n: i32 = backbone_hidden_size;
+        let args = [
+            (&mut x) as *mut u64 as *mut core::ffi::c_void,
+            (&mut s) as *mut f32 as *mut core::ffi::c_void,
+            (&mut n) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        let block: u32 = 256;
+        let grid: u32 = ((n as u32 + block - 1) / block).max(1);
+        let rc = cuLaunchKernel(
+            self.fused.fn_scale_inplace_f16.raw() as CUfunction,
+            grid, 1, 1, block, 1, 1, 0,
+            stream as CUstream,
+            args.as_ptr() as *mut *mut core::ffi::c_void,
+            core::ptr::null_mut(),
+        );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "drafter pre_projection embed half sqrt(backbone) scale",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        Ok(())
+    }
+
     unsafe fn run_drafter_pre_projection(
         &self,
         drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
