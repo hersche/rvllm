@@ -125,3 +125,53 @@ If correctness diverges or build doesn't stabilize, `git revert` the new commits
 - EOS-before-push parity (Round 4 #3).
 - Drafter `"stable"` scale default (HF-parity verified, in `dea6f54`).
 - `SpecHookGuard` (RAII for the legacy `run_generate`-based warmup path — keep it for that call only).
+
+## Per-iter timing data (added end-of-session via `RVLLM_GEMMA4_SPEC_PERF_TRACE=1`)
+
+Measured 128-token creative continuation, K=4, FP8 KV, bf16 residual, GB10:
+
+```
+[spec-perf] iters=109
+            drafter_avg_ms=8.20
+            verify_avg_ms=183.23      <- K=4 chunked prefill via run_generate
+            prefill_one_avg_ms=213.98 <- K=1 chunked prefill via run_generate
+            shadow_us_total=1365      <- negligible
+```
+
+**The decisive observation:** `prefill_one` at K=1 (214ms) is nearly as
+expensive as `verify` at K=4 (183ms). The K-scaled portion of GPU
+work is small; the dominant cost is `run_generate`'s per-call host
+overhead — env reads, region allocations (mitigated by commit
+`2fb7a14`), prefix-cache lookup, position vec build, kernel launch
+dispatch.
+
+Per-iter total: 8 + 183 + 214 = 405 ms. For 109 iters: 44.1 s wall
+time. Matches measured.
+
+Non-spec baseline: 240 ms/token.
+
+**Implication for the kernel extraction**: even if a `verify_suffix_k_only`
+primitive matches the K=4 GPU work cost exactly (183ms), and a
+similar `commit_one_from_state_k_only` matches the K=1 GPU work
+cost (~80ms — only the actual K=1 forward, no setup overhead), per
+iter cost drops to ~270 ms (drafter 8 + verify 183 + commit 80 = 271).
+At observed accept_per_verify=0.15 (creative): emit_per_iter = 1.15.
+cost/token = 271 / 1.15 = 236 ms. **Matches non-spec 240 ms — JUST
+at parity, not "huge boost".**
+
+For real speedup, the setup overhead reduction has to be combined
+with a higher accept rate workload (factual content) where
+emit_per_iter ≥ 2. There, cost/token = 271/3 ≈ 90 ms, a clear ~2.6×
+speedup vs non-spec.
+
+**Recommended next-session ordering:**
+1. First implement the perf trace as a permanent diagnostic surface
+   (already done — commit `7f58464`).
+2. Then attempt `verify_batched_suffix_k_only` extraction (codex Round
+   7 #1) and measure: target `verify_avg_ms` ≤ 150 ms (vs current 183).
+3. Then attempt `commit_base_token_from_state` (codex Round 7 #1 / K=1
+   variant): target `prefill_one_avg_ms` ≤ 80 ms (vs current 214).
+4. Validate spec ON vs OFF byte-identity on the three regression
+   prompts after each step.
+5. Final bench: target ≤ 28 s on the 128-token creative continuation
+   (= parity with non-spec). Stretch: ≤ 20 s.
