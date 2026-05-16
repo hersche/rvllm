@@ -1125,6 +1125,27 @@ pub struct Gemma4Bringup {
     /// position (= base_argmax_K[accept_len - 1] from prev iter).
     /// `u32::MAX` is the sentinel "no cached value".
     pub saved_warmup_b_p: std::sync::atomic::AtomicU32,
+    /// Codex review priority 1 (commit 49 — Phase B-2): when
+    /// non-`u32::MAX`, overrides the `prefix_cache` token-match +
+    /// chunk_size-cap computation inside `run_generate`. The next
+    /// `run_generate` call treats this many tokens as already
+    /// committed and only prefills the suffix. One-shot semantics:
+    /// the value is `swap(u32::MAX)`'d on consumption.
+    ///
+    /// Used by `verify_batched_from_state` to bypass the cross-
+    /// request `committed_prefix_len = floor(P/chunk_size)*chunk_size`
+    /// cap that was forcing whole-prompt re-prefill on every spec
+    /// iteration with short prompts. Sentinel default keeps the
+    /// non-spec hot path untouched (cheap atomic load + branch).
+    pub force_common_prefix_override: std::sync::atomic::AtomicU32,
+    /// Codex review priority 1 (commit 49 — Phase B-2): when true,
+    /// the next `run_generate` call SKIPS the end-of-request
+    /// `prefix_cache.last_tokens` / `committed_prefix_len` write.
+    /// `verify_batched_from_state` sets this on so spec-internal
+    /// state doesn't pollute the cross-request prefix cache (which
+    /// is meant for the NEXT request's prompt, not the SAME
+    /// request's spec iterations).
+    pub skip_prefix_cache_publish: std::sync::atomic::AtomicBool,
     /// Spec-decode commit 25: last-request K-prefix accept-rate
     /// stats from `run_generate_speculative`. Populated at the end
     /// of the spec-decode path; cleared (taken) by the worker right
@@ -1929,6 +1950,8 @@ impl Gemma4Bringup {
             base_last_k_count: std::sync::atomic::AtomicU32::new(0),
             skip_next_warmup: std::sync::atomic::AtomicBool::new(false),
             saved_warmup_b_p: std::sync::atomic::AtomicU32::new(u32::MAX),
+            force_common_prefix_override: std::sync::atomic::AtomicU32::new(u32::MAX),
+            skip_prefix_cache_publish: std::sync::atomic::AtomicBool::new(false),
             base_last_k_snapshot_pending:
                 std::sync::atomic::AtomicBool::new(false),
             last_spec_stats: std::sync::Mutex::new(None),
@@ -3962,32 +3985,216 @@ impl Gemma4Bringup {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn verify_batched_from_state(
         &self,
-        _fn_embed: rvllm_kernels::KernelFn,
-        _drafts: &[u32],
-        _start_pos: u32,
-        _session: &SpecDecodeSession,
-        _k_hidden_out_ptr: u64,
-        _k_argmax_host_out: &mut [u32],
+        fn_embed: rvllm_kernels::KernelFn,
+        drafts: &[u32],
+        start_pos: u32,
+        session: &SpecDecodeSession,
+        k_hidden_out_ptr: u64,
+        k_argmax_host_out: &mut [u32],
     ) -> Result<()> {
-        // Phase B-1: API surface only. Body lands in B-2.
-        Err(rvllm_core::RvllmError::Attention {
-            err: rvllm_core::AttentionError::FeatureNotAvailable {
-                op: "verify_batched_from_state: Phase B-1 API skeleton; \
-                     real layer-loop body lands in Phase B-2 (commit 49). \
-                     Until then, callers must use the legacy \
-                     run_generate(prompt + drafts, max_new=1) batched-verify \
-                     branch — RVLLM_GEMMA4_SPEC_SESSION=1 will refuse to \
-                     activate the new path.",
-                backend: "Gemma4SpecDecode",
-            },
-            ctx: rvllm_core::AttnCtx {
-                op: "verify_batched_from_state",
-                stream: self.stream.raw(),
-                num_seqs: 1,
-                head_dim: self.arch.max_head_dim() as u32,
-            },
-            bt: std::backtrace::Backtrace::capture(),
-        })
+        // Phase B-2: real body. Rather than duplicating the ~650 LOC
+        // chunk-prefill body of `run_generate`, we drive that path
+        // with two new override hooks added in this commit:
+        //
+        //   * `force_common_prefix_override = start_pos`: bypasses
+        //     the token-id match + `committed_prefix_len` chunk-cap
+        //     in the prefix-cache lookup. `run_generate` then
+        //     prefills exactly K = drafts.len() new tokens at
+        //     positions [start_pos .. start_pos+K).
+        //
+        //   * `skip_prefix_cache_publish = true`: skips the end-of-
+        //     request `last_tokens` + `committed_prefix_len` write,
+        //     so spec-internal iteration doesn't pollute the
+        //     cross-request cache. The session itself owns spec
+        //     state.
+        //
+        // The existing K-row capture hook (commit 40, fixed in
+        // commit 40b) writes the K POST-layer-loop hiddens into
+        // `base_last_k_hidden_ptr`. We re-aim it at the caller's
+        // output buffer for this pass.
+        //
+        // This is NOT the "no run_generate" purity the Phase B-1
+        // contract documented, but it IS the substantive codex
+        // priority-1 fix: short-prompt spec iters no longer
+        // re-prefill the entire prompt under chunk_size cap.
+        if drafts.is_empty() {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "drafts",
+                    reason: "empty drafts vec".into(),
+                },
+                field: "drafts",
+            });
+        }
+        if k_argmax_host_out.len() < drafts.len() {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "k_argmax_host_out",
+                    reason: format!(
+                        "buffer len {} < drafts.len {}",
+                        k_argmax_host_out.len(),
+                        drafts.len(),
+                    )
+                    .into(),
+                },
+                field: "k_argmax_host_out",
+            });
+        }
+        if (drafts.len() as usize) > MAX_SPEC_K {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "drafts.len",
+                    reason: format!(
+                        "{} exceeds MAX_SPEC_K={}",
+                        drafts.len(),
+                        MAX_SPEC_K,
+                    )
+                    .into(),
+                },
+                field: "drafts.len",
+            });
+        }
+
+        let k = drafts.len();
+
+        // Build the input prompt: session.tokens (= prompt + accepted
+        // drafts) + this iter's K drafts.
+        let mut input_ids: Vec<u32> =
+            Vec::with_capacity(session.tokens.len() + k);
+        input_ids.extend_from_slice(&session.tokens);
+        input_ids.extend_from_slice(drafts);
+        debug_assert_eq!(
+            session.tokens.len() as u32,
+            start_pos,
+            "verify_batched_from_state: session.tokens.len() must equal start_pos",
+        );
+
+        // Aim the K-row hidden capture at the caller's output buffer.
+        // The existing `base_last_k_hidden_ptr` is the pre-allocated
+        // reusable region; we point the atomic at the caller's
+        // buffer for this pass, then restore the original ptr after.
+        let original_k_dst = self
+            .base_last_k_hidden_ptr
+            .swap(k_hidden_out_ptr, std::sync::atomic::Ordering::AcqRel);
+        self.base_last_k_count
+            .store(k as u32, std::sync::atomic::Ordering::Release);
+        self.base_last_k_snapshot_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        // Arm the prefix-cache override + skip-publish hooks.
+        self.force_common_prefix_override
+            .store(start_pos, std::sync::atomic::Ordering::Release);
+        self.skip_prefix_cache_publish
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        // Run the existing chunk-prefill body. With the override
+        // active, common_prefix_len = start_pos, new_q = K, layer
+        // loop processes exactly K tokens, K-hidden hook captures
+        // [residual rows 0..K) (= post-layer-loop, pre-final-norm
+        // hiddens at positions start_pos..start_pos+K).
+        let result = self.run_generate(
+            fn_embed,
+            self.fused.fn_argmax,
+            &input_ids,
+            /* max_new */ 1,
+            /* eos_ids */ &[],
+            /* shadow_requested */ false,
+            SamplingConfig::Greedy,
+            /* cancel */ None,
+            /* on_token */ None,
+            /* vision_splice */ &[],
+            /* audio_splice */ &[],
+        );
+
+        // Restore the K-buffer ptr regardless of result.
+        self.base_last_k_hidden_ptr
+            .store(original_k_dst, std::sync::atomic::Ordering::Release);
+
+        let _bonus = result?;
+        // The K-row hidden buffer at `k_hidden_out_ptr` now holds K
+        // POST-layer-loop, PRE-final-norm hiddens. Caller is
+        // responsible for final_norm + lm_head + softcap + argmax
+        // (those are already part of the legacy batched-verify
+        // branch's post-capture sequence; Phase C wires that
+        // sequence around this call).
+        //
+        // For Phase B-2 SAFETY: also fill k_argmax_host_out with
+        // the K argmaxes by running final_norm + lm_head + argmax
+        // ourselves on `k_hidden_out_ptr`. That keeps the API
+        // self-contained — caller doesn't need to replicate the
+        // GEMM machinery.
+        let arena = &self.arena;
+        let arena_ck = self.arena.checkpoint();
+        let stream = self.stream.raw();
+        let hidden_u = self.arch.hidden_size as u32;
+        let vocab_u = self.arch.vocab_size as u32;
+
+        rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: k as u32,
+            hidden: hidden_u,
+            eps: self.arch.rms_norm_eps,
+        }
+        .launch(
+            self.fused.fn_rmsnorm,
+            k_hidden_out_ptr,
+            self.model.final_norm.offset_bytes,
+            stream,
+        )?;
+
+        let logits_region = arena.region(
+            "spec_verify_logits_f32",
+            k * (vocab_u as usize) * 4,
+            16,
+        )?;
+        self.cublaslt.f16_gemm_f32(
+            k_hidden_out_ptr,
+            self.model.lm_head_f16.offset_bytes,
+            logits_region.device_ptr(),
+            k as i32,
+            vocab_u as i32,
+            hidden_u as i32,
+            stream,
+        )?;
+        if self.arch.logit_softcap > 0.0 {
+            rvllm_fused::gemma4_launcher::LogitSoftcapLaunch {
+                num_tokens: k as u32,
+                vocab: vocab_u,
+                cap: self.arch.logit_softcap,
+            }
+            .launch(
+                self.fused.fn_softcap_f32,
+                logits_region.device_ptr(),
+                stream,
+            )?;
+        }
+        let argmax_region = arena.region("spec_verify_argmax", k * 4, 16)?;
+        rvllm_fused::ArgmaxLaunch {
+            num_tokens: k as u32,
+            vocab: vocab_u,
+        }
+        .launch(
+            self.fused.fn_argmax,
+            logits_region.device_ptr(),
+            argmax_region.device_ptr(),
+            stream,
+        )?;
+        self.stream.fence()?;
+        let rc = cudarc::driver::sys::cuMemcpyDtoH_v2(
+            k_argmax_host_out.as_mut_ptr() as *mut _,
+            argmax_region.device_ptr(),
+            k * 4,
+        );
+        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            self.arena.restore(arena_ck);
+            return Err(rvllm_core::RvllmError::cuda(
+                "verify_batched_from_state: argmax DtoH",
+                rvllm_core::CudaErrorKind::MemcpyFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        self.arena.restore(arena_ck);
+        let _ = session; // future: cross-check committed_len consistency
+        Ok(())
     }
 
     /// Gated by RVLLM_GEMMA4_SPEC_BATCHED=1 (default off).
@@ -7431,14 +7638,36 @@ impl Gemma4Bringup {
         // arena allocation — no cache hit available in that case.
         let sliding_blocks = num_blocks_total;
         let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(false);
+        // Codex review priority 1 (commit 49 — Phase B-2):
+        // verify_batched_from_state arms this AtomicU32 with the
+        // session's committed_len. When non-sentinel, the prefix-
+        // cache match (token-id loop + chunk_size cap) is bypassed:
+        // we use the forced value directly as common_prefix_len.
+        // This eliminates the "RVLLM_PREFILL_CHUNK_SIZE=2048 forces
+        // full re-prefill on short prompts" failure mode that was
+        // killing wall-clock for spec-decode.
+        let forced_prefix_override = self
+            .force_common_prefix_override
+            .swap(u32::MAX, std::sync::atomic::Ordering::AcqRel);
         let (kv_cache_ptr, kv_scale_ptr, kv_layer_offsets, kv_scale_layer_offsets,
              kv_total_bytes, kv_scale_total_bytes, common_prefix_len_raw) = {
             let guard = self.prefix_cache.lock().unwrap();
             match &*guard {
                 Some(pc) => {
+                    let mut prefix = 0usize;
+                    if forced_prefix_override != u32::MAX {
+                        // Spec-decode override path: caller has its
+                        // own committed-len bookkeeping
+                        // (SpecDecodeSession); honor it directly,
+                        // skip the token-match loop AND skip the
+                        // chunk_size cap below. The slots up to
+                        // `forced_prefix_override` are guaranteed
+                        // valid by the spec session contract.
+                        prefix = (forced_prefix_override as usize)
+                            .min(prompt_ids.len());
+                    } else {
                     // Cache hit path: compute the longest common
                     // prefix in raw token ids.
-                    let mut prefix = 0usize;
                     while prefix < pc.last_tokens.len()
                         && prefix < prompt_ids.len()
                         && pc.last_tokens[prefix] == prompt_ids[prefix]
@@ -7494,6 +7723,7 @@ impl Gemma4Bringup {
                             prefix = cap;
                         }
                     }
+                    } // end else (non-forced-override branch)
                     // Leave at least one token for the prefill to
                     // process (otherwise there's nothing to decode
                     // the last hidden state from).
@@ -9888,7 +10118,14 @@ impl Gemma4Bringup {
         // prior assistant responses in the NEXT prompt's history
         // anyway, so persisting generated-token KV here adds
         // complexity without extra benefit.
-        if use_prefix_cache {
+        // Codex review priority 1 (commit 49 — Phase B-2):
+        // verify_batched_from_state arms this flag so spec-internal
+        // state doesn't pollute the cross-request prefix cache.
+        // One-shot semantics: swap(false) on consume.
+        let skip_publish = self
+            .skip_prefix_cache_publish
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        if use_prefix_cache && !skip_publish {
             if let Ok(mut guard) = self.prefix_cache.lock() {
                 if let Some(pc) = guard.as_mut() {
                     pc.last_tokens.clear();
