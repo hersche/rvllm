@@ -5139,6 +5139,15 @@ impl Gemma4Bringup {
             let full_li = sources.full_source_layer as usize;
             let sliding_view = source_view(sources.sliding_source_layer);
             let full_view = source_view(sources.full_source_layer);
+            // Commit 57 (codex #1): truncate populate work to the
+            // current active-context slot count. Before: each spec
+            // iteration dequanted the entire max-cache shadow
+            // (RVLLM_NUM_BLOCKS * block_size slots = 32768 on
+            // default config), most of which held zero base KV. Now:
+            // only `prompt_ids.len()` slots are touched per iter.
+            // For a 100-token chat prompt that's ~320× fewer
+            // dequant work-elements per iter.
+            let valid_len_slots = prompt_ids.len() as u32;
             drafter.populate_shadow_kv_from_base(
                 sliding_view.k_cache,
                 sliding_view.v_cache,
@@ -5152,6 +5161,7 @@ impl Gemma4Bringup {
                 kv_dtype_per_layer[full_li],
                 shadow.sliding_layer_bytes,
                 shadow.full_layer_bytes,
+                valid_len_slots,
                 stream,
             )?;
             let _ = (sliding_view, full_view);
@@ -6413,9 +6423,15 @@ impl Gemma4Bringup {
                             rvllm_core::CudaCtx::setup(),
                         ));
                     }
-                    // Ensure copy completes before next call could
-                    // read the buffer (defensive).
-                    self.stream.fence()?;
+                    // Commit 57 (codex #4): no fence needed. The
+                    // DtoD copy is enqueued on `self.stream` and the
+                    // next consumer (drafter step 0 of the next spec
+                    // iter) reads `base_last_hidden_ptr` from the
+                    // same stream — CUDA stream ordering guarantees
+                    // the read sees the copied bytes. The host never
+                    // reads the copy. A defensive fence here
+                    // serialised CPU↔GPU per successful spec iter
+                    // for no functional reason.
                     // Cache the next iter's warmup base argmax.
                     let cached_b = base_argmax_k[accept_len - 1];
                     self.saved_warmup_b_p

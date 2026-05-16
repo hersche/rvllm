@@ -681,6 +681,17 @@ impl Gemma4DrafterRuntime {
     /// KV cache dtypes — feeding both layers through the sliding-layer
     /// dtype path silently dequanted the full source layer with the
     /// wrong codec, producing junk K/V in the shadow.
+    ///
+    /// Commit 57 (codex review #1): `valid_len_slots` truncates the
+    /// per-source-layer work to the first `valid_len_slots` slots in
+    /// the base buffer's `[num_slots, num_kv_heads, head_dim]`
+    /// row-major layout (= the current `prompt_len + emitted_so_far`
+    /// for the active spec request). Shadow regions are sized for
+    /// `RVLLM_NUM_BLOCKS * block_size` slots — the max — and the
+    /// previous code dequanted ALL of them every spec iteration even
+    /// though only the active-context prefix held valid base KV.
+    /// `0` is a sentinel meaning "populate the full buffer"
+    /// (legacy/back-compat call path).
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn populate_shadow_kv_from_base(
@@ -697,6 +708,7 @@ impl Gemma4DrafterRuntime {
         full_kv_dtype: crate::gemma4_layer_exec::KvDtype,
         sliding_bytes: usize,
         full_bytes: usize,
+        valid_len_slots: u32,
         stream: u64,
     ) -> Result<()> {
         let shadow = self.shadow_kv.as_ref().ok_or_else(|| RvllmError::Attention {
@@ -731,8 +743,34 @@ impl Gemma4DrafterRuntime {
             });
         }
         // F16 element counts in the shadow (one buffer = K or V).
-        let sliding_elems = (sliding_bytes / 2) as i64;
-        let full_elems = (full_bytes / 2) as i64;
+        let sliding_max_elems = (sliding_bytes / 2) as i64;
+        let full_max_elems = (full_bytes / 2) as i64;
+
+        // Commit 57: derive the truncated work range from
+        // `valid_len_slots`. Both kernels and the F16 DtoD use the
+        // contiguous `[num_slots, nkvh, head_dim]` layout, so element
+        // index i < valid_len_slots * nkvh * head_dim covers exactly
+        // the active-context slots. `valid_len_slots == 0` keeps the
+        // legacy full-buffer behaviour for callers that haven't
+        // been ported.
+        let sliding_per_slot_elems =
+            (shadow.sliding_num_kv_heads as i64) * (shadow.sliding_head_dim as i64);
+        let full_per_slot_elems =
+            (shadow.full_num_kv_heads as i64) * (shadow.full_head_dim as i64);
+        let (sliding_elems, sliding_dst_bytes) = if valid_len_slots == 0 {
+            (sliding_max_elems, sliding_bytes)
+        } else {
+            let want = (valid_len_slots as i64) * sliding_per_slot_elems;
+            let clamped = want.min(sliding_max_elems);
+            (clamped, (clamped as usize) * 2)
+        };
+        let (full_elems, full_dst_bytes) = if valid_len_slots == 0 {
+            (full_max_elems, full_bytes)
+        } else {
+            let want = (valid_len_slots as i64) * full_per_slot_elems;
+            let clamped = want.min(full_max_elems);
+            (clamped, (clamped as usize) * 2)
+        };
 
         // Sliding source layer (K + V).
         self.populate_one_source_layer(
@@ -744,7 +782,7 @@ impl Gemma4DrafterRuntime {
             base_sliding_v_scale,
             shadow.sliding_num_kv_heads as i32,
             shadow.sliding_head_dim as i32,
-            sliding_bytes,
+            sliding_dst_bytes,
             sliding_elems,
             sliding_kv_dtype,
             "sliding",
@@ -761,7 +799,7 @@ impl Gemma4DrafterRuntime {
             base_full_v_scale,
             shadow.full_num_kv_heads as i32,
             shadow.full_head_dim as i32,
-            full_bytes,
+            full_dst_bytes,
             full_elems,
             full_kv_dtype,
             "full",
