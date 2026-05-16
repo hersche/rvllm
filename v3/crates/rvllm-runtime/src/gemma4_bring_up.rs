@@ -4255,20 +4255,38 @@ impl Gemma4Bringup {
             cancel, None,
             vision_splice, audio_splice,
         )?;
-        // The first base argmax is the "iter 0 bonus" — emit it and
-        // extend the prompt before entering the spec loop. This is
-        // also the only chance our base sees vision/audio splice;
-        // subsequent iters are text-only.
+        // Commit 51 (Phase C-2): instead of emitting the outer
+        // warmup's first base argmax + pushing to current_prompt
+        // (which forces the FIRST inner call to re-prefill +1 token
+        // under chunk-cap), defer it. Hand the value to the inner
+        // spec function via skip_next_warmup / saved_warmup_b_p so
+        // the first iter skips its own warmup:
+        //
+        //   * `base_last_hidden_ptr` was just populated by outer
+        //     warmup (snapshot fired on the prefill final_norm).
+        //   * `saved_warmup_b_p = warmup_base[0]` provides
+        //     `_base_first_tok[0]` to the inner spec function.
+        //   * `skip_next_warmup = true` activates the skip-warmup
+        //     path in run_generate_speculative.
+        //
+        // The first base argmax is THEN emitted by the inner spec
+        // function in its normal emit logic (accept_len=0 case
+        // emits warmup_b_p; accept_len>=1 case emits an accepted
+        // draft and pushes the warmup_b_p to next-iter's cache).
+        // Net effect: ZERO inner warmups for the first iter — the
+        // codex priority-3 double-warmup fix.
         if let Some(&first) = warmup_base.first() {
             if eos_ids.contains(&first) {
+                // EOS at first token: emit + return; nothing further
+                // to spec.
                 emitted.push(first);
-            } else {
-                if let Some(cb) = on_token.as_mut() {
-                    if !cb(first) { return Ok(emitted); }
-                }
-                emitted.push(first);
-                current_prompt.push(first);
+                return Ok(emitted);
             }
+            // Arm skip-warmup for the first inner call.
+            self.saved_warmup_b_p
+                .store(first, std::sync::atomic::Ordering::Release);
+            self.skip_next_warmup
+                .store(true, std::sync::atomic::Ordering::Release);
         }
 
         // Main batched-verify spec loop.
@@ -4711,8 +4729,25 @@ impl Gemma4Bringup {
         //   - _base_first_tok[0] is filled from saved_warmup_b_p (=
         //     prev iter's base_argmax_K[accept_len - 1] = base's
         //     prediction at the would-be warmup position).
+        // Commit 51 (Phase C-2): drop the RVLLM_GEMMA4_SPEC_SKIP_WARMUP
+        // env gate. When batched_verify_mode is on, honor the
+        // `skip_next_warmup` atomic unconditionally. The atomic is
+        // only set by code we control:
+        //   (a) the batched-verify branch at end of prev iter, when
+        //       accept_len >= 1 (saved_warmup_b_p = base_argmax_K[
+        //       accept_len - 1], last_base_hidden DtoD-copied from
+        //       K-buffer[accept_len - 1]).
+        //   (b) the OUTER wrapper run_generate_speculative_batched
+        //       before each inner call (this commit — arms from
+        //       outer's own warmup so the first inner call also
+        //       skips its redundant warmup).
+        //
+        // accept_len = 0 iters from (a) leave the atomic at false, so
+        // the inner warmup runs normally — that's the forward-progress
+        // fallback codex priority 4 documented. No regression at
+        // accept_len = 0; saving comes from accept_len >= 1 iters +
+        // the first iter (always saved).
         let skip_warmup_active = batched_verify_mode
-            && std::env::var("RVLLM_GEMMA4_SPEC_SKIP_WARMUP").as_deref() == Ok("1")
             && self
                 .skip_next_warmup
                 .swap(false, std::sync::atomic::Ordering::AcqRel);
@@ -6245,8 +6280,13 @@ impl Gemma4Bringup {
             // Vs baseline (no spec): 1 base decode per emitted token.
             // Each iter emits accept_len tokens. Breakeven shifts to
             // ~0 — any positive accept_rate yields speedup.
-            let skip_warmup_env = std::env::var("RVLLM_GEMMA4_SPEC_SKIP_WARMUP")
-                .as_deref() == Ok("1");
+            // Commit 51 (Phase C-2): the env gate is dropped — when
+            // we're in the batched-verify branch (= batched_verify_mode
+            // was true at function entry), arming skip-warmup for the
+            // next iter is structurally part of the protocol, not an
+            // optional knob. Subsequent iter's skip_warmup_active check
+            // honors this atomic unconditionally.
+            let skip_warmup_env = true;
             let mut emit_for_skip = emitted.clone();
             if skip_warmup_env && accept_len >= 1 && accept_len <= kmax {
                 // Drop the bonus/divergence token — next iter will
