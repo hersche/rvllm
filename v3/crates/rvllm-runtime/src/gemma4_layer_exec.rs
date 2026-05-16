@@ -4083,6 +4083,8 @@ mod validate_tests {
         Gemma4LayerDims {
             num_tokens: 1,
             hidden: 5376,
+            // 31B-shaped fixture: PLE inactive, no kv-share.
+            ple_dim: 0,
             num_heads: 32,
             num_kv_heads: 8,
             head_dim: 256,
@@ -4101,6 +4103,7 @@ mod validate_tests {
             // Cycle 55 step 1: bf16 is the production default; f16
             // remains as an env-overridable diagnostic path.
             bf16_residual: true,
+            kv_share_source_layer: None,
         }
     }
 

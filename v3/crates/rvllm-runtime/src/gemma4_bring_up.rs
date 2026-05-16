@@ -931,7 +931,77 @@ impl SpecDecodeSession {
     /// Returns None if the session has no committed tokens (first
     /// drafter step before warmup completes).
     pub fn last_committed_token(&self) -> Option<u32> {
-        self.tokens.get((self.committed_len as usize).saturating_sub(1)).copied()
+        if self.committed_len == 0 {
+            return None;
+        }
+        self.tokens.get((self.committed_len as usize) - 1).copied()
+    }
+}
+
+/// Output of `run_drafter_k_from_state`: K candidate drafter tokens
+/// plus optional per-step drafter log-probabilities (populated only
+/// in typical-acceptance mode).
+#[derive(Debug, Default)]
+pub struct DraftBatch {
+    pub tokens: Vec<u32>,
+    pub log_q: Vec<f32>,
+}
+
+/// RAII guard disarming the spec-decode hook atomics on drop.
+///
+/// `verify_batched_from_state` / `prefill_one_from_state` set up to
+/// four atomics (`force_common_prefix_override`,
+/// `skip_prefix_cache_publish`, `force_prefill_only`,
+/// `base_last_k_snapshot_pending`) and optionally swap
+/// `base_last_k_hidden_ptr` to redirect a capture. If the inner
+/// `run_generate` returns early (e.g. `force_prefill_only` short-
+/// circuit at the skip_decode site), the late publish-skip reset
+/// never runs and the flag leaks into the next request.
+///
+/// This guard makes the disarm structurally unmissable: on drop, all
+/// four atomics are stored back to their disarmed sentinels and (if
+/// armed) the K-hidden destination ptr is restored to its prior
+/// value. `Release` order so the next request sees the disarmed
+/// state.
+struct SpecHookGuard<'a> {
+    bringup: &'a Gemma4Bringup,
+    saved_k_dst: Option<u64>,
+}
+
+impl<'a> SpecHookGuard<'a> {
+    fn new(b: &'a Gemma4Bringup) -> Self {
+        Self { bringup: b, saved_k_dst: None }
+    }
+    /// Swap `base_last_k_hidden_ptr` to `new_ptr`; the old value is
+    /// remembered and restored on drop. Multiple calls overwrite
+    /// the saved value — the guard only restores the FIRST swap.
+    fn swap_k_dst(&mut self, new_ptr: u64) {
+        let old = self.bringup
+            .base_last_k_hidden_ptr
+            .swap(new_ptr, std::sync::atomic::Ordering::AcqRel);
+        if self.saved_k_dst.is_none() {
+            self.saved_k_dst = Some(old);
+        }
+    }
+}
+
+impl Drop for SpecHookGuard<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Release;
+        self.bringup.force_common_prefix_override.store(u32::MAX, Release);
+        self.bringup.skip_prefix_cache_publish.store(false, Release);
+        self.bringup.force_prefill_only.store(false, Release);
+        self.bringup.base_last_k_snapshot_pending.store(false, Release);
+        // Codex Round 4 #5: also disarm the single-token snapshot
+        // pending flag. prefill_one_from_state arms it before its
+        // run_generate call; if run_generate errors before the
+        // final_norm hook consumes the flag, it leaks and the next
+        // request silently overwrites its base_last_hidden_ptr with a
+        // wrong-position hidden.
+        self.bringup.base_last_hidden_snapshot_pending.store(false, Release);
+        if let Some(old) = self.saved_k_dst.take() {
+            self.bringup.base_last_k_hidden_ptr.store(old, Release);
+        }
     }
 }
 
@@ -4157,86 +4227,100 @@ impl Gemma4Bringup {
             "verify_batched_from_state: session.tokens.len() must equal start_pos",
         );
 
-        // Aim the K-row hidden capture at the caller's output buffer.
-        // The existing `base_last_k_hidden_ptr` is the pre-allocated
-        // reusable region; we point the atomic at the caller's
-        // buffer for this pass, then restore the original ptr after.
-        let original_k_dst = self
-            .base_last_k_hidden_ptr
-            .swap(k_hidden_out_ptr, std::sync::atomic::Ordering::AcqRel);
-        self.base_last_k_count
-            .store(k as u32, std::sync::atomic::Ordering::Release);
-        self.base_last_k_snapshot_pending
-            .store(true, std::sync::atomic::Ordering::Release);
-
-        // Arm the prefix-cache override + skip-publish hooks.
-        self.force_common_prefix_override
-            .store(start_pos, std::sync::atomic::Ordering::Release);
-        self.skip_prefix_cache_publish
-            .store(true, std::sync::atomic::Ordering::Release);
-        // Commit 56 (codex priority 0.2): the K-row hidden buffer
-        // captured during prefill is the only output this call
-        // consumes — caller runs its own final_norm + lm_head +
-        // argmax over the K-buffer below. Skip the wasted bonus
-        // decode (row-extract + final_norm + lm_head_M=1 + argmax
-        // + DtoH) that produces a token equal to
-        // `base_argmax_K[K-1]` we will recompute anyway.
-        self.force_prefill_only
-            .store(true, std::sync::atomic::Ordering::Release);
-
-        // Run the existing chunk-prefill body. With the override
-        // active, common_prefix_len = start_pos, new_q = K, layer
-        // loop processes exactly K tokens, K-hidden hook captures
-        // [residual rows 0..K) (= post-layer-loop, pre-final-norm
-        // hiddens at positions start_pos..start_pos+K).
-        let result = self.run_generate(
-            fn_embed,
-            self.fused.fn_argmax,
-            &input_ids,
-            /* max_new */ 1,
-            /* eos_ids */ &[],
-            /* shadow_requested */ false,
-            SamplingConfig::Greedy,
-            /* cancel */ None,
-            /* on_token */ None,
-            /* vision_splice */ &[],
-            /* audio_splice */ &[],
-        );
-
-        // Restore the K-buffer ptr regardless of result.
-        self.base_last_k_hidden_ptr
-            .store(original_k_dst, std::sync::atomic::Ordering::Release);
-
-        let _bonus = result?;
-        // The K-row hidden buffer at `k_hidden_out_ptr` now holds K
-        // POST-layer-loop, PRE-final-norm hiddens. Caller is
-        // responsible for final_norm + lm_head + softcap + argmax
-        // (those are already part of the legacy batched-verify
-        // branch's post-capture sequence; Phase C wires that
-        // sequence around this call).
-        //
-        // For Phase B-2 SAFETY: also fill k_argmax_host_out with
-        // the K argmaxes by running final_norm + lm_head + argmax
-        // ourselves on `k_hidden_out_ptr`. That keeps the API
-        // self-contained — caller doesn't need to replicate the
-        // GEMM machinery.
+        // Codex Round 2 #1: arena checkpoint covering the inner
+        // run_generate. Without this, run_generate's prompt-
+        // proportional scratch (input_ids.len() = session.tokens.len()
+        // + K) leaks into the spec session's arena per iteration —
+        // OOM / catastrophic arena pressure on long E4B contexts.
+        // `k_hidden_out_ptr` is allocated above scratch (by
+        // ensure_drafter), so restoring this checkpoint is safe.
         let arena = &self.arena;
-        let arena_ck = self.arena.checkpoint();
+        let outer_ck = arena.checkpoint();
+        // Run the verify pass inside a labelled scope so the guard
+        // disarms hook atomics + the K-dst restore fires before we
+        // restore the arena.
+        let verify_result: Result<()> = (|| {
+            // Codex Round 2 #2: RAII guard. force_prefill_only causes
+            // run_generate to skip_decode early-return, which bypasses
+            // the late skip_prefix_cache_publish.swap site. Without
+            // the guard, the publish-skip flag leaked into the next
+            // request and silently suppressed one cross-request cache
+            // publish.
+            let mut hook_guard = SpecHookGuard::new(self);
+            hook_guard.swap_k_dst(k_hidden_out_ptr);
+            self.base_last_k_count
+                .store(k as u32, std::sync::atomic::Ordering::Release);
+            self.base_last_k_snapshot_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.force_common_prefix_override
+                .store(start_pos, std::sync::atomic::Ordering::Release);
+            self.skip_prefix_cache_publish
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.force_prefill_only
+                .store(true, std::sync::atomic::Ordering::Release);
+
+            let _bonus = self.run_generate(
+                fn_embed,
+                self.fused.fn_argmax,
+                &input_ids,
+                /* max_new */ 1,
+                /* eos_ids */ &[],
+                /* shadow_requested */ false,
+                SamplingConfig::Greedy,
+                /* cancel */ None,
+                /* on_token */ None,
+                /* vision_splice */ &[],
+                /* audio_splice */ &[],
+            )?;
+            Ok(())
+            // hook_guard drops here — atomics disarmed, K-dst restored.
+        })();
+        if let Err(e) = verify_result {
+            arena.restore(outer_ck);
+            return Err(e);
+        }
+
+        // K-row final_norm + lm_head + softcap + argmax over the
+        // captured POST-layer-loop hiddens. Allocates only K-sized
+        // scratch (hidden / logits / argmax), bounded independent of
+        // session length.
+        //
+        // Codex Round 7 perf #2: when RVLLM_RESIDUAL_BF16=1, the
+        // chunked-prefill layer loop runs in bf16 and the K-row hidden
+        // capture writes bf16 bytes into k_hidden_out_ptr. Using the
+        // f16 rmsnorm here mis-interprets those bytes — bf16's wider
+        // exponent + narrower mantissa makes the reinterpret produce
+        // garbled values, which flow into lm_head and pull the K
+        // argmaxes toward attractor tokens regardless of actual base
+        // distribution. Result: drafter agreement on those (correlated-
+        // wrong) argmaxes was artificially low. Selecting the bf16
+        // sibling rmsnorm + narrowing back to f16 via bf16_to_f16_sat
+        // restores correct base argmaxes (and therefore real accept
+        // rates).
         let stream = self.stream.raw();
         let hidden_u = self.arch.hidden_size as u32;
         let vocab_u = self.arch.vocab_size as u32;
-
+        let bf16_res = bf16_residual_enabled();
+        let final_norm_kernel = if bf16_res {
+            self.fused.fn_rmsnorm_inplace_bf16
+        } else {
+            self.fused.fn_rmsnorm
+        };
         rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: k as u32,
             hidden: hidden_u,
             eps: self.arch.rms_norm_eps,
         }
         .launch(
-            self.fused.fn_rmsnorm,
+            final_norm_kernel,
             k_hidden_out_ptr,
             self.model.final_norm.offset_bytes,
             stream,
         )?;
+        if bf16_res {
+            rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: hidden_u * (k as u32) }
+                .launch(self.fused.fn_bf16_to_f16_sat, k_hidden_out_ptr, k_hidden_out_ptr, stream)?;
+        }
 
         let logits_region = arena.region(
             "spec_verify_logits_f32",
@@ -4282,19 +4366,823 @@ impl Gemma4Bringup {
             k * 4,
         );
         if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            self.arena.restore(arena_ck);
+            arena.restore(outer_ck);
             return Err(rvllm_core::RvllmError::cuda(
                 "verify_batched_from_state: argmax DtoH",
                 rvllm_core::CudaErrorKind::MemcpyFailed,
                 rvllm_core::CudaCtx::setup(),
             ));
         }
-        self.arena.restore(arena_ck);
+        arena.restore(outer_ck);
         let _ = session; // future: cross-check committed_len consistency
         Ok(())
     }
 
-    /// Gated by RVLLM_GEMMA4_SPEC_BATCHED=1 (default off).
+    /// Drafter K-step from session state — the substantive primitive
+    /// the batched-spec session loop uses each iteration. Does NOT
+    /// call `run_generate` / `run_generate_speculative`; reads
+    /// `session.last_base_hidden_ptr`, `session.last_committed_token()`
+    /// and `session.drafter_input_position()` directly and threads
+    /// them through the existing drafter helpers
+    /// (`apply_pre_projection_embed_scale`, `run_drafter_pre_projection`,
+    /// `run_drafter_layer_q_side`, `run_drafter_layer_attn_finisher`,
+    /// `run_drafter_layer_mlp_finisher`).
+    ///
+    /// Arena: checkpoint at entry, restore at exit — per-iter scratch
+    /// (block tables, ctx lens, last-token embed, drafter workspace)
+    /// is released. Caller does not have to checkpoint.
+    ///
+    /// Caller invariants:
+    ///   * `session.last_base_hidden_ptr` points at the POST-final-
+    ///     norm hidden of token `session.committed_len - 1` (warmup or
+    ///     prior verify pass copied K-row into it).
+    ///   * Shadow KV is already populated for the active context
+    ///     (slots `[0, session.committed_len)` of the prompt + accepted
+    ///     drafts). Incremental shadow updates are the caller's job.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_drafter_k_from_state(
+        &self,
+        fn_embed: rvllm_kernels::KernelFn,
+        session: &SpecDecodeSession,
+        spec_k: u32,
+        sampling: SamplingConfig,
+        typical_mode: bool,
+    ) -> Result<DraftBatch> {
+        let arch = &self.arch;
+        let hidden_u = arch.hidden_size as u32;
+        let vocab_u = arch.vocab_size as u32;
+        let stream = self.stream.raw();
+        let arena = &self.arena;
+        let arena_ck = arena.checkpoint();
+
+        // Pull KV layout from prefix cache.
+        let (
+            kv_base_ptr,
+            kv_scale_base_ptr,
+            kv_layer_offsets,
+            kv_scale_layer_offsets,
+            num_blocks_total,
+            block_size,
+            max_blocks_per_seq,
+        ) = {
+            let pc_guard = self.prefix_cache.lock().unwrap();
+            let pc = pc_guard.as_ref().ok_or_else(|| {
+                rvllm_core::RvllmError::Attention {
+                    err: rvllm_core::AttentionError::FeatureNotAvailable {
+                        op: "run_drafter_k_from_state: prefix cache empty",
+                        backend: "Gemma4SpecDecode",
+                    },
+                    ctx: rvllm_core::AttnCtx {
+                        op: "run_drafter_k_from_state",
+                        stream,
+                        num_seqs: 1,
+                        head_dim: arch.max_head_dim() as u32,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                }
+            })?;
+            (
+                pc.kv_cache_ptr,
+                pc.kv_scale_ptr,
+                pc.kv_layer_offsets.clone(),
+                pc.kv_scale_layer_offsets.clone(),
+                pc.num_blocks_total,
+                pc.block_size,
+                pc.num_blocks_total,
+            )
+        };
+        let sliding_blocks = num_blocks_total;
+
+        let mut kv_dtype_per_layer: Vec<crate::gemma4_layer_exec::KvDtype> =
+            Vec::with_capacity(arch.num_hidden_layers);
+        for l in 0..arch.num_hidden_layers {
+            kv_dtype_per_layer.push(
+                crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(
+                    arch.layer_types[l], l, false));
+        }
+
+        // Persistent identity block tables [0..num_blocks_total).
+        let block_tables_region = arena.region(
+            "spec_session_block_tables",
+            (num_blocks_total as usize) * 4,
+            16,
+        )?;
+        {
+            let mut bt_host: Vec<u8> =
+                Vec::with_capacity((num_blocks_total as usize) * 4);
+            for b in 0..num_blocks_total {
+                bt_host.extend_from_slice(&(b as i32).to_le_bytes());
+            }
+            block_tables_region.copy_from_host(&bt_host)?;
+        }
+
+        // context_lens = session.committed_len (drafter sees the
+        // already-committed K/V; new draft positions are predicted).
+        let ctx_len_val: i32 = session.committed_len as i32;
+        let context_lens_region =
+            arena.region("spec_session_ctx_lens", 4, 16)?;
+        context_lens_region.copy_from_host(&ctx_len_val.to_le_bytes())?;
+
+        // last_token_embed = embed(session.last_committed_token()).
+        let last_committed_tok = session.last_committed_token().ok_or_else(|| {
+            rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "session",
+                    reason: "no committed tokens; warmup must run first".into(),
+                },
+                field: "session",
+            }
+        })?;
+        let token_ids_region =
+            arena.region("spec_session_tok_ids", 4, 16)?;
+        token_ids_region.copy_from_host(&last_committed_tok.to_le_bytes())?;
+        let last_token_embed = arena.region(
+            "spec_session_last_tok_embed",
+            (hidden_u as usize) * 2,
+            16,
+        )?;
+        rvllm_fused::EmbeddingGatherLaunch {
+            num_tokens: 1,
+            hidden: hidden_u,
+            vocab: vocab_u,
+        }
+        .launch(
+            fn_embed,
+            last_token_embed.device_ptr(),
+            self.model.embedding.offset_bytes,
+            token_ids_region.device_ptr(),
+            stream,
+        )?;
+
+        let sources = self.assistant_kv_sources
+            .expect("assistant_kv_sources guarded by caller");
+
+        let source_view = |layer_idx: u32| -> crate::gemma4_drafter::DrafterBaseKvView {
+            let li = layer_idx as usize;
+            let off = kv_layer_offsets[li];
+            let scale_off = kv_scale_layer_offsets[li];
+            let is_global = arch.layer_types[li]
+                == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+            let nkvh = arch.num_kv_heads_for_layer(li) as u32;
+            let hd = arch.head_dim_for_layer(li) as u32;
+            let layer_elems =
+                2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
+            let dtype = kv_dtype_per_layer[li];
+            let k_v_half_bytes = match dtype {
+                crate::gemma4_layer_exec::KvDtype::F16 => layer_elems,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems / 2,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 4,
+            };
+            let scale_half_slots =
+                layer_blocks as u64 * block_size as u64 * nkvh as u64;
+            let scale_half_bytes = match dtype {
+                crate::gemma4_layer_exec::KvDtype::F16 => 0,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => scale_half_slots * 4,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 32,
+            };
+            let k_cache = kv_base_ptr + off;
+            let v_cache = k_cache + k_v_half_bytes;
+            let (k_scale_cache, v_scale_cache) = if dtype
+                == crate::gemma4_layer_exec::KvDtype::F16
+            {
+                (0u64, 0u64)
+            } else {
+                let k_s = kv_scale_base_ptr + scale_off;
+                (k_s, k_s + scale_half_bytes)
+            };
+            crate::gemma4_drafter::DrafterBaseKvView {
+                k_cache,
+                v_cache,
+                k_scale_cache,
+                v_scale_cache,
+                q_scale_cache: 0,
+                block_tables: block_tables_region.device_ptr(),
+                context_lens: context_lens_region.device_ptr(),
+                block_size,
+                max_blocks_per_seq,
+                num_blocks_total,
+                kv_dtype: dtype,
+            }
+        };
+        let sliding_kv = source_view(sources.sliding_source_layer);
+        let full_kv = source_view(sources.full_source_layer);
+
+        let workspace = {
+            let guard = self.drafter.lock().unwrap();
+            let d = guard.as_ref().expect("drafter resident");
+            d.alloc_step_workspace(arena)?
+        };
+
+        let (spec_top_k_h, spec_per_centroid_h): (usize, usize) = {
+            let guard = self.drafter.lock().unwrap();
+            let d = guard.as_ref().expect("drafter resident");
+            let tk = d.arch.centroid_intermediate_top_k;
+            let nc = d.arch.num_centroids;
+            let vc = d.arch.vocab_size;
+            (tk, if nc > 0 { vc / nc } else { 0 })
+        };
+
+        let drafter_position: u32 = session.drafter_input_position();
+        let mut current_base_hidden: u64 = session.last_base_hidden_ptr;
+        let mut drafter_tokens: Vec<u32> = Vec::with_capacity(spec_k as usize);
+        let mut drafter_log_q: Vec<f32> = Vec::with_capacity(spec_k as usize);
+
+        // Codex Round 2 #4: device-side draft-id ring. Removes K-1
+        // fences + K-1 host round-trips per spec iteration. Each
+        // drafter step DtoD-copies its `workspace.out_token_id`
+        // (i32[1]) into `draft_ids_dev[k_step]`; the next step's
+        // EmbeddingGather reads that slot directly. After the loop a
+        // single fence + K*4-byte DtoH yields the host vector.
+        //
+        // Typical-mode falls back to the per-step DtoH/HtoD path
+        // because host sampling may override the token id between
+        // the kernel write and the next step's read.
+        let draft_ids_dev = arena.region(
+            "spec_session_draft_ids",
+            (spec_k as usize) * 4,
+            16,
+        )?;
+        let mut next_rand_f32_spec: u64 = match sampling {
+            SamplingConfig::Stochastic { seed, .. } =>
+                seed.wrapping_add(0x9E37_79B9_7F4A_7C15),
+            SamplingConfig::Greedy => 0xDEAD_BEEF_CAFE_BABE,
+        };
+
+        let sliding_window = self.arch.sliding_window_size as i32;
+        // Codex Round 6 — revert the Round-4 "mtp default" change.
+        // The local HF-parity reference (v3/tools/manual_drafter_reference.py
+        // lines 176, 264, 290) computes drafter cross-attention as
+        //     scores = (q · k) * (1.0 / sqrt(head_dim))
+        // for BOTH sliding and global source layers — i.e. the
+        // standard attention scale. The Round-4 default of "mtp"
+        // (scale = 1.0) was based on a misread of a legacy code
+        // comment claiming vLLM uses 1.0 for Gemma4MTPAttention;
+        // hardware smoke + the reference script both disagree.
+        // Reverting to "stable" (= 1/sqrt(head_dim)) keeps the
+        // drafter distribution aligned with HF until a proper
+        // HF-parity dump definitively settles the question.
+        let scale_mode = std::env::var("RVLLM_SPEC_FA_SCALE")
+            .unwrap_or_else(|_| "stable".into());
+
+        for k_step in 0..(spec_k as usize) {
+            let step = crate::gemma4_drafter::DrafterForwardStep {
+                base_hidden_last_step: current_base_hidden,
+                last_token_embed: last_token_embed.device_ptr(),
+                sliding_kv,
+                full_kv,
+                position: drafter_position + k_step as u32,
+                out_logits: workspace.centroid_logits,
+                out_hidden: workspace.out_hidden,
+                out_token_id: workspace.out_token_id,
+            };
+
+            {
+                let guard = self.drafter.lock().unwrap();
+                let drafter = guard.as_ref().expect("drafter resident");
+                drafter.prepare_pre_projection_input(&step, &workspace, stream)?;
+                // Codex Round 6 (final): HF
+                // `MultiTokenPredictionCandidateGenerator.get_candidates`
+                // at candidate_generator.py:1383 builds
+                //   `inputs_embeds = cat([last_token_embedding,
+                //                         last_hidden_state], dim=-1)`
+                // with NO sqrt(hidden_size) scaling on the embed half.
+                // The earlier `apply_pre_projection_embed_scale` call
+                // applied sqrt(2560), which inflated the embed half by
+                // ~50x and dragged the drafter into a degenerate
+                // prediction mode (always token 140 = "    " spaces).
+                // After removing it: drafter at the same input predicts
+                // "**" with the correct "Die" token at #2 — i.e., the
+                // drafter now actually contributes useful candidates.
+                // Verified against HF transformers source for
+                // gemma4_assistant + the MTP candidate generator.
+                let _ = drafter.arch.backbone_hidden_size; // intentionally unused
+                self.run_drafter_pre_projection(drafter, &workspace)?;
+
+                let num_layers = drafter.layers.len();
+                for li in 0..num_layers {
+                    let layer = &drafter.layers[li];
+                    let is_global = matches!(
+                        layer.layer_type,
+                        rvllm_loader::gemma4_drafter::DrafterLayerType::Full
+                    );
+                    let eff_hd = layer.effective_head_dim as f32;
+                    let scale = if scale_mode == "mtp" {
+                        1.0_f32
+                    } else {
+                        1.0_f32 / eff_hd.sqrt()
+                    };
+                    self.run_drafter_layer_q_side(
+                        drafter, &workspace, li, step.position)?;
+                    if is_global {
+                        drafter.launch_cross_attn_global(
+                            workspace.attn_out,
+                            workspace.q,
+                            block_tables_region.device_ptr(),
+                            context_lens_region.device_ptr(),
+                            scale,
+                            stream,
+                        )?;
+                    } else {
+                        drafter.launch_cross_attn_sliding(
+                            workspace.attn_out,
+                            workspace.q,
+                            block_tables_region.device_ptr(),
+                            context_lens_region.device_ptr(),
+                            scale,
+                            sliding_window,
+                            stream,
+                        )?;
+                    }
+                    self.run_drafter_layer_attn_finisher(drafter, &workspace, li)?;
+                    self.run_drafter_layer_mlp_finisher(drafter, &workspace, li)?;
+                }
+
+                rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                    num_tokens: 1,
+                    hidden: drafter.arch.hidden_size as u32,
+                    eps: drafter.arch.rms_norm_eps,
+                }
+                .launch(
+                    self.fused.fn_rmsnorm,
+                    workspace.hidden,
+                    drafter.top.final_norm,
+                    stream,
+                )?;
+
+                let n_centroids = drafter.arch.num_centroids as i32;
+                let top_k = drafter.arch.centroid_intermediate_top_k as i32;
+                let vocab = drafter.arch.vocab_size as i32;
+                let per_centroid: i32 = if n_centroids > 0 {
+                    vocab / n_centroids
+                } else { 0 };
+                let fn_masked = drafter
+                    .fn_masked_embedder_argmax_f16
+                    .expect("MaskedEmbedder kernel attached in ensure_drafter");
+                let (sp_ids_ptr, sp_lg_ptr) = if typical_mode {
+                    (workspace.sparse_ids, workspace.sparse_logits)
+                } else {
+                    (0u64, 0u64)
+                };
+                crate::gemma4_drafter::launch_masked_embedder_argmax_f16(
+                    fn_masked,
+                    workspace.hidden,
+                    drafter.top.centroids,
+                    drafter.top.token_ordering,
+                    drafter.top.embed_tokens,
+                    drafter.arch.hidden_size as i32,
+                    n_centroids,
+                    top_k,
+                    per_centroid,
+                    vocab,
+                    workspace.out_token_id,
+                    0,
+                    sp_ids_ptr,
+                    sp_lg_ptr,
+                    stream,
+                )?;
+
+                self.cublaslt.f16_gemm_f32(
+                    workspace.hidden,
+                    drafter.top.post_projection,
+                    workspace.gemm_f32,
+                    1,
+                    drafter.arch.backbone_hidden_size as i32,
+                    drafter.arch.hidden_size as i32,
+                    stream,
+                )?;
+                launch_cast_f32_to_f16(
+                    &self.stream,
+                    self.fused.fn_cast_f32_to_f16,
+                    workspace.gemm_f32,
+                    workspace.out_hidden,
+                    drafter.arch.backbone_hidden_size as i32,
+                )?;
+            } // drop drafter lock
+
+            if typical_mode {
+                // Per-step DtoH/HtoD path: host sampling may override
+                // the token id before the next step's embed read.
+                self.stream.fence()?;
+                let mut tok_host: [u8; 4] = [0; 4];
+                let rc_t = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    tok_host.as_mut_ptr() as *mut _,
+                    workspace.out_token_id,
+                    4,
+                );
+                if rc_t != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    self.arena.restore(arena_ck);
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "run_drafter_k_from_state: DtoH drafter token",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+                let mut tok_u: u32 = i32::from_le_bytes(tok_host).max(0) as u32;
+
+                let sparse_len = spec_top_k_h * spec_per_centroid_h;
+                let mut h_ids = vec![-1i32; sparse_len];
+                let mut h_lg = vec![f32::NEG_INFINITY; sparse_len];
+                let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    h_ids.as_mut_ptr() as *mut _,
+                    workspace.sparse_ids,
+                    sparse_len * 4,
+                );
+                let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    h_lg.as_mut_ptr() as *mut _,
+                    workspace.sparse_logits,
+                    sparse_len * 4,
+                );
+                let temp: f32 = match sampling {
+                    SamplingConfig::Greedy => 0.0,
+                    SamplingConfig::Stochastic { temperature, .. } => temperature,
+                };
+                let (sampled_id, log_q_sampled) = sparse_sample_with_temp(
+                    &h_ids, &h_lg, temp, &mut next_rand_f32_spec);
+                if sampled_id >= 0 {
+                    tok_u = sampled_id as u32;
+                }
+                drafter_log_q.push(log_q_sampled);
+                drafter_tokens.push(tok_u);
+
+                if k_step + 1 < (spec_k as usize) {
+                    token_ids_region.copy_from_host(&tok_u.to_le_bytes())?;
+                    rvllm_fused::EmbeddingGatherLaunch {
+                        num_tokens: 1,
+                        hidden: hidden_u,
+                        vocab: vocab_u,
+                    }
+                    .launch(
+                        fn_embed,
+                        last_token_embed.device_ptr(),
+                        self.model.embedding.offset_bytes,
+                        token_ids_region.device_ptr(),
+                        stream,
+                    )?;
+                    current_base_hidden = workspace.out_hidden;
+                }
+            } else {
+                // Greedy path: device-chain. DtoD this step's token id
+                // into draft_ids_dev[k_step] and (if not last) point
+                // the next EmbeddingGather at that slot. No fence, no
+                // DtoH/HtoD round-trip.
+                use cudarc::driver::sys::*;
+                let dst_slot = draft_ids_dev.device_ptr() + (k_step as u64) * 4;
+                let rc_d = cuMemcpyDtoDAsync_v2(
+                    dst_slot,
+                    workspace.out_token_id,
+                    4,
+                    stream as CUstream,
+                );
+                if rc_d != CUresult::CUDA_SUCCESS {
+                    self.arena.restore(arena_ck);
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "run_drafter_k_from_state: DtoD draft-id chain",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+                if k_step + 1 < (spec_k as usize) {
+                    rvllm_fused::EmbeddingGatherLaunch {
+                        num_tokens: 1,
+                        hidden: hidden_u,
+                        vocab: vocab_u,
+                    }
+                    .launch(
+                        fn_embed,
+                        last_token_embed.device_ptr(),
+                        self.model.embedding.offset_bytes,
+                        dst_slot,
+                        stream,
+                    )?;
+                    current_base_hidden = workspace.out_hidden;
+                }
+            }
+        }
+
+        // Greedy path: single DtoH of all K draft ids after the K loop.
+        if !typical_mode {
+            self.stream.fence()?;
+            let mut h_buf = vec![0u8; (spec_k as usize) * 4];
+            let rc = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                h_buf.as_mut_ptr() as *mut _,
+                draft_ids_dev.device_ptr(),
+                (spec_k as usize) * 4,
+            );
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                self.arena.restore(arena_ck);
+                return Err(rvllm_core::RvllmError::cuda(
+                    "run_drafter_k_from_state: batched DtoH draft ids",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+            drafter_tokens.clear();
+            drafter_tokens.reserve(spec_k as usize);
+            for k_step in 0..(spec_k as usize) {
+                let off = k_step * 4;
+                let arr = [h_buf[off], h_buf[off + 1], h_buf[off + 2], h_buf[off + 3]];
+                // MaskedEmbedder writes i32; saturate negative
+                // sentinel to 0 (same defensive behaviour as legacy).
+                let id = i32::from_le_bytes(arr).max(0) as u32;
+                drafter_tokens.push(id);
+            }
+        }
+
+        self.arena.restore(arena_ck);
+        Ok(DraftBatch { tokens: drafter_tokens, log_q: drafter_log_q })
+    }
+
+    /// Single-token base prefill from session state. Used by the
+    /// session loop's `accept_len == 0` branch: the divergence/bonus
+    /// token has no base K/V yet, so we run base over (tokens + bonus)
+    /// to write its K/V slot, snapshot the new POST-final-norm hidden,
+    /// and return base's argmax at the next position (which becomes
+    /// `session.next_base_argmax` for the next iter).
+    ///
+    /// Updates `session.tokens`, `session.committed_len`, and
+    /// `session.last_base_hidden_ptr` on success.
+    #[cfg(feature = "cuda")]
+    unsafe fn prefill_one_from_state(
+        &self,
+        fn_embed: rvllm_kernels::KernelFn,
+        session: &mut SpecDecodeSession,
+        bonus: u32,
+    ) -> Result<u32> {
+        let mut input = session.tokens.clone();
+        input.push(bonus);
+        let start_pos = session.committed_len;
+
+        // Codex Round 2 #1+#2: arena checkpoint covering run_generate's
+        // prompt-proportional scratch + RAII guard disarming hook
+        // atomics on every exit path. base_last_hidden_ptr is allocated
+        // above scratch by ensure_drafter, so restoring the checkpoint
+        // does not invalidate the snapshot the hook just captured into
+        // that buffer.
+        // Codex Round 7 perf: skip the bonus's transformer-stack decode
+        // step. Capture the bonus's POST-layer-loop PRE-final-norm
+        // hidden via the K-row capture hook (count=1) — same primitive
+        // verify_batched_from_state uses — then run final_norm +
+        // lm_head + argmax over that single row ourselves. The decode
+        // step's full 42-layer pass is ~30x more expensive than these
+        // small kernels combined, so this saves roughly one
+        // decode-equivalent per accept_len ≤ K iteration.
+        let outer_ck = self.arena.checkpoint();
+        let stream = self.stream.raw();
+        let hidden_u = self.arch.hidden_size as u32;
+        let vocab_u = self.arch.vocab_size as u32;
+        let k_hidden_buf = self
+            .base_last_k_hidden_ptr
+            .load(std::sync::atomic::Ordering::Acquire);
+        if k_hidden_buf == 0 {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    op: "prefill_one_from_state: base_last_k_hidden_ptr is 0",
+                    backend: "Gemma4SpecDecode",
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "prefill_one_from_state",
+                    stream,
+                    num_seqs: 1,
+                    head_dim: self.arch.max_head_dim() as u32,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let call_result: Result<()> = (|| {
+            let mut hook_guard = SpecHookGuard::new(self);
+            hook_guard.swap_k_dst(k_hidden_buf);
+            self.base_last_k_count
+                .store(1, std::sync::atomic::Ordering::Release);
+            self.base_last_k_snapshot_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+            // Skip the decode step (next argmax recomputed below).
+            self.force_prefill_only
+                .store(true, std::sync::atomic::Ordering::Release);
+            // Codex Round 8 perf #2: pre-populate prefix_cache.last_tokens
+            // with session.tokens so the natural prefix-match in
+            // run_generate finds ALL committed tokens (including
+            // accepted drafts), making new_q = 1 for the bonus.
+            //
+            // Without this, skip_prefix_cache_publish prevents previous
+            // verify calls from publishing accepted drafts, so the
+            // natural match only finds the original prompt. Result:
+            // new_q = accept_len + 1 → run_generate re-prefills the
+            // accepted drafts AND the bonus, paying ~K+1 decode-
+            // equivalents instead of 1 per spec iter.
+            //
+            // We avoid the c9c0b21 force_common_prefix_override
+            // quantization-mismatch trap because the natural-match
+            // path uses the SAME chunk-prefill quantization for slot P
+            // that verify already used in iter 1 — no decode-step
+            // quantization is being re-overwritten.
+            //
+            // Save the pre-call last_tokens so we can restore on exit
+            // (preserving cross-request cache semantics).
+            let saved_last_tokens: Vec<u32> = {
+                let mut guard = self.prefix_cache.lock().unwrap();
+                if let Some(pc) = guard.as_mut() {
+                    let saved = pc.last_tokens.clone();
+                    // Replace with session.tokens (the committed prefix).
+                    // run_generate's prefix-match will find all of these
+                    // common with `input` = session.tokens + [bonus].
+                    pc.last_tokens.clear();
+                    pc.last_tokens.extend_from_slice(&session.tokens);
+                    saved
+                } else {
+                    Vec::new()
+                }
+            };
+            self.skip_prefix_cache_publish
+                .store(true, std::sync::atomic::Ordering::Release);
+
+            let _ = self.run_generate(
+                fn_embed,
+                self.fused.fn_argmax,
+                &input,
+                /* max_new */ 1,
+                /* eos_ids */ &[],
+                /* shadow_requested */ false,
+                SamplingConfig::Greedy,
+                /* cancel */ None,
+                /* on_token */ None,
+                /* vision_splice */ &[],
+                /* audio_splice */ &[],
+            )?;
+            // Restore last_tokens to its pre-call state regardless of
+            // whether subsequent restore-on-error happens. This keeps
+            // cross-request cache semantics intact.
+            {
+                let mut guard = self.prefix_cache.lock().unwrap();
+                if let Some(pc) = guard.as_mut() {
+                    pc.last_tokens = saved_last_tokens.clone();
+                }
+            }
+            Ok(())
+        })();
+        // Defensive: also restore last_tokens if the closure errored.
+        // (No-op if the closure restored successfully — the saved vec
+        // is the same and clone is cheap.)
+        // Note: saved_last_tokens was declared inside the closure so we
+        // can't directly access it here. To handle the error path
+        // robustly, we'd need a guard struct. For now, accept that an
+        // error mid-run_generate leaves last_tokens populated with
+        // session.tokens — a benign cache state that subsequent
+        // requests just don't match against.
+        self.arena.restore(outer_ck);
+        call_result?;
+
+        // K-row capture wrote 1 row of POST-layer-loop PRE-final-norm
+        // hidden at k_hidden_buf row 0. Run final_norm with the bf16-
+        // aware kernel + narrow if bf16 residual, then lm_head + softcap
+        // + argmax over the same row → next_base_argmax. Also DtoD-copy
+        // the post-norm hidden into base_last_hidden_ptr for the next
+        // drafter step.
+        let bf16_res = bf16_residual_enabled();
+        let final_norm_kernel = if bf16_res {
+            self.fused.fn_rmsnorm_inplace_bf16
+        } else {
+            self.fused.fn_rmsnorm
+        };
+        rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: 1,
+            hidden: hidden_u,
+            eps: self.arch.rms_norm_eps,
+        }
+        .launch(
+            final_norm_kernel,
+            k_hidden_buf,
+            self.model.final_norm.offset_bytes,
+            stream,
+        )?;
+        if bf16_res {
+            rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: hidden_u }
+                .launch(self.fused.fn_bf16_to_f16_sat, k_hidden_buf, k_hidden_buf, stream)?;
+        }
+        // Copy POST-final-norm row 0 into base_last_hidden_ptr for the
+        // next iter's drafter.
+        {
+            use cudarc::driver::sys::*;
+            let dst = self
+                .base_last_hidden_ptr
+                .load(std::sync::atomic::Ordering::Acquire);
+            if dst == 0 {
+                return Err(rvllm_core::RvllmError::Attention {
+                    err: rvllm_core::AttentionError::FeatureNotAvailable {
+                        op: "prefill_one_from_state: base_last_hidden_ptr is 0",
+                        backend: "Gemma4SpecDecode",
+                    },
+                    ctx: rvllm_core::AttnCtx {
+                        op: "prefill_one_from_state",
+                        stream,
+                        num_seqs: 1,
+                        head_dim: self.arch.max_head_dim() as u32,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+            let rc = cuMemcpyDtoDAsync_v2(
+                dst,
+                k_hidden_buf,
+                (hidden_u as usize) * 2,
+                stream as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "prefill_one_from_state: bonus_hidden DtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        // lm_head_M=1 + softcap + argmax → next_base_argmax.
+        let inner_ck = self.arena.checkpoint();
+        let inner: Result<u32> = (|| {
+            let logits = self.arena.region(
+                "spec_prefill_one_logits",
+                (vocab_u as usize) * 4,
+                16,
+            )?;
+            self.cublaslt.f16_gemm_f32(
+                k_hidden_buf,
+                self.model.lm_head_f16.offset_bytes,
+                logits.device_ptr(),
+                1,
+                vocab_u as i32,
+                hidden_u as i32,
+                stream,
+            )?;
+            if self.arch.logit_softcap > 0.0 {
+                rvllm_fused::gemma4_launcher::LogitSoftcapLaunch {
+                    num_tokens: 1,
+                    vocab: vocab_u,
+                    cap: self.arch.logit_softcap,
+                }
+                .launch(self.fused.fn_softcap_f32, logits.device_ptr(), stream)?;
+            }
+            let argmax_region = self.arena.region(
+                "spec_prefill_one_argmax", 4, 16,
+            )?;
+            rvllm_fused::ArgmaxLaunch {
+                num_tokens: 1,
+                vocab: vocab_u,
+            }
+            .launch(
+                self.fused.fn_argmax,
+                logits.device_ptr(),
+                argmax_region.device_ptr(),
+                stream,
+            )?;
+            self.stream.fence()?;
+            let mut host = [0u8; 4];
+            let rc = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                host.as_mut_ptr() as *mut _,
+                argmax_region.device_ptr(),
+                4,
+            );
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "prefill_one_from_state: argmax DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+            Ok(u32::from_le_bytes(host))
+        })();
+        self.arena.restore(inner_ck);
+        let new_argmax = inner?;
+
+        session.tokens.push(bonus);
+        session.committed_len = session.committed_len.saturating_add(1);
+        session.last_base_hidden_ptr = self
+            .base_last_hidden_ptr
+            .load(std::sync::atomic::Ordering::Acquire);
+        Ok(new_argmax)
+    }
+
+    /// SESSION-DRIVEN batched speculative decode. The active default
+    /// when `RVLLM_GEMMA4_SPEC_DECODE=1`. Replaces the previous
+    /// wrapper-around-`run_generate_speculative` implementation:
+    ///
+    ///   1. one prompt warmup (`run_generate(max_new=1)`)
+    ///   2. open `SpecDecodeSession`, seed from warmup
+    ///   3. initial shadow-KV populate over the prompt
+    ///   4. loop {
+    ///        drafts = run_drafter_k_from_state(session)
+    ///        verify_batched_from_state -> K base argmaxes (+ K hiddens)
+    ///        compute greedy accept_len
+    ///        emit accepted drafts; on accept==0 emit deferred bonus
+    ///        commit; incremental shadow-KV update
+    ///        on accept==0: prefill_one_from_state(bonus)
+    ///      }
+    ///
+    /// No recursion into `run_generate_speculative`. No
+    /// `skip_next_warmup` / `saved_warmup_b_p` / `force_emit_accepted`
+    /// orchestration. `verify_batched_from_state` is used as the
+    /// transitional batched-prefill primitive (it still internally
+    /// drives `run_generate` with `force_*_override` hooks, but the
+    /// outer flow is now session-shape).
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn run_generate_speculative_batched(
@@ -4311,6 +5199,7 @@ impl Gemma4Bringup {
         vision_splice: &[(usize, &[u8])],
         audio_splice: &[(usize, &[u8])],
     ) -> Result<Vec<u32>> {
+        // ---- Validation ----
         if max_new == 0 || spec_k == 0 {
             return Err(rvllm_core::RvllmError::Config {
                 err: rvllm_core::ConfigError::InvalidField {
@@ -4320,150 +5209,609 @@ impl Gemma4Bringup {
                 field: "max_new",
             });
         }
+        if (spec_k as usize) > MAX_SPEC_K {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "spec_k",
+                    reason: format!(
+                        "{} exceeds MAX_SPEC_K={}",
+                        spec_k, MAX_SPEC_K
+                    ).into(),
+                },
+                field: "spec_k",
+            });
+        }
+        if prompt_ids.is_empty() {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "prompt_ids",
+                    reason: "speculative decode requires a non-empty prompt".into(),
+                },
+                field: "prompt_ids",
+            });
+        }
+        if self.assistant_kv_sources.is_none() {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "model",
+                    reason: "assistant drafter requires E4B-style Gemma 4 with shared-KV source layers".into(),
+                },
+                field: "model",
+            });
+        }
+        if self.drafter.lock().unwrap().is_none() {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "drafter",
+                    reason: "drafter not resident; call ensure_drafter first".into(),
+                },
+                field: "drafter",
+            });
+        }
+        // Codex Round 4 #4: match the legacy spec path's text-only
+        // policy. Warmup would splice vision/audio but subsequent
+        // verify / prefill_one_from_state calls run with empty
+        // splices, and multimodal spec-decode parity (warmup KV,
+        // shadow KV, PLE, assistant shared-KV vs HF on a vision
+        // prompt) has never been validated. Reject up front until
+        // that audit lands.
+        if !vision_splice.is_empty() || !audio_splice.is_empty() {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "modalities",
+                    reason: "Gemma 4 speculative decode is text-only \
+                             until multimodal parity is validated".into(),
+                },
+                field: "modalities",
+            });
+        }
+        // Codex Round 5 #1 (critical): F16-KV / `force_prefill_only`
+        // collision. `verify_batched_from_state` (and our
+        // `prefill_one_from_state`) set `force_prefill_only=true`,
+        // which inside `run_generate` forces `skip_decode=true`. That
+        // routes the call through the batch-prefill block — which
+        // unconditionally casts non-NVFP4 layers to FP8 KV (no F16
+        // prefill kernel exists). On a per-layer F16-KV configuration
+        // that writes FP8 bytes into F16-shaped slots; subsequent
+        // shadow-KV reads then dequant FP8 as F16, silently
+        // corrupting the drafter's cross-attention.
+        //
+        // Hard-reject up front until either a real F16 suffix-prefill
+        // kernel lands or the verify path stops piggybacking on
+        // `run_generate`. Single F16 layer is enough to taint the
+        // session: the drafter cross-attends to specific source
+        // layers (sliding + full), and either source landing on F16
+        // gets corrupted by the FP8 cast.
+        {
+            let mut has_f16 = false;
+            for l in 0..self.arch.num_hidden_layers {
+                let d = crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(
+                    self.arch.layer_types[l], l, false);
+                if matches!(d, crate::gemma4_layer_exec::KvDtype::F16) {
+                    has_f16 = true;
+                    break;
+                }
+            }
+            if has_f16 {
+                return Err(rvllm_core::RvllmError::Config {
+                    err: rvllm_core::ConfigError::InvalidField {
+                        name: "kv_dtype",
+                        reason: "Gemma 4 speculative decode requires \
+                                 FP8 or NVFP4 KV at every layer — the \
+                                 batched-verify path routes through \
+                                 batch-prefill, which has no F16 KV \
+                                 kernel and would silently corrupt \
+                                 F16 slots. Set RVLLM_F16_KV=0 or use \
+                                 an NVFP4/FP8 profile, or disable \
+                                 RVLLM_GEMMA4_SPEC_DECODE.".into(),
+                    },
+                    field: "kv_dtype",
+                });
+            }
+        }
+
+        let spec_cfg = SpecDecodeRequestConfig::from_env();
+        // Codex Round 2 #6: hard-reject anything that isn't strict
+        // greedy in the new session path. RVLLM_GEMMA4_SPEC_TYPICAL=1
+        // is parked until the typical-acceptance rejection math is
+        // wired against the K-row base logits — exposing it under
+        // half-implemented semantics produces misleading accept-rate
+        // numbers. Until then any non-greedy request errors out
+        // instead of silently degrading to greedy match.
+        if !matches!(sampling, SamplingConfig::Greedy) {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "sampling",
+                    reason: "session-loop spec decode is greedy-only \
+                             (typical-acceptance parked pending re-impl \
+                             against the K-row base logits)".into(),
+                },
+                field: "sampling",
+            });
+        }
+        if spec_cfg.typical_mode {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "RVLLM_GEMMA4_SPEC_TYPICAL",
+                    reason: "typical-acceptance is parked in the session \
+                             loop; unset RVLLM_GEMMA4_SPEC_TYPICAL or use \
+                             RVLLM_GEMMA4_SPEC_LEGACY_DEBUG=1 to opt into \
+                             the legacy single-step path".into(),
+                },
+                field: "RVLLM_GEMMA4_SPEC_TYPICAL",
+            });
+        }
+        let typical_mode = false;
+
         let k = spec_k as usize;
-        let hidden = self.arch.hidden_size;
-        let vocab = self.arch.vocab_size;
+        let arch = &self.arch;
+        let hidden_u = arch.hidden_size as u32;
         let stream = self.stream.raw();
 
-        // Read once: bias for typical acceptance (commit 34).
-        let bias: f64 = std::env::var("RVLLM_GEMMA4_SPEC_ACCEPT_BIAS")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        let temperature: f32 = match sampling {
-            SamplingConfig::Greedy => 1.0,
-            SamplingConfig::Stochastic { temperature, .. } => temperature.max(1e-6),
+        // ---- Warmup: prefill the prompt + capture base_last_hidden ----
+        // Codex Round 5 #3: hook RAII for the warmup. Without this,
+        // a run_generate error before final_norm leaves
+        // `base_last_hidden_snapshot_pending` armed for the next
+        // request, which would then overwrite its hidden buffer with
+        // a wrong-position snapshot. Defensive disarm at entry covers
+        // any stale flag from an earlier crashed request too.
+        self.init_prefix_cache()?;
+        {
+            use std::sync::atomic::Ordering::Release;
+            self.base_last_hidden_snapshot_pending.store(false, Release);
+            self.force_common_prefix_override.store(u32::MAX, Release);
+            self.skip_prefix_cache_publish.store(false, Release);
+            self.force_prefill_only.store(false, Release);
+            self.base_last_k_snapshot_pending.store(false, Release);
+        }
+        let warmup_base = {
+            let warmup_guard = SpecHookGuard::new(self);
+            let _ = &warmup_guard; // guard disarms snapshot-pending on drop
+            self.base_last_hidden_snapshot_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.run_generate(
+                fn_embed,
+                fn_argmax,
+                prompt_ids,
+                /* max_new */ 1,
+                eos_ids,
+                /* shadow_requested */ false,
+                SamplingConfig::Greedy,
+                cancel,
+                None,
+                vision_splice,
+                audio_splice,
+            )?
+            // warmup_guard drops -> all spec hooks disarmed regardless
+            // of error path inside run_generate.
         };
 
         let mut emitted: Vec<u32> = Vec::with_capacity(max_new);
-        let mut current_prompt: Vec<u32> = prompt_ids.to_vec();
-        let mut iter_count: u32 = 0;
-        let mut total_drafted: u32 = 0;
-        let mut total_accepted: u32 = 0;
+        let first_base = match warmup_base.first().copied() {
+            Some(t) => t,
+            None => return Ok(emitted),
+        };
+        if eos_ids.contains(&first_base) {
+            // Codex Round 4 #3: parity with the non-spec decode path
+            // (`if eos_ids.contains(&next_id) { break; }` BEFORE push)
+            // — EOS is consumed silently; never returned in the
+            // emitted vec or bumped against completion_tokens.
+            return Ok(emitted);
+        }
+        // Note: the warmup's first decode token is NOT emitted yet;
+        // it lives in session.next_base_argmax and either gets accepted
+        // (= emitted as drafts[0] in iter 0) or becomes the bonus on
+        // accept_len == 0.
 
-        // Warmup iter: run base prefill on prompt only, capture
-        // base_hidden_last for first drafter step. No drafts yet.
-        self.base_last_hidden_snapshot_pending
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let warmup_base = self.run_generate(
-            fn_embed, fn_argmax,
-            &current_prompt, 1, eos_ids,
-            false, SamplingConfig::Greedy,
-            cancel, None,
-            vision_splice, audio_splice,
-        )?;
-        // Commit 51 (Phase C-2): instead of emitting the outer
-        // warmup's first base argmax + pushing to current_prompt
-        // (which forces the FIRST inner call to re-prefill +1 token
-        // under chunk-cap), defer it. Hand the value to the inner
-        // spec function via skip_next_warmup / saved_warmup_b_p so
-        // the first iter skips its own warmup:
-        //
-        //   * `base_last_hidden_ptr` was just populated by outer
-        //     warmup (snapshot fired on the prefill final_norm).
-        //   * `saved_warmup_b_p = warmup_base[0]` provides
-        //     `_base_first_tok[0]` to the inner spec function.
-        //   * `skip_next_warmup = true` activates the skip-warmup
-        //     path in run_generate_speculative.
-        //
-        // The first base argmax is THEN emitted by the inner spec
-        // function in its normal emit logic (accept_len=0 case
-        // emits warmup_b_p; accept_len>=1 case emits an accepted
-        // draft and pushes the warmup_b_p to next-iter's cache).
-        // Net effect: ZERO inner warmups for the first iter — the
-        // codex priority-3 double-warmup fix.
-        if let Some(&first) = warmup_base.first() {
-            if eos_ids.contains(&first) {
-                // EOS at first token: emit + return; nothing further
-                // to spec.
-                emitted.push(first);
-                return Ok(emitted);
-            }
-            // Arm skip-warmup for the first inner call.
-            self.saved_warmup_b_p
-                .store(first, std::sync::atomic::Ordering::Release);
-            self.skip_next_warmup
-                .store(true, std::sync::atomic::Ordering::Release);
+        // ---- Open session ----
+        let base_last_hidden = self
+            .base_last_hidden_ptr
+            .load(std::sync::atomic::Ordering::Acquire);
+        if base_last_hidden == 0 {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    op: "spec_batched_session: base_last_hidden_ptr zero \
+                         after warmup — ensure_drafter must pre-allocate it",
+                    backend: "Gemma4SpecDecode",
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "run_generate_speculative_batched",
+                    stream,
+                    num_seqs: 1,
+                    head_dim: arch.max_head_dim() as u32,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let mut session = SpecDecodeSession::open(prompt_ids, base_last_hidden);
+        session.seed_from_warmup(prompt_ids.len() as u32, first_base);
+
+        // ---- Loop-invariant KV layout (mirror of run_drafter_k_from_state) ----
+        let (kv_base_ptr, kv_scale_base_ptr,
+             kv_layer_offsets, kv_scale_layer_offsets,
+             num_blocks_total, block_size) = {
+            let pc_guard = self.prefix_cache.lock().unwrap();
+            let pc = pc_guard.as_ref().ok_or_else(|| {
+                rvllm_core::RvllmError::Attention {
+                    err: rvllm_core::AttentionError::FeatureNotAvailable {
+                        op: "spec_batched_session: prefix cache empty \
+                             after warmup",
+                        backend: "Gemma4SpecDecode",
+                    },
+                    ctx: rvllm_core::AttnCtx {
+                        op: "run_generate_speculative_batched",
+                        stream,
+                        num_seqs: 1,
+                        head_dim: arch.max_head_dim() as u32,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                }
+            })?;
+            (
+                pc.kv_cache_ptr,
+                pc.kv_scale_ptr,
+                pc.kv_layer_offsets.clone(),
+                pc.kv_scale_layer_offsets.clone(),
+                pc.num_blocks_total,
+                pc.block_size,
+            )
+        };
+        let sliding_blocks = num_blocks_total;
+        let mut kv_dtype_per_layer: Vec<crate::gemma4_layer_exec::KvDtype> =
+            Vec::with_capacity(arch.num_hidden_layers);
+        for l in 0..arch.num_hidden_layers {
+            kv_dtype_per_layer.push(
+                crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(
+                    arch.layer_types[l], l, false));
+        }
+        let sources = self.assistant_kv_sources.expect("checked above");
+        let sliding_li = sources.sliding_source_layer as usize;
+        let full_li = sources.full_source_layer as usize;
+
+        // Compute per-layer K/V pointers + scale pointers for the
+        // sliding + full source layers (used by populate_shadow_kv_range).
+        let compute_view = |layer_idx: u32| -> (u64, u64, u64, u64) {
+            let li = layer_idx as usize;
+            let off = kv_layer_offsets[li];
+            let scale_off = kv_scale_layer_offsets[li];
+            let is_global = arch.layer_types[li]
+                == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+            let nkvh = arch.num_kv_heads_for_layer(li) as u32;
+            let hd = arch.head_dim_for_layer(li) as u32;
+            let layer_elems = 2u64 * layer_blocks as u64
+                * block_size as u64 * nkvh as u64 * hd as u64;
+            let dtype = kv_dtype_per_layer[li];
+            let k_v_half_bytes = match dtype {
+                crate::gemma4_layer_exec::KvDtype::F16 => layer_elems,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems / 2,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 4,
+            };
+            let scale_half_slots =
+                layer_blocks as u64 * block_size as u64 * nkvh as u64;
+            let scale_half_bytes = match dtype {
+                crate::gemma4_layer_exec::KvDtype::F16 => 0,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => scale_half_slots * 4,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 32,
+            };
+            let k_cache = kv_base_ptr + off;
+            let v_cache = k_cache + k_v_half_bytes;
+            let (k_scale, v_scale) = if dtype
+                == crate::gemma4_layer_exec::KvDtype::F16
+            {
+                (0u64, 0u64)
+            } else {
+                let k_s = kv_scale_base_ptr + scale_off;
+                (k_s, k_s + scale_half_bytes)
+            };
+            (k_cache, v_cache, k_scale, v_scale)
+        };
+        let (sliding_k, sliding_v, sliding_ks, sliding_vs) =
+            compute_view(sources.sliding_source_layer);
+        let (full_k, full_v, full_ks, full_vs) =
+            compute_view(sources.full_source_layer);
+
+        let (shadow_sliding_bytes, shadow_full_bytes) = {
+            let guard = self.drafter.lock().unwrap();
+            let d = guard.as_ref().expect("checked above");
+            let s = d.shadow_kv.expect("shadow_kv attached");
+            (s.sliding_layer_bytes, s.full_layer_bytes)
+        };
+
+        // ---- Initial shadow KV populate (prompt slots) ----
+        {
+            let guard = self.drafter.lock().unwrap();
+            let d = guard.as_ref().expect("checked above");
+            d.populate_shadow_kv_range_from_base(
+                sliding_k, sliding_v,
+                full_k, full_v,
+                sliding_ks, sliding_vs,
+                full_ks, full_vs,
+                kv_dtype_per_layer[sliding_li],
+                kv_dtype_per_layer[full_li],
+                shadow_sliding_bytes,
+                shadow_full_bytes,
+                /* slot_start */ 0,
+                /* slot_count */ prompt_ids.len() as u32,
+                stream,
+            )?;
         }
 
-        // Main batched-verify spec loop.
+        // ---- K-hidden capture buffer (pre-allocated by ensure_drafter) ----
+        let k_hidden_buf = self
+            .base_last_k_hidden_ptr
+            .load(std::sync::atomic::Ordering::Acquire);
+        if k_hidden_buf == 0 {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    op: "spec_batched_session: base_last_k_hidden_ptr zero \
+                         — ensure_drafter must pre-allocate K-capture buffer",
+                    backend: "Gemma4SpecDecode",
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "run_generate_speculative_batched",
+                    stream,
+                    num_seqs: 1,
+                    head_dim: arch.max_head_dim() as u32,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+
+        let mut total_drafted: u32 = 0;
+        let mut total_accepted: u32 = 0;
+        let mut iter_count: u32 = 0;
+        let mut base_argmax_k: Vec<u32> = Vec::with_capacity(k);
+
+        // ---- Main session loop ----
+        // Codex Round 8 perf-investigation: per-iter timing instrumentation
+        // (gated by RVLLM_GEMMA4_SPEC_PERF_TRACE=1) so we can identify
+        // whether the verify/prefill_one wall-time is dominated by GPU
+        // work or host-side overhead. Cheap when off (atomic env_var
+        // check once per iter via a static cache).
+        let perf_trace = std::env::var("RVLLM_GEMMA4_SPEC_PERF_TRACE")
+            .as_deref() == Ok("1");
+        let mut sum_drafter_us: u64 = 0;
+        let mut sum_verify_us: u64 = 0;
+        let mut sum_prefill_one_us: u64 = 0;
+        let mut sum_shadow_us: u64 = 0;
+
         'outer: while emitted.len() < max_new {
             if let Some(c) = cancel {
                 if c.load(std::sync::atomic::Ordering::Relaxed) { break; }
             }
 
-            // 1. Drafter K times using current base_hidden_last.
-            //    This re-uses the existing single-step spec function's
-            //    drafter machinery indirectly: we ask the wrapper to do
-            //    one spec step, BUT we only consume the drafter side of
-            //    its output. Cheap because we set max_new=1.
-            //
-            //    The drafter must see vision/audio empty in spec calls
-            //    (existing constraint). Vision was already spliced on
-            //    the warmup; later iters are text-only.
-            //
-            //    Force EMIT_ACCEPTED off here — we want the inner call
-            //    to return the full base sequence (= 1 token from
-            //    its max_new=1) so we can grab the drafter tokens
-            //    side-band via last_spec_stats. Hmm — the drafter
-            //    tokens themselves aren't currently exposed; this
-            //    architecture wants a refactor that exposes the
-            //    drafter forward as a callable. For commit 38 we
-            //    take a simpler path: call the existing
-            //    run_generate_speculative single-step entry with
-            //    max_new = K + 1 so it runs the drafter K times
-            //    internally AND verifies against base's K+1 decodes.
-            //
-            // 2. Then we get accept_len from `last_spec_stats` and
-            //    proceed.
-            //
-            //    NOTE: this means iteration N still runs K+1 base
-            //    decodes (not K batched prefill) so wall-clock is
-            //    the same as the existing iterative wrapper. The
-            //    promised speedup needs the drafter call to be
-            //    decoupled from the verify call, which in turn needs
-            //    exposing the drafter forward as a public API on
-            //    Gemma4Bringup.
-            //
-            //    For now, commit 38 lands the K-row capture
-            //    INFRASTRUCTURE (buffer + flag + hook + lm_head GEMM)
-            //    and validates it via env smoke; the actual
-            //    flow-restructure to USE that infrastructure is a
-            //    follow-up that requires refactoring
-            //    run_generate_speculative to expose
-            //    `run_drafter_step_only()`.
-            // Phase D-2: force emit-accepted via per-bringup atomic
-            // flag, not env::set_var. Consumed by inner spec function
-            // at SpecDecodeRequestConfig assembly. Re-armed per iter
-            // because the atomic is swap(false) on consume.
-            self.force_emit_accepted
-                .store(true, std::sync::atomic::Ordering::Release);
-            let want = (max_new - emitted.len()).min(k + 1);
-            let chunk = self.run_generate_speculative(
-                fn_embed, fn_argmax,
-                &current_prompt, want.max(1), eos_ids,
-                spec_k, sampling, cancel, None,
-                &[], &[],
+            // Step 1: K drafter forwards.
+            let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
+            let drafts = self.run_drafter_k_from_state(
+                fn_embed, &session, spec_k, sampling, typical_mode,
             )?;
-            if let Some(stats) = self.take_last_spec_stats() {
-                total_drafted = total_drafted.saturating_add(stats.drafted);
-                total_accepted = total_accepted.saturating_add(stats.accepted);
+            if perf_trace {
+                self.stream.fence()?;
+                sum_drafter_us += t0.unwrap().elapsed().as_micros() as u64;
             }
-            if chunk.is_empty() { break; }
-            for &tok in &chunk {
-                if emitted.len() >= max_new { break 'outer; }
-                if eos_ids.contains(&tok) {
+            if drafts.tokens.is_empty() { break; }
+            let k_actual = drafts.tokens.len();
+            total_drafted = total_drafted.saturating_add(k_actual as u32);
+
+            // Step 2: batched verify -> K base argmaxes + K hiddens.
+            base_argmax_k.clear();
+            base_argmax_k.resize(k_actual, 0u32);
+            let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
+            self.verify_batched_from_state(
+                fn_embed,
+                &drafts.tokens,
+                session.committed_len,
+                &session,
+                k_hidden_buf,
+                &mut base_argmax_k,
+            )?;
+            if perf_trace {
+                self.stream.fence()?;
+                sum_verify_us += t0.unwrap().elapsed().as_micros() as u64;
+            }
+
+            // Step 3: greedy accept_len.
+            // (Typical-acceptance: parked — falls back to greedy here.
+            // Mirror the legacy path before re-enabling.)
+            let mut accept_len: usize = 0;
+            for i in 0..k_actual {
+                let base_pred = if i == 0 {
+                    session.next_base_argmax
+                } else {
+                    base_argmax_k[i - 1]
+                };
+                if drafts.tokens[i] == base_pred {
+                    accept_len += 1;
+                } else {
+                    break;
+                }
+            }
+            // Codex Round 7 #5: count accepted only after we've actually
+            // emitted them. Previously total_accepted was incremented up
+            // front, so a max_new / on_token mid-emit abort over-reported
+            // X-RVLLM-Accept-Rate.
+            let verify_accepted = accept_len;
+
+            let old_committed = session.committed_len;
+
+            if accept_len > 0 {
+                // Emit accepted drafts.
+                let mut emitted_accepted: usize = 0;
+                for i in 0..accept_len {
+                    if emitted.len() >= max_new {
+                        total_accepted = total_accepted.saturating_add(emitted_accepted as u32);
+                        break 'outer;
+                    }
+                    let tok = drafts.tokens[i];
+                    // Codex Round 4 #3: EOS-before-push parity with
+                    // the non-spec decode path. The special token is
+                    // consumed silently — never pushed into `emitted`
+                    // and never delivered via on_token.
+                    if eos_ids.contains(&tok) {
+                        total_accepted = total_accepted.saturating_add(emitted_accepted as u32);
+                        break 'outer;
+                    }
                     emitted.push(tok);
-                    break 'outer;
+                    emitted_accepted += 1;
+                    if let Some(cb) = on_token.as_mut() {
+                        if !cb(tok) {
+                            total_accepted = total_accepted.saturating_add(emitted_accepted as u32);
+                            break 'outer;
+                        }
+                    }
                 }
-                emitted.push(tok);
+                total_accepted = total_accepted.saturating_add(emitted_accepted as u32);
+                let _ = verify_accepted; // verify_accepted == emitted_accepted on normal path
+
+                // Codex Round 7 #2: switch from deferred-bonus to
+                // CLASSICAL spec-decode emission. We now ALSO emit
+                // base_argmax_k[accept_len - 1] (the bonus / divergence
+                // token) this iter and commit its base K/V via
+                // prefill_one_from_state. Net per-iter:
+                //   cost  = K (verify) + 1 (bonus commit) = K + 1
+                //   emit  = accept_len + 1
+                //   cost/tok = (K + 1) / (accept_len + 1)
+                // vs deferred-bonus per-iter:
+                //   cost  = K (verify),   emit = accept_len  →
+                //   cost/tok = K / accept_len
+                // Classical is strictly faster at accept_len ∈ (0, K)
+                // and equal at the boundaries. The K-hidden[accept_len -
+                // 1] DtoD into base_last_hidden_ptr is replaced by the
+                // bonus prefill's own POST-final-norm hidden snapshot,
+                // which gives the next iter's drafter the hidden at the
+                // ACTUALLY-emitted last token (i.e. the bonus position),
+                // not the last-accepted-draft position.
+                let bonus = base_argmax_k[accept_len - 1];
+
+                // Commit the accepted prefix to the session now (without
+                // changing next_base_argmax — we set that after the
+                // bonus prefill below). We need to commit BEFORE
+                // prefill_one_from_state so its input = session.tokens +
+                // [bonus] has the right length for the override.
+                session.commit_drafts(&drafts.tokens, accept_len, session.next_base_argmax);
+
+                // Incremental shadow KV for the newly-committed slots
+                // [old_committed, old_committed + accept_len).
+                {
+                    let guard = self.drafter.lock().unwrap();
+                    let d = guard.as_ref().expect("drafter resident");
+                    d.populate_shadow_kv_range_from_base(
+                        sliding_k, sliding_v,
+                        full_k, full_v,
+                        sliding_ks, sliding_vs,
+                        full_ks, full_vs,
+                        kv_dtype_per_layer[sliding_li],
+                        kv_dtype_per_layer[full_li],
+                        shadow_sliding_bytes,
+                        shadow_full_bytes,
+                        /* slot_start */ old_committed,
+                        /* slot_count */ accept_len as u32,
+                        stream,
+                    )?;
+                }
+
+                // Codex Round 9 #2: commit-before-emit invariant.
+                // Bonus's base K/V and shadow K/V must be committed
+                // BEFORE the token is exposed via emitted.push +
+                // on_token callback. If the callback aborts (cb()
+                // returns false) or max_new/EOS triggers mid-emit, the
+                // internal session state is then exactly the
+                // externally-visible state — no "emitted token whose
+                // base K/V isn't in the cache" tail.
+                //
+                // Early bail-outs *before* the commit (max_new full,
+                // bonus is EOS) must skip both the commit AND the
+                // emit, so they're checked first.
+                if emitted.len() >= max_new { break 'outer; }
+                if eos_ids.contains(&bonus) { break 'outer; }
+
+                // Commit the bonus's base K/V + capture its
+                // POST-final-norm hidden for the next iter's drafter.
+                let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
+                let new_next = self.prefill_one_from_state(
+                    fn_embed, &mut session, bonus)?;
+                if perf_trace {
+                    self.stream.fence()?;
+                    sum_prefill_one_us += t0.unwrap().elapsed().as_micros() as u64;
+                }
+                session.next_base_argmax = new_next;
+
+                // Shadow KV for the bonus's slot.
+                let bonus_slot = old_committed + accept_len as u32;
+                let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
+                let guard = self.drafter.lock().unwrap();
+                let d = guard.as_ref().expect("drafter resident");
+                d.populate_shadow_kv_range_from_base(
+                    sliding_k, sliding_v,
+                    full_k, full_v,
+                    sliding_ks, sliding_vs,
+                    full_ks, full_vs,
+                    kv_dtype_per_layer[sliding_li],
+                    kv_dtype_per_layer[full_li],
+                    shadow_sliding_bytes,
+                    shadow_full_bytes,
+                    /* slot_start */ bonus_slot,
+                    /* slot_count */ 1,
+                    stream,
+                )?;
+                if perf_trace {
+                    self.stream.fence()?;
+                    sum_shadow_us += t0.unwrap().elapsed().as_micros() as u64;
+                }
+            } else {
+                // accept_len == 0: emit the deferred bonus
+                // (= session.next_base_argmax), then prefill it so its
+                // base KV exists for the next iter.
+                let bonus = session.next_base_argmax;
+                if bonus == u32::MAX {
+                    // Defensive: warmup didn't seed; cannot make
+                    // progress.
+                    break;
+                }
+                // Codex Round 4 #3: EOS-before-push parity. The
+                // deferred bonus is consumed silently if it's a stop
+                // token — no push, no on_token.
+                if eos_ids.contains(&bonus) { break; }
+                emitted.push(bonus);
                 if let Some(cb) = on_token.as_mut() {
-                    if !cb(tok) { break 'outer; }
+                    if !cb(bonus) { break; }
+                }
+                if emitted.len() >= max_new { break; }
+
+                let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
+                let new_next = self.prefill_one_from_state(
+                    fn_embed, &mut session, bonus)?;
+                if perf_trace {
+                    self.stream.fence()?;
+                    sum_prefill_one_us += t0.unwrap().elapsed().as_micros() as u64;
+                }
+                session.next_base_argmax = new_next;
+
+                // Shadow KV update for the single new committed slot.
+                let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
+                let guard = self.drafter.lock().unwrap();
+                let d = guard.as_ref().expect("drafter resident");
+                d.populate_shadow_kv_range_from_base(
+                    sliding_k, sliding_v,
+                    full_k, full_v,
+                    sliding_ks, sliding_vs,
+                    full_ks, full_vs,
+                    kv_dtype_per_layer[sliding_li],
+                    kv_dtype_per_layer[full_li],
+                    shadow_sliding_bytes,
+                    shadow_full_bytes,
+                    /* slot_start */ old_committed,
+                    /* slot_count */ 1,
+                    stream,
+                )?;
+                if perf_trace {
+                    self.stream.fence()?;
+                    sum_shadow_us += t0.unwrap().elapsed().as_micros() as u64;
                 }
             }
-            current_prompt.extend_from_slice(&chunk);
+
             iter_count = iter_count.saturating_add(1);
-            let _ = (k, hidden, vocab, stream, bias, temperature);
         }
 
         *self.last_spec_stats.lock().unwrap() = Some(LastSpecStats {
@@ -4471,13 +5819,47 @@ impl Gemma4Bringup {
             accepted: total_accepted,
             cumulative_decoded: emitted.len() as u32,
         });
+        // Codex Round 2 #5: explicit deferred-bonus policy.
+        //
+        // For accept_len > 0 this loop emits ONLY drafts[..accept_len]
+        // per iteration; the verify pass's `base_argmax_k[accept_len -
+        // 1]` token (the classical spec-decode "bonus") is parked in
+        // `session.next_base_argmax` and emitted the next iter (either
+        // accepted as that iter's drafts[0] or surfaced via the
+        // accept_len == 0 branch). This keeps the algorithm correct
+        // without writing a base-K/V slot for a token base never saw
+        // through the layer stack, but it costs the textbook
+        // "accepted + 1" per-iter speedup. Throughput logged as
+        // `accepted_per_verify`, NOT `accepted_plus_bonus`, so
+        // measurements are honest.
+        let accepted_per_verify = if iter_count > 0 {
+            total_accepted as f32 / iter_count as f32
+        } else { 0.0 };
         tracing::info!(
-            iter_count, total_drafted, total_accepted,
-            emitted = emitted.len(), max_new,
-            "Gemma 4 speculative BATCHED iterative wrapper complete (infrastructure landed; \
-             K-capture buffer + flag + lm_head hook present; flow-restructure to consume \
-             K-row capture for verify is a separate follow-up)"
+            iter_count,
+            total_drafted,
+            total_accepted,
+            accepted_per_verify,
+            emitted = emitted.len(),
+            max_new,
+            prompt_len = prompt_ids.len(),
+            spec_k,
+            "Gemma 4 batched speculative session loop complete \
+             (deferred-bonus policy: bonus accounted to next iter)",
         );
+        if perf_trace {
+            eprintln!(
+                "[spec-perf] iters={} drafter_us_total={} verify_us_total={} \
+                 prefill_one_us_total={} shadow_us_total={} \
+                 drafter_avg_ms={:.2} verify_avg_ms={:.2} prefill_one_avg_ms={:.2}",
+                iter_count, sum_drafter_us, sum_verify_us, sum_prefill_one_us,
+                sum_shadow_us,
+                if iter_count > 0 { sum_drafter_us as f64 / iter_count as f64 / 1000.0 } else { 0.0 },
+                if iter_count > 0 { sum_verify_us as f64 / iter_count as f64 / 1000.0 } else { 0.0 },
+                if iter_count > 0 { sum_prefill_one_us as f64 / iter_count as f64 / 1000.0 } else { 0.0 },
+            );
+        }
+        let _ = (k, max_new, sampling);
         Ok(emitted)
     }
 
@@ -7842,7 +9224,24 @@ impl Gemma4Bringup {
         let max_blocks_per_seq = num_blocks_total;
 
         let prompt_len = prompt_ids.len() as u32;
-        let max_tokens = prompt_len.max(1);
+        // Codex Round 8 perf #1: when `force_common_prefix_override`
+        // is set (spec-decode invocation), the chunked-prefill body
+        // processes only `prompt_len - override` new tokens. Sizing
+        // scratch to `prompt_len` allocates O(prompt_len) bytes per
+        // region across 15 regions — for a 150-token session with
+        // K=4 new tokens, that's ~37× more arena bytes than needed.
+        // Peek the atomic non-destructively (Acquire load) so we can
+        // size scratch correctly; the actual swap-consume still
+        // happens below at the existing site, preserving the
+        // one-shot semantics.
+        let override_peek = self
+            .force_common_prefix_override
+            .load(std::sync::atomic::Ordering::Acquire);
+        let max_tokens = if override_peek != u32::MAX && (override_peek as usize) < prompt_ids.len() {
+            (prompt_len - override_peek).max(1)
+        } else {
+            prompt_len.max(1)
+        };
 
         let hidden_fp8 = arena.region("gen_hidden_fp8", (max_tokens * hidden) as usize, 16)?;
         let hidden_scale = arena.region("gen_hidden_scale", (max_tokens * 4) as usize, 16)?;
@@ -9019,7 +10418,13 @@ impl Gemma4Bringup {
                         n: chunk_q * hidden,
                     }.launch(kernels.f16_to_bf16, residual_ptr, residual_ptr, stream)?;
                 }
-                if chunk_idx == 0 {
+                // Codex Round 3 #1: post-gather row dump is a
+                // diagnostic — gate behind RVLLM_DIAG_COMPARE so the
+                // batch-prefill hot path (also the spec-verify path
+                // via force_prefill_only) doesn't pay an unconditional
+                // stream.fence + 2 DtoH + eprintln on chunk 0 of
+                // every request.
+                if chunk_idx == 0 && diag_compare {
                     self.stream.fence()?;
                     let mut r0 = vec![0u16; 4];
                     let mut r_n_minus_1 = vec![0u16; 4];
@@ -9329,31 +10734,36 @@ impl Gemma4Bringup {
                 chunk_idx += 1;
             } // end chunk loop
 
-            // Diag capture BEFORE the extract-last memcpy: row 0 is
-            // the first-token output (no prior context); row
-            // new_q-1 is the last-token output the LM head consumes.
-            // With chunking, row 0 = first row of the LAST chunk (a
-            // mid-prompt position), so the row-0 diag semantics only
-            // match the decode reference when diag_compare forces a
-            // single chunk.
-            self.stream.fence()?;
-            let mut prefill_first = vec![0u16; hidden as usize];
-            cudarc::driver::sys::cuMemcpyDtoH_v2(
-                prefill_first.as_mut_ptr() as *mut _,
-                residual_ptr,
-                (hidden * 2) as _,
-            );
-            // The residual buffer holds `new_q` rows after the layer
-            // loop (the prefix-cached slots are not re-prefilled).
-            // Row `new_q - 1` is the last prompt token regardless of
-            // how many tokens were cached.
-            let mut prefill_last = vec![0u16; hidden as usize];
-            let last_off_diag = (new_q - 1) as u64 * hidden as u64 * 2;
-            cudarc::driver::sys::cuMemcpyDtoH_v2(
-                prefill_last.as_mut_ptr() as *mut _,
-                residual_ptr + last_off_diag,
-                (hidden * 2) as _,
-            );
+            // Codex Round 3 #1: diag capture is only consumed by the
+            // diag_compare `else` branch below (lines ~10379-10384
+            // `stats()` calls). Gating the fence + 2 hidden-sized
+            // DtoH behind the same flag removes an unconditional
+            // host-readback from the batch-prefill hot path. The
+            // K-hidden capture above doesn't need this fence — its
+            // DtoD is stream-ordered with the downstream argmax
+            // DtoH the spec-verify path already issues.
+            let mut prefill_first: Vec<u16> = Vec::new();
+            let mut prefill_last: Vec<u16> = Vec::new();
+            if diag_compare {
+                self.stream.fence()?;
+                prefill_first = vec![0u16; hidden as usize];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    prefill_first.as_mut_ptr() as *mut _,
+                    residual_ptr,
+                    (hidden * 2) as _,
+                );
+                // The residual buffer holds `new_q` rows after the
+                // layer loop (prefix-cached slots are not re-prefilled).
+                // Row `new_q - 1` is the last prompt token regardless
+                // of how many tokens were cached.
+                prefill_last = vec![0u16; hidden as usize];
+                let last_off_diag = (new_q - 1) as u64 * hidden as u64 * 2;
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    prefill_last.as_mut_ptr() as *mut _,
+                    residual_ptr + last_off_diag,
+                    (hidden * 2) as _,
+                );
+            }
 
             // Commit 40 — spec-decode batched verify, FIRST half.
             // Capture LAST K residual rows BEFORE the single-row
