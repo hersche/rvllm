@@ -1220,6 +1220,17 @@ pub struct Gemma4Bringup {
     /// is meant for the NEXT request's prompt, not the SAME
     /// request's spec iterations).
     pub skip_prefix_cache_publish: std::sync::atomic::AtomicBool,
+    /// Commit 56 (codex review priority 0.2): per-request override
+    /// forcing `run_generate` to return Ok(Vec::new()) immediately
+    /// after the K-row hidden-state capture, skipping the wasted
+    /// row-extract + final_norm + lm_head + softcap + argmax + DtoH
+    /// that produces the "bonus" decode token. Both batched-verify
+    /// callers (`verify_batched_from_state`, the inline batched-verify
+    /// branch in `run_generate_speculative`) already discard that
+    /// bonus — it's equivalent to `base_argmax_K[K-1]` which they
+    /// compute themselves from the K-buffer. One-shot: consumed
+    /// (`swap(false)`) inside `run_generate`.
+    pub force_prefill_only: std::sync::atomic::AtomicBool,
     /// Spec-decode commit 25: last-request K-prefix accept-rate
     /// stats from `run_generate_speculative`. Populated at the end
     /// of the spec-decode path; cleared (taken) by the worker right
@@ -2028,6 +2039,7 @@ impl Gemma4Bringup {
             force_batched_verify: std::sync::atomic::AtomicBool::new(false),
             force_common_prefix_override: std::sync::atomic::AtomicU32::new(u32::MAX),
             skip_prefix_cache_publish: std::sync::atomic::AtomicBool::new(false),
+            force_prefill_only: std::sync::atomic::AtomicBool::new(false),
             base_last_k_snapshot_pending:
                 std::sync::atomic::AtomicBool::new(false),
             last_spec_stats: std::sync::Mutex::new(None),
@@ -4162,6 +4174,15 @@ impl Gemma4Bringup {
             .store(start_pos, std::sync::atomic::Ordering::Release);
         self.skip_prefix_cache_publish
             .store(true, std::sync::atomic::Ordering::Release);
+        // Commit 56 (codex priority 0.2): the K-row hidden buffer
+        // captured during prefill is the only output this call
+        // consumes — caller runs its own final_norm + lm_head +
+        // argmax over the K-buffer below. Skip the wasted bonus
+        // decode (row-extract + final_norm + lm_head_M=1 + argmax
+        // + DtoH) that produces a token equal to
+        // `base_argmax_K[K-1]` we will recompute anyway.
+        self.force_prefill_only
+            .store(true, std::sync::atomic::Ordering::Release);
 
         // Run the existing chunk-prefill body. With the override
         // active, common_prefix_len = start_pos, new_q = K, layer
@@ -5932,6 +5953,20 @@ impl Gemma4Bringup {
             self.force_common_prefix_override
                 .store(prompt_ids.len() as u32, std::sync::atomic::Ordering::Release);
             self.skip_prefix_cache_publish
+                .store(true, std::sync::atomic::Ordering::Release);
+            // Commit 56 (codex priority 0.2): drop the wasted bonus
+            // base decode. The verify call's K-row hidden capture
+            // is the only output this branch consumes — we run our
+            // own final_norm + lm_head_M=K + softcap + argmax_M=K
+            // on the K-buffer below to produce `base_argmax_K`.
+            // `base_argmax_K[K-1]` equals what the bonus token
+            // would have been (= argmax over hidden_{P+K-1}), so
+            // skipping the bonus saves one row-extract + 1-row
+            // final_norm + M=1 GEMM (vocab columns) + softcap +
+            // M=1 argmax + 4-byte DtoH per spec iteration, with no
+            // semantic change. `bonus_tok_vec` was already marked
+            // unused (`let _ = bonus_tok_vec;` ~30 lines below).
+            self.force_prefill_only
                 .store(true, std::sync::atomic::Ordering::Release);
             let bonus_tok_vec = self.run_generate(
                 fn_embed,
@@ -8618,7 +8653,18 @@ impl Gemma4Bringup {
         // lengths today. RVLLM_BATCH_PREFILL=1 flips to the unified
         // batch path (diagnostic: verifies CUTLASS >=128 correctness,
         // or measures the collapsed-scalar quality floor at <128).
-        let skip_decode = std::env::var_os("RVLLM_DIAG_SKIP_DECODE").is_some();
+        // Commit 56: one-shot override consumed here. When set,
+        // run_generate returns Ok(Vec::new()) at the post-K-capture
+        // early-out site (~line 9361) — the K-row hidden-state buffer
+        // is the only output the caller cares about. Skips
+        // row-extract + final_norm + lm_head_M=1 + softcap + argmax
+        // + DtoH (= the "bonus" decode token the batched-verify
+        // callers were discarding anyway).
+        let force_prefill_only = self
+            .force_prefill_only
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        let skip_decode = force_prefill_only
+            || std::env::var_os("RVLLM_DIAG_SKIP_DECODE").is_some();
         let requested_batch_prefill = parse_truthy_env("RVLLM_BATCH_PREFILL").unwrap_or(false);
         // Vision-splice availability gate (Codex review #1 round 5).
         // The vision-embedding splice into residual_ptr lives ONLY in
