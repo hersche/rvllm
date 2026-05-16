@@ -4620,11 +4620,22 @@ impl Gemma4Bringup {
                 let guard = self.drafter.lock().unwrap();
                 let drafter = guard.as_ref().expect("drafter resident");
                 drafter.prepare_pre_projection_input(&step, &workspace, stream)?;
-                self.apply_pre_projection_embed_scale(
-                    &workspace,
-                    drafter.arch.backbone_hidden_size as i32,
-                    stream,
-                )?;
+                // Codex Round 6 (final): HF
+                // `MultiTokenPredictionCandidateGenerator.get_candidates`
+                // at candidate_generator.py:1383 builds
+                //   `inputs_embeds = cat([last_token_embedding,
+                //                         last_hidden_state], dim=-1)`
+                // with NO sqrt(hidden_size) scaling on the embed half.
+                // The earlier `apply_pre_projection_embed_scale` call
+                // applied sqrt(2560), which inflated the embed half by
+                // ~50x and dragged the drafter into a degenerate
+                // prediction mode (always token 140 = "    " spaces).
+                // After removing it: drafter at the same input predicts
+                // "**" with the correct "Die" token at #2 — i.e., the
+                // drafter now actually contributes useful candidates.
+                // Verified against HF transformers source for
+                // gemma4_assistant + the MTP candidate generator.
+                let _ = drafter.arch.backbone_hidden_size; // intentionally unused
                 self.run_drafter_pre_projection(drafter, &workspace)?;
 
                 let num_layers = drafter.layers.len();
