@@ -4284,21 +4284,43 @@ impl Gemma4Bringup {
         // captured POST-layer-loop hiddens. Allocates only K-sized
         // scratch (hidden / logits / argmax), bounded independent of
         // session length.
+        //
+        // Codex Round 7 perf #2: when RVLLM_RESIDUAL_BF16=1, the
+        // chunked-prefill layer loop runs in bf16 and the K-row hidden
+        // capture writes bf16 bytes into k_hidden_out_ptr. Using the
+        // f16 rmsnorm here mis-interprets those bytes — bf16's wider
+        // exponent + narrower mantissa makes the reinterpret produce
+        // garbled values, which flow into lm_head and pull the K
+        // argmaxes toward attractor tokens regardless of actual base
+        // distribution. Result: drafter agreement on those (correlated-
+        // wrong) argmaxes was artificially low. Selecting the bf16
+        // sibling rmsnorm + narrowing back to f16 via bf16_to_f16_sat
+        // restores correct base argmaxes (and therefore real accept
+        // rates).
         let stream = self.stream.raw();
         let hidden_u = self.arch.hidden_size as u32;
         let vocab_u = self.arch.vocab_size as u32;
-
+        let bf16_res = bf16_residual_enabled();
+        let final_norm_kernel = if bf16_res {
+            self.fused.fn_rmsnorm_inplace_bf16
+        } else {
+            self.fused.fn_rmsnorm
+        };
         rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: k as u32,
             hidden: hidden_u,
             eps: self.arch.rms_norm_eps,
         }
         .launch(
-            self.fused.fn_rmsnorm,
+            final_norm_kernel,
             k_hidden_out_ptr,
             self.model.final_norm.offset_bytes,
             stream,
         )?;
+        if bf16_res {
+            rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: hidden_u * (k as u32) }
+                .launch(self.fused.fn_bf16_to_f16_sat, k_hidden_out_ptr, k_hidden_out_ptr, stream)?;
+        }
 
         let logits_region = arena.region(
             "spec_verify_logits_f32",
@@ -4898,28 +4920,54 @@ impl Gemma4Bringup {
         // above scratch by ensure_drafter, so restoring the checkpoint
         // does not invalidate the snapshot the hook just captured into
         // that buffer.
+        // Codex Round 7 perf: skip the bonus's transformer-stack decode
+        // step. Capture the bonus's POST-layer-loop PRE-final-norm
+        // hidden via the K-row capture hook (count=1) — same primitive
+        // verify_batched_from_state uses — then run final_norm +
+        // lm_head + argmax over that single row ourselves. The decode
+        // step's full 42-layer pass is ~30x more expensive than these
+        // small kernels combined, so this saves roughly one
+        // decode-equivalent per accept_len ≤ K iteration.
         let outer_ck = self.arena.checkpoint();
-        let call_result: Result<u32> = (|| {
+        let stream = self.stream.raw();
+        let hidden_u = self.arch.hidden_size as u32;
+        let vocab_u = self.arch.vocab_size as u32;
+        let k_hidden_buf = self
+            .base_last_k_hidden_ptr
+            .load(std::sync::atomic::Ordering::Acquire);
+        if k_hidden_buf == 0 {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    op: "prefill_one_from_state: base_last_k_hidden_ptr is 0",
+                    backend: "Gemma4SpecDecode",
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "prefill_one_from_state",
+                    stream,
+                    num_seqs: 1,
+                    head_dim: self.arch.max_head_dim() as u32,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let call_result: Result<()> = (|| {
             let mut hook_guard = SpecHookGuard::new(self);
-            let _ = &mut hook_guard;
-            // Codex Round 6: do NOT set force_common_prefix_override.
-            // The warmup's max_new=1 decode step wrote per-token-decode
-            // K/V into slot P; chunk-prefill K/V via override produces
-            // slightly different bytes for the same input, and the
-            // downstream decode reads from that mismatched slot and
-            // diverges. Use the natural prefix-cache token-id match
-            // path: prefix_cache.last_tokens already holds the prompt,
-            // and the appended bonus is the only new token — run_generate
-            // will detect new_q = 1 and prefill it via the same code
-            // path the warmup decode used. skip_prefix_cache_publish
-            // still keeps spec-internal state out of the cross-request
-            // cache.
+            hook_guard.swap_k_dst(k_hidden_buf);
+            self.base_last_k_count
+                .store(1, std::sync::atomic::Ordering::Release);
+            self.base_last_k_snapshot_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+            // Skip the decode step (next argmax recomputed below).
+            self.force_prefill_only
+                .store(true, std::sync::atomic::Ordering::Release);
+            // No force_common_prefix_override: rely on natural prefix-
+            // cache token-id match. Only the bonus is new, so new_q=1
+            // via the standard path. skip_prefix_cache_publish keeps
+            // spec-internal state out of the cross-request cache.
             self.skip_prefix_cache_publish
                 .store(true, std::sync::atomic::Ordering::Release);
-            self.base_last_hidden_snapshot_pending
-                .store(true, std::sync::atomic::Ordering::Release);
 
-            let result = self.run_generate(
+            let _ = self.run_generate(
                 fn_embed,
                 self.fused.fn_argmax,
                 &input,
@@ -4932,11 +4980,130 @@ impl Gemma4Bringup {
                 /* vision_splice */ &[],
                 /* audio_splice */ &[],
             )?;
-            Ok(result.first().copied().unwrap_or(0))
-            // hook_guard drops here -> hook atomics disarmed.
+            Ok(())
         })();
         self.arena.restore(outer_ck);
-        let new_argmax = call_result?;
+        call_result?;
+
+        // K-row capture wrote 1 row of POST-layer-loop PRE-final-norm
+        // hidden at k_hidden_buf row 0. Run final_norm with the bf16-
+        // aware kernel + narrow if bf16 residual, then lm_head + softcap
+        // + argmax over the same row → next_base_argmax. Also DtoD-copy
+        // the post-norm hidden into base_last_hidden_ptr for the next
+        // drafter step.
+        let bf16_res = bf16_residual_enabled();
+        let final_norm_kernel = if bf16_res {
+            self.fused.fn_rmsnorm_inplace_bf16
+        } else {
+            self.fused.fn_rmsnorm
+        };
+        rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: 1,
+            hidden: hidden_u,
+            eps: self.arch.rms_norm_eps,
+        }
+        .launch(
+            final_norm_kernel,
+            k_hidden_buf,
+            self.model.final_norm.offset_bytes,
+            stream,
+        )?;
+        if bf16_res {
+            rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: hidden_u }
+                .launch(self.fused.fn_bf16_to_f16_sat, k_hidden_buf, k_hidden_buf, stream)?;
+        }
+        // Copy POST-final-norm row 0 into base_last_hidden_ptr for the
+        // next iter's drafter.
+        {
+            use cudarc::driver::sys::*;
+            let dst = self
+                .base_last_hidden_ptr
+                .load(std::sync::atomic::Ordering::Acquire);
+            if dst == 0 {
+                return Err(rvllm_core::RvllmError::Attention {
+                    err: rvllm_core::AttentionError::FeatureNotAvailable {
+                        op: "prefill_one_from_state: base_last_hidden_ptr is 0",
+                        backend: "Gemma4SpecDecode",
+                    },
+                    ctx: rvllm_core::AttnCtx {
+                        op: "prefill_one_from_state",
+                        stream,
+                        num_seqs: 1,
+                        head_dim: self.arch.max_head_dim() as u32,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+            let rc = cuMemcpyDtoDAsync_v2(
+                dst,
+                k_hidden_buf,
+                (hidden_u as usize) * 2,
+                stream as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "prefill_one_from_state: bonus_hidden DtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        // lm_head_M=1 + softcap + argmax → next_base_argmax.
+        let inner_ck = self.arena.checkpoint();
+        let inner: Result<u32> = (|| {
+            let logits = self.arena.region(
+                "spec_prefill_one_logits",
+                (vocab_u as usize) * 4,
+                16,
+            )?;
+            self.cublaslt.f16_gemm_f32(
+                k_hidden_buf,
+                self.model.lm_head_f16.offset_bytes,
+                logits.device_ptr(),
+                1,
+                vocab_u as i32,
+                hidden_u as i32,
+                stream,
+            )?;
+            if self.arch.logit_softcap > 0.0 {
+                rvllm_fused::gemma4_launcher::LogitSoftcapLaunch {
+                    num_tokens: 1,
+                    vocab: vocab_u,
+                    cap: self.arch.logit_softcap,
+                }
+                .launch(self.fused.fn_softcap_f32, logits.device_ptr(), stream)?;
+            }
+            let argmax_region = self.arena.region(
+                "spec_prefill_one_argmax", 4, 16,
+            )?;
+            rvllm_fused::ArgmaxLaunch {
+                num_tokens: 1,
+                vocab: vocab_u,
+            }
+            .launch(
+                self.fused.fn_argmax,
+                logits.device_ptr(),
+                argmax_region.device_ptr(),
+                stream,
+            )?;
+            self.stream.fence()?;
+            let mut host = [0u8; 4];
+            let rc = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                host.as_mut_ptr() as *mut _,
+                argmax_region.device_ptr(),
+                4,
+            );
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "prefill_one_from_state: argmax DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+            Ok(u32::from_le_bytes(host))
+        })();
+        self.arena.restore(inner_ck);
+        let new_argmax = inner?;
 
         session.tokens.push(bonus);
         session.committed_len = session.committed_len.saturating_add(1);
