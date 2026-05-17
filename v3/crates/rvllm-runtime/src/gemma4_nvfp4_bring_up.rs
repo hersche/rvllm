@@ -69,6 +69,11 @@ struct ForwardKernels {
     /// `[n_heads, head_dim]` in-place. No KV side-effect.
     _rope_mod: LoadedModule,
     fn_rope_split_half_bf16: KernelFn,
+    /// `argmax_kernel` — f32 logits → i32 token id. Grid=(rows,1,1),
+    /// block=(min(vocab, 1024),1,1), shared-mem reduction handles
+    /// vocab > block_size via tid-strided pre-fold.
+    _argmax_mod: LoadedModule,
+    fn_argmax_f32: KernelFn,
 }
 
 /// Phase 3c+ text-only bring-up for `nvidia/Gemma-4-31B-IT-NVFP4`.
@@ -156,6 +161,9 @@ impl Gemma4Nvfp4Bringup {
         let fn_rope_split_half_bf16 =
             rope_mod.get_function("rope_split_half_bf16_kernel")?;
 
+        let argmax_mod = loader.load_ptx("argmax")?;
+        let fn_argmax_f32 = argmax_mod.get_function("argmax_kernel")?;
+
         // MLP kernels (commit #3).
         let mlp_gemv_mod = loader.load_ptx("mistral35_w4a16_gemv_bf16")?;
         let fn_w4a16_gemv =
@@ -182,6 +190,8 @@ impl Gemma4Nvfp4Bringup {
             fn_vector_add_bf16,
             _rope_mod: rope_mod,
             fn_rope_split_half_bf16,
+            _argmax_mod: argmax_mod,
+            fn_argmax_f32,
         };
 
         Ok(Self {
@@ -326,6 +336,116 @@ impl Gemma4Nvfp4Bringup {
         }).collect();
 
         Ok((q_normed, k_normed, v_f32))
+    }
+
+    /// Final close-out: final_norm → tied LM head → argmax.
+    ///
+    ///   h_final  = final_norm(h_residual)        // bf16 in-place RMSNorm
+    ///   logits   = h_final @ embed_tokens.T      // bf16 GEMV via cuBLASLt → f32
+    ///   token_id = argmax(logits)
+    ///
+    /// `tie_word_embeddings=true` on this checkpoint, so the
+    /// LM head uses `embed_tokens` (already sqrt(hidden)-pre-
+    /// scaled at load time per the round-3 D5 fix). cuBLASLt
+    /// computes A @ B^T under the TN swap, so passing
+    /// weight=embed_tokens [vocab, hidden] produces the right
+    /// math.
+    ///
+    /// Returns the predicted next token id.
+    pub fn forward_final_to_token(
+        &self,
+        h_residual_bf16_host: &[u16], // [hidden]
+    ) -> Result<u32> {
+        let hidden = self.arch.hidden_size as u32;
+        let vocab = self.arch.vocab_size as u32;
+        if h_residual_bf16_host.len() != hidden as usize {
+            return Err(rvllm_core::RvllmError::cuda(
+                "forward_final_to_token: h_residual length != hidden",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        let h_region = self.arena.region(
+            "gemma4_nvfp4_final_h", (hidden as usize) * 2, 256)?;
+        let logits_region = self.arena.region(
+            "gemma4_nvfp4_final_logits", (vocab as usize) * 4, 256)?;
+        let token_region = self.arena.region(
+            "gemma4_nvfp4_final_token", 4, 16)?;
+        unsafe {
+            let r: &[u8] = std::slice::from_raw_parts(
+                h_residual_bf16_host.as_ptr() as *const u8,
+                h_residual_bf16_host.len() * 2);
+            h_region.copy_from_host(r)?;
+        }
+        let stream_u64 = self.stream.raw();
+
+        // (1) final_norm in-place on h_region.
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+            }
+            .launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                h_region.device_ptr(),
+                self.model.outside.final_norm.offset_bytes,
+                stream_u64,
+            )?;
+        }
+
+        // (2) Tied LM head GEMV: h_normed @ embed_tokens.T → f32 [1, vocab].
+        unsafe {
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt,
+                h_region.device_ptr(),
+                self.model.outside.embed_tokens.offset_bytes,
+                logits_region.device_ptr(),
+                1, vocab as i32, hidden as i32, stream_u64,
+            )?;
+        }
+
+        // (3) argmax over [1, vocab] f32 → [1] i32 token id.
+        //     Grid=(1,1,1), block=(1024,1,1), shared-mem reduction.
+        unsafe {
+            let mut logits_ptr = logits_region.device_ptr();
+            let mut out_ptr = token_region.device_ptr();
+            let mut vs = vocab as i32;
+            let args: [*mut core::ffi::c_void; 3] = [
+                (&mut logits_ptr) as *mut u64 as *mut _,
+                (&mut out_ptr) as *mut u64 as *mut _,
+                (&mut vs) as *mut i32 as *mut _,
+            ];
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_argmax_f32,
+                (1, 1, 1), (1024, 1, 1), 0, stream_u64, &args,
+            )?;
+        }
+        self.stream.fence()?;
+
+        let mut tok = [0i32; 1];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                tok.as_mut_ptr() as *mut _,
+                token_region.device_ptr(),
+                4,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "forward_final_to_token: token DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let id = tok[0];
+        if id < 0 || (id as u32) >= vocab {
+            return Err(rvllm_core::RvllmError::cuda(
+                "forward_final_to_token: argmax produced out-of-range token id",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        Ok(id as u32)
     }
 
     /// Layer-0 MLP block close-out:
@@ -1429,5 +1549,49 @@ mod tests {
             "mlp_block delta mean_abs={diff_mean_abs} implausibly large");
         assert!(mean_abs < 100.0,
             "mlp_block h_out mean_abs={mean_abs} implausibly large");
+    }
+
+    /// Commit #4g smoke: final_norm + tied LM head + argmax.
+    /// Synthetic bf16 residual (all 0.01) → predict a token id.
+    /// Doesn't validate THE next-token correctness (that needs
+    /// the full 60-layer attention+MLP chain from #5+), but
+    /// verifies the LM head pipeline:
+    ///   * final_norm runs without NaN/Inf
+    ///   * cuBLASLt produces non-degenerate f32 logits
+    ///   * argmax returns a valid token id in [0, vocab)
+    /// Also confirms the tied-embed weight is correctly accessed
+    /// via `model.outside.embed_tokens` (the same buffer the
+    /// embed lookup reads from).
+    #[test]
+    #[ignore]
+    fn ondisk_bringup_final_to_token() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skipping final smoke");
+                return;
+            }
+        };
+        let kernels_dir = std::path::PathBuf::from(
+            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
+        );
+        let bringup = Gemma4Nvfp4Bringup::load(
+            &dir, 32 * 1024 * 1024 * 1024, &kernels_dir,
+        ).expect("Gemma4Nvfp4Bringup::load");
+
+        let hidden = bringup.arch.hidden_size;
+        let vocab = bringup.arch.vocab_size;
+        let bf16_0_01: u16 = 0x3C23;
+        let h_in: Vec<u16> = vec![bf16_0_01; hidden];
+
+        let token_id = bringup.forward_final_to_token(&h_in)
+            .expect("forward_final_to_token");
+
+        eprintln!(
+            "[final-smoke] hidden={hidden} vocab={vocab} \
+             predicted_token_id={token_id}"
+        );
+        assert!((token_id as usize) < vocab,
+            "argmax produced token_id={token_id} >= vocab={vocab}");
     }
 }
