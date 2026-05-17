@@ -1880,16 +1880,28 @@ impl Gemma4Nvfp4Bringup {
     ///   V-RMSNorm (host, parameter-free) → RoPE + NVFP4 K/V
     ///   write at `kv.<layer>` slot=position → GQA bf16 decode
     ///
-    /// Restricted to SLIDING layers (head_dim=256, full RoPE,
-    /// explicit v_proj). Global layers (head_dim=512, partial
-    /// RoPE, attention_k_eq_v=true) need their own dispatch
-    /// path — that lands in a follow-up commit alongside the
-    /// 60-layer driver.
+    /// Handles both layer types via runtime dispatch on
+    /// `arch.layer_types[layer_idx]`:
+    ///
+    ///   * SlidingAttention: head_dim=256, full RoPE,
+    ///     theta=10_000, GQA=2, window_size_left=1023, explicit
+    ///     v_proj. Decode via the GQA kernel (gqa ≤
+    ///     MAX_GQA_DECODE=4).
+    ///   * GlobalAttention: head_dim=512, partial RoPE
+    ///     (rotary_dim_global=128), theta=1_000_000, GQA=8,
+    ///     window_size_left=-1 (no window), attention_k_eq_v=
+    ///     true → V aliases the post-k_proj output (no v_proj
+    ///     on disk) and gets its own parameter-free V-norm.
+    ///     Decode via the non-GQA kernel (GQA=8 exceeds the
+    ///     GQA kernel's MAX_GQA_DECODE=4 cap).
+    ///
+    /// `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` is
+    /// called once per launch when the requested dynamic smem
+    /// exceeds the default 48 KiB — head_dim=512 needs ~64 KiB,
+    /// so the global path always opts in.
     ///
     /// The per-layer KV state lives at `kv.{k,v}_*_layer_ptrs
-    /// [layer_idx]` already (#5b1). This method just wires the
-    /// correct per-layer weights into the same RoPE+KV write +
-    /// decode launch chain validated by `forward_layer0_attn`.
+    /// [layer_idx]` already (#5b1).
     pub fn forward_layer_attn_from_residual(
         &self,
         layer_idx: usize,
@@ -1898,21 +1910,12 @@ impl Gemma4Nvfp4Bringup {
         kv: &Gemma4Nvfp4KvState,
     ) -> Result<Vec<f32>> {
         use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
         if layer_idx >= self.arch.num_hidden_layers {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_attn_from_residual: layer_idx={} >= num_hidden_layers={}",
                 layer_idx, self.arch.num_hidden_layers)));
-        }
-        if !matches!(
-            self.arch.layer_types[layer_idx],
-            rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention,
-        ) {
-            return Err(corrupt_runtime_err(format!(
-                "forward_layer_attn_from_residual: layer_idx={} is GlobalAttention; \
-                 global-layer dispatch (head_dim=512 + partial RoPE + attention_k_eq_v) \
-                 is a follow-up commit",
-                layer_idx)));
         }
         if position >= kv.max_pos {
             return Err(corrupt_runtime_err(format!(
@@ -1924,26 +1927,68 @@ impl Gemma4Nvfp4Bringup {
 
         let layer = &self.model.layers[layer_idx];
         let hidden = self.arch.hidden_size as u32;
-        let head_dim = self.arch.head_dim_sliding;
+        let is_global = matches!(
+            self.arch.layer_types[layer_idx], Gemma4LayerType::GlobalAttention);
+
+        // Per-layer-type config.
+        let (head_dim, rotary_dim, theta, window_size_left) = if is_global {
+            (
+                self.arch.head_dim_global,
+                self.arch.rotary_dim_global(),
+                self.arch.rope_theta_global as f64,
+                -1i32, // full attention — no sliding window
+            )
+        } else {
+            (
+                self.arch.head_dim_sliding,
+                self.arch.head_dim_sliding, // sliding = full RoPE
+                self.arch.rope_theta_sliding as f64,
+                (self.arch.sliding_window_size as i32) - 1,
+            )
+        };
+
         let n_q = layer.q_proj.shape[0] as i32;
         let n_kv = layer.k_proj.shape[0] as i32;
-        let v_weight = layer.v_proj.as_ref().ok_or_else(|| corrupt_runtime_err(
-            format!("forward_layer_attn_from_residual: layer {layer_idx} \
-                     is sliding but v_proj is absent")))?;
-        let n_v = v_weight.shape[0] as i32;
-        if n_kv != n_v {
-            return Err(corrupt_runtime_err(format!(
-                "forward_layer_attn_from_residual: layer {layer_idx} K/V dim mismatch \
-                 ({n_kv} vs {n_v})")));
+
+        // V source: explicit v_proj for sliding; alias K-proj
+        // output for global (attention_k_eq_v=true, see HF
+        // `modeling_gemma4.py:1203-1207`). With the alias path,
+        // V_in is the K-projection output BEFORE K-norm /
+        // RoPE — the V cache then gets its own parameter-free
+        // V-RMSNorm and is written separately from K.
+        let v_proj_weight: Option<&rvllm_loader::weights::F16Weight>;
+        let n_v: i32;
+        if is_global {
+            if layer.v_proj.is_some() {
+                return Err(corrupt_runtime_err(format!(
+                    "forward_layer_attn_from_residual: layer {layer_idx} is \
+                     Global but v_proj IS present — attention_k_eq_v expected \
+                     to drop v_proj from the modelopt checkpoint")));
+            }
+            v_proj_weight = None;
+            n_v = n_kv;
+        } else {
+            let vw = layer.v_proj.as_ref().ok_or_else(|| corrupt_runtime_err(
+                format!("forward_layer_attn_from_residual: layer {layer_idx} \
+                         is sliding but v_proj is absent")))?;
+            n_v = vw.shape[0] as i32;
+            v_proj_weight = Some(vw);
+            if n_kv != n_v {
+                return Err(corrupt_runtime_err(format!(
+                    "forward_layer_attn_from_residual: layer {layer_idx} K/V dim mismatch \
+                     ({n_kv} vs {n_v})")));
+            }
         }
+
         let num_q_heads = (n_q as usize) / head_dim;
         let num_kv_heads = (n_kv as usize) / head_dim;
         debug_assert!(num_q_heads % num_kv_heads == 0);
         let gqa = num_q_heads / num_kv_heads;
-        if gqa > 4 {
-            return Err(corrupt_runtime_err(format!(
-                "forward_layer_attn_from_residual: gqa={gqa} > MAX_GQA_DECODE=4")));
-        }
+        // GQA kernel handles gqa ∈ [1, MAX_GQA_DECODE=4]; above
+        // that it silently returns. Fall back to the per-Q-head
+        // (non-GQA) decode kernel which handles any GQA via
+        // internal `kv_head_idx = head_idx / gqa` mapping.
+        let use_gqa_kernel = gqa <= 4;
         if h_residual_bf16_host.len() != hidden as usize {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_attn_from_residual: residual length {} != hidden {}",
@@ -1990,11 +2035,34 @@ impl Gemma4Nvfp4Bringup {
                 layer.k_proj.offset_bytes, k_f32_region.device_ptr(),
                 1, n_kv, hidden as i32, stream_u64,
             )?;
-            gemma4_nvfp4_attn_proj(
-                &self.cublaslt, residual_region.device_ptr(),
-                v_weight.offset_bytes, v_f32_region.device_ptr(),
-                1, n_v, hidden as i32, stream_u64,
-            )?;
+            // V source: alias k_proj output for global
+            // (attention_k_eq_v=true); explicit v_proj for
+            // sliding. The aliased path does a DtoD copy
+            // from `k_f32_region` to `v_f32_region` so the
+            // downstream V-norm reads its own buffer.
+            match v_proj_weight {
+                Some(vw) => {
+                    gemma4_nvfp4_attn_proj(
+                        &self.cublaslt, residual_region.device_ptr(),
+                        vw.offset_bytes, v_f32_region.device_ptr(),
+                        1, n_v, hidden as i32, stream_u64,
+                    )?;
+                }
+                None => {
+                    use cudarc::driver::sys::*;
+                    let rc = cuMemcpyDtoDAsync_v2(
+                        v_f32_region.device_ptr(),
+                        k_f32_region.device_ptr(),
+                        (n_v as usize) * 4,
+                        stream_u64 as CUstream);
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(RvllmError::cuda(
+                            "forward_layer_attn_from_residual: \
+                             k_eq_v DtoD copy",
+                            CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    }
+                }
+            }
         }
         self.stream.fence()?;
 
@@ -2091,9 +2159,7 @@ impl Gemma4Nvfp4Bringup {
             "g4n_lN_attn_out_bf16", num_q_heads * head_dim * 2, 256)?;
 
         // -- Per-position f16 cos/sin mini-tables + i32 state writes -----
-        let rotary_dim = head_dim; // sliding = full RoPE
         let half_rotary = rotary_dim / 2;
-        let theta = self.arch.rope_theta_sliding as f64;
         let p = position as f64;
         let mut cos_f16: Vec<u16> = Vec::with_capacity(half_rotary);
         let mut sin_f16: Vec<u16> = Vec::with_capacity(half_rotary);
@@ -2224,8 +2290,7 @@ impl Gemma4Nvfp4Bringup {
             let mut hd: i32 = head_dim as i32;
             let mut block_size: i32 = kv.block_size as i32;
             let mut max_blocks_per_seq: i32 = kv.max_pos as i32;
-            let mut window_size_left: i32 =
-                (self.arch.sliding_window_size as i32) - 1;
+            let mut window_size_left: i32 = window_size_left;
 
             let args = [
                 (&mut output) as *mut u64 as *mut core::ffi::c_void,
@@ -2247,15 +2312,44 @@ impl Gemma4Nvfp4Bringup {
                 (&mut window_size_left) as *mut i32 as *mut core::ffi::c_void,
             ];
             let fa2_bc: u32 = 32;
-            let max_gqa: u32 = 4;
             let fa2_threads: u32 = 128;
-            let smem_bytes: u32 =
-                2 * fa2_bc * (head_dim as u32) * 2
-                + (max_gqa * fa2_bc + fa2_threads / 32) * 4;
-
+            // GQA kernel: s_score is [MAX_GQA * FA2_BC] floats; grid_y =
+            // num_kv_heads, one block per (kv_head) loops over its
+            // gqa Q-heads internally.
+            // Non-GQA kernel: s_score is [FA2_BC] floats; grid_y =
+            // num_heads, one block per Q-head with kernel-internal
+            // (head_idx → kv_head) mapping.
+            let (kernel, grid_y, smem_bytes) = if use_gqa_kernel {
+                let max_gqa: u32 = 4;
+                let smem = 2 * fa2_bc * (head_dim as u32) * 2
+                    + (max_gqa * fa2_bc + fa2_threads / 32) * 4;
+                (self.forward_kernels.fn_attn_decode_gqa_bf16out,
+                 num_kv_heads as u32, smem)
+            } else {
+                let smem = 2 * fa2_bc * (head_dim as u32) * 2
+                    + (fa2_bc + fa2_threads / 32) * 4;
+                (self.forward_kernels.fn_attn_decode_bf16out,
+                 num_q_heads as u32, smem)
+            };
+            // head_dim=512 pushes the decode kernel above the 48 KiB
+            // default per-launch smem cap; opt in via cuFuncSetAttribute.
+            if smem_bytes >= 48 * 1024 {
+                use cudarc::driver::sys::*;
+                let rc = cuFuncSetAttribute(
+                    kernel.raw() as CUfunction,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    smem_bytes as i32,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(RvllmError::cuda(
+                        "forward_layer_attn_from_residual: \
+                         cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE)",
+                        CudaErrorKind::LaunchFailed, CudaCtx::setup()));
+                }
+            }
             rvllm_fused::launch_raw(
-                self.forward_kernels.fn_attn_decode_gqa_bf16out,
-                (1u32, num_kv_heads as u32, 1u32),
+                kernel,
+                (1u32, grid_y, 1u32),
                 (fa2_threads, 1u32, 1u32),
                 smem_bytes, stream_u64, &args,
             )?;
@@ -3135,20 +3229,134 @@ mod tests {
             "layer 0 and layer 1 attn_out are identical (diff={diff}) — \
              per-layer weight indexing is likely broken");
 
-        // Sanity: global-layer guard rejects layer index 5 (the
-        // first global layer on 31B's 5-sliding/1-global pattern).
+        // #5b3 used to reject global layers; #5b4 wires them
+        // through the same method via partial RoPE + k_eq_v V
+        // alias + non-GQA decode kernel. See the dedicated
+        // global-layer smoke below.
+    }
+
+    /// Commit #5b4 smoke: global-layer attention works through
+    /// the same `forward_layer_attn_from_residual` method via
+    /// runtime dispatch on `arch.layer_types`. 31B layer 5 is
+    /// the first GlobalAttention layer (5-sliding/1-global
+    /// pattern).
+    ///
+    /// Global-layer specifics covered by this smoke:
+    ///   * head_dim=512 (vs sliding 256) → decode kernel needs
+    ///     `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)`
+    ///     because per-block dynamic smem ≈ 64 KiB > 48 KiB
+    ///     default cap.
+    ///   * Partial RoPE: rotary_dim_global = head_dim_global *
+    ///     partial_rotary_factor_global (= 128 on 31B). Only
+    ///     the first 128 of 512 channels get rotated.
+    ///   * rope_theta_global = 1_000_000 (vs sliding 10_000).
+    ///   * attention_k_eq_v = true: no v_proj on disk, V is
+    ///     the K-projection output (DtoD-copied before V-norm).
+    ///   * GQA = 32/4 = 8 > MAX_GQA_DECODE=4 → falls through
+    ///     to the non-GQA decode kernel (1 block per Q head,
+    ///     internal kv_head mapping).
+    ///   * window_size_left = -1 (full attention, no window).
+    ///
+    /// Asserts no NaN/Inf, plausible magnitudes, and (since
+    /// the smoke runs on a fresh KV cache) at position=0 the
+    /// trivial single-slot attention output should be V_normed
+    /// replicated across each Q-head's kv_head group — which
+    /// just means the output magnitude tracks the V-norm
+    /// output's scale, comfortably below typical FP overflow.
+    ///
+    /// Run:
+    ///   GEMMA4_NVFP4_DIR=/home/r00t/Gemma-4-31B-IT-NVFP4 \
+    ///     cargo test --release -p rvllm-runtime --features cuda,gb10 \
+    ///     gemma4_nvfp4_bring_up::tests::ondisk_bringup_global_attn \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ondisk_bringup_global_attn() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skipping #5b4 smoke");
+                return;
+            }
+        };
+        let kernels_dir = std::path::PathBuf::from(
+            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
+        );
+        let mut bringup = Gemma4Nvfp4Bringup::load(
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
+        ).expect("Gemma4Nvfp4Bringup::load");
+
+        // Pick the first global layer.
         let global_idx = (0..bringup.arch.num_hidden_layers)
             .find(|&i| matches!(
                 bringup.arch.layer_types[i],
                 rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention))
             .expect("31B must have at least one global layer");
-        let err = bringup
-            .forward_layer_attn_from_residual(global_idx, &residual, 0, &kv);
-        assert!(err.is_err(),
-            "forward_layer_attn_from_residual must reject layer {global_idx} (Global)");
         eprintln!(
-            "[#5b3-smoke] global-layer guard: layer {global_idx} \
-             rejected as expected"
+            "[#5b4-smoke] global layer index = {global_idx}, \
+             head_dim_global = {}, num_kv_heads_global = {}, \
+             rotary_dim_global = {}, rope_theta_global = {}",
+            bringup.arch.head_dim_global,
+            bringup.arch.num_kv_heads_global,
+            bringup.arch.rotary_dim_global(),
+            bringup.arch.rope_theta_global,
         );
+
+        let kv = bringup.allocate_kv_state(64)
+            .expect("allocate_kv_state(64)");
+
+        // Two DIFFERENT tokens so the per-position V differs.
+        // If we used the same token at both positions the
+        // attention output for pos=1 collapses back to
+        // V_pos0 = V_pos1 = sm[0]·V + sm[1]·V = V, masking the
+        // KV-cache read (matches #5b2's sliding-pos1 smoke).
+        let resid0 = bringup.embed_one_token_bf16(2)   // BOS
+            .expect("embed_one_token_bf16(BOS=2)");
+        let resid1 = bringup.embed_one_token_bf16(64)  // arbitrary
+            .expect("embed_one_token_bf16(64)");
+
+        let attn_g0 = bringup.forward_layer_attn_from_residual(
+            global_idx, &resid0, 0, &kv,
+        ).expect("forward_layer_attn_from_residual(global, pos=0)");
+        let attn_g1 = bringup.forward_layer_attn_from_residual(
+            global_idx, &resid1, 1, &kv,
+        ).expect("forward_layer_attn_from_residual(global, pos=1)");
+
+        for (label, a) in [("attn_g0", &attn_g0), ("attn_g1", &attn_g1)] {
+            let nan = a.iter().filter(|x| x.is_nan()).count();
+            let inf = a.iter().filter(|x| x.is_infinite()).count();
+            let mean_abs: f32 = a.iter().map(|x| x.abs()).sum::<f32>()
+                / (a.len() as f32);
+            let max_abs: f32 = a.iter().fold(0f32, |a, &x| a.max(x.abs()));
+            eprintln!(
+                "[#5b4-smoke] {label}: N={} nan={nan} inf={inf} \
+                 mean_abs={mean_abs:.4} max_abs={max_abs:.4} \
+                 first4={:?}",
+                a.len(), &a[..4],
+            );
+            assert_eq!(nan, 0, "{label} has {nan} NaN");
+            assert_eq!(inf, 0, "{label} has {inf} Inf");
+            assert!(mean_abs > 0.0 && mean_abs < 100.0,
+                "{label} mean_abs={mean_abs} out of (0, 100)");
+            assert!(max_abs < 1000.0,
+                "{label} max_abs={max_abs} implausibly large");
+        }
+
+        // Pos=0 cache state has only slot 0; pos=1 reads two slots.
+        // Outputs MUST differ.
+        let diff: f32 = attn_g0.iter().zip(attn_g1.iter())
+            .map(|(a, b)| (a - b).abs()).sum::<f32>()
+            / (attn_g0.len() as f32);
+        eprintln!("[#5b4-smoke] mean_abs(attn_g0 - attn_g1) = {diff:.6}");
+        assert!(diff > 1e-4,
+            "global pos=0 and pos=1 are identical (diff={diff}) — \
+             global decode kernel likely not consuming the KV cache");
+
+        // Confirm output dim = num_attention_heads * head_dim_global.
+        let expected_n =
+            bringup.arch.num_attention_heads * bringup.arch.head_dim_global;
+        assert_eq!(attn_g0.len(), expected_n,
+            "global attn_out length {} != num_attention_heads*head_dim_global {}",
+            attn_g0.len(), expected_n);
     }
 }
