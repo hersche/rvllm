@@ -1621,6 +1621,93 @@ impl Qwen36Bringup {
         Ok(())
     }
 
+    /// Recurrent-state snapshot for prompt-lookup spec-decode. The
+    /// Gated-DeltaNet linear state + Conv1d state are RECURRENT: a
+    /// verify forward over [current, d_0, …, d_{K-1}] advances them
+    /// through all K drafts in place. If we accept fewer than K
+    /// drafts, the state has been polluted by rejected tokens with
+    /// no built-in rollback. This pair of helpers lets the spec
+    /// session snapshot the state before verify and restore it on
+    /// any partial-accept iter, after which a separate commit-only
+    /// forward replays only the accepted prefix.
+    ///
+    /// `dst_*_ptr` must point at device buffers sized to
+    /// `linear_state_bytes` / `conv_state_bytes` respectively. The
+    /// spec session owns the scratch allocation.
+    pub fn snapshot_recurrent_state(
+        &self,
+        dst_linear_ptr: u64,
+        dst_conv_ptr: u64,
+    ) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                dst_linear_ptr, self.linear_state_ptr,
+                self.linear_state_bytes, self.stream.raw() as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 snapshot_recurrent_state(linear)",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+            let rc = cuMemcpyDtoDAsync_v2(
+                dst_conv_ptr, self.conv_state_ptr,
+                self.conv_state_bytes, self.stream.raw() as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 snapshot_recurrent_state(conv)",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let _ = (dst_linear_ptr, dst_conv_ptr);
+        Ok(())
+    }
+
+    pub fn restore_recurrent_state(
+        &self,
+        src_linear_ptr: u64,
+        src_conv_ptr: u64,
+    ) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                self.linear_state_ptr, src_linear_ptr,
+                self.linear_state_bytes, self.stream.raw() as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 restore_recurrent_state(linear)",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+            let rc = cuMemcpyDtoDAsync_v2(
+                self.conv_state_ptr, src_conv_ptr,
+                self.conv_state_bytes, self.stream.raw() as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 restore_recurrent_state(conv)",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let _ = (src_linear_ptr, src_conv_ptr);
+        Ok(())
+    }
+
+    pub fn recurrent_state_bytes(&self) -> (usize, usize) {
+        (self.linear_state_bytes, self.conv_state_bytes)
+    }
+
     /// Phase 5f: zero out the conv1d state cache.
     pub fn reset_conv_state(&self) -> Result<()> {
         #[cfg(feature = "cuda")]
@@ -4150,8 +4237,29 @@ impl Qwen36Bringup {
         self.forward_qwen36_decode_inner(
             token_ids, start_position, vision_splice, cancel,
             /* all_argmaxes */ Some(&mut out),
+            /* skip_closer */ false,
         )?;
         Ok(out)
+    }
+
+    /// Commit-only forward: runs the full layer stack (KV writes +
+    /// recurrent state advance) but SKIPS the lm_head closer. Used
+    /// by prompt-lookup spec-decode after a partial accept to
+    /// replay the accepted prefix onto a freshly-restored recurrent
+    /// state.
+    pub fn forward_qwen36_decode_commit_only(
+        &self,
+        token_ids: &[i32],
+        start_position: u32,
+        vision_splice: &[(usize, &[u8])],
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        self.forward_qwen36_decode_inner(
+            token_ids, start_position, vision_splice, cancel,
+            /* all_argmaxes */ None,
+            /* skip_closer */ true,
+        )?;
+        Ok(())
     }
 
     /// Same as `forward_qwen36_decode` but with caller-supplied
@@ -4168,6 +4276,7 @@ impl Qwen36Bringup {
     ) -> Result<i32> {
         self.forward_qwen36_decode_inner(
             token_ids, start_position, vision_splice, cancel, None,
+            /* skip_closer */ false,
         )
     }
 
@@ -4178,6 +4287,7 @@ impl Qwen36Bringup {
         vision_splice: &[(usize, &[u8])],
         cancel: Option<&std::sync::atomic::AtomicBool>,
         mut all_argmaxes: Option<&mut Vec<i32>>,
+        skip_closer: bool,
     ) -> Result<i32> {
         if token_ids.is_empty() {
             return Err(rvllm_core::RvllmError::cuda(
@@ -4839,6 +4949,14 @@ impl Qwen36Bringup {
         //    by K lm_head GEMMs at M=1. For K=4-8 this is
         //    structurally negligible vs the K-position layer stack
         //    which is the real spend.
+        if skip_closer {
+            // Commit-only path: layer stack + KV writes + recurrent
+            // state update have already run; the closer would
+            // produce argmaxes the caller doesn't need. Return 0
+            // — the value is never consumed by callers passing
+            // skip_closer=true.
+            return Ok(0);
+        }
         if let Some(out) = all_argmaxes.as_mut() {
             out.clear();
             out.reserve(num_tokens as usize);

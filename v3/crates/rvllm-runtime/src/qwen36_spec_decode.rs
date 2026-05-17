@@ -25,13 +25,32 @@
 //! mismatch. Emit the accepted prefix + the base's next
 //! prediction ("bonus") and advance the session.
 //!
-//! KV semantics: each verify writes KV for K + 1 positions
-//! [P, P + K]. If accept_len = m, slots [P, P + m] are valid
-//! (bonus + accepted drafts). Slots [P + m + 1, P + K] are
-//! stale from rejected drafts but get overwritten by the next
-//! iter's verify starting at P + m + 1. No explicit rollback
-//! needed — Qwen's KV writes are positional and idempotent
-//! given the same input.
+//! State semantics — there are TWO kinds of caches to rollback:
+//!
+//! 1. Full-attn KV cache (positional, slot-indexed). Each verify
+//!    writes K+1 slots [P, P+K]. If accept_len = m, slots
+//!    [P, P+m] are valid; [P+m+1, P+K] are stale but get
+//!    overwritten by the next iter's verify starting at P+m+1.
+//!    No explicit rollback needed for KV.
+//!
+//! 2. **Recurrent state** (Gated-DeltaNet linear state + Conv1d
+//!    state). RECURRENT — each forward step ADVANCES the state
+//!    in place. A verify forward over [current, d_0, …, d_{K-1}]
+//!    has advanced the persistent recurrent state through ALL
+//!    K drafts by the time we know accept_len. Rejected drafts
+//!    are not optional — the state IS already corrupted past the
+//!    accepted prefix. **No naïve "overwrite later" trick works
+//!    here** — the state is a moving window, not a slot-indexed
+//!    cache.
+//!
+//!    Fix (Codex review 2026-05-17): snapshot the linear + conv
+//!    state into a scratch arena region BEFORE verify, run verify
+//!    on persistent state (so its KV writes land in the real
+//!    cache), then on ANY partial accept restore the snapshot
+//!    and replay a commit-only forward over [current, d_0, …,
+//!    d_{accept_len-1}]. Commit-only = full layer stack + KV
+//!    writes + recurrent state update, but no closer/argmax.
+//!    On accept_len == K nothing to roll back — state is correct.
 
 #![cfg(feature = "cuda")]
 
@@ -123,6 +142,21 @@ where
         .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
     let perf_trace = std::env::var("RVLLM_QWEN36_SPEC_PERF_TRACE")
         .as_deref() == Ok("1");
+
+    // (0) Allocate scratch snapshot buffers for recurrent state.
+    //     Sized to the bring-up's persistent linear+conv state
+    //     so a full snapshot/restore round-trip preserves byte-
+    //     for-byte equality. Lives on the qwen arena alongside
+    //     the per-request scratch (cuda_worker restores below).
+    let (linear_bytes, conv_bytes) = qwen.recurrent_state_bytes();
+    let snap_linear = qwen.arena.region(
+        "qwen36_spec_snap_linear", linear_bytes, 16,
+    )?;
+    let snap_conv = qwen.arena.region(
+        "qwen36_spec_snap_conv", conv_bytes, 16,
+    )?;
+    let snap_linear_ptr = snap_linear.device_ptr();
+    let snap_conv_ptr = snap_conv.device_ptr();
 
     // (1) Initial prefill: feed the whole prompt at start_position=0.
     //     Returns the argmax of the LAST prompt position — the
@@ -222,6 +256,10 @@ where
             verify_input.push(*d as i32);
         }
 
+        // SNAPSHOT recurrent state before verify (which would
+        // otherwise advance it through ALL K drafts in place).
+        qwen.snapshot_recurrent_state(snap_linear_ptr, snap_conv_ptr)?;
+
         let argmax_at = qwen.forward_qwen36_decode_argmax_all(
             &verify_input, base_pos, &[], cancel,
         )?;
@@ -259,7 +297,30 @@ where
             }
         }
 
-        // (5) Set the next `current` = base's prediction at accept_len.
+        // (5) Recurrent-state rollback.
+        //     If accept_len == kmax: state is correct (all draft
+        //     advances were "accepted" — they're real commits).
+        //     Otherwise: state is past rejected drafts. Restore
+        //     the snapshot, then replay a commit-only forward
+        //     over [current, d_0, …, d_{accept_len-1}] so the
+        //     recurrent state lands exactly at the position past
+        //     the accepted prefix. KV writes at slots [base_pos,
+        //     base_pos+accept_len] are overwritten with the same
+        //     idempotent K/V values (same tokens, same positions).
+        if accept_len < kmax {
+            qwen.restore_recurrent_state(snap_linear_ptr, snap_conv_ptr)?;
+            // commit prefix = [current] + accepted drafts.
+            let mut commit_input: Vec<i32> = Vec::with_capacity(accept_len + 1);
+            commit_input.push(current);
+            for i in 0..accept_len {
+                commit_input.push(drafts[i] as i32);
+            }
+            qwen.forward_qwen36_decode_commit_only(
+                &commit_input, base_pos, &[], cancel,
+            )?;
+        }
+
+        // (6) Set the next `current` = base's prediction at accept_len.
         //     If all K accepted, that's argmax_at[kmax] (the bonus past
         //     all drafts). Otherwise it's argmax_at[accept_len] (which
         //     diverged from drafts[accept_len]).
