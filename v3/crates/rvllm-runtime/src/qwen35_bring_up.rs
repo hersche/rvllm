@@ -4246,6 +4246,144 @@ impl Qwen35Bringup {
         self.generate_session_with_vision(prompt_ids, max_new_tokens, &[], on_token)
     }
 
+    /// Zero the Gated-DeltaNet linear-attn state. Mirror of
+    /// `Qwen36Bringup::reset_linear_state`. Codex review flagged
+    /// that the worker currently does NOT reset Qwen 3.5's
+    /// persistent recurrent state per request, so cross-request
+    /// state contamination is possible. No-op when the model has
+    /// no linear-attn layers.
+    pub fn reset_linear_state(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let ls = match self.linear_state.as_ref() {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            let total = ls.n_linear_layers.saturating_mul(ls.per_layer_bytes);
+            if total == 0 || ls.base_ptr == 0 { return Ok(()); }
+            let stream = match self.stream.as_ref() {
+                Some(s) => s.raw() as CUstream,
+                None => return Ok(()),
+            };
+            let rc = cuMemsetD8Async(
+                ls.base_ptr, 0, total, stream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 reset_linear_state",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Zero the causal-conv1d state. Mirror of
+    /// `Qwen36Bringup::reset_conv_state`.
+    pub fn reset_conv_state(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let ls = match self.linear_state.as_ref() {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            let total = ls.n_linear_layers.saturating_mul(ls.conv_state_per_layer_bytes);
+            if total == 0 || ls.conv_state_base_ptr == 0 { return Ok(()); }
+            let stream = match self.stream.as_ref() {
+                Some(s) => s.raw() as CUstream,
+                None => return Ok(()),
+            };
+            let rc = cuMemsetD8Async(
+                ls.conv_state_base_ptr, 0, total, stream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 reset_conv_state",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Zero the full-attn KV cache (and per-layer scale buffers
+    /// for NVFP4 KV). Unlike Qwen 3.6 (single contiguous KV
+    /// region), Qwen 3.5 allocates per-layer regions; this
+    /// iterates the layer table and memsets each.
+    pub fn reset_kv_cache(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let kvc = match self.kv_cache.as_ref() {
+                Some(c) => c,
+                None => return Ok(()),
+            };
+            let stream = match self.stream.as_ref() {
+                Some(s) => s.raw() as CUstream,
+                None => return Ok(()),
+            };
+            for layer in kvc.layers.iter() {
+                if layer.k_ptr != 0 {
+                    let rc = cuMemsetD8Async(
+                        layer.k_ptr, 0, kvc.per_layer_bytes, stream,
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen35 reset_kv_cache (k)",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                if layer.v_ptr != 0 {
+                    let rc = cuMemsetD8Async(
+                        layer.v_ptr, 0, kvc.per_layer_bytes, stream,
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen35 reset_kv_cache (v)",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                if kvc.per_layer_scale_bytes > 0 {
+                    if layer.k_scale_ptr != 0 {
+                        let rc = cuMemsetD8Async(
+                            layer.k_scale_ptr, 0,
+                            kvc.per_layer_scale_bytes, stream,
+                        );
+                        if rc != CUresult::CUDA_SUCCESS {
+                            return Err(rvllm_core::RvllmError::cuda(
+                                "qwen35 reset_kv_cache (k_scale)",
+                                rvllm_core::CudaErrorKind::MemcpyFailed,
+                                rvllm_core::CudaCtx::setup(),
+                            ));
+                        }
+                    }
+                    if layer.v_scale_ptr != 0 {
+                        let rc = cuMemsetD8Async(
+                            layer.v_scale_ptr, 0,
+                            kvc.per_layer_scale_bytes, stream,
+                        );
+                        if rc != CUresult::CUDA_SUCCESS {
+                            return Err(rvllm_core::RvllmError::cuda(
+                                "qwen35 reset_kv_cache (v_scale)",
+                                rvllm_core::CudaErrorKind::MemcpyFailed,
+                                rvllm_core::CudaCtx::setup(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Phase 3-b: same as `generate_session` but accepts vision
     /// splice tuples `[(token_start, &[u8])]`. Each tuple's bytes
     /// are `[num_rows, hidden] f16` — i.e. one row per spliced

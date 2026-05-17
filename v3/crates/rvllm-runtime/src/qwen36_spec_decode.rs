@@ -185,9 +185,20 @@ where
 
     let t0_session = if perf_trace { Some(std::time::Instant::now()) } else { None };
 
+    // Per-iter arena checkpoint — placed AFTER the snap_linear /
+    // snap_conv allocations so they survive every restore. Codex
+    // review found that forward_qwen36_decode_argmax_all and the
+    // closer K-times path allocate hidden_fp8 / hidden_scale /
+    // logits / token regions per call without freeing them; over
+    // many spec iters this grows the per-request arena unbounded.
+    // Restoring at the end of each iter bounds peak usage to one
+    // iter's footprint.
+    let iter_ck = qwen.arena.checkpoint();
+
     while completion_tokens < max_new_tokens {
         if let Some(c) = cancel {
             if c.load(std::sync::atomic::Ordering::Relaxed) {
+                unsafe { qwen.arena.restore(iter_ck); }
                 return Ok((completion_tokens, "cancelled"));
             }
         }
@@ -195,14 +206,17 @@ where
         // Emit `current` first (the token at position prompt_len + completion_tokens).
         let current_u32 = if current < 0 { 0u32 } else { current as u32 };
         if stop_token_ids.contains(&current_u32) {
+            unsafe { qwen.arena.restore(iter_ck); }
             return Ok((completion_tokens, "stop"));
         }
         if !on_token(current_u32, prompt_len + completion_tokens) {
+            unsafe { qwen.arena.restore(iter_ck); }
             return Ok((completion_tokens, "cancelled"));
         }
         committed.push(current_u32);
         completion_tokens += 1;
         if completion_tokens >= max_new_tokens {
+            unsafe { qwen.arena.restore(iter_ck); }
             return Ok((completion_tokens, "length"));
         }
 
@@ -226,6 +240,7 @@ where
             };
             current = if t < 0 { 0 } else { t };
             iter_count += 1;
+            unsafe { qwen.arena.restore(iter_ck); }
             continue;
         }
 
@@ -281,32 +296,15 @@ where
         }
         total_accepted += accept_len as u32;
 
-        // Emit accepted drafts.
-        for i in 0..accept_len {
-            let tok = drafts[i];
-            if stop_token_ids.contains(&tok) {
-                return Ok((completion_tokens, "stop"));
-            }
-            if !on_token(tok, prompt_len + completion_tokens) {
-                return Ok((completion_tokens, "cancelled"));
-            }
-            committed.push(tok);
-            completion_tokens += 1;
-            if completion_tokens >= max_new_tokens {
-                return Ok((completion_tokens, "length"));
-            }
-        }
-
-        // (5) Recurrent-state rollback.
-        //     If accept_len == kmax: state is correct (all draft
-        //     advances were "accepted" — they're real commits).
-        //     Otherwise: state is past rejected drafts. Restore
-        //     the snapshot, then replay a commit-only forward
-        //     over [current, d_0, …, d_{accept_len-1}] so the
-        //     recurrent state lands exactly at the position past
-        //     the accepted prefix. KV writes at slots [base_pos,
-        //     base_pos+accept_len] are overwritten with the same
-        //     idempotent K/V values (same tokens, same positions).
+        // (4a) Recurrent-state rollback FIRST — codex review
+        //      (MEDIUM): emitting accepted drafts before rollback
+        //      means a stop/length/cancel mid-emit early-returns
+        //      with the persistent state polluted by rejected
+        //      drafts. Today the cross-request reset covers it,
+        //      but a future session-continuation path would
+        //      inherit the dirty state. Doing rollback first
+        //      makes the path correct under all early-return
+        //      cases.
         if accept_len < kmax {
             qwen.restore_recurrent_state(snap_linear_ptr, snap_conv_ptr)?;
             // commit prefix = [current] + accepted drafts.
@@ -319,14 +317,41 @@ where
                 &commit_input, base_pos, &[], cancel,
             )?;
         }
+        // On accept_len == kmax: state is already correct (every
+        // verify advance was a real commit), nothing to roll back.
 
-        // (6) Set the next `current` = base's prediction at accept_len.
-        //     If all K accepted, that's argmax_at[kmax] (the bonus past
-        //     all drafts). Otherwise it's argmax_at[accept_len] (which
-        //     diverged from drafts[accept_len]).
+        // (4b) Set the next `current` = base's prediction at
+        //      accept_len. If all K accepted, that's argmax_at[kmax]
+        //      (bonus past all drafts). Otherwise argmax_at[accept_len]
+        //      (which diverged from drafts[accept_len]).
         current = argmax_at[accept_len];
 
+        // (5) Emit accepted drafts. Safe to early-return now —
+        //     recurrent state already matches the committed prefix.
+        for i in 0..accept_len {
+            let tok = drafts[i];
+            if stop_token_ids.contains(&tok) {
+                unsafe { qwen.arena.restore(iter_ck); }
+                return Ok((completion_tokens, "stop"));
+            }
+            if !on_token(tok, prompt_len + completion_tokens) {
+                unsafe { qwen.arena.restore(iter_ck); }
+                return Ok((completion_tokens, "cancelled"));
+            }
+            committed.push(tok);
+            completion_tokens += 1;
+            if completion_tokens >= max_new_tokens {
+                unsafe { qwen.arena.restore(iter_ck); }
+                return Ok((completion_tokens, "length"));
+            }
+        }
+
         iter_count += 1;
+        // End-of-iter arena restore — bounds peak per-request
+        // arena usage to one iter's footprint regardless of how
+        // many spec iters fire. The snap_linear / snap_conv
+        // allocations are above this checkpoint, so they survive.
+        unsafe { qwen.arena.restore(iter_ck); }
     }
 
     if let Some(t0) = t0_session {

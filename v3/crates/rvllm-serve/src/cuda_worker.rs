@@ -167,6 +167,22 @@ pub async fn spawn_cuda_worker(
                     //       events up to max_new_tokens.
                     let last_tok = req.prompt_ids.last().copied().unwrap_or(1);
                     if qwen35_fwd_mode == "generate" {
+                        // Codex review (drive-by fix): Qwen 3.5 allocates
+                        // persistent KV + linear-attn delta state + conv1d
+                        // state at load time but the worker never resets
+                        // them per request, so state from request N can
+                        // leak into request N+1. Qwen 3.6 has this reset
+                        // — Qwen 3.5 did not. Match the Qwen 3.6 pattern.
+                        let reset_ok = bringup.reset_linear_state()
+                            .and_then(|_| bringup.reset_kv_cache())
+                            .and_then(|_| bringup.reset_conv_state());
+                        if let Err(e) = reset_ok {
+                            let _ = req.events_tx.send(GenerateEvent::Error(
+                                format!("qwen35 per-request reset: {e:?}"),
+                            ));
+                            continue;
+                        }
+
                         let prompt_ids = req.prompt_ids.clone();
                         let max_new = req.max_new_tokens.max(1);
                         let prompt_len = prompt_ids.len() as u32;
@@ -964,8 +980,6 @@ pub async fn spawn_cuda_worker(
                             let events_tx = req.events_tx.clone();
                             let cancelled_for_cb = req.cancelled.clone();
                             let stop_tokens = req.stop_token_ids.clone();
-                            let prompt_len_u32 = prompt_len;
-                            let mut emitted_for_finish: u32 = 0;
                             let result = rvllm_runtime::qwen36_spec_decode::
                                 run_qwen36_prompt_lookup_spec(
                                     &qwen,
@@ -975,13 +989,10 @@ pub async fn spawn_cuda_worker(
                                     &vision_splice,
                                     Some(&*req.cancelled),
                                     |tok, pos| {
-                                        let _ = pos; // events_tx already binds the right position via emit order
-                                        let _ = prompt_len_u32;
                                         let _ = events_tx.send(GenerateEvent::Token {
                                             id: tok,
                                             position: pos,
                                         });
-                                        emitted_for_finish += 1;
                                         !cancelled_for_cb.load(Ordering::Relaxed)
                                     },
                                 );

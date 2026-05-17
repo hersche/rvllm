@@ -4958,21 +4958,38 @@ impl Qwen36Bringup {
             return Ok(0);
         }
         if let Some(out) = all_argmaxes.as_mut() {
-            out.clear();
-            out.reserve(num_tokens as usize);
-            for i in 0..(num_tokens as usize) {
-                let t = self.forward_qwen36_outside_closer(
-                    &hidden_region,
-                    num_tokens,
-                    hidden,
-                    vocab,
-                    i,
-                )?;
-                out.push(t);
+            // Closer-all path (single fused rmsnorm + M=K fp8_gemm +
+            // grid=K argmax + one fence + one rows*4 DtoH) is opt-in
+            // via RVLLM_QWEN36_SPEC_CLOSER_ALL=1 while it's validated
+            // separately. The K-times closer loop is the proven
+            // path; codex flagged it as wasteful but it produces
+            // correct output. Default closer-all OFF until the
+            // single-call variant is hardware-bisected against the
+            // loop in isolation.
+            let closer_all = std::env::var("RVLLM_QWEN36_SPEC_CLOSER_ALL")
+                .as_deref() == Ok("1");
+            if closer_all {
+                #[cfg(feature = "cuda")]
+                {
+                    self.forward_qwen36_outside_closer_all(
+                        &hidden_region, num_tokens, hidden, vocab, out,
+                    )?;
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    out.clear();
+                    out.resize(num_tokens as usize, 0i32);
+                }
+            } else {
+                out.clear();
+                out.reserve(num_tokens as usize);
+                for i in 0..(num_tokens as usize) {
+                    let t = self.forward_qwen36_outside_closer(
+                        &hidden_region, num_tokens, hidden, vocab, i,
+                    )?;
+                    out.push(t);
+                }
             }
-            // Last argmax is what the legacy single-tok path would
-            // have returned; keep it as the Result<i32> contract
-            // so the no-spec wrapper stays a one-liner.
             Ok(*out.last().unwrap_or(&0))
         } else {
             self.forward_qwen36_outside_closer(
@@ -8282,6 +8299,135 @@ impl Qwen36Bringup {
             }
         }
         Ok(tok_buf[0])
+    }
+
+    /// Spec-decode closer-all: runs RMSNorm + fp8_quant + lm_head +
+    /// argmax for ALL `rows` positions in one pass. Replaces the
+    /// codex-flagged K-times-closer loop in
+    /// `forward_qwen36_decode_argmax_all` which paid K fences +
+    /// K DtoHs (each 4 bytes) + K small lm_head GEMMs at M=1.
+    ///
+    /// Costs per call: ONE fused_rmsnorm_fp8_quant (row-batched
+    /// via num_tokens), ONE fp8_gemm at M=rows (much better GEMM
+    /// shape than M=1 on small/medium K), ONE argmax_f16_kernel
+    /// launch with grid=rows (already block-per-row in
+    /// kernels/argmax.cu:21), ONE stream fence, ONE DtoH of
+    /// rows*4 bytes.
+    ///
+    /// `out_tokens`: caller-owned Vec; cleared and refilled with
+    /// `rows` argmax ids in row order.
+    #[cfg(feature = "cuda")]
+    fn forward_qwen36_outside_closer_all(
+        &self,
+        hidden_region: &rvllm_mem::Region<'_>,
+        rows: u32,
+        hidden: u32,
+        vocab: u32,
+        out_tokens: &mut Vec<i32>,
+    ) -> Result<()> {
+        if rows == 0 {
+            out_tokens.clear();
+            return Ok(());
+        }
+        let eps = self.arch.base.rms_norm_eps;
+        let rows_us = rows as usize;
+        let hidden_us = hidden as usize;
+        let vocab_us = vocab as usize;
+        // [rows, hidden] fp8 + [rows] f32 scales + [rows, vocab] f16 logits + [rows] i32 tokens.
+        let hidden_fp8_region = self.arena.region(
+            "qwen36_spec_closer_h_fp8",
+            rows_us * hidden_us, 16,
+        )?;
+        let hidden_scale_region = self.arena.region(
+            "qwen36_spec_closer_h_scale",
+            rows_us * 4, 16,
+        )?;
+        let logits_region = self.arena.region(
+            "qwen36_spec_closer_logits",
+            rows_us * vocab_us * 2, 16,
+        )?;
+        let tokens_region = self.arena.region(
+            "qwen36_spec_closer_tokens",
+            rows_us * 4, 16,
+        )?;
+        let stream_raw = self.stream.raw() as u64;
+
+        unsafe {
+            rvllm_fused::FusedRmsnormFp8QuantLaunch {
+                num_tokens: rows,
+                hidden,
+                eps,
+            }
+            .launch(
+                self.outside_kernels.fn_fused_rmsnorm_fp8_quant,
+                hidden_fp8_region.device_ptr(),
+                hidden_scale_region.device_ptr(),
+                hidden_region.device_ptr(),
+                self.model.outside.final_norm.offset_bytes,
+                stream_raw,
+            )?;
+        }
+        unsafe {
+            self.cublaslt.fp8_gemm(
+                hidden_fp8_region.device_ptr(),
+                self.model.outside.lm_head_fp8.offset_bytes,
+                logits_region.device_ptr(),
+                rows as i32,
+                vocab as i32,
+                hidden as i32,
+                hidden_scale_region.device_ptr(),
+                self.model.outside.lm_head_fp8.scale_ptr,
+                stream_raw,
+            )?;
+        }
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut logits_ptr = logits_region.device_ptr();
+            let mut out_ptr = tokens_region.device_ptr();
+            let mut vs = vocab as i32;
+            let args = [
+                (&mut logits_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vs) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 512;
+            // grid=rows: argmax_f16_kernel uses blockIdx.x to pick its row.
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_argmax_f16.raw() as CUfunction,
+                rows, 1, 1,
+                block, 1, 1,
+                0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 spec closer-all argmax_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        self.stream.fence()?;
+        out_tokens.clear();
+        out_tokens.resize(rows_us, 0i32);
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                out_tokens.as_mut_ptr() as *mut _,
+                tokens_region.device_ptr(),
+                rows_us * 4,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 spec closer-all tokens DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn forward_outside_smoke(&self) -> Result<()> {
