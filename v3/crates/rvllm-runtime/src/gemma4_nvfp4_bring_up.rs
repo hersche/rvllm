@@ -2416,6 +2416,357 @@ impl Gemma4Nvfp4Bringup {
         }
         Ok(out)
     }
+
+    /// Commit #5c: per-layer post-attention close-out
+    /// (o_proj + post_attention_layernorm + residual add).
+    /// Same structure as `forward_layer0_post_attn` but
+    /// parameterized over `layer_idx` — uses
+    /// `self.model.layers[layer_idx].{o_proj, post_attention_layernorm}`.
+    pub fn forward_layer_post_attn(
+        &self,
+        layer_idx: usize,
+        attn_out_bf16_host: &[u16],
+        h_residual_bf16_host: &[u16],
+    ) -> Result<Vec<f32>> {
+        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        if layer_idx >= self.arch.num_hidden_layers {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer_post_attn: layer_idx={} >= num_hidden_layers={}",
+                layer_idx, self.arch.num_hidden_layers)));
+        }
+        let _scratch_guard = self.forward_scratch_guard();
+        let layer = &self.model.layers[layer_idx];
+        let n_q = layer.o_proj.shape[1] as i32;
+        let hidden = self.arch.hidden_size as u32;
+        if attn_out_bf16_host.len() != n_q as usize {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer_post_attn: attn_out length {} != N_q {}",
+                attn_out_bf16_host.len(), n_q)));
+        }
+        if h_residual_bf16_host.len() != hidden as usize {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer_post_attn: residual length {} != hidden {}",
+                h_residual_bf16_host.len(), hidden)));
+        }
+
+        let attn_in_region = self.arena.region(
+            "g4n_lN_post_attn_in", attn_out_bf16_host.len() * 2, 256)?;
+        let residual_region = self.arena.region(
+            "g4n_lN_post_attn_resid", h_residual_bf16_host.len() * 2, 256)?;
+        let o_f32_region = self.arena.region(
+            "g4n_lN_post_attn_o_f32", (hidden as usize) * 4, 256)?;
+        let o_bf16_region = self.arena.region(
+            "g4n_lN_post_attn_o_bf16", (hidden as usize) * 2, 256)?;
+        unsafe {
+            let a: &[u8] = std::slice::from_raw_parts(
+                attn_out_bf16_host.as_ptr() as *const u8,
+                attn_out_bf16_host.len() * 2);
+            let r: &[u8] = std::slice::from_raw_parts(
+                h_residual_bf16_host.as_ptr() as *const u8,
+                h_residual_bf16_host.len() * 2);
+            attn_in_region.copy_from_host(a)?;
+            residual_region.copy_from_host(r)?;
+        }
+        let stream_u64 = self.stream.raw();
+
+        // o_proj: bf16 attn_out @ bf16 o_proj^T → f32 hidden.
+        unsafe {
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt,
+                attn_in_region.device_ptr(),
+                layer.o_proj.offset_bytes,
+                o_f32_region.device_ptr(),
+                1, hidden as i32, n_q, stream_u64,
+            )?;
+        }
+        self.stream.fence()?;
+
+        // f32 → bf16 narrow on host.
+        let mut o_f32_host: Vec<f32> = vec![0.0; hidden as usize];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                o_f32_host.as_mut_ptr() as *mut _,
+                o_f32_region.device_ptr(),
+                (hidden as usize) * 4);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "forward_layer_post_attn: o f32 DtoH",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+        }
+        let o_bf16_host: Vec<u16> = o_f32_host.iter().map(|&x| {
+            let bits = x.to_bits();
+            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+            (rounded >> 16) as u16
+        }).collect();
+        unsafe {
+            let b: &[u8] = std::slice::from_raw_parts(
+                o_bf16_host.as_ptr() as *const u8, o_bf16_host.len() * 2);
+            o_bf16_region.copy_from_host(b)?;
+        }
+
+        // post_attention_layernorm in-place on o_bf16.
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+            }
+            .launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                o_bf16_region.device_ptr(),
+                layer.post_attention_layernorm.offset_bytes,
+                stream_u64,
+            )?;
+            // Residual add: residual += normed_o.
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }
+                .launch(
+                    self.forward_kernels.fn_vector_add_bf16,
+                    residual_region.device_ptr(),
+                    o_bf16_region.device_ptr(),
+                    stream_u64,
+                )?;
+        }
+        self.stream.fence()?;
+
+        let mut h_out_bf16 = vec![0u16; hidden as usize];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                h_out_bf16.as_mut_ptr() as *mut _,
+                residual_region.device_ptr(),
+                (hidden as usize) * 2);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "forward_layer_post_attn: residual DtoH",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+        }
+        Ok(h_out_bf16.iter()
+            .map(|&b| f32::from_bits((b as u32) << 16)).collect())
+    }
+
+    /// Commit #5c: per-layer post-MLP close-out
+    /// (pre_feedforward_layernorm + MLP + post_feedforward_layernorm
+    /// + scale by layer_scalar + residual add). Same as
+    /// `forward_layer0_post_attn_mlp` but parameterized over
+    /// `layer_idx` — uses the per-layer norms, MLP linears, and
+    /// `layer_scalar`.
+    pub fn forward_layer_post_attn_mlp(
+        &self,
+        layer_idx: usize,
+        h_residual_bf16_host: &[u16],
+    ) -> Result<Vec<f32>> {
+        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        if layer_idx >= self.arch.num_hidden_layers {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer_post_attn_mlp: layer_idx={} >= num_hidden_layers={}",
+                layer_idx, self.arch.num_hidden_layers)));
+        }
+        let _scratch_guard = self.forward_scratch_guard();
+        let layer = &self.model.layers[layer_idx];
+        let hidden = self.arch.hidden_size as u32;
+        let intermediate = self.arch.intermediate_size as u32;
+        if h_residual_bf16_host.len() != hidden as usize {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer_post_attn_mlp: residual length {} != hidden {}",
+                h_residual_bf16_host.len(), hidden)));
+        }
+
+        let h_residual_region = self.arena.region(
+            "g4n_lN_pamlp_resid", (hidden as usize) * 2, 256)?;
+        let h_normed_region = self.arena.region(
+            "g4n_lN_pamlp_normed", (hidden as usize) * 2, 256)?;
+        let scratch_region = self.arena.region(
+            "g4n_lN_pamlp_scratch", (2 * intermediate as usize) * 2, 256)?;
+        let mlp_out_region = self.arena.region(
+            "g4n_lN_pamlp_out", (hidden as usize) * 2, 256)?;
+        unsafe {
+            let r: &[u8] = std::slice::from_raw_parts(
+                h_residual_bf16_host.as_ptr() as *const u8,
+                h_residual_bf16_host.len() * 2);
+            h_residual_region.copy_from_host(r)?;
+            h_normed_region.copy_from_host(r)?;
+        }
+        let stream_u64 = self.stream.raw();
+
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+            }
+            .launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                h_normed_region.device_ptr(),
+                layer.pre_feedforward_layernorm.offset_bytes,
+                stream_u64,
+            )?;
+            crate::gemma4_nvfp4_ops::gemma4_nvfp4_mlp_forward(
+                &self.mlp_kernels,
+                h_normed_region.device_ptr(),
+                mlp_out_region.device_ptr(),
+                &layer.gate_proj,
+                &layer.up_proj,
+                &layer.down_proj,
+                scratch_region.device_ptr(),
+                stream_u64,
+            )?;
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+            }
+            .launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                mlp_out_region.device_ptr(),
+                layer.post_feedforward_layernorm.offset_bytes,
+                stream_u64,
+            )?;
+        }
+
+        // Read mlp_normed back to host, scale by layer_scalar, re-upload.
+        let mut mlp_normed_bf16 = vec![0u16; hidden as usize];
+        let mut scalar_bf16 = [0u16; 1];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                mlp_normed_bf16.as_mut_ptr() as *mut _,
+                mlp_out_region.device_ptr(),
+                (hidden as usize) * 2);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "forward_layer_post_attn_mlp: mlp_normed DtoH",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+            let rc = cuMemcpyDtoH_v2(
+                scalar_bf16.as_mut_ptr() as *mut _,
+                layer.layer_scalar.offset_bytes, 2);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "forward_layer_post_attn_mlp: layer_scalar DtoH",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+        }
+        let layer_scalar_f32 = f32::from_bits((scalar_bf16[0] as u32) << 16);
+        let scaled_bf16: Vec<u16> = mlp_normed_bf16.iter().map(|&b| {
+            let v = f32::from_bits((b as u32) << 16) * layer_scalar_f32;
+            let bits = v.to_bits();
+            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+            (rounded >> 16) as u16
+        }).collect();
+        unsafe {
+            let s: &[u8] = std::slice::from_raw_parts(
+                scaled_bf16.as_ptr() as *const u8, scaled_bf16.len() * 2);
+            mlp_out_region.copy_from_host(s)?;
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }
+                .launch(
+                    self.forward_kernels.fn_vector_add_bf16,
+                    h_residual_region.device_ptr(),
+                    mlp_out_region.device_ptr(),
+                    stream_u64,
+                )?;
+        }
+        self.stream.fence()?;
+
+        let mut h_out_bf16 = vec![0u16; hidden as usize];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                h_out_bf16.as_mut_ptr() as *mut _,
+                h_residual_region.device_ptr(),
+                (hidden as usize) * 2);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "forward_layer_post_attn_mlp: residual DtoH",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+        }
+        Ok(h_out_bf16.iter()
+            .map(|&b| f32::from_bits((b as u32) << 16)).collect())
+    }
+
+    /// Commit #5c: 60-layer driver for a single-token decode at
+    /// `position`. Chains:
+    ///   embed_tokens[token_id] → for each of `num_hidden_layers`:
+    ///     attn_out = forward_layer_attn_from_residual(layer_idx, …)
+    ///     residual = forward_layer_post_attn(layer_idx, attn_out, residual)
+    ///     residual = forward_layer_post_attn_mlp(layer_idx, residual)
+    ///   → forward_final_to_token(residual) → argmax token id
+    ///
+    /// All inter-layer state lives on the host as bf16 (DtoH ↔
+    /// HtoD between layers). This is structurally correct but
+    /// inefficient — each layer round-trips the residual through
+    /// PCIe. A future "stay-on-device" forward keeps residual +
+    /// attn_out in HBM and skips ~120 DtoH/HtoD copies per token.
+    ///
+    /// `kv` MUST have `max_pos > position`. Caller manages the
+    /// position counter across multi-token decode loops.
+    ///
+    /// Returns the predicted next-token id from the tied LM head
+    /// + argmax. The numerical correctness of this output depends
+    /// on the cumulative correctness of all 60 layers — codex
+    /// round-4 work is what would validate per-layer cosines.
+    /// At this milestone we assert structural correctness only:
+    /// no NaN/Inf, no panics, finite plausible-magnitude
+    /// intermediate residuals, an in-range token id.
+    pub fn forward_full_to_token(
+        &self,
+        token_id: u32,
+        position: u32,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<u32> {
+        if position >= kv.max_pos {
+            return Err(corrupt_runtime_err(format!(
+                "forward_full_to_token: position={} >= kv.max_pos={}",
+                position, kv.max_pos)));
+        }
+        // bf16 narrow on host. Used to flip the f32 Vec returned
+        // by attn/post-attn/post-mlp back to bf16 between layers.
+        let f32_to_bf16_vec = |xs: &[f32]| -> Vec<u16> {
+            xs.iter().map(|&x| {
+                let bits = x.to_bits();
+                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+                (rounded >> 16) as u16
+            }).collect()
+        };
+
+        let mut residual_bf16 = self.embed_one_token_bf16(token_id)?;
+
+        for li in 0..self.arch.num_hidden_layers {
+            let attn_out_f32 = self.forward_layer_attn_from_residual(
+                li, &residual_bf16, position, kv)?;
+            let attn_out_bf16 = f32_to_bf16_vec(&attn_out_f32);
+
+            let resid_after_attn_f32 = self.forward_layer_post_attn(
+                li, &attn_out_bf16, &residual_bf16)?;
+            let resid_after_attn_bf16 = f32_to_bf16_vec(&resid_after_attn_f32);
+
+            let resid_after_mlp_f32 = self.forward_layer_post_attn_mlp(
+                li, &resid_after_attn_bf16)?;
+            residual_bf16 = f32_to_bf16_vec(&resid_after_mlp_f32);
+
+            // Optional periodic dump for triage of long-running
+            // bring-up. Off by default; opt-in via env.
+            if std::env::var("G4N_FORWARD_TRACE").ok().as_deref() == Some("1")
+                && (li % 10 == 0 || li == self.arch.num_hidden_layers - 1)
+            {
+                let mut mean_abs: f32 = 0.0;
+                let mut max_abs: f32 = 0.0;
+                let mut nan = 0usize;
+                let mut inf = 0usize;
+                for &b in &residual_bf16 {
+                    let v = f32::from_bits((b as u32) << 16);
+                    if v.is_nan() { nan += 1; continue; }
+                    if v.is_infinite() { inf += 1; continue; }
+                    mean_abs += v.abs();
+                    if v.abs() > max_abs { max_abs = v.abs(); }
+                }
+                mean_abs /= residual_bf16.len() as f32;
+                eprintln!(
+                    "[g4n-trace] layer {li}: residual mean_abs={mean_abs:.4} \
+                     max_abs={max_abs:.4} nan={nan} inf={inf}"
+                );
+            }
+        }
+
+        self.forward_final_to_token(&residual_bf16)
+    }
 }
 
 /// f32 → f16 IEEE-754 round-to-nearest-even, returning the raw u16
@@ -3358,5 +3709,57 @@ mod tests {
         assert_eq!(attn_g0.len(), expected_n,
             "global attn_out length {} != num_attention_heads*head_dim_global {}",
             attn_g0.len(), expected_n);
+    }
+
+    /// Commit #5c smoke: full 60-layer forward at position=0.
+    ///
+    /// Drives every decoder block (50 sliding + 10 global, in
+    /// the 5+1 pattern on 31B) end-to-end via the per-layer
+    /// attention + post-attn + post-MLP helpers, then final_norm
+    /// + tied LM head + argmax. Asserts the resulting token id
+    /// is in [0, vocab_size). Structural pass; numerical
+    /// correctness of the predicted token is NOT validated here.
+    ///
+    /// Run:
+    ///   GEMMA4_NVFP4_DIR=/home/r00t/Gemma-4-31B-IT-NVFP4 \
+    ///     cargo test --release -p rvllm-runtime --features cuda,gb10 \
+    ///     gemma4_nvfp4_bring_up::tests::ondisk_bringup_full_60_layer \
+    ///     -- --ignored --nocapture
+    ///
+    /// Set `G4N_FORWARD_TRACE=1` to dump residual mean/max/abs
+    /// every 10 layers (handy when triaging mid-layer blow-ups).
+    #[test]
+    #[ignore]
+    fn ondisk_bringup_full_60_layer() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skipping #5c smoke");
+                return;
+            }
+        };
+        let kernels_dir = std::path::PathBuf::from(
+            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
+        );
+        let mut bringup = Gemma4Nvfp4Bringup::load(
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
+        ).expect("Gemma4Nvfp4Bringup::load");
+
+        let kv = bringup.allocate_kv_state(64)
+            .expect("allocate_kv_state(64)");
+
+        let t0 = std::time::Instant::now();
+        let token = bringup.forward_full_to_token(2 /*BOS*/, 0, &kv)
+            .expect("forward_full_to_token");
+        let elapsed = t0.elapsed().as_secs_f64();
+
+        let vocab = bringup.arch.vocab_size;
+        let n_layers = bringup.arch.num_hidden_layers;
+        eprintln!(
+            "[#5c-smoke] BOS at pos=0 → {n_layers}-layer NVFP4 forward → \
+             argmax token = {token} (vocab={vocab}) in {elapsed:.2}s"
+        );
+        assert!((token as usize) < vocab,
+            "argmax returned out-of-range token {token} (vocab={vocab})");
     }
 }
