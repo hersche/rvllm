@@ -20,7 +20,7 @@ use axum::{
 use serde_json::json;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
 
-use crate::config::ServerConfig;
+use crate::config::{ModelFamily, ServerConfig};
 use crate::tokenize::TokenizerHandle;
 use crate::worker::WorkerHandle;
 
@@ -50,6 +50,17 @@ pub struct AppState {
     /// admission. Other archs (Qwen 3.6, Gemma 4) load vision
     /// unconditionally so this is always true for them.
     pub vision_loaded: bool,
+    /// Resolved model family. Operator's `--model-family` is
+    /// `Auto` by default; the family resolver in main.rs's
+    /// `resolve_model_family` pins this to the concrete arch.
+    /// Handlers use it for family-specific admission gates that
+    /// can't be expressed via `vision_arch` alone — Gemma4 fp8-
+    /// block and Gemma4Nvfp4 share the same vision tower
+    /// (`VisionArch::Gemma4`) but the NVFP4 path doesn't have
+    /// the splice wired yet, so vision/audio must reject early
+    /// at admission rather than burning a fetch + tokenize round
+    /// trip before the cuda_worker bounces the request.
+    pub resolved_family: ModelFamily,
 }
 
 /// Which vision tower the worker has loaded. Set once at startup

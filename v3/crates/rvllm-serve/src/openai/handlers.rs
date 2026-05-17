@@ -632,6 +632,27 @@ pub async fn chat_completions(
             "vision_not_loaded",
         ));
     }
+    // Stream-7 scaffold: Option B (Gemma4-NVFP4) shares the
+    // Gemma 4 vision tower tag via VisionArch::Gemma4 but the
+    // splice into the NVFP4 forward isn't wired yet. The
+    // cuda_worker already bounces this with a typed error; we
+    // reject at admission too so the request doesn't burn a
+    // vision fetch + tokenize round-trip before the bounce.
+    // Same rationale as the Mistral35-RVLLM_LOAD_VISION=0
+    // guard above.
+    if has_image_parts
+        && matches!(state.resolved_family,
+                    crate::config::ModelFamily::Gemma4Nvfp4)
+    {
+        return Err(ApiError::invalid_param(
+            "image input is not yet supported on the Gemma 4 NVFP4 \
+             (Option B) forward path — codex Stream-7. Use the \
+             fp8-block Gemma 4 profile for vision until the NVFP4 \
+             ViT splice + device-resident residual land.",
+            "messages",
+            "vision_not_supported_on_gemma4_nvfp4",
+        ));
+    }
     let vision_items: Vec<crate::worker::VisionItem> = if !has_image_parts {
         Vec::new()
     } else {
@@ -714,6 +735,22 @@ pub async fn chat_completions(
             .iter()
             .filter_map(|m| m.content.as_ref())
             .any(|c| c.audio_urls().next().is_some());
+        // Stream-7 scaffold: same as the vision early-reject
+        // above. Option B has no audio path (audio is
+        // E4B-it-only in production, separate from 31B). Reject
+        // before fetch.
+        if has_audio_parts
+            && matches!(state.resolved_family,
+                        crate::config::ModelFamily::Gemma4Nvfp4)
+        {
+            return Err(ApiError::invalid_param(
+                "audio input is not supported on the Gemma 4 NVFP4 \
+                 (Option B) path — 31B has no audio encoder. Use \
+                 the E4B-it profile for audio.",
+                "messages",
+                "audio_not_supported_on_gemma4_nvfp4",
+            ));
+        }
         if !audio_admitted || !has_audio_parts {
             Vec::new()
         } else {

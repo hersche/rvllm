@@ -200,6 +200,7 @@ async fn main() -> anyhow_compat::Result<()> {
     let state = AppState {
         config: config.clone(), tokenizer, worker, started_at,
         vision_arch, vision_loaded,
+        resolved_family: resolved.family,
     };
     let router = build_router(state);
 

@@ -78,6 +78,7 @@ fn try_build_state() -> Option<(AppState, std::thread::JoinHandle<()>)> {
         started_at: 0,
         vision_arch: rvllm_serve::router::VisionArch::Gemma4,
         vision_loaded: true,
+        resolved_family: rvllm_serve::ModelFamily::Gemma4,
     };
     Some((state, join))
 }
@@ -119,6 +120,7 @@ fn try_build_state_with_erroring_worker(
         started_at: 0,
         vision_arch: rvllm_serve::router::VisionArch::Gemma4,
         vision_loaded: true,
+        resolved_family: rvllm_serve::ModelFamily::Gemma4,
     };
     Some((state, join))
 }
