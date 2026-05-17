@@ -83,15 +83,25 @@ pub struct Gemma4Nvfp4KvState {
     pub max_pos: u32,
     /// Identity-block size. Always 1 in the bring-up.
     pub block_size: u32,
+    /// Maximum number of query tokens the metadata buffers
+    /// (positions / slot_mapping / context_lens) can hold per
+    /// forward call. The current decode path uses 1; #5f
+    /// chunked prefill bumps it. Capped at allocation; the
+    /// `g4n_fill_pos_slots_i32` kernel rejects fills beyond
+    /// this limit implicitly via grid sizing.
+    pub max_query_tokens: u32,
     /// `[max_pos]` i32 identity block table.
     pub block_tables_ptr: u64,
-    /// `[1]` i32 current context length. Caller writes
-    /// `position + 1` before each decode launch.
+    /// `[max_query_tokens]` i32 context lengths. Filled per
+    /// forward call by `g4n_fill_pos_slots_i32` on
+    /// `self.stream` — stream-ordered with the kernels that
+    /// read it.
     pub context_lens_ptr: u64,
-    /// `[1]` i32 current position; written before RoPE+KV write.
+    /// `[max_query_tokens]` i32 positions. Indexes the RoPE
+    /// cos/sin tables.
     pub positions_ptr: u64,
-    /// `[1]` i32 slot_mapping[0] = position; tells the
-    /// RoPE+KV-write kernel where to write the new K/V slot.
+    /// `[max_query_tokens]` i32 slot mapping. Where K/V are
+    /// written in the cache.
     pub slot_mapping_ptr: u64,
     /// `[1]` f32 fallback scalar Q scale (RVLLM_Q_SCALE; 2.0 in
     /// the production NVFP4 profile). The RoPE+KV-write kernel
@@ -124,18 +134,25 @@ impl Gemma4Nvfp4KvState {
         arena: &rvllm_mem::HbmArena<'_>,
         arch: &rvllm_loader::gemma4_arch::Gemma4Arch,
         max_pos: u32,
+        max_query_tokens: u32,
     ) -> Result<Self> {
         let block_size: u32 = 1;
+        if max_query_tokens == 0 {
+            return Err(corrupt_runtime_err(
+                "Gemma4Nvfp4KvState::allocate: max_query_tokens must be >= 1"
+                    .into()));
+        }
 
         let block_tables_region = arena.region(
             "gemma4_nvfp4_kv_block_tables",
             (max_pos as usize) * 4, 256)?;
+        let meta_bytes = (max_query_tokens as usize) * 4;
         let context_lens_region = arena.region(
-            "gemma4_nvfp4_kv_context_lens", 4, 16)?;
+            "gemma4_nvfp4_kv_context_lens", meta_bytes, 16)?;
         let positions_region = arena.region(
-            "gemma4_nvfp4_kv_positions", 4, 16)?;
+            "gemma4_nvfp4_kv_positions", meta_bytes, 16)?;
         let slot_mapping_region = arena.region(
-            "gemma4_nvfp4_kv_slot_mapping", 4, 16)?;
+            "gemma4_nvfp4_kv_slot_mapping", meta_bytes, 16)?;
         let q_scale_region = arena.region(
             "gemma4_nvfp4_kv_q_scale", 4, 16)?;
 
@@ -161,7 +178,9 @@ impl Gemma4Nvfp4KvState {
         let mut v_packed_layer_ptrs = Vec::with_capacity(arch.num_hidden_layers);
         let mut k_scale_layer_ptrs = Vec::with_capacity(arch.num_hidden_layers);
         let mut v_scale_layer_ptrs = Vec::with_capacity(arch.num_hidden_layers);
-        let mut total_bytes: u64 = (max_pos as u64) * 4 + 4 * 4; // tables + scalars
+        // block_tables[max_pos] + (positions+slot+context_lens)[max_query_tokens] + q_scale[1]
+        let mut total_bytes: u64 =
+            (max_pos as u64) * 4 + 3 * (max_query_tokens as u64) * 4 + 4;
 
         for layer_idx in 0..arch.num_hidden_layers {
             let lt = &arch.layer_types[layer_idx];
@@ -202,6 +221,7 @@ impl Gemma4Nvfp4KvState {
         Ok(Self {
             max_pos,
             block_size,
+            max_query_tokens,
             block_tables_ptr: block_tables_region.device_ptr(),
             context_lens_ptr: context_lens_region.device_ptr(),
             positions_ptr: positions_region.device_ptr(),
@@ -256,6 +276,12 @@ struct ForwardKernels {
     /// num_kv_heads (always true on Gemma 4 31B layers).
     #[allow(dead_code)]
     fn_attn_decode_gqa_bf16out: KernelFn,
+    /// `g4n_fill_pos_slots_i32_kernel` — device-side fill of the
+    /// per-token positions / slot_mapping / context_lens arrays.
+    /// Replaces sync-HtoD-on-default-stream scalar writes that
+    /// race with kernels on `self.stream`.
+    _fill_pos_slots_mod: LoadedModule,
+    fn_fill_pos_slots_i32: KernelFn,
 }
 
 /// Restores the arena to the post-load high-water mark when a forward
@@ -385,6 +411,11 @@ impl Gemma4Nvfp4Bringup {
         let fn_attn_decode_gqa_bf16out = attn_decode_mod
             .get_function("flash_attention_2_decode_nvfp4kv_gqa_bf16out_kernel")?;
 
+        // Floor commit 2 (stream-safe metadata).
+        let fill_pos_slots_mod = loader.load_ptx("g4n_fill_pos_slots_i32")?;
+        let fn_fill_pos_slots_i32 =
+            fill_pos_slots_mod.get_function("g4n_fill_pos_slots_i32_kernel")?;
+
         // MLP kernels (commit #3).
         let mlp_gemv_mod = loader.load_ptx("mistral35_w4a16_gemv_bf16")?;
         let fn_w4a16_gemv =
@@ -418,6 +449,8 @@ impl Gemma4Nvfp4Bringup {
             _attn_decode_mod: attn_decode_mod,
             fn_attn_decode_bf16out,
             fn_attn_decode_gqa_bf16out,
+            _fill_pos_slots_mod: fill_pos_slots_mod,
+            fn_fill_pos_slots_i32,
         };
         let forward_checkpoint = arena.checkpoint();
 
@@ -436,6 +469,63 @@ impl Gemma4Nvfp4Bringup {
             kv_state_allocated: false,
             _ctx: ctx,
         })
+    }
+
+    /// Stream-ordered fill of the per-token metadata buffers
+    /// (positions, slot_mapping, context_lens) via the
+    /// `g4n_fill_pos_slots_i32` kernel on `self.stream`. Replaces
+    /// the prior 3×sync-`cuMemcpyHtoD_v2`-on-default-stream
+    /// pattern that races with non-blocking compute (same race
+    /// as Qwen 3.6 hit on the legacy `pos_cl_region` path —
+    /// codex round-25/26 review).
+    ///
+    /// Caller responsibility: `num_tokens <= kv.max_query_tokens`.
+    /// The bounds check lives here so the launch is one atomic
+    /// invariant — fewer chances for an off-by-one at call sites.
+    fn fill_pos_slots(
+        &self,
+        kv: &Gemma4Nvfp4KvState,
+        position_offset: i32,
+        start_slot: i32,
+        num_tokens: i32,
+    ) -> Result<()> {
+        if (num_tokens as u32) > kv.max_query_tokens {
+            return Err(corrupt_runtime_err(format!(
+                "fill_pos_slots: num_tokens={num_tokens} > \
+                 kv.max_query_tokens={}",
+                kv.max_query_tokens)));
+        }
+        if num_tokens <= 0 {
+            return Err(corrupt_runtime_err(format!(
+                "fill_pos_slots: num_tokens={num_tokens} must be > 0")));
+        }
+        let mut positions: u64 = kv.positions_ptr;
+        let mut slot_mapping: u64 = kv.slot_mapping_ptr;
+        let mut context_lens: u64 = kv.context_lens_ptr;
+        let mut pos_off: i32 = position_offset;
+        let mut sslot: i32 = start_slot;
+        let mut n: i32 = num_tokens;
+        let args: [*mut core::ffi::c_void; 6] = [
+            (&mut positions)    as *mut u64 as *mut _,
+            (&mut slot_mapping) as *mut u64 as *mut _,
+            (&mut context_lens) as *mut u64 as *mut _,
+            (&mut pos_off)      as *mut i32 as *mut _,
+            (&mut sslot)        as *mut i32 as *mut _,
+            (&mut n)            as *mut i32 as *mut _,
+        ];
+        const BLOCK: u32 = 256;
+        let grid_x: u32 = ((num_tokens as u32) + BLOCK - 1) / BLOCK;
+        unsafe {
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_fill_pos_slots_i32,
+                (grid_x, 1, 1),
+                (BLOCK, 1, 1),
+                0,
+                self.stream.raw(),
+                &args,
+            )?;
+        }
+        Ok(())
     }
 
     fn forward_scratch_guard(&self) -> ForwardScratchGuard<'_> {
@@ -462,6 +552,19 @@ impl Gemma4Nvfp4Bringup {
     /// supports up to 262144 but rope-table memory grows
     /// linearly).
     pub fn allocate_kv_state(&mut self, max_pos: u32) -> Result<Gemma4Nvfp4KvState> {
+        // Default per-forward chunk size matches single-token decode.
+        // #5f raises this once chunked prefill is wired.
+        self.allocate_kv_state_with_chunk(max_pos, 1)
+    }
+
+    /// Variant that lets the caller pre-size the metadata buffers
+    /// (positions / slot_mapping / context_lens) for chunked
+    /// prefill. The decode-only path uses `max_query_tokens = 1`
+    /// via `allocate_kv_state`; #5f prefill bumps it to the
+    /// configured chunk size.
+    pub fn allocate_kv_state_with_chunk(
+        &mut self, max_pos: u32, max_query_tokens: u32,
+    ) -> Result<Gemma4Nvfp4KvState> {
         if self.kv_state_allocated {
             return Err(corrupt_runtime_err(
                 "allocate_kv_state called twice: arena would leak the first \
@@ -472,7 +575,8 @@ impl Gemma4Nvfp4Bringup {
                     .to_string(),
             ));
         }
-        let kv = Gemma4Nvfp4KvState::allocate(&self.arena, &self.arch, max_pos)?;
+        let kv = Gemma4Nvfp4KvState::allocate(
+            &self.arena, &self.arch, max_pos, max_query_tokens)?;
         // Re-anchor scratch rewinds above the KV state.
         self.forward_checkpoint = self.arena.checkpoint();
         self.kv_state_allocated = true;
@@ -1709,27 +1813,16 @@ impl Gemma4Nvfp4Bringup {
             sin_region.copy_from_host(sb)?;
         }
 
-        // Write i32 scalars into the persistent KV state buffers.
-        //   positions[0] = 0    (mini-table is 1 row at index 0)
-        //   slot_mapping[0] = position  (actual cache slot to write)
-        //   context_lens[0] = position + 1  (decoder reads this)
-        let write_i32_devptr = |dst: u64, val: i32| -> Result<()> {
-            let bytes = val.to_le_bytes();
-            unsafe {
-                use cudarc::driver::sys::*;
-                let rc = cuMemcpyHtoD_v2(dst, bytes.as_ptr() as *const _, 4);
-                if rc != CUresult::CUDA_SUCCESS {
-                    return Err(RvllmError::cuda(
-                        "forward_layer0_attn: kv state HtoD",
-                        CudaErrorKind::MemcpyFailed,
-                        CudaCtx::setup()));
-                }
-            }
-            Ok(())
-        };
-        write_i32_devptr(kv.positions_ptr,     0)?;
-        write_i32_devptr(kv.slot_mapping_ptr,  position as i32)?;
-        write_i32_devptr(kv.context_lens_ptr,  (position as i32) + 1)?;
+        // Per-token metadata fill via stream-ordered kernel. The
+        // mini-table mode uses positions[t] = t (kernel reads
+        // cos_table[positions[t] * half_rotary + freq] and the
+        // per-launch table holds rows for actual positions).
+        // slot_mapping/context_lens use absolute slots.
+        self.fill_pos_slots(kv,
+            /*position_offset=*/0,
+            /*start_slot=*/position as i32,
+            /*num_tokens=*/1,
+        )?;
 
         // ---- 5. Launch RoPE + NVFP4 K/V write + FP8 Q ---------------------
         // Layer 0 is sliding; pick the layer-0 KV pointers.
@@ -2205,22 +2298,14 @@ impl Gemma4Nvfp4Bringup {
             cos_region.copy_from_host(cb)?;
             sin_region.copy_from_host(sb)?;
         }
-        let write_i32_devptr = |dst: u64, val: i32| -> Result<()> {
-            let bytes = val.to_le_bytes();
-            unsafe {
-                use cudarc::driver::sys::*;
-                let rc = cuMemcpyHtoD_v2(dst, bytes.as_ptr() as *const _, 4);
-                if rc != CUresult::CUDA_SUCCESS {
-                    return Err(RvllmError::cuda(
-                        "forward_layer_attn_from_residual: kv state HtoD",
-                        CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
-                }
-            }
-            Ok(())
-        };
-        write_i32_devptr(kv.positions_ptr,    0)?;
-        write_i32_devptr(kv.slot_mapping_ptr, position as i32)?;
-        write_i32_devptr(kv.context_lens_ptr, (position as i32) + 1)?;
+        // Stream-ordered metadata fill (see fill_pos_slots
+        // docstring + g4n_fill_pos_slots_i32.cu for the race
+        // this replaces).
+        self.fill_pos_slots(kv,
+            /*position_offset=*/0,
+            /*start_slot=*/position as i32,
+            /*num_tokens=*/1,
+        )?;
 
         // -- RoPE + NVFP4 K/V write + FP8 Q launch -----------------------
         let k_packed = kv.k_packed_layer_ptrs[layer_idx];
