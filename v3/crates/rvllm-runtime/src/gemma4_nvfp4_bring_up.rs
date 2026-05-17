@@ -328,6 +328,197 @@ impl Gemma4Nvfp4Bringup {
         Ok((q_normed, k_normed, v_f32))
     }
 
+    /// Layer-0 MLP block close-out:
+    ///   h_normed   = pre_feedforward_layernorm(h_residual)
+    ///   mlp_out    = down(gelu_tanh(gate(h_normed)) * up(h_normed))   // commit #3
+    ///   mlp_normed = post_feedforward_layernorm(mlp_out)
+    ///   h_residual += mlp_normed * layer_scalar
+    ///
+    /// `layer_scalar` is a learned per-layer f32 scalar (~0.09
+    /// for 31B layer 0). It scales the MLP contribution before
+    /// the residual add. Codex C2 confirmed this scalar is only
+    /// applied AFTER the MLP block, never after attention.
+    ///
+    /// For commit #4f's smoke, `h_residual_bf16_host` is the
+    /// post-attention residual (synthetic 0.01 or the output
+    /// from `forward_layer0_post_attn`). Returns the updated
+    /// residual after the MLP block.
+    pub fn forward_layer0_post_attn_mlp(
+        &self,
+        h_residual_bf16_host: &[u16], // [hidden]
+    ) -> Result<Vec<f32>> {
+        let layer0 = &self.model.layers[0];
+        let hidden = self.arch.hidden_size as u32;
+        let intermediate = self.arch.intermediate_size as u32;
+        if h_residual_bf16_host.len() != hidden as usize {
+            return Err(rvllm_core::RvllmError::cuda(
+                "forward_layer0_post_attn_mlp: h_residual length != hidden",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+
+        // h_residual stays as bf16 on device. h_normed is a
+        // SEPARATE bf16 buffer (pre_ff_norm is NOT in-place on
+        // the residual — the residual is preserved for the final
+        // add). MLP scratch is [2 * intermediate] bf16. mlp_out
+        // is [hidden] bf16.
+        let h_residual_region = self.arena.region(
+            "gemma4_nvfp4_post_attn_mlp_resid",
+            (hidden as usize) * 2, 256)?;
+        let h_normed_region = self.arena.region(
+            "gemma4_nvfp4_post_attn_mlp_normed",
+            (hidden as usize) * 2, 256)?;
+        let scratch_region = self.arena.region(
+            "gemma4_nvfp4_post_attn_mlp_scratch",
+            (2 * intermediate as usize) * 2, 256)?;
+        let mlp_out_region = self.arena.region(
+            "gemma4_nvfp4_post_attn_mlp_out",
+            (hidden as usize) * 2, 256)?;
+
+        unsafe {
+            // Upload h_residual; copy to h_normed so the
+            // RMSNorm-in-place writes into h_normed, leaving
+            // h_residual intact for the final add.
+            let r: &[u8] = std::slice::from_raw_parts(
+                h_residual_bf16_host.as_ptr() as *const u8,
+                h_residual_bf16_host.len() * 2);
+            h_residual_region.copy_from_host(r)?;
+            h_normed_region.copy_from_host(r)?;
+        }
+        let stream_u64 = self.stream.raw();
+
+        // (1) pre_feedforward_layernorm in-place on h_normed.
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+            }
+            .launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                h_normed_region.device_ptr(),
+                layer0.pre_feedforward_layernorm.offset_bytes,
+                stream_u64,
+            )?;
+        }
+
+        // (2) MLP forward via commit #3 helper. gate_up_fused
+        //     writes [intermediate] gate + [intermediate] up
+        //     into scratch; gelu_tanh_mul writes back into the
+        //     gate slot; down_proj reads from there and writes
+        //     [hidden] into mlp_out.
+        unsafe {
+            crate::gemma4_nvfp4_ops::gemma4_nvfp4_mlp_forward(
+                &self.mlp_kernels,
+                h_normed_region.device_ptr(),
+                mlp_out_region.device_ptr(),
+                &layer0.gate_proj,
+                &layer0.up_proj,
+                &layer0.down_proj,
+                scratch_region.device_ptr(),
+                stream_u64,
+            )?;
+        }
+
+        // (3) post_feedforward_layernorm in-place on mlp_out.
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+            }
+            .launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                mlp_out_region.device_ptr(),
+                layer0.post_feedforward_layernorm.offset_bytes,
+                stream_u64,
+            )?;
+        }
+
+        // (4) Read mlp_normed back to host, scale by layer_scalar
+        //     (host-side because there's no scale_inplace_bf16
+        //     kernel and the scalar is a single f32). Re-upload
+        //     into mlp_out_region.
+        let mut mlp_normed_bf16 = vec![0u16; hidden as usize];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                mlp_normed_bf16.as_mut_ptr() as *mut _,
+                mlp_out_region.device_ptr(),
+                (hidden as usize) * 2,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "post_attn_mlp: mlp_normed DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        // Pull layer_scalar value off device. It's a bf16 [1]
+        // value uploaded by the loader; one DtoH of 2 bytes.
+        let mut scalar_bf16 = [0u16; 1];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                scalar_bf16.as_mut_ptr() as *mut _,
+                layer0.layer_scalar.offset_bytes,
+                2,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "post_attn_mlp: layer_scalar DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let layer_scalar_f32 = f32::from_bits((scalar_bf16[0] as u32) << 16);
+
+        // Scale + narrow back to bf16. RTNE narrow.
+        let scaled_bf16: Vec<u16> = mlp_normed_bf16.iter().map(|&b| {
+            let v = f32::from_bits((b as u32) << 16) * layer_scalar_f32;
+            let bits = v.to_bits();
+            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+            (rounded >> 16) as u16
+        }).collect();
+        unsafe {
+            let s: &[u8] = std::slice::from_raw_parts(
+                scaled_bf16.as_ptr() as *const u8, scaled_bf16.len() * 2);
+            mlp_out_region.copy_from_host(s)?;
+        }
+
+        // (5) Residual add: h_residual += mlp_normed * layer_scalar.
+        //     mlp_out_region NOW holds the scaled mlp_normed.
+        unsafe {
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }
+                .launch(
+                    self.forward_kernels.fn_vector_add_bf16,
+                    h_residual_region.device_ptr(),
+                    mlp_out_region.device_ptr(),
+                    stream_u64,
+                )?;
+        }
+        self.stream.fence()?;
+
+        let mut h_out_bf16 = vec![0u16; hidden as usize];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                h_out_bf16.as_mut_ptr() as *mut _,
+                h_residual_region.device_ptr(),
+                (hidden as usize) * 2,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "post_attn_mlp: h_out DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(h_out_bf16.iter().map(|&b| {
+            f32::from_bits((b as u32) << 16)
+        }).collect())
+    }
+
     /// Layer-0 post-attention close-out: o_proj +
     /// post_attention_layernorm + residual add. Given a
     /// synthetic `attn_out_bf16` and `h_residual_bf16` (each
@@ -1171,5 +1362,72 @@ mod tests {
             "post_attn h_out mean_abs={mean_abs} implausibly large");
         assert!(diff_mean_abs < 100.0,
             "post_attn delta mean_abs={diff_mean_abs} implausibly large");
+    }
+
+    /// Commit #4f smoke: MLP-block composition on layer 0.
+    /// Pre_ff_norm → MLP (commit #3) → post_ff_norm → residual
+    /// add with layer_scalar. Synthetic 0.01 bf16 input.
+    #[test]
+    #[ignore]
+    fn ondisk_bringup_post_attn_mlp() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skipping mlp_block smoke");
+                return;
+            }
+        };
+        let kernels_dir = std::path::PathBuf::from(
+            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
+        );
+        let bringup = Gemma4Nvfp4Bringup::load(
+            &dir, 32 * 1024 * 1024 * 1024, &kernels_dir,
+        ).expect("Gemma4Nvfp4Bringup::load");
+
+        let hidden = bringup.arch.hidden_size;
+        let bf16_0_01: u16 = 0x3C23;
+        let h_in: Vec<u16> = vec![bf16_0_01; hidden];
+        let h_in_f32: Vec<f32> = h_in.iter().map(|&b| {
+            f32::from_bits((b as u32) << 16)
+        }).collect();
+
+        let h_out = bringup.forward_layer0_post_attn_mlp(&h_in)
+            .expect("forward_layer0_post_attn_mlp");
+
+        let nan = h_out.iter().filter(|x| x.is_nan()).count();
+        let inf = h_out.iter().filter(|x| x.is_infinite()).count();
+        let mean_abs: f32 = h_out.iter().map(|x| x.abs()).sum::<f32>()
+                          / (hidden as f32);
+        let max_abs: f32 = h_out.iter().fold(0f32, |a, &x| a.max(x.abs()));
+        let diff: Vec<f32> = h_out.iter().zip(h_in_f32.iter())
+            .map(|(o, i)| o - i)
+            .collect();
+        let diff_mean_abs: f32 = diff.iter().map(|x| x.abs()).sum::<f32>()
+                              / (hidden as f32);
+        let diff_max_abs: f32 = diff.iter().fold(0f32, |a, &x| a.max(x.abs()));
+
+        eprintln!(
+            "[mlp-block-smoke] hidden={hidden}\n  \
+             h_out: nan={nan} inf={inf} mean_abs={mean_abs:.6} max_abs={max_abs:.6}\n  \
+             delta (mlp_normed * layer_scalar): \
+             mean_abs={diff_mean_abs:.6} max_abs={diff_max_abs:.6}\n  \
+             first4_in=0.01 first4_out={:?}",
+            &h_out[..4],
+        );
+
+        assert_eq!(nan, 0, "mlp_block produced NaN");
+        assert_eq!(inf, 0, "mlp_block produced Inf");
+        assert!(diff_mean_abs > 1e-7,
+            "mlp_block delta=0 — residual add did nothing");
+        // layer_scalar≈0.0894 means the MLP contribution is
+        // small relative to whatever post_ff_norm would normally
+        // produce (~mean_gamma=1.39). diff_mean_abs upper bound
+        // is roughly layer_scalar * gamma ≈ 0.12. Allow wide
+        // headroom — real MLP output for 0.01 input is much
+        // smaller than the trained-on activation magnitudes.
+        assert!(diff_mean_abs < 100.0,
+            "mlp_block delta mean_abs={diff_mean_abs} implausibly large");
+        assert!(mean_abs < 100.0,
+            "mlp_block h_out mean_abs={mean_abs} implausibly large");
     }
 }
