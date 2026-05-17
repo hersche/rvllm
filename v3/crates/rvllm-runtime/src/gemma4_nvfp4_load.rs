@@ -168,11 +168,18 @@ pub fn upload_gemma4_nvfp4_linear(
         )));
     }
     let ws2_f32 = f32::from_le_bytes([ws2_raw[0], ws2_raw[1], ws2_raw[2], ws2_raw[3]]);
-    let alpha_f32 = if ws2_f32.is_finite() && ws2_f32 != 0.0 {
-        1.0_f32 / ws2_f32
-    } else {
-        ws2_f32 // propagate NaN / 0 so the kernel-side guard trips
-    };
+    // Gemma 4 modelopt NVFP4 stores weight_scale_2 ALREADY in
+    // decode form (e.g. ~9.7e-5 for layer-0 gate_proj, matches
+    // Mistral 3.5's 1/gs_disk ≈ 8e-5 — same magnitude class).
+    // The Mistral kernel expects `alpha = decode form` and uses
+    // it as `w_dequant = fp4 * scale_block * alpha`. So we
+    // forward weight_scale_2 verbatim, no reciprocal.
+    //
+    // Earlier draft applied 1/ws2, which doubled the encode-form
+    // ratio and produced ~1e20 MLP outputs on the layer-0
+    // smoke. Hardware-bisected 2026-05-17 via
+    // gemma4_nvfp4_ops::tests::ondisk_layer0_mlp_smoke.
+    let alpha_f32 = ws2_f32;
     let gs_region = arena.region("gemma4_nvfp4_w_global_scale", 4, 4)?;
     unsafe { gs_region.copy_from_host(&alpha_f32.to_le_bytes())? };
     let global_scale_ptr = gs_region.device_ptr();
