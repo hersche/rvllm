@@ -760,21 +760,205 @@ pub async fn spawn_cuda_worker(
             // skip the probe; under Auto fall back to the marker
             // probe. `Gemma4` selection short-circuits straight to the
             // Gemma 4 loader.
-            // Gemma4Nvfp4 — Phase 3c not yet wired into cuda_worker.
-            // Fail early with a clear message so an operator who
-            // points the server at the NVFP4 checkpoint gets a
-            // useful error instead of a silent fall-through to the
-            // fp8-block loader (which would crash on tensor name
-            // mismatch). Loader chain itself is validated by the
-            // gemma4_nvfp4_load integration test.
+            // Gemma4Nvfp4 — Option B native NVFP4-weights + NVFP4-KV
+            // text-only worker. Floor → #5f sequence (commits
+            // bc89650..d152cc9) wired the 60-layer forward and
+            // multi-token prompt processing. This branch makes it
+            // servable via the OpenAI API for the first time.
+            //
+            // Scope of this commit (codex Stream-5+6+7 review,
+            // "fix current blocker"): greedy-only, text-only,
+            // no spec-decode, no vision/audio. Each rejection has a
+            // typed error message pointing at the corresponding
+            // stream that lifts it.
             if matches!(family, ModelFamily::Gemma4Nvfp4) {
-                let _ = ready_tx.send(Err(
-                    "Gemma4-NVFP4 forward path is not yet implemented \
-                     (Phase 3c+). Loader is done; see \
-                     rvllm_runtime::gemma4_nvfp4_load. Use the fp8-block \
-                     Gemma 4 checkpoint at /home/r00t/.vllm/models/gemma-4-31b-it-fp8-block \
-                     until Phase 3c lands.".to_string(),
-                ));
+                use rvllm_runtime::gemma4_nvfp4_bring_up::Gemma4Nvfp4Bringup;
+                if spec_decode {
+                    let _ = ready_tx.send(Err(
+                        "RVLLM_GEMMA4_SPEC_DECODE=1 is not yet supported on \
+                         the Option B Gemma4-NVFP4 path. Spec-decode wiring \
+                         (BaseKvSource trait + drafter cross-attn over the \
+                         NVFP4 KV layout) is codex Stream-6a; see \
+                         rvllm-serve/CLAUDE.md for the staging. Unset the \
+                         env to start text-only.".to_string(),
+                    ));
+                    return;
+                }
+                // Tracking — keep these fields alive even when
+                // unused on this branch; spec wiring lands in
+                // codex Stream-6a.
+                let _: &PathBuf = &spec_drafter_dir;
+                let _: &WorkerSpecDecode = &spec_cfg;
+                // Conservative max_pos cap for KV cache. The
+                // checkpoint advertises max_position_embeddings =
+                // 262144 but per-layer NVFP4 KV at that cap would
+                // be O(60 GiB). 4096 matches the production NVFP4
+                // smoke profile and fits comfortably alongside the
+                // ~22 GiB of model weights in a 40 GiB arena.
+                const G4N_KV_MAX_POS: u32 = 4096;
+                let mut bringup = match Gemma4Nvfp4Bringup::load(
+                    &paths.model_dir, arena_bytes, &paths.kernels_dir,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "Gemma4Nvfp4Bringup::load: {e:?}"
+                        )));
+                        return;
+                    }
+                };
+                let kv = match bringup.allocate_kv_state(G4N_KV_MAX_POS) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "Gemma4Nvfp4Bringup::allocate_kv_state: {e:?}"
+                        )));
+                        return;
+                    }
+                };
+                let _ = ready_tx.send(Ok(()));
+                tracing::info!(
+                    "gemma4-nvfp4 worker ready (Option B native; \
+                     max_pos={G4N_KV_MAX_POS}, vocab={}, hidden={}, \
+                     layers={}). Greedy/text-only this commit.",
+                    bringup.arch.vocab_size,
+                    bringup.arch.hidden_size,
+                    bringup.arch.num_hidden_layers,
+                );
+
+                while let Some(req) = req_rx.blocking_recv() {
+                    let prompt_len = req.prompt_ids.len() as u32;
+                    if req.prompt_ids.is_empty() {
+                        let _ = req.events_tx.send(GenerateEvent::Error(
+                            "gemma4-nvfp4: empty prompt".to_string()));
+                        continue;
+                    }
+                    if !req.sampling.is_greedy() {
+                        let _ = req.events_tx.send(GenerateEvent::Error(
+                            "gemma4-nvfp4 path: non-greedy sampling \
+                             (temperature>0 / top_p<1 / top_k / seed) \
+                             is not yet supported. Set temperature=0 \
+                             explicitly, or omit it. Sampling lands once \
+                             logits-out + sampler are wired."
+                                .to_string()));
+                        continue;
+                    }
+                    if !req.vision_items.is_empty()
+                        || !req.vision_slots.is_empty()
+                        || !req.audio_items.is_empty()
+                        || !req.audio_slots.is_empty()
+                    {
+                        let _ = req.events_tx.send(GenerateEvent::Error(
+                            "gemma4-nvfp4 path: vision and audio are not \
+                             yet wired on the Option B forward (codex \
+                             Stream-7 — text-only this commit)."
+                                .to_string()));
+                        continue;
+                    }
+                    if req.cancelled.load(Ordering::Relaxed) {
+                        let _ = req.events_tx.send(GenerateEvent::Done {
+                            finish: FinishReason::Cancelled,
+                            prompt_tokens: prompt_len,
+                            completion_tokens: 0,
+                        });
+                        continue;
+                    }
+                    // Prompt overflow guard: we own one KV state for
+                    // the worker's lifetime (no per-request reset
+                    // yet — rollback on completion uses
+                    // context_lens-only, but with text-only +
+                    // greedy + no spec there's no rollback to do).
+                    // Conservative reject when the prompt+decode
+                    // would exceed the KV cap.
+                    let max_new = req.max_new_tokens.max(1);
+                    if (prompt_len as u32) + max_new > G4N_KV_MAX_POS {
+                        let _ = req.events_tx.send(GenerateEvent::Error(
+                            format!(
+                                "gemma4-nvfp4: prompt_len({prompt_len}) + \
+                                 max_new_tokens({max_new}) exceeds \
+                                 max_pos({G4N_KV_MAX_POS}). Raise \
+                                 G4N_KV_MAX_POS or shorten the prompt."
+                            )));
+                        continue;
+                    }
+
+                    // Stop tokens: union of the request's
+                    // stop_token_ids with the model's EOS (Gemma 4
+                    // EOS = 106 per the tokenizer). Empty
+                    // stop_token_ids on the request still triggers
+                    // EOS-only stop.
+                    let stop_set: std::collections::HashSet<u32> =
+                        req.stop_token_ids.iter().copied().chain([106u32]).collect();
+
+                    // Prefill all prompt tokens at position 0. The
+                    // first generation token is what
+                    // forward_prompt_to_token returns (argmax of
+                    // the last prompt token's final residual).
+                    let next_first = match bringup.forward_prompt_to_token(
+                        &req.prompt_ids, 0, &kv,
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let _ = req.events_tx.send(GenerateEvent::Error(
+                                format!("forward_prompt_to_token: {e:?}")));
+                            continue;
+                        }
+                    };
+                    let _ = req.events_tx.send(GenerateEvent::Token {
+                        id: next_first,
+                        position: 0,
+                    });
+
+                    let mut completion_tokens: u32 = 1;
+                    let mut finish = FinishReason::Length;
+                    if stop_set.contains(&next_first) {
+                        finish = FinishReason::Stop;
+                    } else {
+                        // Decode loop: feed last token at the next
+                        // position, get its successor, emit, until
+                        // EOS / stop / max_new / cancellation.
+                        let mut last_token = next_first;
+                        for step in 1..max_new {
+                            if req.cancelled.load(Ordering::Relaxed) {
+                                finish = FinishReason::Cancelled;
+                                break;
+                            }
+                            let position = prompt_len + (step - 1);
+                            let next = match bringup.forward_full_to_token(
+                                last_token, position, &kv,
+                            ) {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    let _ = req.events_tx.send(GenerateEvent::Error(
+                                        format!("forward_full_to_token: {e:?}")));
+                                    break;
+                                }
+                            };
+                            let _ = req.events_tx.send(GenerateEvent::Token {
+                                id: next,
+                                position: step,
+                            });
+                            completion_tokens += 1;
+                            if stop_set.contains(&next) {
+                                finish = FinishReason::Stop;
+                                break;
+                            }
+                            last_token = next;
+                        }
+                    }
+                    let _ = req.events_tx.send(GenerateEvent::Done {
+                        finish,
+                        prompt_tokens: prompt_len,
+                        completion_tokens,
+                    });
+                    // No arena restore — Option B's forward methods
+                    // already use ForwardScratchGuard per call which
+                    // rewinds to the post-allocate_kv_state
+                    // checkpoint. KV state itself persists for the
+                    // worker's lifetime; commit 2 of codex's
+                    // Stream-5+6+7 plan (BaseKvSource) will
+                    // generalize this for the spec rollback path.
+                }
                 return;
             }
 
