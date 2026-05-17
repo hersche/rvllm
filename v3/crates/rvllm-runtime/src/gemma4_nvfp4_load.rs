@@ -500,3 +500,91 @@ fn corrupt(detail: String) -> RvllmError {
         bt: std::backtrace::Backtrace::capture(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GPU smoke: opens the on-disk NVFP4 checkpoint and uploads
+    /// just layer 0 (~330 MB on device, small enough to coexist
+    /// with a running rvllm-serve on GB10's unified memory). Proves
+    /// the Phase 2 + 3a upload chain works end-to-end on hardware
+    /// without disturbing production.
+    ///
+    /// Run:  GEMMA4_NVFP4_DIR=/home/r00t/Gemma-4-31B-IT-NVFP4 \
+    ///       cargo test -p rvllm-runtime --features cuda \
+    ///         gemma4_nvfp4_load::tests::ondisk_layer0_upload \
+    ///         -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ondisk_layer0_upload_smoke() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skipping GPU smoke");
+                return;
+            }
+        };
+        let arch = rvllm_loader::gemma4_arch::Gemma4Arch::from_dir(&dir)
+            .expect("Gemma4Arch::from_dir");
+        eprintln!(
+            "[gpu-smoke] arch: layers={} hidden={} intermediate={} prefix={}",
+            arch.num_hidden_layers, arch.hidden_size, arch.intermediate_size,
+            arch.weight_prefix,
+        );
+
+        // 512 MiB arena — fits layer 0 with headroom; leaves rvllm-
+        // serve's working set undisturbed on GB10 (unified memory,
+        // ~70 GB free with prod active).
+        let ctx = rvllm_mem::context::CudaContextHandle::init(0)
+            .expect("CudaContextHandle::init");
+        let arena = rvllm_mem::HbmArena::new(&ctx, 512 * 1024 * 1024)
+            .expect("HbmArena::new");
+
+        let pool = Gemma4Nvfp4ShardPool::open(&dir).expect("ShardPool::open");
+        eprintln!("[gpu-smoke] pool open: {} tensors, {} shards",
+                  pool.tensors.len(), pool.mmaps.len());
+
+        let layer0 = upload_gemma4_nvfp4_layer(&arena, &pool, &arch, 0)
+            .expect("upload_gemma4_nvfp4_layer(0)");
+        eprintln!(
+            "[gpu-smoke] layer 0 uploaded: \n  \
+             input_ln.shape={:?}\n  \
+             q_proj.shape={:?}\n  \
+             k_proj.shape={:?}\n  \
+             v_proj.shape={:?}\n  \
+             gate_proj.shape=N={} K={}\n  \
+             gate_proj.packed_ptr=0x{:x} sfb_natural_ptr=0x{:x}\n  \
+             gate_proj.global_scale_ptr=0x{:x} input_scale_ptr=0x{:x}\n  \
+             down_proj.packed_bytes={}",
+            layer0.input_layernorm.shape,
+            layer0.q_proj.shape,
+            layer0.k_proj.shape,
+            layer0.v_proj.as_ref().map(|w| &w.shape),
+            layer0.gate_proj.shape.n, layer0.gate_proj.shape.k,
+            layer0.gate_proj.packed_ptr, layer0.gate_proj.sfb_natural_ptr,
+            layer0.gate_proj.global_scale_ptr, layer0.gate_proj.input_scale_ptr,
+            layer0.down_proj.packed_bytes,
+        );
+
+        // Sanity: every device pointer must be non-zero (HbmArena
+        // never returns zero on a successful allocation), and
+        // packed/scale byte counts must match the on-disk values.
+        for (name, lin) in [
+            ("gate", &layer0.gate_proj),
+            ("up",   &layer0.up_proj),
+            ("down", &layer0.down_proj),
+        ] {
+            assert!(lin.packed_ptr != 0, "{name}: packed_ptr is null");
+            assert!(lin.sfb_natural_ptr != 0, "{name}: sfb_natural_ptr is null");
+            assert!(lin.global_scale_ptr != 0, "{name}: global_scale_ptr is null");
+            assert!(lin.input_scale_ptr != 0, "{name}: input_scale_ptr is null");
+            assert_eq!(lin.packed_bytes, lin.shape.packed_bytes(),
+                       "{name}: packed_bytes != shape.packed_bytes()");
+        }
+        assert!(layer0.q_proj.offset_bytes != 0, "q_proj.offset_bytes is null");
+        assert!(layer0.k_proj.offset_bytes != 0, "k_proj.offset_bytes is null");
+        assert!(layer0.o_proj.offset_bytes != 0, "o_proj.offset_bytes is null");
+        eprintln!("[gpu-smoke] all pointers non-null + byte counts match");
+    }
+}
