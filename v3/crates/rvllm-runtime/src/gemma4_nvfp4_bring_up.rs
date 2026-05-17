@@ -328,6 +328,167 @@ impl Gemma4Nvfp4Bringup {
         Ok((q_normed, k_normed, v_f32))
     }
 
+    /// Layer-0 post-attention close-out: o_proj +
+    /// post_attention_layernorm + residual add. Given a
+    /// synthetic `attn_out_bf16` and `h_residual_bf16` (each
+    /// [hidden]), returns the updated residual after applying
+    /// `h += post_attn_norm(o_proj(attn_out))`.
+    ///
+    /// The real attention math (softmax(QK^T)V) lands with the
+    /// KV cache in commit #5. For #4e the synthetic inputs let
+    /// us validate the o_proj + norm + residual chain without
+    /// depending on that.
+    ///
+    /// Per codex round-3 C1: Gemma 4 places post_attention_
+    /// layernorm BETWEEN o_proj and residual (not before
+    /// residual like Llama). layer_scalar is NOT applied here —
+    /// it only multiplies after the MLP block.
+    /// residual_weight (arch field, 1.0 on 31B) is conceptually
+    /// in the residual add but a no-op at value 1.0.
+    pub fn forward_layer0_post_attn(
+        &self,
+        attn_out_bf16_host: &[u16], // [N_q]
+        h_residual_bf16_host: &[u16], // [hidden]
+    ) -> Result<Vec<f32>> {
+        let layer0 = &self.model.layers[0];
+        let n_q = layer0.o_proj.shape[1] as i32; // o_proj is [hidden, N_q]
+        let hidden = self.arch.hidden_size as u32;
+        if attn_out_bf16_host.len() != n_q as usize {
+            return Err(rvllm_core::RvllmError::cuda(
+                "forward_layer0_post_attn: attn_out length != N_q",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        if h_residual_bf16_host.len() != hidden as usize {
+            return Err(rvllm_core::RvllmError::cuda(
+                "forward_layer0_post_attn: h_residual length != hidden",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+
+        // Upload synthetic inputs.
+        let attn_in_region = self.arena.region(
+            "gemma4_nvfp4_post_attn_in",
+            attn_out_bf16_host.len() * 2, 256)?;
+        let residual_region = self.arena.region(
+            "gemma4_nvfp4_post_attn_resid",
+            h_residual_bf16_host.len() * 2, 256)?;
+        let o_f32_region = self.arena.region(
+            "gemma4_nvfp4_post_attn_o_f32",
+            (hidden as usize) * 4, 256)?;
+        let o_bf16_region = self.arena.region(
+            "gemma4_nvfp4_post_attn_o_bf16",
+            (hidden as usize) * 2, 256)?;
+        unsafe {
+            let a: &[u8] = std::slice::from_raw_parts(
+                attn_out_bf16_host.as_ptr() as *const u8,
+                attn_out_bf16_host.len() * 2);
+            let r: &[u8] = std::slice::from_raw_parts(
+                h_residual_bf16_host.as_ptr() as *const u8,
+                h_residual_bf16_host.len() * 2);
+            attn_in_region.copy_from_host(a)?;
+            residual_region.copy_from_host(r)?;
+        }
+        let stream_u64 = self.stream.raw();
+
+        // (1) o_proj: bf16 attn_out [1, N_q] @ bf16 o_proj weight
+        //     [hidden, N_q]^T → f32 [1, hidden].
+        unsafe {
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt,
+                attn_in_region.device_ptr(),
+                layer0.o_proj.offset_bytes,
+                o_f32_region.device_ptr(),
+                1, hidden as i32, n_q, stream_u64,
+            )?;
+        }
+        self.stream.fence()?;
+
+        // (2) Narrow f32 → bf16 on host (commit #4c convention).
+        //     Read f32 back, narrow, re-upload as bf16 into
+        //     o_bf16_region. GPU f32_to_bf16 wiring is a
+        //     follow-up — codex round-3 B2 captures the kernel.
+        let mut o_f32_host: Vec<f32> = vec![0.0; hidden as usize];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                o_f32_host.as_mut_ptr() as *mut _,
+                o_f32_region.device_ptr(),
+                (hidden as usize) * 4,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "post_attn: o f32 DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let o_bf16_host: Vec<u16> = o_f32_host.iter().map(|&x| {
+            let bits = x.to_bits();
+            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+            (rounded >> 16) as u16
+        }).collect();
+        unsafe {
+            let b: &[u8] = std::slice::from_raw_parts(
+                o_bf16_host.as_ptr() as *const u8,
+                o_bf16_host.len() * 2);
+            o_bf16_region.copy_from_host(b)?;
+        }
+
+        // (3) post_attention_layernorm in-place on o_bf16_region.
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+            }
+            .launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                o_bf16_region.device_ptr(),
+                layer0.post_attention_layernorm.offset_bytes,
+                stream_u64,
+            )?;
+        }
+
+        // (4) Residual add: h_residual += normed_o (both bf16).
+        //     residual_weight is 1.0 on 31B (verified at arch
+        //     parse) — vector_add_bf16 implements `dst += src`
+        //     which is what we want for weight=1.0. A future
+        //     scaled-residual kernel handles weight!=1.0.
+        unsafe {
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }
+                .launch(
+                    self.forward_kernels.fn_vector_add_bf16,
+                    residual_region.device_ptr(),
+                    o_bf16_region.device_ptr(),
+                    stream_u64,
+                )?;
+        }
+        self.stream.fence()?;
+
+        // Read back the updated residual as f32 for caller.
+        let mut h_out_bf16 = vec![0u16; hidden as usize];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                h_out_bf16.as_mut_ptr() as *mut _,
+                residual_region.device_ptr(),
+                (hidden as usize) * 2,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "post_attn: h_residual DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(h_out_bf16.iter().map(|&b| {
+            f32::from_bits((b as u32) << 16)
+        }).collect())
+    }
+
     /// Layer-0 RoPE on post-norm Q/K. Extends qk_norm by
     /// applying `rope_split_half_bf16` at `position`. Sliding
     /// layer 0 uses FULL RoPE on head_dim=256, theta=10000.
@@ -934,5 +1095,81 @@ mod tests {
             assert!(max_elem_diff < 0.5,
                     "{name} RoPE@pos=0 NOT identity: max_elem_diff={max_elem_diff}");
         }
+    }
+
+    /// Commit #4e smoke: o_proj + post_attention_layernorm +
+    /// residual add. Uses a synthetic bf16 attn_out (all 0.01)
+    /// and a synthetic bf16 residual (all 0.01) — the goal is
+    /// structural, not numerical (real attention output lands
+    /// with #5's KV cache).
+    ///
+    /// Assertions:
+    /// * Output residual is finite, has plausible magnitudes.
+    /// * Output != input residual (the add did something).
+    /// * Post-norm contribution is consistent with the post_attn
+    ///   gamma magnitude.
+    #[test]
+    #[ignore]
+    fn ondisk_bringup_post_attn() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skipping post_attn smoke");
+                return;
+            }
+        };
+        let kernels_dir = std::path::PathBuf::from(
+            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
+        );
+        let bringup = Gemma4Nvfp4Bringup::load(
+            &dir, 32 * 1024 * 1024 * 1024, &kernels_dir,
+        ).expect("Gemma4Nvfp4Bringup::load");
+
+        let hidden = bringup.arch.hidden_size;
+        let n_q = (bringup.arch.num_attention_heads
+                   * bringup.arch.head_dim_sliding) as usize;
+        assert_eq!(n_q, 8192, "31B sliding N_q sanity");
+
+        // Synthetic bf16 0.01 ≈ 0x3C23.
+        let bf16_0_01: u16 = 0x3C23;
+        let attn_out: Vec<u16> = vec![bf16_0_01; n_q];
+        let h_in: Vec<u16> = vec![bf16_0_01; hidden];
+        let h_in_f32: Vec<f32> = h_in.iter().map(|&b| {
+            f32::from_bits((b as u32) << 16)
+        }).collect();
+
+        let h_out = bringup.forward_layer0_post_attn(&attn_out, &h_in)
+            .expect("forward_layer0_post_attn");
+
+        assert_eq!(h_out.len(), hidden);
+        let nan = h_out.iter().filter(|x| x.is_nan()).count();
+        let inf = h_out.iter().filter(|x| x.is_infinite()).count();
+        let mean_abs: f32 = h_out.iter().map(|x| x.abs()).sum::<f32>()
+                          / (hidden as f32);
+        let max_abs: f32 = h_out.iter().fold(0f32, |a, &x| a.max(x.abs()));
+        // Delta = output - input (= the normed o_proj contribution)
+        let diff: Vec<f32> = h_out.iter().zip(h_in_f32.iter())
+            .map(|(o, i)| o - i)
+            .collect();
+        let diff_mean_abs: f32 = diff.iter().map(|x| x.abs()).sum::<f32>()
+                              / (hidden as f32);
+        let diff_max_abs: f32 = diff.iter().fold(0f32, |a, &x| a.max(x.abs()));
+
+        eprintln!(
+            "[post-attn-smoke] hidden={hidden} N_q={n_q}\n  \
+             h_out: nan={nan} inf={inf} mean_abs={mean_abs:.6} max_abs={max_abs:.6}\n  \
+             delta: mean_abs={diff_mean_abs:.6} max_abs={diff_max_abs:.6}\n  \
+             first4_in=0.01  first4_out={:?}",
+            &h_out[..4],
+        );
+
+        assert_eq!(nan, 0, "post_attn produced NaN");
+        assert_eq!(inf, 0, "post_attn produced Inf");
+        assert!(diff_mean_abs > 1e-6,
+            "post_attn delta=0 — residual add did nothing");
+        assert!(mean_abs < 100.0,
+            "post_attn h_out mean_abs={mean_abs} implausibly large");
+        assert!(diff_mean_abs < 100.0,
+            "post_attn delta mean_abs={diff_mean_abs} implausibly large");
     }
 }
