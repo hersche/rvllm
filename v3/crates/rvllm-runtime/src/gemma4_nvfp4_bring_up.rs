@@ -299,6 +299,11 @@ pub struct Gemma4Nvfp4Bringup {
     /// Checkpoint taken after persistent allocations. Forward helpers
     /// restore here so scratch allocations do not accumulate across calls.
     pub forward_checkpoint: usize,
+    /// Re-entrancy guard for `allocate_kv_state`. A second call
+    /// without `release_kv_state` would leak the first allocation
+    /// (arena bump points past it) and silently shadow the caller's
+    /// pointer to the prior state. We reject the second call instead.
+    kv_state_allocated: bool,
     /// Held to keep the primary CUDA context alive.
     _ctx: CudaContextHandle,
 }
@@ -319,6 +324,7 @@ impl Gemma4Nvfp4Bringup {
         arena_bytes: usize,
         kernels_dir: &Path,
     ) -> Result<Self> {
+        validate_no_stale_g4n_debug_envs()?;
         let ctx = CudaContextHandle::init(0)?;
         // SAFETY: HbmArena borrows the context for its lifetime.
         // We extend the borrow to 'static by moving the context
@@ -427,6 +433,7 @@ impl Gemma4Nvfp4Bringup {
             stream,
             arena,
             forward_checkpoint,
+            kv_state_allocated: false,
             _ctx: ctx,
         })
     }
@@ -455,9 +462,20 @@ impl Gemma4Nvfp4Bringup {
     /// supports up to 262144 but rope-table memory grows
     /// linearly).
     pub fn allocate_kv_state(&mut self, max_pos: u32) -> Result<Gemma4Nvfp4KvState> {
+        if self.kv_state_allocated {
+            return Err(corrupt_runtime_err(
+                "allocate_kv_state called twice: arena would leak the first \
+                 allocation (no API to free a single region) and the caller's \
+                 prior `Gemma4Nvfp4KvState` would silently point at stale \
+                 memory once a forward runs. If you need a fresh state, \
+                 rebuild the Gemma4Nvfp4Bringup."
+                    .to_string(),
+            ));
+        }
         let kv = Gemma4Nvfp4KvState::allocate(&self.arena, &self.arch, max_pos)?;
         // Re-anchor scratch rewinds above the KV state.
         self.forward_checkpoint = self.arena.checkpoint();
+        self.kv_state_allocated = true;
         Ok(kv)
     }
 
@@ -1746,8 +1764,8 @@ impl Gemma4Nvfp4Bringup {
             let mut nkvh: i32 = num_kv_heads as i32;
             let mut hd: i32 = head_dim as i32;
             let mut rd: i32 = rotary_dim as i32;
-            let mut scale_policy: i32 = 0;   // amax6
-            let mut v_scale_policy: i32 = 0; // amax6
+            let (mut scale_policy, mut v_scale_policy) =
+                read_nvfp4_kv_policies();
             let mut rotate_v: i32 = 0;
             let mut stoch_round_v: i32 = 0;
 
@@ -1802,7 +1820,13 @@ impl Gemma4Nvfp4Bringup {
             let mut context_lens: u64 = kv.context_lens_ptr;
             let mut q_descale: u64 = kv.q_scale_ptr;
 
-            let mut scale: f32 = 1.0 / (head_dim as f32).sqrt();
+            // Gemma 4 QK-norm gamma absorbs the 1/sqrt(d_k) — the
+            // attention kernel must run with scale=1.0. Production
+            // confirms this in gemma4_layer_exec.rs / gemma4_bring_up.rs
+            // (search `attn_scale: 1.0`). Using 1/sqrt(d_k) here makes
+            // every layer's softmax underflowed by ~1/16 (head_dim=256)
+            // or ~1/22.6 (head_dim=512) vs the reference HF Gemma 4.
+            let mut scale: f32 = 1.0;
             let mut nh: i32 = num_q_heads as i32;
             let mut nkvh: i32 = num_kv_heads as i32;
             let mut hd: i32 = head_dim as i32;
@@ -2228,8 +2252,8 @@ impl Gemma4Nvfp4Bringup {
             let mut nkvh: i32 = num_kv_heads as i32;
             let mut hd: i32 = head_dim as i32;
             let mut rd: i32 = rotary_dim as i32;
-            let mut scale_policy: i32 = 0;
-            let mut v_scale_policy: i32 = 0;
+            let (mut scale_policy, mut v_scale_policy) =
+                read_nvfp4_kv_policies();
             let mut rotate_v: i32 = 0;
             let mut stoch_round_v: i32 = 0;
 
@@ -2284,7 +2308,13 @@ impl Gemma4Nvfp4Bringup {
             let mut context_lens: u64 = kv.context_lens_ptr;
             let mut q_descale: u64 = kv.q_scale_ptr;
 
-            let mut scale: f32 = 1.0 / (head_dim as f32).sqrt();
+            // Gemma 4 QK-norm gamma absorbs the 1/sqrt(d_k) — the
+            // attention kernel must run with scale=1.0. Production
+            // confirms this in gemma4_layer_exec.rs / gemma4_bring_up.rs
+            // (search `attn_scale: 1.0`). Using 1/sqrt(d_k) here makes
+            // every layer's softmax underflowed by ~1/16 (head_dim=256)
+            // or ~1/22.6 (head_dim=512) vs the reference HF Gemma 4.
+            let mut scale: f32 = 1.0;
             let mut nh: i32 = num_q_heads as i32;
             let mut nkvh: i32 = num_kv_heads as i32;
             let mut hd: i32 = head_dim as i32;
@@ -3019,6 +3049,84 @@ fn corrupt_runtime_err(msg: String) -> rvllm_core::RvllmError {
     }
 }
 
+/// Parse a Gemma4 NVFP4 K/V scale-policy env value.
+/// `0 | "amax6"` → 0 (range-preserving baseline)
+/// `1 | "mse"`   → 1 (outlier-aware MSE search)
+/// Unknown values fall through to `None`. Matches production's
+/// `parse_policy` in gemma4_layer_exec.rs::rope_nvfp4kv so a
+/// profile set for the production path works on Option B too.
+fn parse_nvfp4_policy(v: &str) -> Option<i32> {
+    match v.trim() {
+        "amax6" | "0" => Some(0),
+        "mse"   | "1" => Some(1),
+        _ => None,
+    }
+}
+
+/// Read the (K, V) NVFP4 scale policies for Option B with
+/// production-matching defaults: K = amax6, V = mse.
+///
+/// Resolution order (per side):
+///   1. `RVLLM_NVFP4_{K,V}_SCALE_POLICY` if set + recognized
+///   2. `RVLLM_NVFP4_SCALE_POLICY` (legacy single-knob) if set
+///   3. default — K=amax6 (0), V=mse (1)
+///
+/// V=mse is the codex round-4 fix that landed in production
+/// to remove the V-clipping cliff on long German prompts. The
+/// previous Option B default (V=amax6) was a smoke-test
+/// shortcut.
+fn read_nvfp4_kv_policies() -> (i32, i32) {
+    let global = std::env::var("RVLLM_NVFP4_SCALE_POLICY")
+        .ok()
+        .and_then(|s| parse_nvfp4_policy(&s));
+    let k = std::env::var("RVLLM_NVFP4_K_SCALE_POLICY")
+        .ok()
+        .and_then(|s| parse_nvfp4_policy(&s))
+        .or(global)
+        .unwrap_or(0);          // K default = amax6
+    let v = std::env::var("RVLLM_NVFP4_V_SCALE_POLICY")
+        .ok()
+        .and_then(|s| parse_nvfp4_policy(&s))
+        .or(global)
+        .unwrap_or(1);          // V default = mse
+    (k, v)
+}
+
+/// Debug-env knobs that change the Option B forward path
+/// behavior (extra disk writes, stderr spam) but are inert in
+/// production. Mirror Mistral 3.5's stale-env guard: if any of
+/// these is set without `RVLLM_DEBUG_G4N=1`, refuse to start so
+/// a leaked diagnostic env from a prior session can't slowly
+/// fill disk on a production rvllm-serve.
+const G4N_STALE_DEBUG_KEYS: &[&str] = &[
+    "G4N_DUMP_DIR",
+    "G4N_FORWARD_TRACE",
+];
+
+#[inline]
+fn g4n_debug_active() -> bool {
+    matches!(
+        std::env::var("RVLLM_DEBUG_G4N").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+fn validate_no_stale_g4n_debug_envs() -> Result<()> {
+    if g4n_debug_active() { return Ok(()); }
+    for key in G4N_STALE_DEBUG_KEYS {
+        if std::env::var_os(key).is_some() {
+            return Err(corrupt_runtime_err(format!(
+                "[gemma4-nvfp4] refusing to start: {key} is set but \
+                 RVLLM_DEBUG_G4N=1 is not. These knobs add disk I/O \
+                 + stderr writes that production should not silently \
+                 pay. Set RVLLM_DEBUG_G4N=1 to opt in, or unset \
+                 {key} for a production run."
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3555,6 +3663,13 @@ mod tests {
         let max_pos: u32 = 4096;
         let kv = bringup.allocate_kv_state(max_pos)
             .expect("allocate_kv_state");
+
+        // Commit floor: re-entrancy guard — a second call must
+        // refuse rather than silently leak the first state.
+        let second = bringup.allocate_kv_state(max_pos);
+        assert!(second.is_err(),
+            "allocate_kv_state must reject the second call");
+        eprintln!("[#floor-smoke] double-allocate guard: rejected ✓");
 
         assert_eq!(kv.max_pos, max_pos);
         assert_eq!(kv.block_size, 1);
