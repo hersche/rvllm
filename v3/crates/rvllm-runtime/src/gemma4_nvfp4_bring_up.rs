@@ -358,8 +358,17 @@ impl Gemma4Nvfp4Bringup {
         let n_v = v_weight.shape[0] as i32;
         // Sliding layer: k and v have the same output dim
         // (n_kv_heads * head_dim); on 31B that's 16 * 256 = 4096.
-        debug_assert_eq!(n_kv, n_v,
-            "sliding-layer K and V projections must match");
+        // Codex review caught the prior debug_assert was release-
+        // invisible: a corrupted checkpoint with mismatched K/V
+        // dims on a sliding layer would silently produce wrong
+        // attention output. Upgrade to a hard runtime check.
+        if n_kv != n_v {
+            return Err(rvllm_core::RvllmError::cuda(
+                "forward_layer0_qkv_only: sliding-layer K/V dim mismatch",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
 
         let hidden = self.arch.hidden_size as u32;
 

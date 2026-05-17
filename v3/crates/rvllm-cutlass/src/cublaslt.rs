@@ -180,6 +180,21 @@ impl CublasLt {
     }
 
     /// FP8 matmul with f32 output and per-channel weight scales (OUTER_VEC_32F).
+    ///
+    /// Hardware note (codex round-3, 2026-05-17): cuBLASLt's FP8 +
+    /// OUTER_VEC_32F on the **B side** (per-column activation
+    /// scales) is documented support on sm_90a (H100) / sm_100a
+    /// (B200) only. On sm_121 (GB10 Grace-Blackwell) the launch
+    /// returns LaunchFailed at cublasLtMatmul — descriptor sets
+    /// clean, kernel can't execute. The
+    /// `fp8_gemm_f16_per_row_act_scale` entrypoint below was
+    /// shipped to exercise this and confirms the limitation.
+    ///
+    /// For the A side (per-channel WEIGHT scales) the mode IS
+    /// supported on sm_121 — that's what THIS entrypoint enables
+    /// and what `fp8_gemm_channelscale_or_fallback` in the Gemma
+    /// 4 layer-exec path uses, falling back to CUTLASS SM120
+    /// blockscale for M >= 128.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn fp8_gemm_f32_channelscale(

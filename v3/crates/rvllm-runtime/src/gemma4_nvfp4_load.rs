@@ -433,10 +433,23 @@ pub fn upload_gemma4_nvfp4_outside_text(
     arch: &Gemma4Arch,
 ) -> Result<Gemma4Nvfp4OutsideText> {
     let prefix = &arch.weight_prefix;
-    let embed_tokens = upload_typed_tensor(
-        arena, pool, "gemma4n_embed_tokens",
+    // Gemma 4 convention: the embed_tokens output is multiplied by
+    // sqrt(hidden_size) before entering the first transformer layer.
+    // The fp8-block path pre-scales the weight at upload time (see
+    // gemma4_bring_up.rs:8482 — "already pre-scaled by sqrt(hidden_size)
+    // at loader time"). Codex review 2026-05-17 (round 3) flagged the
+    // NVFP4 bring-up was missing this, which made every downstream
+    // smoke's QKV magnitudes qualitatively wrong vs. the production
+    // path even though they passed the structural "finite + non-zero"
+    // assertions. Fix matches the fp8-block convention exactly: scale
+    // on the host before HtoD so the device path stays simple and
+    // every embed_tokens read (forward + tied lm_head) sees the
+    // scaled values uniformly.
+    let embed_tokens = upload_embed_tokens_scaled(
+        arena, pool,
         &format!("{prefix}.embed_tokens.weight"),
-        DType::Bf16, Some(&[arch.vocab_size, arch.hidden_size])
+        &[arch.vocab_size, arch.hidden_size],
+        (arch.hidden_size as f32).sqrt(),
     )?;
     let final_norm = upload_typed_tensor(
         arena, pool, "gemma4n_final_norm",
@@ -444,6 +457,53 @@ pub fn upload_gemma4_nvfp4_outside_text(
         DType::Bf16, Some(&[arch.hidden_size])
     )?;
     Ok(Gemma4Nvfp4OutsideText { embed_tokens, final_norm })
+}
+
+/// Pre-scaled bf16 embed_tokens upload. Reads the raw bf16 tensor,
+/// multiplies every element by `scale` on the host with round-to-
+/// nearest-even bf16 narrow, then uploads the scaled bytes.
+fn upload_embed_tokens_scaled(
+    arena: &HbmArena<'_>,
+    pool: &Gemma4Nvfp4ShardPool,
+    tensor_name: &str,
+    expected_shape: &[usize],
+    scale: f32,
+) -> Result<rvllm_loader::weights::F16Weight> {
+    let (si, e) = pool.must_get(tensor_name)?;
+    if e.dtype != DType::Bf16 {
+        return Err(corrupt(format!(
+            "{tensor_name}: expected Bf16, got {:?}", e.dtype)));
+    }
+    if e.shape != expected_shape {
+        return Err(corrupt(format!(
+            "{tensor_name}: shape {:?} != expected {:?}",
+            e.shape, expected_shape)));
+    }
+    let n_elems: usize = e.shape.iter().product();
+    let raw = pool.bytes_of(si, e);
+    if raw.len() != n_elems * 2 {
+        return Err(corrupt(format!(
+            "{tensor_name}: mmap len={} != elems*2 = {}",
+            raw.len(), n_elems * 2)));
+    }
+    let mut scaled = vec![0u8; raw.len()];
+    for i in 0..n_elems {
+        let bf16_in = u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]);
+        let f = f32::from_bits((bf16_in as u32) << 16) * scale;
+        // Round-to-nearest-even bf16 narrow.
+        let bits = f.to_bits();
+        let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+        let bf16_out = (rounded >> 16) as u16;
+        let b = bf16_out.to_le_bytes();
+        scaled[i * 2] = b[0];
+        scaled[i * 2 + 1] = b[1];
+    }
+    let region = arena.region("gemma4n_embed_tokens", scaled.len(), 16)?;
+    unsafe { region.copy_from_host(&scaled)? };
+    Ok(rvllm_loader::weights::F16Weight {
+        offset_bytes: region.device_ptr(),
+        shape: e.shape.clone(),
+    })
 }
 
 /// Top-level loader: reads the model directory, validates the
