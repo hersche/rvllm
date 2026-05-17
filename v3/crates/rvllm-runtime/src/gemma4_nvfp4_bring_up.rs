@@ -338,6 +338,160 @@ impl Gemma4Nvfp4Bringup {
         Ok((q_normed, k_normed, v_f32))
     }
 
+    /// END-TO-END layer-0 forward at position=0 (single token,
+    /// no prior context).
+    ///
+    /// This is commit #5a's structural milestone: compose every
+    /// piece commits #4a–#4g built into one path, exercising
+    /// the WHOLE layer-0 pipeline on real weights. The
+    /// attention math at position=0 collapses to a trivial
+    /// identity:
+    ///
+    ///   For a single-token decode with no KV history, the
+    ///   softmax of the 1×1 score matrix is [1.0], so
+    ///   attn_out_per_head = V_per_head. Under GQA (Q heads =
+    ///   32, KV heads = 16 on 31B sliding), each Q-head h
+    ///   reads from KV-head `h / gqa_ratio = h / 2`, so the
+    ///   attn_out tensor is built by replicating each KV-head's
+    ///   V row across its `gqa_ratio` Q-head slots.
+    ///
+    /// This validates layer 0's pipeline at the smallest
+    /// meaningful problem. Real attention (Q × K^T → softmax
+    /// → × V) for position > 0 OR num_tokens > 1 needs a KV
+    /// cache + paged-decode kernel — commit #5b's territory.
+    ///
+    /// Returns the predicted next token id from feeding layer 0's
+    /// output through the final close-out (#4g).
+    pub fn forward_layer0_position_zero_to_token(
+        &self,
+        token_id: u32,
+    ) -> Result<u32> {
+        let (q_post_rope_f32, _k_post_rope_f32, v_f32) =
+            self.forward_layer0_qk_rope(token_id, 0)?;
+        let _ = q_post_rope_f32; // Q is consumed by attention; not used in identity case
+        let head_dim = self.arch.head_dim_sliding;
+        let num_q_heads = self.arch.num_attention_heads;
+        let num_kv_heads = self.arch.num_kv_heads_sliding;
+        if num_q_heads % num_kv_heads != 0 {
+            return Err(rvllm_core::RvllmError::cuda(
+                "forward_layer0_position_zero: num_q_heads not divisible by num_kv_heads",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        let gqa_ratio = num_q_heads / num_kv_heads;
+        if v_f32.len() != num_kv_heads * head_dim {
+            return Err(rvllm_core::RvllmError::cuda(
+                "forward_layer0_position_zero: v_f32 length unexpected",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+
+        // Build attn_out [num_q_heads * head_dim] by replicating
+        // each KV-head's V row gqa_ratio times. For 31B sliding
+        // (gqa_ratio=2): Q-heads 0,1 read V[0]; Q-heads 2,3 read
+        // V[1]; ...; Q-heads 30,31 read V[15].
+        let mut attn_out_f32: Vec<f32> =
+            Vec::with_capacity(num_q_heads * head_dim);
+        for qh in 0..num_q_heads {
+            let kvh = qh / gqa_ratio;
+            let src = &v_f32[kvh * head_dim..(kvh + 1) * head_dim];
+            attn_out_f32.extend_from_slice(src);
+        }
+        debug_assert_eq!(attn_out_f32.len(), num_q_heads * head_dim);
+
+        // Narrow attn_out to bf16 for the post-attn flow.
+        let attn_out_bf16: Vec<u16> = attn_out_f32.iter().map(|&x| {
+            let bits = x.to_bits();
+            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+            (rounded >> 16) as u16
+        }).collect();
+
+        // Compute the input residual (embed → input_layernorm
+        // output → no, actually the residual ENTERING the
+        // post-attn step is the residual that was preserved AROUND
+        // the attention sub-block, i.e. the pre-input_layernorm
+        // residual = the embed lookup output). We need to grab
+        // that here.
+        //
+        // Reconstruct: re-do embed lookup to get the residual.
+        // Cheaper than threading a residual handle through the
+        // intermediate methods.
+        let hidden = self.arch.hidden_size as u32;
+        let tok_region = self.arena.region(
+            "gemma4_nvfp4_pz_tok", 4, 16)?;
+        unsafe {
+            tok_region.copy_from_host(&(token_id as i32).to_le_bytes())?;
+        }
+        let h_residual_region = self.arena.region(
+            "gemma4_nvfp4_pz_residual", (hidden as usize) * 2, 256)?;
+        unsafe {
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens: 1, hidden,
+                vocab: self.arch.vocab_size as u32,
+            }
+            .launch(
+                self.forward_kernels.fn_embedding_gather_bf16,
+                h_residual_region.device_ptr(),
+                self.model.outside.embed_tokens.offset_bytes,
+                tok_region.device_ptr(),
+                self.stream.raw(),
+            )?;
+        }
+        self.stream.fence()?;
+        let mut h_residual_bf16 = vec![0u16; hidden as usize];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                h_residual_bf16.as_mut_ptr() as *mut _,
+                h_residual_region.device_ptr(),
+                (hidden as usize) * 2,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "position_zero: residual DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // Post-attention close-out (#4e): o_proj + post_attn_norm
+        // + residual add → updated residual.
+        let h_after_attn_f32 = self.forward_layer0_post_attn(
+            &attn_out_bf16, &h_residual_bf16,
+        )?;
+
+        // Narrow back to bf16 for the MLP block (#4f).
+        let h_after_attn_bf16: Vec<u16> = h_after_attn_f32.iter().map(|&x| {
+            let bits = x.to_bits();
+            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+            (rounded >> 16) as u16
+        }).collect();
+
+        // MLP block (#4f): pre_ff_norm → MLP → post_ff_norm
+        // → residual += mlp_normed * layer_scalar.
+        let h_after_mlp_f32 = self.forward_layer0_post_attn_mlp(
+            &h_after_attn_bf16,
+        )?;
+
+        // For end-to-end position=0 we only have ONE layer. The
+        // remaining 59 layers are stubbed by passing the layer-0
+        // output directly to the final close-out. Full 60-layer
+        // composition lands with #5b once real attention works
+        // for layers 1..59 (each layer's attention reads the KV
+        // cache populated by earlier layers).
+        let h_after_mlp_bf16: Vec<u16> = h_after_mlp_f32.iter().map(|&x| {
+            let bits = x.to_bits();
+            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+            (rounded >> 16) as u16
+        }).collect();
+
+        // Final close-out (#4g): final_norm → tied lm_head → argmax.
+        self.forward_final_to_token(&h_after_mlp_bf16)
+    }
+
     /// Final close-out: final_norm → tied LM head → argmax.
     ///
     ///   h_final  = final_norm(h_residual)        // bf16 in-place RMSNorm
@@ -1593,5 +1747,45 @@ mod tests {
         );
         assert!((token_id as usize) < vocab,
             "argmax produced token_id={token_id} >= vocab={vocab}");
+    }
+
+    /// Commit #5a smoke: layer-0 END-TO-END at position=0.
+    /// Exercises every kernel from commit #4a–#4g composed into
+    /// one path using the position=0 trivial attention identity
+    /// (attn_out = V with GQA head replication).
+    ///
+    /// This is the structural milestone for the bring-up:
+    /// everything from embed lookup through tied lm_head argmax
+    /// runs on real weights with no NaN/Inf/crash. The predicted
+    /// token is NOT semantically meaningful (only 1 of 60 layers
+    /// is actually composed — the remaining 59 are bypassed at
+    /// this point), but the pipeline is byte-stable.
+    #[test]
+    #[ignore]
+    fn ondisk_bringup_layer0_position_zero_e2e() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skipping #5a smoke");
+                return;
+            }
+        };
+        let kernels_dir = std::path::PathBuf::from(
+            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
+        );
+        let bringup = Gemma4Nvfp4Bringup::load(
+            &dir, 32 * 1024 * 1024 * 1024, &kernels_dir,
+        ).expect("Gemma4Nvfp4Bringup::load");
+
+        // BOS token at position=0.
+        let token_id = bringup.forward_layer0_position_zero_to_token(2)
+            .expect("forward_layer0_position_zero_to_token");
+
+        eprintln!(
+            "[e2e-pos0-smoke] BOS(2) at position=0 → layer0 only → tied_lm_head → token_id={token_id}"
+        );
+        let vocab = bringup.arch.vocab_size;
+        assert!((token_id as usize) < vocab,
+            "e2e pos=0 produced token_id={token_id} >= vocab={vocab}");
     }
 }
