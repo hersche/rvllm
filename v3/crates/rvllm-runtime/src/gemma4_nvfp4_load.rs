@@ -20,12 +20,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rvllm_core::{DType, LoaderCtx, LoaderError, Result, RvllmError};
-use rvllm_loader::gemma4_arch::Gemma4Arch;
+use rvllm_loader::gemma4_arch::{Gemma4Arch, Gemma4LayerType};
 use rvllm_loader::gemma4_nvfp4_weights::{
-    Gemma4Nvfp4LinearLoaded, Gemma4Nvfp4MlpKind,
+    Gemma4Nvfp4LayerLoaded, Gemma4Nvfp4LinearLoaded, Gemma4Nvfp4MlpKind,
 };
 use rvllm_loader::mistral35_weights::Nvfp4LinearShape;
 use rvllm_loader::safetensors::{ShardHeader, ShardIndex, TensorEntry};
+use rvllm_loader::weights::F16Weight;
 use rvllm_mem::HbmArena;
 
 /// Memory-mapped shard pool. Duplicates the Mistral-side
@@ -238,6 +239,181 @@ pub fn upload_gemma4_nvfp4_layer_mlp(
         out[i] = Some(upload_gemma4_nvfp4_linear(arena, pool, &base, kind.shape_for(arch))?);
     }
     Ok((out[0].unwrap(), out[1].unwrap(), out[2].unwrap()))
+}
+
+/// Upload one bf16/f16 tensor verbatim, with dtype + shape
+/// validation. Used for retained-bf16 attention projections,
+/// layernorms, q_norm/k_norm, and layer_scalar. Mirrors
+/// `mistral35_load::upload_typed_tensor`; localized here so the
+/// Gemma path stays self-contained until Phase 5 cleanup
+/// promotes both to a shared helper.
+fn upload_typed_tensor(
+    arena: &HbmArena<'_>,
+    pool: &Gemma4Nvfp4ShardPool,
+    region_name: &'static str,
+    tensor_name: &str,
+    expected_dtype: DType,
+    expected_shape: Option<&[usize]>,
+) -> Result<F16Weight> {
+    let (si, e) = pool.must_get(tensor_name)?;
+    let bytes_per_elem: usize = match expected_dtype {
+        DType::Bf16 | DType::F16 => 2,
+        DType::F32 => 4,
+        DType::Fp8E4M3 | DType::U8 => 1,
+        other => {
+            return Err(corrupt(format!(
+                "upload_typed_tensor: dtype {:?} not supported for {tensor_name}",
+                other
+            )))
+        }
+    };
+    if e.dtype != expected_dtype {
+        return Err(corrupt(format!(
+            "{tensor_name}: dtype={:?} but loader expected {:?}",
+            e.dtype, expected_dtype
+        )));
+    }
+    if let Some(want) = expected_shape {
+        if e.shape != want {
+            return Err(corrupt(format!(
+                "{tensor_name}: shape={:?} but loader expected {:?}",
+                e.shape, want
+            )));
+        }
+    }
+    let elem_count: usize = e.shape.iter().product();
+    let expect_bytes = elem_count * bytes_per_elem;
+    let raw = pool.bytes_of(si, e);
+    if raw.len() != expect_bytes {
+        return Err(corrupt(format!(
+            "{tensor_name}: mmap len={} but shape={:?} × {} = {} bytes",
+            raw.len(),
+            e.shape,
+            bytes_per_elem,
+            expect_bytes
+        )));
+    }
+    let region = arena.region(region_name, raw.len(), 16)?;
+    unsafe { region.copy_from_host(raw)? };
+    Ok(F16Weight {
+        offset_bytes: region.device_ptr(),
+        shape: e.shape.clone(),
+    })
+}
+
+/// Upload every weight tensor for one Gemma 4 layer: the four
+/// norms, the per-head q_norm/k_norm gammas, the layer_scalar
+/// residual multiplier, the bf16 attention projections (v_proj
+/// optional for `attention_k_eq_v` global layers), and the three
+/// NVFP4 MLP linears. Returns a populated `Gemma4Nvfp4LayerLoaded`.
+pub fn upload_gemma4_nvfp4_layer(
+    arena: &HbmArena<'_>,
+    pool: &Gemma4Nvfp4ShardPool,
+    arch: &Gemma4Arch,
+    layer_idx: usize,
+) -> Result<Gemma4Nvfp4LayerLoaded> {
+    let prefix = &arch.weight_prefix;
+    let h = arch.hidden_size;
+    let base = format!("{prefix}.layers.{layer_idx}");
+
+    let input_layernorm = upload_typed_tensor(
+        arena, pool, "gemma4n_input_ln",
+        &format!("{base}.input_layernorm.weight"),
+        DType::Bf16, Some(&[h])
+    )?;
+    let post_attention_layernorm = upload_typed_tensor(
+        arena, pool, "gemma4n_post_attn_ln",
+        &format!("{base}.post_attention_layernorm.weight"),
+        DType::Bf16, Some(&[h])
+    )?;
+    let pre_feedforward_layernorm = upload_typed_tensor(
+        arena, pool, "gemma4n_pre_ff_ln",
+        &format!("{base}.pre_feedforward_layernorm.weight"),
+        DType::Bf16, Some(&[h])
+    )?;
+    let post_feedforward_layernorm = upload_typed_tensor(
+        arena, pool, "gemma4n_post_ff_ln",
+        &format!("{base}.post_feedforward_layernorm.weight"),
+        DType::Bf16, Some(&[h])
+    )?;
+    let layer_scalar = upload_typed_tensor(
+        arena, pool, "gemma4n_layer_scalar",
+        &format!("{base}.layer_scalar"),
+        DType::Bf16, Some(&[1])
+    )?;
+    // q_norm/k_norm shape is [head_dim]; head_dim differs by layer
+    // type (sliding=256, global=512 on 31B). The bring-up's actual
+    // forward path is the canonical gate — shape None lets either
+    // pass through this load step.
+    let q_norm = upload_typed_tensor(
+        arena, pool, "gemma4n_q_norm",
+        &format!("{base}.self_attn.q_norm.weight"),
+        DType::Bf16, None
+    )?;
+    let k_norm = upload_typed_tensor(
+        arena, pool, "gemma4n_k_norm",
+        &format!("{base}.self_attn.k_norm.weight"),
+        DType::Bf16, None
+    )?;
+
+    // Attention projections (bf16). Shape unconstrained here; the
+    // bring-up validates against the arch-derived per-layer
+    // expectation (sliding/global heads differ on 31B).
+    let q_proj = upload_typed_tensor(
+        arena, pool, "gemma4n_q_proj",
+        &format!("{base}.self_attn.q_proj.weight"),
+        DType::Bf16, None
+    )?;
+    let k_proj = upload_typed_tensor(
+        arena, pool, "gemma4n_k_proj",
+        &format!("{base}.self_attn.k_proj.weight"),
+        DType::Bf16, None
+    )?;
+    // v_proj is absent on global layers when `attention_k_eq_v=true`;
+    // checked by presence in the pool, not via arch flags (the arch
+    // currently doesn't surface per-layer k_eq_v).
+    let v_key = format!("{base}.self_attn.v_proj.weight");
+    let v_proj = if pool.tensors.contains_key(&v_key) {
+        Some(upload_typed_tensor(
+            arena, pool, "gemma4n_v_proj", &v_key, DType::Bf16, None
+        )?)
+    } else {
+        // Global layer with k_eq_v aliasing — runtime forward will
+        // reuse k_proj. Sanity-check: only global layers may have
+        // v_proj absent.
+        match arch.layer_types.get(layer_idx) {
+            Some(Gemma4LayerType::GlobalAttention) => None,
+            _ => return Err(corrupt(format!(
+                "v_proj absent on layer {layer_idx} but layer_type is not GlobalAttention"
+            ))),
+        }
+    };
+    let o_proj = upload_typed_tensor(
+        arena, pool, "gemma4n_o_proj",
+        &format!("{base}.self_attn.o_proj.weight"),
+        DType::Bf16, None
+    )?;
+
+    // MLP NVFP4 trio.
+    let (gate_proj, up_proj, down_proj) =
+        upload_gemma4_nvfp4_layer_mlp(arena, pool, arch, layer_idx)?;
+
+    Ok(Gemma4Nvfp4LayerLoaded {
+        input_layernorm,
+        post_attention_layernorm,
+        pre_feedforward_layernorm,
+        post_feedforward_layernorm,
+        layer_scalar,
+        q_norm,
+        k_norm,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        gate_proj,
+        up_proj,
+        down_proj,
+    })
 }
 
 fn corrupt(detail: String) -> RvllmError {
