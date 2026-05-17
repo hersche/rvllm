@@ -4848,6 +4848,18 @@ impl Gemma4Bringup {
                             stream,
                         )?;
                     }
+                    // V-side Hadamard parity: base writes V to NVFP4 KV
+                    // rotated by R when HADAMARD=1 && HADAMARD_V=1. Cross-
+                    // attn output is therefore P·V·R; o_proj expects P·V.
+                    // Mirror of `unrotate_attn_out_v_if_enabled` in
+                    // gemma4_layer_exec.rs (base path).
+                    self.apply_hadamard_unrotate_drafter_attn_out(
+                        &workspace,
+                        source_layer_idx,
+                        drafter.arch.num_attention_heads as u32,
+                        layer.effective_head_dim as u32,
+                        stream,
+                    )?;
                     self.run_drafter_layer_attn_finisher(drafter, &workspace, li)?;
                     self.run_drafter_layer_mlp_finisher(drafter, &workspace, li)?;
                 }
@@ -9032,6 +9044,93 @@ impl Gemma4Bringup {
         if rc != CUresult::CUDA_SUCCESS {
             return Err(rvllm_core::RvllmError::cuda(
                 "drafter Q hadamard_rotate_f16 launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Drafter-side companion to `apply_hadamard_to_drafter_q`: when
+    /// the BASE writes V to its NVFP4 KV cache rotated by R = H·diag(D)
+    /// (RVLLM_NVFP4_HADAMARD=1 && RVLLM_NVFP4_HADAMARD_V=1), the
+    /// drafter's cross-attention output is `P · (V · R)` instead of
+    /// the mathematically-correct `P · V` the o_proj expects. The
+    /// base path already calls `unrotate_attn_out_v_if_enabled`
+    /// after its NVFP4-decode attention; this is the equivalent for
+    /// the drafter's cross-attn into the base's NVFP4 KV.
+    ///
+    /// Same gates and sign-vector source as the Q-rotate helper:
+    ///   * RVLLM_NVFP4_HADAMARD must be on (kernel side gated on
+    ///     `hadamard_on && rotate_v`, so V was only rotated when
+    ///     both are true).
+    ///   * RVLLM_NVFP4_HADAMARD_V must be on for the same reason.
+    ///   * `source_layer_idx` is the BASE layer the drafter
+    ///     cross-attends to.
+    #[cfg(feature = "cuda")]
+    unsafe fn apply_hadamard_unrotate_drafter_attn_out(
+        &self,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        source_layer_idx: u32,
+        num_heads: u32,
+        eff_hd: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if !nvfp4_hadamard_enabled() {
+            return Ok(());
+        }
+        let rotate_v = parse_truthy_env("RVLLM_NVFP4_HADAMARD_V").unwrap_or(true);
+        if !rotate_v {
+            return Ok(());
+        }
+        let alloc = {
+            let guard = self.nvfp4_hadamard.lock().unwrap();
+            match guard.as_ref() {
+                Some(a) => *a,
+                None => return Ok(()),
+            }
+        };
+        let kernel = match self.fused.fn_hadamard_unrotate_f16 {
+            Some(k) => k,
+            None => {
+                static WARN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                WARN.get_or_init(|| {
+                    eprintln!(
+                        "[spec-decode] WARNING: RVLLM_NVFP4_HADAMARD_V=1 but \
+                         hadamard_unrotate_f16.ptx not loaded; drafter attn_out \
+                         stays P·V·R and o_proj sees wrong values."
+                    );
+                });
+                return Ok(());
+            }
+        };
+        let signs_ptr = alloc.base_ptr
+            + (source_layer_idx as u64) * (alloc.head_dim as u64);
+        let mut x_ptr: u64 = workspace.attn_out;
+        let mut signs: u64 = signs_ptr;
+        let mut nt: i32 = 1;
+        let mut nh: i32 = num_heads as i32;
+        let mut hd: i32 = eff_hd as i32;
+        let args: [*mut core::ffi::c_void; 5] = [
+            &mut x_ptr as *mut _ as *mut _,
+            &mut signs as *mut _ as *mut _,
+            &mut nt    as *mut _ as *mut _,
+            &mut nh    as *mut _ as *mut _,
+            &mut hd    as *mut _ as *mut _,
+        ];
+        use cudarc::driver::sys::*;
+        let rc = cuLaunchKernel(
+            kernel.raw() as CUfunction,
+            1, num_heads, 1,
+            eff_hd, 1, 1,
+            0,
+            stream as CUstream,
+            args.as_ptr() as *mut *mut core::ffi::c_void,
+            core::ptr::null_mut(),
+        );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "drafter attn_out hadamard_unrotate_f16 launch",
                 rvllm_core::CudaErrorKind::LaunchFailed,
                 rvllm_core::CudaCtx::setup(),
             ));
