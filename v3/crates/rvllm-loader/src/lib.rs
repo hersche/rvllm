@@ -21,6 +21,7 @@ pub mod fp8_quant;
 pub mod gemma4_arch;
 pub mod gemma4_drafter;
 pub mod gemma4_load;
+pub mod gemma4_nvfp4_weights;
 pub mod gemma4_weights;
 pub mod load;
 pub mod load_multiformat;
