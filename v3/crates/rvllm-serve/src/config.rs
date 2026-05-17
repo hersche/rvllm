@@ -22,6 +22,11 @@ pub enum ModelFamily {
     Qwen35,
     Qwen36,
     Gemma4,
+    /// nvidia/Gemma-4-31B-IT-NVFP4 — same Gemma 4 architecture as
+    /// `Gemma4` but with modelopt NVFP4 MLP weights + retained
+    /// bf16 attention. Forward path lives behind feature parity
+    /// with `Gemma4` and is staged in.
+    Gemma4Nvfp4,
     Mistral35,
 }
 
@@ -37,6 +42,9 @@ impl ModelFamily {
             "qwen35" | "qwen-35" | "qwen3.5" | "qwen-3.5" => Ok(ModelFamily::Qwen35),
             "qwen36" | "qwen-36" | "qwen3.6" | "qwen-3.6" => Ok(ModelFamily::Qwen36),
             "gemma4" | "gemma-4" => Ok(ModelFamily::Gemma4),
+            "gemma4-nvfp4" | "gemma-4-nvfp4" | "gemma4nvfp4" => {
+                Ok(ModelFamily::Gemma4Nvfp4)
+            }
             "mistral35" | "mistral-35" | "mistral3.5" | "mistral-3.5" => {
                 Ok(ModelFamily::Mistral35)
             }
@@ -50,13 +58,14 @@ impl ModelFamily {
             ModelFamily::Qwen35 => "qwen35",
             ModelFamily::Qwen36 => "qwen36",
             ModelFamily::Gemma4 => "gemma4",
+            ModelFamily::Gemma4Nvfp4 => "gemma4-nvfp4",
             ModelFamily::Mistral35 => "mistral35",
         }
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("--model-family must be one of auto|qwen35|qwen36|gemma4|mistral35 (got: {0:?})")]
+#[error("--model-family must be one of auto|qwen35|qwen36|gemma4|gemma4-nvfp4|mistral35 (got: {0:?})")]
 pub struct ModelFamilyParseError(pub String);
 
 impl std::str::FromStr for ModelFamily {

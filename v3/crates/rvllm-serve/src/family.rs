@@ -87,6 +87,7 @@ pub fn resolve_model_family(
     let mistral_match = mistral_image_token.is_some();
     let qwen35_match = is_qwen35(model_dir);
     let qwen_match = is_qwen36(model_dir);
+    let gemma4_nvfp4_match = is_gemma4_nvfp4(model_dir)?;
 
     match selected {
         ModelFamily::Auto => {
@@ -104,6 +105,11 @@ pub fn resolve_model_family(
                 Ok(ResolvedFamily {
                     family: ModelFamily::Qwen36,
                     vision_arch: VisionArch::Qwen36,
+                })
+            } else if gemma4_nvfp4_match {
+                Ok(ResolvedFamily {
+                    family: ModelFamily::Gemma4Nvfp4,
+                    vision_arch: VisionArch::Gemma4,
                 })
             } else {
                 Ok(ResolvedFamily {
@@ -149,6 +155,20 @@ pub fn resolve_model_family(
             } else {
                 Err(FamilyResolveError::Mismatch {
                     requested: "qwen36",
+                    path: model_dir.join("config.json"),
+                    markers: collect_markers(model_dir),
+                })
+            }
+        }
+        ModelFamily::Gemma4Nvfp4 => {
+            if gemma4_nvfp4_match {
+                Ok(ResolvedFamily {
+                    family: ModelFamily::Gemma4Nvfp4,
+                    vision_arch: VisionArch::Gemma4,
+                })
+            } else {
+                Err(FamilyResolveError::Mismatch {
+                    requested: "gemma4-nvfp4",
                     path: model_dir.join("config.json"),
                     markers: collect_markers(model_dir),
                 })
@@ -244,6 +264,30 @@ fn is_mistral35(model_dir: &Path) -> Result<Option<u32>, FamilyResolveError> {
             }
         }
     }
+}
+
+/// Detect `nvidia/Gemma-4-31B-IT-NVFP4` and other modelopt-NVFP4
+/// Gemma 4 checkpoints. Marker: top-level
+/// `quantization_config.quant_method == "modelopt"` +
+/// `quant_algo == "NVFP4"` (the standard modelopt 0.37+ payload).
+/// Falls back to no-match cleanly — anything else routes to the
+/// default Gemma 4 fp8-block path.
+fn is_gemma4_nvfp4(model_dir: &Path) -> Result<bool, FamilyResolveError> {
+    let v = match read_config(model_dir)? {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+    let arch_match = v["architectures"][0]
+        .as_str()
+        .map(|s| s == "Gemma4ForConditionalGeneration" || s == "Gemma4ForCausalLM")
+        .unwrap_or(false);
+    if !arch_match {
+        return Ok(false);
+    }
+    let qc = &v["quantization_config"];
+    let method = qc["quant_method"].as_str() == Some("modelopt");
+    let algo = qc["quant_algo"].as_str() == Some("NVFP4");
+    Ok(method && algo)
 }
 
 fn is_qwen35(model_dir: &Path) -> bool {

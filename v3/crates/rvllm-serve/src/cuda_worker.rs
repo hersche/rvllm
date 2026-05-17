@@ -735,8 +735,26 @@ pub async fn spawn_cuda_worker(
             // skip the probe; under Auto fall back to the marker
             // probe. `Gemma4` selection short-circuits straight to the
             // Gemma 4 loader.
+            // Gemma4Nvfp4 — Phase 3c not yet wired into cuda_worker.
+            // Fail early with a clear message so an operator who
+            // points the server at the NVFP4 checkpoint gets a
+            // useful error instead of a silent fall-through to the
+            // fp8-block loader (which would crash on tensor name
+            // mismatch). Loader chain itself is validated by the
+            // gemma4_nvfp4_load integration test.
+            if matches!(family, ModelFamily::Gemma4Nvfp4) {
+                let _ = ready_tx.send(Err(
+                    "Gemma4-NVFP4 forward path is not yet implemented \
+                     (Phase 3c+). Loader is done; see \
+                     rvllm_runtime::gemma4_nvfp4_load. Use the fp8-block \
+                     Gemma 4 checkpoint at /home/r00t/.vllm/models/gemma-4-31b-it-fp8-block \
+                     until Phase 3c lands.".to_string(),
+                ));
+                return;
+            }
+
             let qwen_probe = match family {
-                ModelFamily::Gemma4 | ModelFamily::Qwen35 => Ok(None),
+                ModelFamily::Gemma4 | ModelFamily::Qwen35 | ModelFamily::Gemma4Nvfp4 => Ok(None),
                 ModelFamily::Qwen36 => {
                     rvllm_runtime::qwen36_arch::Qwen36Arch::from_dir(&paths.model_dir)
                         .and_then(|opt| match opt {

@@ -186,7 +186,8 @@ async fn main() -> anyhow_compat::Result<()> {
                 .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
                 .unwrap_or(false)
         }
-        ModelFamily::Auto | ModelFamily::Qwen36 | ModelFamily::Gemma4 => true,
+        ModelFamily::Auto | ModelFamily::Qwen36 | ModelFamily::Gemma4
+        | ModelFamily::Gemma4Nvfp4 => true,
         // Phase 3-a-vi: Qwen 3.5 now loads the Qwen3-VL ViT
         // (qwen35_load::load_qwen35_vision) and drives it via
         // Qwen35Bringup::forward_qwen_vision against the shared
