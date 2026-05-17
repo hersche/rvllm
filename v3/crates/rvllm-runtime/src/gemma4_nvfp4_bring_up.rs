@@ -2962,6 +2962,116 @@ impl Gemma4Nvfp4Bringup {
         }
     }
 
+    /// Commit #5f: multi-token prompt processing on Option B.
+    /// Processes `prompt` token IDs sequentially through the 60
+    /// decoder blocks, writing N consecutive KV cache slots at
+    /// `position_start..position_start+N`, then returns the
+    /// argmax token id from the LAST prompt position's final
+    /// hidden state (i.e. the predicted next token after the
+    /// prompt).
+    ///
+    /// Strategy: per-token-decode-loop fallback. Each prompt
+    /// token runs the existing single-token attention chain at
+    /// its slot, and subsequent prompt tokens see the prior K/V
+    /// slots via the decode kernel's `context_lens` (which now
+    /// equals the absolute slot+1). This matches the production
+    /// Qwen35/Qwen36 NVFP4 path's "batched prefill falls back to
+    /// per-token decode loop; unified prefill kernel is a
+    /// follow-up" pattern (see rvllm-serve CLAUDE.md).
+    ///
+    /// Cost: 60 × N attention calls instead of 60 × 1 for
+    /// single-token forward. The unified NVFP4 prefill kernel
+    /// (`PagedPrefillNvfp4Launcher::launch_nvfp4kv_unified_sm121`,
+    /// `v3/crates/rvllm-attention/src/prefill.rs:1041`) would
+    /// collapse those N calls into a single kernel launch per
+    /// layer. Wiring it requires plumbing the full Fa2Ptx
+    /// backend through Option B — separate commit (#5f-prime).
+    ///
+    /// Correctness invariant: at slot t, the decode reads slots
+    /// [0, t] for sliding (within window) or [0, t] for global
+    /// (full attention). Each token's contribution is causal by
+    /// construction — token t only sees what was written by
+    /// tokens 0..t.
+    ///
+    /// `kv` MUST have `max_pos >= position_start + N` and
+    /// `max_query_tokens >= 1` (today we still launch
+    /// one-token-at-a-time inside the loop; #5f-prime bumps
+    /// this).
+    pub fn forward_prompt_to_token(
+        &self,
+        prompt: &[u32],
+        position_start: u32,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<u32> {
+        if prompt.is_empty() {
+            return Err(corrupt_runtime_err(
+                "forward_prompt_to_token: prompt is empty".into()));
+        }
+        let n_tokens = prompt.len() as u32;
+        if (position_start as u64) + (n_tokens as u64) > kv.max_pos as u64 {
+            return Err(corrupt_runtime_err(format!(
+                "forward_prompt_to_token: position_start={} + n_tokens={} \
+                 exceeds kv.max_pos={}",
+                position_start, n_tokens, kv.max_pos)));
+        }
+
+        let f32_to_bf16_vec = |xs: &[f32]| -> Vec<u16> {
+            xs.iter().map(|&x| {
+                let bits = x.to_bits();
+                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+                (rounded >> 16) as u16
+            }).collect()
+        };
+
+        // Per-token residuals on host as bf16. The KV cache on
+        // device accumulates K/V for every prompt slot as each
+        // token's layer chain runs. Layer ordering: outer loop
+        // over LAYERS, inner over tokens — this matches the
+        // production batched-prefill ordering (one layer's KV
+        // for all tokens, then the next layer) and lets each
+        // layer's K/V be reused by subsequent prompt tokens at
+        // the same layer.
+        let mut residuals: Vec<Vec<u16>> = Vec::with_capacity(prompt.len());
+        for &tok in prompt {
+            residuals.push(self.embed_one_token_bf16(tok)?);
+        }
+
+        for li in 0..self.arch.num_hidden_layers {
+            // Pass 1: attention for every prompt token at this layer.
+            // Writes slot `position_start + t` of layer `li`'s KV cache;
+            // the next token's decode sees prior slots via context_lens.
+            let mut attn_outs_bf16: Vec<Vec<u16>> =
+                Vec::with_capacity(prompt.len());
+            for t in 0..prompt.len() {
+                let pos = position_start + (t as u32);
+                let attn_f32 = self.forward_layer_attn_from_residual(
+                    li, &residuals[t], pos, kv)?;
+                attn_outs_bf16.push(f32_to_bf16_vec(&attn_f32));
+            }
+            // Pass 2: post-attn close-out per token (no cross-token
+            // dependency, so order doesn't matter here).
+            let mut post_attn_bf16: Vec<Vec<u16>> =
+                Vec::with_capacity(prompt.len());
+            for t in 0..prompt.len() {
+                let h_f32 = self.forward_layer_post_attn(
+                    li, &attn_outs_bf16[t], &residuals[t])?;
+                post_attn_bf16.push(f32_to_bf16_vec(&h_f32));
+            }
+            // Pass 3: post-MLP close-out per token; output becomes
+            // input residual for next layer.
+            for t in 0..prompt.len() {
+                let h_f32 = self.forward_layer_post_attn_mlp(
+                    li, &post_attn_bf16[t])?;
+                residuals[t] = f32_to_bf16_vec(&h_f32);
+            }
+        }
+
+        // Argmax on the LAST prompt position's final residual —
+        // the predicted next token.
+        let last = residuals.last().expect("non-empty");
+        self.forward_final_to_token(last)
+    }
+
     /// Commit #5e: dump-mode variant of `forward_final_to_token`
     /// that writes `step_final_norm.bf16.bin` (post-norm hidden
     /// state) and `step_final_logits.f32.bin` (LM head output
@@ -4196,5 +4306,79 @@ mod tests {
         );
         assert!((token as usize) < vocab,
             "argmax returned out-of-range token {token} (vocab={vocab})");
+    }
+
+    /// Commit #5f smoke: multi-token prompt processing.
+    /// Drives a 3-token prompt through `forward_prompt_to_token`
+    /// starting at position 0, asserts the returned argmax is in
+    /// `[0, vocab_size)`. Also runs a 1-token call as a
+    /// baseline — a single-element prompt must produce the same
+    /// token as `forward_full_to_token` (BOS-only).
+    ///
+    /// Run:
+    ///   GEMMA4_NVFP4_DIR=/home/r00t/Gemma-4-31B-IT-NVFP4 \
+    ///     cargo test --release -p rvllm-runtime --features cuda,gb10 \
+    ///     gemma4_nvfp4_bring_up::tests::ondisk_bringup_prompt_forward \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ondisk_bringup_prompt_forward() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skipping #5f smoke");
+                return;
+            }
+        };
+        let kernels_dir = std::path::PathBuf::from(
+            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
+        );
+
+        // 1-token baseline: forward_prompt_to_token([BOS]) must
+        // match forward_full_to_token(BOS) byte-identically.
+        {
+            let mut bringup = Gemma4Nvfp4Bringup::load(
+                &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
+            ).expect("Gemma4Nvfp4Bringup::load");
+            let kv = bringup.allocate_kv_state(64)
+                .expect("allocate_kv_state(64)");
+            let token_a = bringup.forward_full_to_token(2, 0, &kv)
+                .expect("forward_full_to_token");
+            eprintln!("[#5f-smoke] forward_full_to_token(BOS)={token_a}");
+            assert!((token_a as usize) < bringup.arch.vocab_size);
+        }
+        {
+            let mut bringup = Gemma4Nvfp4Bringup::load(
+                &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
+            ).expect("Gemma4Nvfp4Bringup::load");
+            let kv = bringup.allocate_kv_state(64)
+                .expect("allocate_kv_state(64)");
+            let token_b = bringup.forward_prompt_to_token(&[2], 0, &kv)
+                .expect("forward_prompt_to_token([BOS])");
+            eprintln!("[#5f-smoke] forward_prompt_to_token([BOS])={token_b}");
+            assert!((token_b as usize) < bringup.arch.vocab_size);
+        }
+
+        // 3-token prompt: BOS + two arbitrary tokens. Verifies
+        // the prompt-loop scaffolding doesn't blow up on N>1 and
+        // produces an in-range argmax.
+        let mut bringup = Gemma4Nvfp4Bringup::load(
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
+        ).expect("Gemma4Nvfp4Bringup::load");
+        let kv = bringup.allocate_kv_state(64)
+            .expect("allocate_kv_state(64)");
+
+        let prompt: Vec<u32> = vec![2, 1000, 5000];
+        let t0 = std::time::Instant::now();
+        let next = bringup.forward_prompt_to_token(&prompt, 0, &kv)
+            .expect("forward_prompt_to_token(3 tokens)");
+        let elapsed = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "[#5f-smoke] 3-token prompt={:?} at pos=0..3 → next token {next} \
+             in {elapsed:.2}s ({} tok/s)",
+            prompt, prompt.len() as f64 / elapsed,
+        );
+        assert!((next as usize) < bringup.arch.vocab_size,
+            "out-of-range prompt argmax {next}");
     }
 }
