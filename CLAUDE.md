@@ -240,6 +240,77 @@ whether E4B's V-shadow at layer 23 is HF-faithful (it might be
 the same bug, just compensating in E4B because the drafter is
 smaller and the centroid-masked LM head clips to top-K).
 
+### Round 3 (2026-05-17) — V-cache hypothesis disproved + new evidence
+
+Read-only investigation refuted the Round 2 V-cache hypothesis:
+
+* HF `models/gemma4/modeling_gemma4.py:1198` defines `v_norm =
+  Gemma4RMSNorm(head_dim, eps, with_scale=False)` — **V-norm IS
+  parameter-free**. Not gamma-applied as Round 2 implied. rvllm's
+  `fused_qkv_rmsnorm.cu` V-head branch sets `use_gamma=false` →
+  matches HF. K_cache and V_cache differ in BOTH frameworks (K
+  has gamma+RoPE, V has parameter-free norm only).
+* `fused_rope_partial_nvfp4kv.cu` writes K and V to NVFP4
+  cache independently, with separate scale policies. No k_eq_v
+  shortcut. V-cache content is HF-faithful.
+
+So V-cache is correct. The bug is elsewhere.
+
+NEW evidence from this session (all gates leave production
+untouched, env-gated probes only, no code changes):
+
+* **KV-dtype invariance**: FP8-KV (`mobile-31b-rvllm-fp8kv-spec.env`)
+  vs NVFP4-KV (`mobile-31b-rvllm-spec.env`) produce BIT-IDENTICAL
+  drafter outputs:
+  ```
+  iter=0  drafts=[2021, 3050, 506, 1638]   base_argmax_k=[229912, 506, 3890, 3890]
+  iter=2  drafts=[3946, 14423, 241113, 237009] base_argmax_k=[3564, …]
+  ```
+  Same in both runs. So either KV quant noise is below the
+  LM-head argmax threshold, or the drafter cross-attn
+  contribution is too small to register at argmax level.
+* **Cross-attn scale insensitivity**: `RVLLM_SPEC_FA_SCALE=mtp`
+  (scale=1.0) vs `stable` (1/sqrt(head_dim)) — iter 0 IDENTICAL
+  drafts, iter 1+ differs but accept_rate stays 0.0.
+* **Source-pair matrix**: 5 candidates × 2 scale states × 2 KV
+  dtypes = 20 cells. Every cell accept_rate=0.0.
+
+The drafter is generating tokens that are FORMALLY VARYING
+(non-degenerate after embed-scale ON; degenerate when off) but
+NEVER matching the base's predictions. The drafter forward is
+running structurally but its prediction is qualitatively wrong.
+
+Remaining hypothesis space:
+1. Drafter weight upload has a subtle layout issue specific to
+   31B's larger dims (q_proj [16384,1024] full layer, embed_tokens
+   [262144,1024]) that the e4b path doesn't exercise.
+2. Drafter `pre_projection` input layout (the cat[embed, hidden]
+   order or per-half magnitudes) doesn't match what the 31B
+   drafter was trained against.
+3. The drafter's predictions DO carry useful signal but the
+   LM-head argmax over full vocab=262144 picks the wrong token
+   because of magnitude/scale issues unique to the
+   use_ordered_embeddings=false path.
+
+Codex Q7's surgical step (HF-vs-rvllm side-by-side dump at
+`pre_projection_in` and `run_drafter_pre_projection` output) is
+the next decisive move. Requires loading 31B base + drafter in
+HF transformers Python, capturing the tensor at iter 0 for the
+same prompt, and comparing byte-for-byte with rvllm's dumps.
+
+Production state: rvllm-serve currently STOPPED (user instructed
+"do not restart any services" for development); pre-session
+state had e4b-spec live with the full brain stack. Switch back
+when ready: `sudo ln -sfn /home/r00t/.rvllm/profiles/
+mobile-e4b-rvllm-spec.env /home/r00t/.rvllm/active-profile.env
+&& sudo systemctl start rvllm-serve vllm-embedding zeroclaw
+whisper-fast chatterbox`.
+
+New file: `~/.rvllm/profiles/mobile-31b-rvllm-fp8kv-spec.env`
+(31B fp8-block weights + FP8 KV + spec) created for the
+KV-dtype-invariance test; kept on disk as a baseline for future
+work.
+
 ### Active diagnostic env knobs (env-gated, all default OFF)
 
 * `RVLLM_GEMMA4_SPEC_SOURCE_PAIR=<sliding>,<full>` — override the
