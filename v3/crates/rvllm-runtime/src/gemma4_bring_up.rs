@@ -4745,6 +4745,27 @@ impl Gemma4Bringup {
                     };
                     self.run_drafter_layer_q_side(
                         drafter, &workspace, li, step.position)?;
+                    // Diagnostic: RVLLM_SPEC_ZERO_Q=1 zeros workspace.q
+                    // RIGHT BEFORE cross-attn. If drafter output stays
+                    // bit-identical, the FA-2 launcher is not actually
+                    // consuming our Q tensor (or Q's contribution is
+                    // dwarfed). Q_ROPE_MODE={pos0,no_rope} already
+                    // produced identical drafts on 31B; this confirms
+                    // wiring vs scale.
+                    if std::env::var("RVLLM_SPEC_ZERO_Q").as_deref() == Ok("1") {
+                        let q_rows = drafter.arch.num_attention_heads
+                            * layer.effective_head_dim;
+                        let rc = cudarc::driver::sys::cuMemsetD8Async(
+                            workspace.q, 0, q_rows * 2,
+                            stream as cudarc::driver::sys::CUstream);
+                        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                            return Err(rvllm_core::RvllmError::cuda(
+                                "spec_zero_q memset failed",
+                                rvllm_core::CudaErrorKind::MemcpyFailed,
+                                rvllm_core::CudaCtx::setup(),
+                            ));
+                        }
+                    }
                     if is_global {
                         drafter.launch_cross_attn_global(
                             workspace.attn_out,
