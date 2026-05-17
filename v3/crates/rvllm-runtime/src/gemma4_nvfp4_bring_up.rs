@@ -440,27 +440,25 @@ impl Gemma4Nvfp4Bringup {
 
     /// Commit #5b1: allocate the persistent NVFP4 KV cache state
     /// on the bring-up's arena. Call once after `load`, before
-    /// the first `forward_*_attn` (commit #5b2). The state is
-    /// allocated ABOVE the forward_checkpoint so scratch
-    /// rewinds don't free it.
+    /// the first `forward_*_attn` (commit #5b2). After allocating,
+    /// this advances `forward_checkpoint` so that subsequent
+    /// scratch rewinds do NOT free the KV state.
+    ///
+    /// Codex round-4-followup fix: in #5b1 this took `&self` and
+    /// did not advance the checkpoint — the KV state was
+    /// allocated above the post-load checkpoint and would be
+    /// freed by the first forward's ForwardScratchGuard drop.
+    /// Caught before any forward integration shipped.
     ///
     /// `max_pos` defaults to 4096 for production workloads;
     /// raise it for long-context inference (the 31B checkpoint
     /// supports up to 262144 but rope-table memory grows
     /// linearly).
-    ///
-    /// The forward integration (`forward_layer0_attn`, the
-    /// 60-layer driver, multi-token prefill) lands in commit
-    /// #5b2 based on codex round-4's verbatim 6-step plan:
-    ///   1. Use this state struct.
-    ///   2. Load attention kernel handles (done in this commit).
-    ///   3. Add forward_layer0_attn using fused RoPE+KV write
-    ///      kernel + bf16-output decode.
-    ///   4. Smoke at positions 0 and 1.
-    ///   5. Extend to 60-layer driver.
-    ///   6. Multi-token prefill (per-token loop fallback first).
-    pub fn allocate_kv_state(&self, max_pos: u32) -> Result<Gemma4Nvfp4KvState> {
-        Gemma4Nvfp4KvState::allocate(&self.arena, &self.arch, max_pos)
+    pub fn allocate_kv_state(&mut self, max_pos: u32) -> Result<Gemma4Nvfp4KvState> {
+        let kv = Gemma4Nvfp4KvState::allocate(&self.arena, &self.arch, max_pos)?;
+        // Re-anchor scratch rewinds above the KV state.
+        self.forward_checkpoint = self.arena.checkpoint();
+        Ok(kv)
     }
 
     /// Layer-0 QKV + Q/K-norm on a single token. Extends
@@ -1545,6 +1543,381 @@ impl Gemma4Nvfp4Bringup {
         }
         Ok(out)
     }
+
+    /// Commit #5b2: layer-0 attention end-to-end at a single
+    /// position, with persistent NVFP4 KV cache.
+    ///
+    /// Composes:
+    ///   1. forward_layer0_qk_norm (Q+K-norm; V returned raw)
+    ///   2. host-side parameter-free V-RMSNorm (Gemma 4 uses
+    ///      `Gemma4RMSNorm(head_dim, eps, with_scale=False)`
+    ///      on V — no gamma. See codex round-3 note in
+    ///      rvllm-serve/CLAUDE.md "V-cache write".)
+    ///   3. upload Q/K/V as bf16, allocate q_fp8 + bf16 attn_out
+    ///      scratch
+    ///   4. build per-position f16 cos/sin mini-tables (1 row
+    ///      each at index 0), write positions[0]=0,
+    ///      slot_mapping[0]=position, context_lens[0]=position+1
+    ///   5. launch `fused_rope_partial_nvfp4kv_bf16in` — RoPE +
+    ///      NVFP4 K/V pack + per-(slot,head) E4M3 microscale
+    ///      write + FP8 Q output. Hadamard OFF, per-token Q
+    ///      scale OFF (uses scalar fallback), K policy = amax6,
+    ///      V policy = amax6.
+    ///   6. launch `flash_attention_2_decode_nvfp4kv_gqa_bf16out`
+    ///      — reads cache + q_fp8, emits bf16 attn_out.
+    ///      Sliding-layer 0 has GQA=2 (32 q / 16 kv); the GQA
+    ///      kernel handles ratio ∈ [1, MAX_GQA_DECODE=4].
+    ///   7. DtoH bf16 attn_out → host f32, return.
+    ///
+    /// Caller responsibilities:
+    ///   * Allocate `kv` once via `allocate_kv_state` BEFORE
+    ///     the first call (anchors it above forward_checkpoint).
+    ///   * Call with `position` advancing 0,1,2,… (caller's
+    ///     decode loop). Each call writes one new slot.
+    ///
+    /// NOT yet wired here (separate commits):
+    ///   * Real RoPE table: per-launch mini-table is fine for
+    ///     numerical correctness at the chosen position; the
+    ///     full f16 table is loader work and lands when the
+    ///     60-layer driver does (memory ≈ 384 MiB).
+    ///   * Hadamard rotation — production NVFP4 profile uses
+    ///     it. For a smoke at layer 0 it's not needed; wiring
+    ///     it requires the sign tables + the unrotate kernel.
+    ///   * Per-token Q scale — required when Hadamard is on.
+    ///   * window_size_left handling at low position is the
+    ///     same as production (= sliding_window_size - 1).
+    pub fn forward_layer0_attn(
+        &self,
+        token_id: u32,
+        position: u32,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<Vec<f32>> {
+        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+
+        if position >= kv.max_pos {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer0_attn: position={} >= kv.max_pos={}",
+                position, kv.max_pos)));
+        }
+
+        let _scratch_guard = self.forward_scratch_guard();
+
+        // ---- 1. Q-norm + K-norm via existing helper -----------------------
+        let (q_normed_f32, k_normed_f32, v_raw_f32) =
+            self.forward_layer0_qk_norm(token_id)?;
+
+        let head_dim = self.arch.head_dim_sliding;
+        let num_q_heads = q_normed_f32.len() / head_dim;
+        let num_kv_heads = k_normed_f32.len() / head_dim;
+        debug_assert_eq!(v_raw_f32.len(), num_kv_heads * head_dim);
+        debug_assert!(num_q_heads >= num_kv_heads
+            && num_q_heads % num_kv_heads == 0);
+        let gqa = num_q_heads / num_kv_heads;
+        if gqa > 4 {
+            // MAX_GQA_DECODE = 4 in the GQA kernel.
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer0_attn: gqa_ratio={} > MAX_GQA_DECODE=4",
+                gqa)));
+        }
+
+        // ---- 2. Parameter-free V-RMSNorm on host --------------------------
+        //   y_h[d] = v_h[d] * rsqrt(mean_d(v_h^2) + eps)
+        let eps = self.arch.rms_norm_eps;
+        let mut v_normed_f32: Vec<f32> = Vec::with_capacity(v_raw_f32.len());
+        for h in 0..num_kv_heads {
+            let row = &v_raw_f32[h * head_dim .. (h + 1) * head_dim];
+            let mean_sq: f32 = row.iter().map(|x| x * x).sum::<f32>()
+                / (head_dim as f32);
+            let scale = 1.0 / (mean_sq + eps).sqrt();
+            for &x in row { v_normed_f32.push(x * scale); }
+        }
+
+        // ---- 3. Upload Q/K/V as bf16 + allocate scratch -------------------
+        let f32_to_bf16 = |xs: &[f32]| -> Vec<u16> {
+            xs.iter().map(|&x| {
+                let bits = x.to_bits();
+                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+                (rounded >> 16) as u16
+            }).collect()
+        };
+        let q_bf16 = f32_to_bf16(&q_normed_f32);
+        let k_bf16 = f32_to_bf16(&k_normed_f32);
+        let v_bf16 = f32_to_bf16(&v_normed_f32);
+
+        let q_region  = self.arena.region("g4n_attn_q_bf16",   q_bf16.len() * 2, 256)?;
+        let k_region  = self.arena.region("g4n_attn_k_bf16",   k_bf16.len() * 2, 256)?;
+        let v_region  = self.arena.region("g4n_attn_v_bf16",   v_bf16.len() * 2, 256)?;
+        let q_fp8_region = self.arena.region(
+            "g4n_attn_q_fp8", q_bf16.len(), 256)?;  // 1 byte/elem
+        let attn_out_region = self.arena.region(
+            "g4n_attn_out_bf16", num_q_heads * head_dim * 2, 256)?;
+
+        unsafe {
+            let qb: &[u8] = std::slice::from_raw_parts(
+                q_bf16.as_ptr() as *const u8, q_bf16.len() * 2);
+            let kb: &[u8] = std::slice::from_raw_parts(
+                k_bf16.as_ptr() as *const u8, k_bf16.len() * 2);
+            let vb: &[u8] = std::slice::from_raw_parts(
+                v_bf16.as_ptr() as *const u8, v_bf16.len() * 2);
+            q_region.copy_from_host(qb)?;
+            k_region.copy_from_host(kb)?;
+            v_region.copy_from_host(vb)?;
+        }
+
+        // ---- 4. Per-position f16 cos/sin mini-tables + state writes ------
+        // Sliding-layer 0 uses FULL RoPE: rotary_dim = head_dim.
+        let rotary_dim = head_dim;
+        let half_rotary = rotary_dim / 2;
+        let theta = self.arch.rope_theta_sliding as f64;
+        let p = position as f64;
+        let mut cos_f16: Vec<u16> = Vec::with_capacity(half_rotary);
+        let mut sin_f16: Vec<u16> = Vec::with_capacity(half_rotary);
+        for i in 0..half_rotary {
+            let inv_freq = 1.0 / theta.powf((2 * i) as f64 / rotary_dim as f64);
+            let angle = p * inv_freq;
+            cos_f16.push(f32_to_f16_bits(angle.cos() as f32));
+            sin_f16.push(f32_to_f16_bits(angle.sin() as f32));
+        }
+        let cos_region = self.arena.region(
+            "g4n_attn_cos_f16", half_rotary * 2, 256)?;
+        let sin_region = self.arena.region(
+            "g4n_attn_sin_f16", half_rotary * 2, 256)?;
+        unsafe {
+            let cb: &[u8] = std::slice::from_raw_parts(
+                cos_f16.as_ptr() as *const u8, cos_f16.len() * 2);
+            let sb: &[u8] = std::slice::from_raw_parts(
+                sin_f16.as_ptr() as *const u8, sin_f16.len() * 2);
+            cos_region.copy_from_host(cb)?;
+            sin_region.copy_from_host(sb)?;
+        }
+
+        // Write i32 scalars into the persistent KV state buffers.
+        //   positions[0] = 0    (mini-table is 1 row at index 0)
+        //   slot_mapping[0] = position  (actual cache slot to write)
+        //   context_lens[0] = position + 1  (decoder reads this)
+        let write_i32_devptr = |dst: u64, val: i32| -> Result<()> {
+            let bytes = val.to_le_bytes();
+            unsafe {
+                use cudarc::driver::sys::*;
+                let rc = cuMemcpyHtoD_v2(dst, bytes.as_ptr() as *const _, 4);
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(RvllmError::cuda(
+                        "forward_layer0_attn: kv state HtoD",
+                        CudaErrorKind::MemcpyFailed,
+                        CudaCtx::setup()));
+                }
+            }
+            Ok(())
+        };
+        write_i32_devptr(kv.positions_ptr,     0)?;
+        write_i32_devptr(kv.slot_mapping_ptr,  position as i32)?;
+        write_i32_devptr(kv.context_lens_ptr,  (position as i32) + 1)?;
+
+        // ---- 5. Launch RoPE + NVFP4 K/V write + FP8 Q ---------------------
+        // Layer 0 is sliding; pick the layer-0 KV pointers.
+        let k_packed = kv.k_packed_layer_ptrs[0];
+        let v_packed = kv.v_packed_layer_ptrs[0];
+        let k_scale  = kv.k_scale_layer_ptrs[0];
+        let v_scale  = kv.v_scale_layer_ptrs[0];
+        let stream_u64 = self.stream.raw();
+
+        unsafe {
+            let mut q_in: u64 = q_region.device_ptr();
+            let mut k_in: u64 = k_region.device_ptr();
+            let mut v_in: u64 = v_region.device_ptr();
+            let mut q_out: u64 = q_fp8_region.device_ptr();
+            let mut kp: u64 = k_packed;
+            let mut vp: u64 = v_packed;
+            let mut ks: u64 = k_scale;
+            let mut vs: u64 = v_scale;
+            let mut cos_ptr: u64 = cos_region.device_ptr();
+            let mut sin_ptr: u64 = sin_region.device_ptr();
+            let mut positions_ptr: u64 = kv.positions_ptr;
+            let mut slot_ptr: u64 = kv.slot_mapping_ptr;
+            let mut q_scale_ptr: u64 = kv.q_scale_ptr;
+            let mut q_scale_cache_ptr: u64 = 0; // no per-token Q scale
+            let mut hadamard_q: u64 = 0;
+            let mut hadamard_k: u64 = 0;
+            let mut debug_k_prequant: u64 = 0;
+            let mut debug_v_prequant: u64 = 0;
+
+            let mut nt: i32 = 1;
+            let mut nh: i32 = num_q_heads as i32;
+            let mut nkvh: i32 = num_kv_heads as i32;
+            let mut hd: i32 = head_dim as i32;
+            let mut rd: i32 = rotary_dim as i32;
+            let mut scale_policy: i32 = 0;   // amax6
+            let mut v_scale_policy: i32 = 0; // amax6
+            let mut rotate_v: i32 = 0;
+            let mut stoch_round_v: i32 = 0;
+
+            let args = [
+                (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut kp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut ks) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vs) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cos_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sin_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut positions_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut slot_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_scale_cache_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut scale_policy) as *mut i32 as *mut core::ffi::c_void,
+                (&mut v_scale_policy) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hadamard_q) as *mut u64 as *mut core::ffi::c_void,
+                (&mut hadamard_k) as *mut u64 as *mut core::ffi::c_void,
+                (&mut rotate_v) as *mut i32 as *mut core::ffi::c_void,
+                (&mut debug_k_prequant) as *mut u64 as *mut core::ffi::c_void,
+                (&mut debug_v_prequant) as *mut u64 as *mut core::ffi::c_void,
+                (&mut stoch_round_v) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let max_heads = num_q_heads.max(num_kv_heads) as u32;
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_rope_kv_write_bf16in,
+                (1u32, max_heads, 1u32),
+                (head_dim as u32, 1u32, 1u32),
+                0, stream_u64, &args,
+            )?;
+        }
+
+        // ---- 6. Launch paged-attention decode (GQA bf16-out) -------------
+        unsafe {
+            let mut output: u64 = attn_out_region.device_ptr();
+            let mut query: u64 = q_fp8_region.device_ptr();
+            let mut kp: u64 = k_packed;
+            let mut vp: u64 = v_packed;
+            let mut ks: u64 = k_scale;
+            let mut vs: u64 = v_scale;
+            let mut q_scale_cache_ptr: u64 = 0;
+            let mut block_tables: u64 = kv.block_tables_ptr;
+            let mut context_lens: u64 = kv.context_lens_ptr;
+            let mut q_descale: u64 = kv.q_scale_ptr;
+
+            let mut scale: f32 = 1.0 / (head_dim as f32).sqrt();
+            let mut nh: i32 = num_q_heads as i32;
+            let mut nkvh: i32 = num_kv_heads as i32;
+            let mut hd: i32 = head_dim as i32;
+            let mut block_size: i32 = kv.block_size as i32;
+            let mut max_blocks_per_seq: i32 = kv.max_pos as i32;
+            // Sliding layer 0: window_size_left = sliding_window - 1.
+            let mut window_size_left: i32 =
+                (self.arch.sliding_window_size as i32) - 1;
+
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut query) as *mut u64 as *mut core::ffi::c_void,
+                (&mut kp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut ks) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vs) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_scale_cache_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut block_tables) as *mut u64 as *mut core::ffi::c_void,
+                (&mut context_lens) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_descale) as *mut u64 as *mut core::ffi::c_void,
+                (&mut scale) as *mut f32 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut block_size) as *mut i32 as *mut core::ffi::c_void,
+                (&mut max_blocks_per_seq) as *mut i32 as *mut core::ffi::c_void,
+                (&mut window_size_left) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            // Smem: 2*FA2_BC*head_dim halves + MAX_GQA*FA2_BC + FA2_THREADS/32 floats
+            // = (2*32*head_dim)*2 + (4*32 + 4)*4  bytes
+            let fa2_bc: u32 = 32;
+            let max_gqa: u32 = 4;
+            let fa2_threads: u32 = 128;
+            let smem_bytes: u32 =
+                2 * fa2_bc * (head_dim as u32) * 2
+                + (max_gqa * fa2_bc + fa2_threads / 32) * 4;
+
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_attn_decode_gqa_bf16out,
+                (1u32, num_kv_heads as u32, 1u32),
+                (fa2_threads, 1u32, 1u32),
+                smem_bytes, stream_u64, &args,
+            )?;
+        }
+
+        self.stream.fence()?;
+
+        // ---- 7. DtoH bf16 → host f32 -------------------------------------
+        let mut attn_out_bf16 = vec![0u16; num_q_heads * head_dim];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                attn_out_bf16.as_mut_ptr() as *mut _,
+                attn_out_region.device_ptr(),
+                attn_out_bf16.len() * 2);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "forward_layer0_attn: attn_out DtoH",
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup()));
+            }
+        }
+        let attn_out_f32: Vec<f32> = attn_out_bf16.iter()
+            .map(|&b| f32::from_bits((b as u32) << 16)).collect();
+        Ok(attn_out_f32)
+    }
+}
+
+/// f32 → f16 IEEE-754 round-to-nearest-even, returning the raw u16
+/// bit pattern. Used for the per-position cos/sin mini-tables in
+/// `forward_layer0_attn`. Handles subnormals, overflow→inf, NaN.
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp32 = ((b >> 23) & 0xff) as i32;
+    let mant32 = b & 0x007fffff;
+    if exp32 == 0xff {
+        // Inf / NaN.
+        let mant16 = if mant32 != 0 { 0x200u16 } else { 0u16 };
+        return sign | 0x7c00 | mant16;
+    }
+    let unbiased = exp32 - 127;
+    if unbiased > 15 {
+        // Overflow → inf with sign.
+        return sign | 0x7c00;
+    }
+    if unbiased < -14 {
+        // Subnormal f16 or zero.
+        let shift = -unbiased - 1; // 0..24
+        if shift >= 24 { return sign; }
+        let mant_with_hidden = mant32 | 0x00800000;
+        let mant16 = (mant_with_hidden >> (shift + 13)) as u16;
+        let round_bit = (mant_with_hidden >> (shift + 12)) & 1;
+        let sticky = (mant_with_hidden & ((1 << (shift + 12)) - 1)) != 0;
+        let bumped = if round_bit == 1 && (sticky || (mant16 & 1) == 1)
+            { mant16 + 1 } else { mant16 };
+        return sign | bumped;
+    }
+    let exp16 = ((unbiased + 15) as u16) << 10;
+    let mant16 = (mant32 >> 13) as u16;
+    let round_bit = (mant32 >> 12) & 1;
+    let sticky = (mant32 & 0xfff) != 0;
+    let bumped = if round_bit == 1 && (sticky || (mant16 & 1) == 1)
+        { (sign | exp16 | mant16) + 1 } else { sign | exp16 | mant16 };
+    bumped
+}
+
+#[inline]
+fn corrupt_runtime_err(msg: String) -> rvllm_core::RvllmError {
+    rvllm_core::RvllmError::Config {
+        err: rvllm_core::ConfigError::InvalidField {
+            name: "runtime", reason: msg.into(),
+        },
+        field: "runtime",
+    }
 }
 
 #[cfg(test)]
@@ -2076,7 +2449,7 @@ mod tests {
         let kernels_dir = std::path::PathBuf::from(
             "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
         );
-        let bringup = Gemma4Nvfp4Bringup::load(
+        let mut bringup = Gemma4Nvfp4Bringup::load(
             &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
         ).expect("Gemma4Nvfp4Bringup::load");
 
@@ -2118,5 +2491,93 @@ mod tests {
         // Gemma4Nvfp4KvState struct). Bound generously.
         assert!(mib > 500.0 && mib < 1500.0,
             "total_bytes={mib:.1} MiB outside expected 500..1500 range");
+    }
+
+    /// Commit #5b2 smoke: layer-0 attention end-to-end at two
+    /// consecutive positions with shared NVFP4 KV cache.
+    ///
+    /// Drives `forward_layer0_attn` at position=0 (BOS, slot 0
+    /// written) and position=1 (a second token, slot 1 written,
+    /// decode reads both slots). Asserts attn_out is finite, has
+    /// plausible magnitude, and the two positions produce
+    /// DIFFERENT outputs (smoke that the cache+attention chain
+    /// actually consumes the prior slot).
+    ///
+    /// Run:
+    ///   GEMMA4_NVFP4_DIR=/home/r00t/Gemma-4-31B-IT-NVFP4 \
+    ///     cargo test --release -p rvllm-runtime --features cuda,gb10 \
+    ///     gemma4_nvfp4_bring_up::tests::ondisk_bringup_layer0_attn_pos0_pos1 \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ondisk_bringup_layer0_attn_pos0_pos1() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skipping #5b2 smoke");
+                return;
+            }
+        };
+        let kernels_dir = std::path::PathBuf::from(
+            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
+        );
+        let mut bringup = Gemma4Nvfp4Bringup::load(
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
+        ).expect("Gemma4Nvfp4Bringup::load");
+
+        let kv = bringup.allocate_kv_state(64)
+            .expect("allocate_kv_state(64)");
+
+        // Run attention at position=0 (BOS) and position=1
+        // (some other token id) sharing the same KV state.
+        let attn0 = bringup.forward_layer0_attn(2, 0, &kv)
+            .expect("forward_layer0_attn(pos=0)");
+        let attn1 = bringup.forward_layer0_attn(64, 1, &kv)
+            .expect("forward_layer0_attn(pos=1)");
+
+        let summarize = |label: &str, a: &[f32]| -> (f32, f32, usize, usize) {
+            let nan = a.iter().filter(|x| x.is_nan()).count();
+            let inf = a.iter().filter(|x| x.is_infinite()).count();
+            let mean_abs: f32 = a.iter().map(|x| x.abs()).sum::<f32>()
+                / (a.len() as f32);
+            let max_abs: f32 = a.iter().fold(0f32, |a, &x| a.max(x.abs()));
+            eprintln!(
+                "[#5b2-smoke] {label}: N={} nan={nan} inf={inf} \
+                 mean_abs={mean_abs:.4} max_abs={max_abs:.4} \
+                 first4={:?}",
+                a.len(), &a[..4],
+            );
+            (mean_abs, max_abs, nan, inf)
+        };
+
+        let (m0, x0, n0, i0) = summarize("attn_pos0", &attn0);
+        let (m1, x1, n1, i1) = summarize("attn_pos1", &attn1);
+
+        assert_eq!(n0, 0, "pos=0 attn_out has {n0} NaN");
+        assert_eq!(i0, 0, "pos=0 attn_out has {i0} Inf");
+        assert_eq!(n1, 0, "pos=1 attn_out has {n1} NaN");
+        assert_eq!(i1, 0, "pos=1 attn_out has {i1} Inf");
+        assert!(m0 > 0.0, "pos=0 attn_out all zero");
+        assert!(m1 > 0.0, "pos=1 attn_out all zero");
+        // Expect magnitudes in a sane band — V-norm scales V to
+        // unit-ish; softmax then averages so attn_out should be
+        // similarly bounded.
+        assert!(m0 < 100.0, "pos=0 mean_abs={m0} implausibly large");
+        assert!(x0 < 1000.0, "pos=0 max_abs={x0} implausibly large");
+        assert!(m1 < 100.0, "pos=1 mean_abs={m1} implausibly large");
+        assert!(x1 < 1000.0, "pos=1 max_abs={x1} implausibly large");
+
+        // The two outputs MUST differ — at pos=1 the decode reads
+        // both slot 0 (BOS-token V) and slot 1 (the second
+        // token's V), so the attn_out distribution is different
+        // from pos=0 (which sees only slot 0).
+        assert_eq!(attn0.len(), attn1.len());
+        let diff: f32 = attn0.iter().zip(attn1.iter())
+            .map(|(a, b)| (a - b).abs()).sum::<f32>()
+            / (attn0.len() as f32);
+        eprintln!("[#5b2-smoke] mean_abs(attn_pos0 - attn_pos1) = {diff:.6}");
+        assert!(diff > 1e-4,
+            "pos=0 and pos=1 attn_out are identical — KV cache likely \
+             not being consumed (diff_mean_abs={diff})");
     }
 }
