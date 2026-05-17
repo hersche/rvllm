@@ -189,6 +189,135 @@ impl Gemma4Nvfp4Bringup {
         })
     }
 
+    /// Layer-0 QKV projection on a single token. Extends the
+    /// `pre_attn_one_token` smoke with K and V projections too.
+    /// Returns (q[N_q], k[N_kv], v[N_kv]) as host f32 vectors.
+    ///
+    /// Layer 0 is a SLIDING-attention layer per
+    /// `arch.layer_types[0]`. v_proj IS present (k_eq_v aliasing
+    /// only applies to global layers); the helper requires that.
+    ///
+    /// `K_kv = arch.num_kv_heads_sliding * arch.head_dim_sliding`
+    /// for layer 0 — 16 * 256 = 4096 on 31B.
+    ///
+    /// What's NOT yet wired (commit #4c):
+    ///   * Q-norm / K-norm (the existing fp8-block path uses
+    ///     `FusedQkvRmsnormLaunch` with `fused_qkv_rmsnorm_bf16`,
+    ///     but the kernel takes fp8-class quantized input. A
+    ///     pure-bf16-in variant is the next addition.)
+    ///   * RoPE (Gemma 4 sliding uses full RoPE on head_dim=256;
+    ///     global uses partial RoPE on head_dim=512 with
+    ///     rotary_dim=128 per arch.partial_rotary_factor_global).
+    ///   * Attention launch + KV write.
+    ///   * O-proj + residual.
+    pub fn forward_layer0_qkv_only(
+        &self,
+        token_id: u32,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let layer0 = &self.model.layers[0];
+        let n_q = layer0.q_proj.shape[0] as i32;
+        let n_kv = layer0.k_proj.shape[0] as i32;
+        let v_weight = layer0.v_proj.as_ref().ok_or_else(|| {
+            rvllm_core::RvllmError::cuda(
+                "forward_layer0_qkv_only: v_proj absent on layer 0 \
+                 (k_eq_v aliasing applies only to global layers — \
+                 layer 0 is sliding, must have v_proj)",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+        let n_v = v_weight.shape[0] as i32;
+        // Sliding layer: k and v have the same output dim
+        // (n_kv_heads * head_dim); on 31B that's 16 * 256 = 4096.
+        debug_assert_eq!(n_kv, n_v,
+            "sliding-layer K and V projections must match");
+
+        let hidden = self.arch.hidden_size as u32;
+
+        // Scratch: token + residual + q + k + v.
+        let tok_region = self.arena.region("gemma4_nvfp4_qkv_tok", 4, 16)?;
+        unsafe {
+            tok_region.copy_from_host(&(token_id as i32).to_le_bytes())?;
+        }
+        let residual_region = self.arena.region(
+            "gemma4_nvfp4_qkv_residual", (hidden as usize) * 2, 256)?;
+        let q_region = self.arena.region(
+            "gemma4_nvfp4_qkv_q", (n_q as usize) * 4, 256)?;
+        let k_region = self.arena.region(
+            "gemma4_nvfp4_qkv_k", (n_kv as usize) * 4, 256)?;
+        let v_region = self.arena.region(
+            "gemma4_nvfp4_qkv_v", (n_v as usize) * 4, 256)?;
+        let stream_u64 = self.stream.raw();
+
+        // embed → residual → input_layernorm in-place.
+        unsafe {
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens: 1, hidden,
+                vocab: self.arch.vocab_size as u32,
+            }
+            .launch(
+                self.forward_kernels.fn_embedding_gather_bf16,
+                residual_region.device_ptr(),
+                self.model.outside.embed_tokens.offset_bytes,
+                tok_region.device_ptr(), stream_u64,
+            )?;
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+            }
+            .launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                residual_region.device_ptr(),
+                layer0.input_layernorm.offset_bytes,
+                stream_u64,
+            )?;
+        }
+
+        // Q/K/V projections via commit #2 helper. Three sequential
+        // bf16 GEMVs at M=1; commit #4c can fuse via cuBLASLt
+        // strided-batched if perf matters here.
+        unsafe {
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt, residual_region.device_ptr(),
+                layer0.q_proj.offset_bytes, q_region.device_ptr(),
+                1, n_q, hidden as i32, stream_u64,
+            )?;
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt, residual_region.device_ptr(),
+                layer0.k_proj.offset_bytes, k_region.device_ptr(),
+                1, n_kv, hidden as i32, stream_u64,
+            )?;
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt, residual_region.device_ptr(),
+                v_weight.offset_bytes, v_region.device_ptr(),
+                1, n_v, hidden as i32, stream_u64,
+            )?;
+        }
+        self.stream.fence()?;
+
+        let mut q = vec![0f32; n_q as usize];
+        let mut k = vec![0f32; n_kv as usize];
+        let mut v = vec![0f32; n_v as usize];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let copies = [
+                (q.as_mut_ptr() as *mut _, q_region.device_ptr(), (n_q as usize) * 4),
+                (k.as_mut_ptr() as *mut _, k_region.device_ptr(), (n_kv as usize) * 4),
+                (v.as_mut_ptr() as *mut _, v_region.device_ptr(), (n_v as usize) * 4),
+            ];
+            for (host, dev, sz) in copies {
+                let rc = cuMemcpyDtoH_v2(host, dev, sz);
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "forward_layer0_qkv_only: DtoH failed",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+        }
+        Ok((q, k, v))
+    }
+
     /// Pre-attention sub-block on layer 0:
     ///   embed[token_id] → input_layernorm → q_proj.
     ///
@@ -355,5 +484,58 @@ mod tests {
                 "q_proj mean_abs={mean_abs} implausibly large");
         assert!(max_abs < 1000.0,
                 "q_proj max_abs={max_abs} implausibly large");
+    }
+
+    /// Commit #4b smoke: full Q/K/V projection on BOS token.
+    /// Extends the pre-attention smoke to also exercise the K
+    /// and V projections from the same bf16 GEMV path. Asserts
+    /// all three outputs are finite and have plausible
+    /// magnitudes.
+    ///
+    /// Run:
+    ///   GEMMA4_NVFP4_DIR=/home/r00t/Gemma-4-31B-IT-NVFP4 \
+    ///     cargo test -p rvllm-runtime --features cuda,gb10 \
+    ///     gemma4_nvfp4_bring_up::tests::ondisk_bringup_qkv \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ondisk_bringup_qkv() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skipping qkv smoke");
+                return;
+            }
+        };
+        let kernels_dir = std::path::PathBuf::from(
+            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
+        );
+        let bringup = Gemma4Nvfp4Bringup::load(
+            &dir, 32 * 1024 * 1024 * 1024, &kernels_dir,
+        ).expect("Gemma4Nvfp4Bringup::load");
+
+        let token_id: u32 = 2;
+        let (q, k, v) = bringup.forward_layer0_qkv_only(token_id)
+            .expect("forward_layer0_qkv_only");
+
+        for (name, vec) in [("q", &q), ("k", &k), ("v", &v)] {
+            let nan = vec.iter().filter(|x| x.is_nan()).count();
+            let inf = vec.iter().filter(|x| x.is_infinite()).count();
+            let mean_abs: f32 = vec.iter().map(|x| x.abs()).sum::<f32>() / (vec.len() as f32);
+            let max_abs: f32 = vec.iter().fold(0f32, |a, &x| a.max(x.abs()));
+            eprintln!(
+                "[qkv-smoke] {name}: N={} nan={nan} inf={inf} \
+                 mean_abs={mean_abs:.4} max_abs={max_abs:.4} first4={:?}",
+                vec.len(), &vec[..4],
+            );
+            assert_eq!(nan, 0, "{name} has {nan} NaN");
+            assert_eq!(inf, 0, "{name} has {inf} Inf");
+            assert!(mean_abs > 0.0, "{name} all-zero");
+            assert!(mean_abs < 100.0, "{name} mean_abs={mean_abs} too large");
+        }
+
+        assert_eq!(q.len(), 8192, "q on sliding layer 0: N_q=32*256");
+        assert_eq!(k.len(), 4096, "k on sliding layer 0: N_kv=16*256");
+        assert_eq!(v.len(), 4096, "v on sliding layer 0: N_kv=16*256");
     }
 }
