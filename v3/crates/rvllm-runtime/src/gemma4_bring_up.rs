@@ -4716,10 +4716,22 @@ impl Gemma4Bringup {
                 // path only. Override via
                 // RVLLM_GEMMA4_SPEC_EMBED_SCALE_31B=0 to disable for
                 // bisecting if this hypothesis is wrong.
+                // RVLLM_GEMMA4_SPEC_EMBED_SCALE_31B was originally
+                // added defaulting ON for 31B (commit 2693894) under
+                // a Round-3 hypothesis that the drafter trained with
+                // an extra sqrt(backbone) on the embed half. Codex
+                // Round 4 Q1(b) confirmed HF's only embed scale is
+                // baked into base.embedding (rvllm already applies
+                // it). With this knob ON we double-scaled the embed
+                // half by sqrt(backbone)=73.32, which inflated
+                // workspace.hidden post-pre_projection by ~70x (RMS
+                // 145 vs ~7.8 in PyTorch reference). DEFAULT IS NOW
+                // OFF; set =1 explicitly to opt back in for
+                // experimentation.
                 let apply_embed_scale_for_31b =
                     !drafter.arch.use_ordered_embeddings
                     && std::env::var("RVLLM_GEMMA4_SPEC_EMBED_SCALE_31B")
-                        .as_deref() != Ok("0");
+                        .as_deref() == Ok("1");
                 if apply_embed_scale_for_31b {
                     self.apply_pre_projection_embed_scale(
                         &workspace,
@@ -5711,6 +5723,37 @@ impl Gemma4Bringup {
                 /* slot_start */ 0,
                 /* slot_count */ prompt_ids.len() as u32,
                 stream,
+            )?;
+        }
+
+        // === RVLLM_SPEC_DUMP_DIR ONE-SHOT DUMP =====================
+        // Codex Round 4 Q5: dump the inputs the drafter receives at
+        // iter 0 so manual_drafter_reference.py can run the same
+        // forward in PyTorch and compare T1..T11 against rvllm's
+        // runtime layer-trace probes. Skips the 70 GB HF base load.
+        //
+        // Files written into $RVLLM_SPEC_DUMP_DIR:
+        //   base_hidden_last.npy  — [hidden] f32
+        //   last_token_embed.npy  — [hidden] f32 (already × sqrt(H))
+        //   shadow_k_sliding_src.npy  — [committed_len, nkvh_s, hd_s] f32
+        //   shadow_v_sliding_src.npy
+        //   shadow_k_global_src.npy   — [committed_len, nkvh_g, hd_g] f32
+        //   shadow_v_global_src.npy
+        //   prompt_tokens.npy     — [committed_len] i64
+        //   meta.json             — { committed_len, sliding_src,
+        //                             full_src, nkvh, head_dim, dtype }
+        //
+        // Triggered once per session via a OnceLock guard; multiple
+        // requests under the same env path overwrite the same files.
+        if let Ok(dump_dir) = std::env::var("RVLLM_SPEC_DUMP_DIR") {
+            self.dump_drafter_reference_inputs(
+                &dump_dir, prompt_ids, &session,
+                sources.sliding_source_layer,
+                sources.full_source_layer,
+                sliding_k, sliding_v, full_k, full_v,
+                shadow_sliding_bytes, shadow_full_bytes,
+                kv_dtype_per_layer[sliding_li],
+                kv_dtype_per_layer[full_li],
             )?;
         }
 
@@ -8263,6 +8306,205 @@ impl Gemma4Bringup {
     /// codex called out. Used here and in the upcoming
     /// `forward_one_drafter_step` method.
     #[cfg(feature = "cuda")]
+    /// Codex Round 4 Q5: one-shot dump of the inputs the drafter
+    /// receives at iter 0 of the batched session loop. Writes raw
+    /// f32 + a meta.json into `$RVLLM_SPEC_DUMP_DIR`. Pair with
+    /// `v3/tools/manual_drafter_reference.py` to run a PyTorch
+    /// reference forward against these inputs and the drafter
+    /// weights, then diff against the rvllm runtime layer-trace
+    /// probes (RVLLM_GEMMA4_SPEC_LAYER_TRACE=1).
+    ///
+    /// Side-effect-only; safe to call once per spec session. On
+    /// HtoD copy failure or directory creation failure logs to
+    /// stderr but does not abort the request.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn dump_drafter_reference_inputs(
+        &self,
+        dump_dir: &str,
+        prompt_ids: &[u32],
+        session: &SpecDecodeSession,
+        sliding_src_layer: u32,
+        full_src_layer: u32,
+        sliding_k: u64,
+        sliding_v: u64,
+        full_k: u64,
+        full_v: u64,
+        shadow_sliding_bytes: usize,
+        shadow_full_bytes: usize,
+        sliding_kv_dtype: crate::gemma4_layer_exec::KvDtype,
+        full_kv_dtype: crate::gemma4_layer_exec::KvDtype,
+    ) -> Result<()> {
+        let _ = (sliding_k, sliding_v, full_k, full_v,
+                 sliding_kv_dtype, full_kv_dtype);
+        let stream = self.stream.raw();
+        let _ = std::fs::create_dir_all(dump_dir);
+
+        let dtoh_f16_to_f32_vec = |ptr: u64, n_elems: usize|
+            -> std::io::Result<Vec<f32>>
+        {
+            self.stream.fence().map_err(|_| std::io::Error::other("fence"))?;
+            let mut buf = vec![0u16; n_elems];
+            let rc = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut _, ptr, n_elems * 2);
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(std::io::Error::other(format!("DtoH failed rc={:?}", rc)));
+            }
+            Ok(buf.iter().map(|&b| half::f16::from_bits(b).to_f32()).collect())
+        };
+
+        let save_f32 = |path: &std::path::Path, data: &[f32]| -> std::io::Result<()> {
+            // Write a minimal NPY 1.0 header.
+            use std::io::Write;
+            let mut f = std::fs::File::create(path)?;
+            let shape_str = format!("({},)", data.len());
+            let dict = format!(
+                "{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_str}, }}"
+            );
+            let mut header = dict.into_bytes();
+            // Pad header to 16-byte alignment of total (magic+ver+len+header).
+            let preamble_len = 10; // \x93NUMPY + version (2) + header_len (2)
+            let unpadded = preamble_len + header.len() + 1; // + final newline
+            let pad = (16 - (unpadded % 16)) % 16;
+            header.extend(std::iter::repeat(b' ').take(pad));
+            header.push(b'\n');
+            f.write_all(b"\x93NUMPY")?;
+            f.write_all(&[1u8, 0u8])?; // version 1.0
+            let hlen = header.len() as u16;
+            f.write_all(&hlen.to_le_bytes())?;
+            f.write_all(&header)?;
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    data.as_ptr() as *const u8, data.len() * 4)
+            };
+            f.write_all(bytes)?;
+            Ok(())
+        };
+
+        // 1) base_hidden_last: post-final-norm hidden of the last
+        // prompt token, captured by the warmup into
+        // `base_last_hidden_ptr`.
+        let base_hidden_ptr = self
+            .base_last_hidden_ptr
+            .load(std::sync::atomic::Ordering::Acquire);
+        if base_hidden_ptr != 0 {
+            match dtoh_f16_to_f32_vec(base_hidden_ptr, self.arch.hidden_size) {
+                Ok(v) => {
+                    let _ = save_f32(
+                        &std::path::Path::new(dump_dir).join("base_hidden_last.npy"),
+                        &v);
+                }
+                Err(e) => eprintln!("[spec-dump] base_hidden_last skipped: {e}"),
+            }
+        }
+
+        // 2) last_token_embed: base.embedding(last_committed_tok),
+        // already pre-scaled by sqrt(hidden_size) at loader time.
+        let last_tok = session.last_committed_token().unwrap_or(0);
+        let hidden = self.arch.hidden_size;
+        // Embedding row at `last_tok` — direct DtoH from base's
+        // embedding region. Each row is `hidden * 2` bytes f16.
+        let row_ptr = self.model.embedding.offset_bytes
+            + (last_tok as u64) * (hidden as u64) * 2;
+        match dtoh_f16_to_f32_vec(row_ptr, hidden) {
+            Ok(v) => {
+                let _ = save_f32(
+                    &std::path::Path::new(dump_dir).join("last_token_embed.npy"),
+                    &v);
+            }
+            Err(e) => eprintln!("[spec-dump] last_token_embed skipped: {e}"),
+        }
+
+        // 3) Shadow K/V at the sliding + full source layers. Shadow
+        // is F16 [num_slots, nkvh, head_dim] flat. Dump only the
+        // first `committed_len` slots' worth (= the prompt context).
+        let committed = session.committed_len as usize;
+        let guard = self.drafter.lock().unwrap();
+        if let Some(d) = guard.as_ref() {
+            if let Some(s) = d.shadow_kv {
+                let sliding_nkvh = s.sliding_num_kv_heads as usize;
+                let sliding_hd = s.sliding_head_dim as usize;
+                let full_nkvh = s.full_num_kv_heads as usize;
+                let full_hd = s.full_head_dim as usize;
+                let sliding_per_slot = sliding_nkvh * sliding_hd;
+                let full_per_slot = full_nkvh * full_hd;
+                let want_sliding = committed * sliding_per_slot;
+                let want_full = committed * full_per_slot;
+                let cap_sliding = shadow_sliding_bytes / 2;
+                let cap_full = shadow_full_bytes / 2;
+                let n_sliding = want_sliding.min(cap_sliding);
+                let n_full = want_full.min(cap_full);
+                if let Ok(v) = dtoh_f16_to_f32_vec(s.sliding_k_ptr, n_sliding) {
+                    let _ = save_f32(
+                        &std::path::Path::new(dump_dir).join("shadow_k_sliding_src.npy"),
+                        &v);
+                }
+                if let Ok(v) = dtoh_f16_to_f32_vec(s.sliding_v_ptr, n_sliding) {
+                    let _ = save_f32(
+                        &std::path::Path::new(dump_dir).join("shadow_v_sliding_src.npy"),
+                        &v);
+                }
+                if let Ok(v) = dtoh_f16_to_f32_vec(s.full_k_ptr, n_full) {
+                    let _ = save_f32(
+                        &std::path::Path::new(dump_dir).join("shadow_k_global_src.npy"),
+                        &v);
+                }
+                if let Ok(v) = dtoh_f16_to_f32_vec(s.full_v_ptr, n_full) {
+                    let _ = save_f32(
+                        &std::path::Path::new(dump_dir).join("shadow_v_global_src.npy"),
+                        &v);
+                }
+
+                // 4) meta.json
+                let meta = format!(
+                    "{{\n  \"prompt_len\": {},\n  \"committed_len\": {},\n  \
+                     \"sliding_src_layer\": {},\n  \"full_src_layer\": {},\n  \
+                     \"sliding_num_kv_heads\": {},\n  \"sliding_head_dim\": {},\n  \
+                     \"full_num_kv_heads\": {},\n  \"full_head_dim\": {},\n  \
+                     \"last_committed_tok\": {},\n  \"hidden_size\": {}\n}}\n",
+                    prompt_ids.len(), committed,
+                    sliding_src_layer, full_src_layer,
+                    sliding_nkvh, sliding_hd,
+                    full_nkvh, full_hd,
+                    last_tok, hidden,
+                );
+                let _ = std::fs::write(
+                    std::path::Path::new(dump_dir).join("meta.json"), meta);
+            }
+        }
+
+        // 5) prompt_tokens.npy — i64 token ids (for cross-ref).
+        let toks_i64: Vec<i64> = prompt_ids.iter().map(|&t| t as i64).collect();
+        let toks_path = std::path::Path::new(dump_dir).join("prompt_tokens.npy");
+        // Hand-roll i64 NPY header.
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::File::create(&toks_path) {
+            let dict = format!(
+                "{{'descr': '<i8', 'fortran_order': False, 'shape': ({},), }}",
+                toks_i64.len()
+            );
+            let mut header = dict.into_bytes();
+            let preamble_len = 10;
+            let unpadded = preamble_len + header.len() + 1;
+            let pad = (16 - (unpadded % 16)) % 16;
+            header.extend(std::iter::repeat(b' ').take(pad));
+            header.push(b'\n');
+            let _ = f.write_all(b"\x93NUMPY");
+            let _ = f.write_all(&[1u8, 0u8]);
+            let hlen = header.len() as u16;
+            let _ = f.write_all(&hlen.to_le_bytes());
+            let _ = f.write_all(&header);
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    toks_i64.as_ptr() as *const u8, toks_i64.len() * 8)
+            };
+            let _ = f.write_all(bytes);
+        }
+
+        eprintln!("[spec-dump] drafter reference inputs written to {}", dump_dir);
+        Ok(())
+    }
+
     unsafe fn apply_pre_projection_embed_scale(
         &self,
         workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
