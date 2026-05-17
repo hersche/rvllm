@@ -106,10 +106,19 @@ pub async fn spawn_cuda_worker(
     let join = std::thread::Builder::new()
         .name("rvllm-serve-cuda-worker".into())
         .spawn(move || {
-            if spec_decode && !matches!(family, ModelFamily::Gemma4) {
+            // RVLLM_GEMMA4_SPEC_DECODE applies to either the fp8-block
+            // Gemma 4 path (production) or the Gemma4-NVFP4 weight
+            // path (Phase 3c — still fails-fast at the forward-path
+            // dispatch below, with a more specific message). Reject
+            // explicitly for any other family so an operator doesn't
+            // wonder why the flag is silently ignored on Qwen / Mistral.
+            if spec_decode
+                && !matches!(family, ModelFamily::Gemma4 | ModelFamily::Gemma4Nvfp4)
+            {
                 let _ = ready_tx.send(Err(format!(
-                    "RVLLM_GEMMA4_SPEC_DECODE=1 is only supported for Gemma 4 E4B; \
-                     resolved model family is {}",
+                    "RVLLM_GEMMA4_SPEC_DECODE=1 is only supported for Gemma 4 \
+                     (fp8-block and NVFP4 weight variants); resolved model \
+                     family is {}",
                     family.as_str()
                 )));
                 return;
