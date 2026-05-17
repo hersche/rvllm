@@ -4125,6 +4125,35 @@ impl Qwen36Bringup {
         self.forward_qwen36_decode_cancellable(token_ids, start_position, vision_splice, None)
     }
 
+    /// Spec-decode variant: runs the same layer stack as
+    /// `forward_qwen36_decode_cancellable` ONCE over the K input
+    /// tokens, then calls the closer K times (one per row) to
+    /// produce argmaxes at every position. Required for prompt-
+    /// lookup speculative decoding — Qwen 3.6's linear-attn
+    /// (Gated DeltaNet) state is RECURRENT and NOT idempotent
+    /// across repeated forward calls, so the "call forward N
+    /// times with growing prefixes" trick that works for full-
+    /// attn-only models corrupts the linear state. Single-call
+    /// is the only correct path.
+    ///
+    /// Returns argmaxes in input order: result[i] is the base's
+    /// prediction for position `start_position + i + 1` given
+    /// inputs `token_ids[0..=i]`.
+    pub fn forward_qwen36_decode_argmax_all(
+        &self,
+        token_ids: &[i32],
+        start_position: u32,
+        vision_splice: &[(usize, &[u8])],
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<i32>> {
+        let mut out = Vec::with_capacity(token_ids.len());
+        self.forward_qwen36_decode_inner(
+            token_ids, start_position, vision_splice, cancel,
+            /* all_argmaxes */ Some(&mut out),
+        )?;
+        Ok(out)
+    }
+
     /// Same as `forward_qwen36_decode` but with caller-supplied
     /// cancellation. The flag is checked between each prompt-token
     /// iteration so a long Qwen 3.6 prefill on a client-disconnected
@@ -4136,6 +4165,19 @@ impl Qwen36Bringup {
         start_position: u32,
         vision_splice: &[(usize, &[u8])],
         cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<i32> {
+        self.forward_qwen36_decode_inner(
+            token_ids, start_position, vision_splice, cancel, None,
+        )
+    }
+
+    fn forward_qwen36_decode_inner(
+        &self,
+        token_ids: &[i32],
+        start_position: u32,
+        vision_splice: &[(usize, &[u8])],
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        mut all_argmaxes: Option<&mut Vec<i32>>,
     ) -> Result<i32> {
         if token_ids.is_empty() {
             return Err(rvllm_core::RvllmError::cuda(
@@ -4787,13 +4829,42 @@ impl Qwen36Bringup {
         // its own fence-before-DtoH. (Phase 4b-prep iter30.)
 
         // 5. Final norm + lm_head + argmax (outside-only closer).
-        self.forward_qwen36_outside_closer(
-            &hidden_region,
-            num_tokens,
-            hidden,
-            vocab,
-            last_idx,
-        )
+        //    For spec-decode (`all_argmaxes = Some(_)`), the closer
+        //    runs K times — once per row — so the caller gets the
+        //    argmax at every input position. The layer stack above
+        //    only runs once (with the K-token input). Linear-attn
+        //    state stays consistent because we don't re-run any
+        //    prefix; we just read more positions from the same
+        //    hidden_region. Cost: K closer calls vs 1, dominated
+        //    by K lm_head GEMMs at M=1. For K=4-8 this is
+        //    structurally negligible vs the K-position layer stack
+        //    which is the real spend.
+        if let Some(out) = all_argmaxes.as_mut() {
+            out.clear();
+            out.reserve(num_tokens as usize);
+            for i in 0..(num_tokens as usize) {
+                let t = self.forward_qwen36_outside_closer(
+                    &hidden_region,
+                    num_tokens,
+                    hidden,
+                    vocab,
+                    i,
+                )?;
+                out.push(t);
+            }
+            // Last argmax is what the legacy single-tok path would
+            // have returned; keep it as the Result<i32> contract
+            // so the no-spec wrapper stays a one-liner.
+            Ok(*out.last().unwrap_or(&0))
+        } else {
+            self.forward_qwen36_outside_closer(
+                &hidden_region,
+                num_tokens,
+                hidden,
+                vocab,
+                last_idx,
+            )
+        }
     }
 
     /// Phase 5d helper: apply one linear-attn layer's Gated-DeltaNet

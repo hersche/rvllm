@@ -949,6 +949,65 @@ pub async fn spawn_cuda_worker(
                         let prefill_start = if timing_on {
                             Some(std::time::Instant::now())
                         } else { None };
+                        // RVLLM_QWEN36_SPEC_DECODE=1 → prompt-lookup
+                        // speculative decoding (no drafter checkpoint
+                        // needed). The session function owns the
+                        // initial prefill + decode loop and emits each
+                        // accepted token via the on_token callback,
+                        // matching the cuda_worker SSE contract.
+                        // Bypasses the per-token loop entirely.
+                        let spec_decode_on = std::env::var("RVLLM_QWEN36_SPEC_DECODE")
+                            .map(|s| matches!(s.as_str(), "1"|"true"|"TRUE"|"yes"))
+                            .unwrap_or(false);
+                        if spec_decode_on {
+                            let max_new = req.max_new_tokens.max(1);
+                            let events_tx = req.events_tx.clone();
+                            let cancelled_for_cb = req.cancelled.clone();
+                            let stop_tokens = req.stop_token_ids.clone();
+                            let prompt_len_u32 = prompt_len;
+                            let mut emitted_for_finish: u32 = 0;
+                            let result = rvllm_runtime::qwen36_spec_decode::
+                                run_qwen36_prompt_lookup_spec(
+                                    &qwen,
+                                    &prompt_i32,
+                                    max_new,
+                                    &stop_tokens,
+                                    &vision_splice,
+                                    Some(&*req.cancelled),
+                                    |tok, pos| {
+                                        let _ = pos; // events_tx already binds the right position via emit order
+                                        let _ = prompt_len_u32;
+                                        let _ = events_tx.send(GenerateEvent::Token {
+                                            id: tok,
+                                            position: pos,
+                                        });
+                                        emitted_for_finish += 1;
+                                        !cancelled_for_cb.load(Ordering::Relaxed)
+                                    },
+                                );
+                            unsafe { qwen.arena.restore(scratch_ck); }
+                            match result {
+                                Ok((completion_tokens, finish_label)) => {
+                                    let finish = match finish_label {
+                                        "stop" => FinishReason::Stop,
+                                        "cancelled" => FinishReason::Cancelled,
+                                        _ => FinishReason::Length,
+                                    };
+                                    let _ = req.events_tx.send(GenerateEvent::Done {
+                                        finish,
+                                        completion_tokens,
+                                        prompt_tokens: prompt_len,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = req.events_tx.send(GenerateEvent::Error(
+                                        format!("qwen36 spec-decode: {e:?}"),
+                                    ));
+                                }
+                            }
+                            continue;
+                        }
+
                         let mut next_token = match qwen
                             .forward_qwen36_decode_cancellable(
                                 &prompt_i32, 0, &vision_splice,
