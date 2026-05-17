@@ -281,6 +281,95 @@ fn require_scalar(
     Ok(e)
 }
 
+// ─── Device-resident loaded model (post-upload) ────────────────────
+//
+// Populated by the rvllm-runtime side `gemma4_nvfp4_load`. Structs
+// live here so the loader can construct the natural-layout
+// intermediates without crossing the DAG line into rvllm-cutlass.
+
+/// One per-layer NVFP4 MLP linear after weight upload. All pointers
+/// are absolute device addresses; the bring-up's arena owns the
+/// backing storage.
+///
+/// Differences from `mistral35_weights::Nvfp4LinearLoaded`:
+/// * Adds `input_scale_ptr` — Gemma 4 NVFP4 ships a static (PTQ)
+///   input scale per linear (`input_activations.dynamic = false`
+///   in the quant config). Mistral derives input scales dynamically
+///   per-token and has no equivalent tensor.
+/// * Uses `weight_scale_2` instead of `weight_global_scale` on disk
+///   (semantically identical — a single f32 scalar — stored here as
+///   the post-decode-scale device scalar `global_scale_ptr`).
+#[derive(Debug, Clone, Copy)]
+pub struct Gemma4Nvfp4LinearLoaded {
+    pub shape: Nvfp4LinearShape,
+    /// `[N, K/2]` U8 NVFP4-packed weight bytes.
+    pub packed_ptr: u64,
+    /// `[N, K/16]` E4M3 weight scale, row-major natural layout.
+    /// Used by the W4A16 dequant-then-bf16-GEMM path.
+    pub sfb_natural_ptr: u64,
+    /// CUTLASS-interleaved E4M3 SFB scratch — `0` unless the legacy
+    /// W4A4 tensor-core GEMM path is wired in. Mirrors the Mistral
+    /// `RVLLM_W4A16_GEMV=0` opt-in: the default fused W4A16 GEMV
+    /// reads `sfb_natural_ptr` and never touches this pointer.
+    pub sfb_cutlass_ptr: u64,
+    /// `[1]` F32 device scalar — `1 / weight_scale_2` (decode form),
+    /// suitable for CUTLASS's `alpha_ptr` epilogue without a host
+    /// stall. Matches Mistral's `global_scale_ptr` semantics; the
+    /// rename in source carries the Gemma checkpoint's
+    /// `weight_scale_2` tensor name.
+    pub global_scale_ptr: u64,
+    /// `[1]` F32 device scalar — static (PTQ) input scale from
+    /// `input_scale` tensor. Forwarded to the GEMM's input-side
+    /// quantization step.
+    pub input_scale_ptr: u64,
+    pub packed_bytes: usize,
+    pub sfb_bytes: usize,
+    /// `[N, K]` BF16 dequantized weight. Zero until a runtime-side
+    /// one-shot dequant pass populates it. Mirrors Mistral's
+    /// `bf16_ptr` lazy-fill semantics.
+    pub bf16_ptr: u64,
+}
+
+/// One Gemma 4 layer's NVFP4 MLP linears + retained-bf16 attention
+/// weights. Attention projection pointers stay as `F16Weight`
+/// because `hf_quant_config.json` excludes every layer's
+/// `self_attn.*` from quantization.
+///
+/// Populated by the runtime-side upload; consumed by the per-layer
+/// forward in the bring-up.
+#[derive(Debug)]
+pub struct Gemma4Nvfp4LayerLoaded {
+    pub input_layernorm: crate::weights::F16Weight,
+    pub post_attention_layernorm: crate::weights::F16Weight,
+    pub pre_feedforward_layernorm: crate::weights::F16Weight,
+    pub post_feedforward_layernorm: crate::weights::F16Weight,
+    /// Per-layer residual multiplier `[1]` f32 (Gemma 4 `layer_scalar`).
+    pub layer_scalar: crate::weights::F16Weight,
+    /// Q/K head-dim RMSNorm gammas (`q_norm`, `k_norm`), per Gemma 4
+    /// architecture. Stay bf16.
+    pub q_norm: crate::weights::F16Weight,
+    pub k_norm: crate::weights::F16Weight,
+    /// Attention projections — bf16 per `exclude_modules`.
+    pub q_proj: crate::weights::F16Weight,
+    pub k_proj: crate::weights::F16Weight,
+    /// `None` on layers where `attention_k_eq_v=true` (V is aliased
+    /// to K and never stored on disk).
+    pub v_proj: Option<crate::weights::F16Weight>,
+    pub o_proj: crate::weights::F16Weight,
+    /// MLP — NVFP4.
+    pub gate_proj: Gemma4Nvfp4LinearLoaded,
+    pub up_proj: Gemma4Nvfp4LinearLoaded,
+    pub down_proj: Gemma4Nvfp4LinearLoaded,
+}
+
+impl Gemma4Nvfp4LayerLoaded {
+    /// Iterate the per-layer NVFP4 linears in
+    /// `Gemma4Nvfp4MlpKind::ALL` order: gate, up, down.
+    pub fn nvfp4_linears(&self) -> [&Gemma4Nvfp4LinearLoaded; 3] {
+        [&self.gate_proj, &self.up_proj, &self.down_proj]
+    }
+}
+
 fn missing(name: &str) -> RvllmError {
     RvllmError::Loader {
         err: LoaderError::MissingTensor { name: name.to_string() },

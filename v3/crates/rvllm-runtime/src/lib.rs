@@ -71,6 +71,7 @@ pub mod bring_up;
 pub mod engine;
 pub mod gemma4_bring_up;
 pub mod gemma4_drafter;
+pub mod gemma4_nvfp4_load;
 pub mod gemma4_layer_exec;
 pub mod layer_exec;
 pub mod qwen35_arch;
