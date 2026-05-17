@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 use rvllm_core::{DType, LoaderCtx, LoaderError, Result, RvllmError};
 use rvllm_loader::gemma4_arch::{Gemma4Arch, Gemma4LayerType};
 use rvllm_loader::gemma4_nvfp4_weights::{
-    Gemma4Nvfp4LayerLoaded, Gemma4Nvfp4LinearLoaded, Gemma4Nvfp4MlpKind,
+    validate_gemma4_nvfp4_inventory, Gemma4Nvfp4LayerLoaded, Gemma4Nvfp4LinearLoaded,
+    Gemma4Nvfp4LoadedModel, Gemma4Nvfp4MlpKind, Gemma4Nvfp4OutsideText,
 };
 use rvllm_loader::mistral35_weights::Nvfp4LinearShape;
 use rvllm_loader::safetensors::{ShardHeader, ShardIndex, TensorEntry};
@@ -414,6 +415,79 @@ pub fn upload_gemma4_nvfp4_layer(
         up_proj,
         down_proj,
     })
+}
+
+/// Upload the outside-the-stack text weights (embed_tokens +
+/// final_norm). Lm-head is tied to embed_tokens so no separate
+/// upload is needed.
+pub fn upload_gemma4_nvfp4_outside_text(
+    arena: &HbmArena<'_>,
+    pool: &Gemma4Nvfp4ShardPool,
+    arch: &Gemma4Arch,
+) -> Result<Gemma4Nvfp4OutsideText> {
+    let prefix = &arch.weight_prefix;
+    let embed_tokens = upload_typed_tensor(
+        arena, pool, "gemma4n_embed_tokens",
+        &format!("{prefix}.embed_tokens.weight"),
+        DType::Bf16, Some(&[arch.vocab_size, arch.hidden_size])
+    )?;
+    let final_norm = upload_typed_tensor(
+        arena, pool, "gemma4n_final_norm",
+        &format!("{prefix}.norm.weight"),
+        DType::Bf16, Some(&[arch.hidden_size])
+    )?;
+    Ok(Gemma4Nvfp4OutsideText { embed_tokens, final_norm })
+}
+
+/// Top-level loader: reads the model directory, validates the
+/// NVFP4 inventory, opens the shard pool, and uploads every
+/// text-side weight (outside + all 60 layers). Returns a
+/// fully-populated `Gemma4Nvfp4LoadedModel`.
+///
+/// Vision tower upload is deferred to Phase 3c — the text
+/// forward path can be validated first and vision splice
+/// integrated after.
+pub fn load_gemma4_nvfp4_text(
+    arena: &HbmArena<'_>,
+    model_dir: &Path,
+    arch: &Gemma4Arch,
+) -> Result<Gemma4Nvfp4LoadedModel> {
+    let pool = Gemma4Nvfp4ShardPool::open(model_dir)?;
+
+    // Inventory pass — cheap; refuses checkpoints with quantized
+    // attention or missing MLP tensors before we touch the GPU.
+    // Pool stores (shard_idx, entry) tuples; the validator wants
+    // a plain entry map — strip the shard index.
+    let entry_map: BTreeMap<String, TensorEntry> = pool
+        .tensors
+        .iter()
+        .map(|(k, (_si, e))| (k.clone(), e.clone()))
+        .collect();
+    let inv = validate_gemma4_nvfp4_inventory(arch, &arch.weight_prefix, &entry_map)?;
+    eprintln!(
+        "[gemma4-nvfp4-load] inventory: layers={} mlp_nvfp4={} attn_bf16={}",
+        inv.num_layers,
+        inv.counts.weight,
+        inv.counts.attn_bf16,
+    );
+
+    let outside = upload_gemma4_nvfp4_outside_text(arena, &pool, arch)?;
+    eprintln!(
+        "[gemma4-nvfp4-load] outside uploaded (embed_tokens + final_norm)"
+    );
+
+    let mut layers = Vec::with_capacity(arch.num_hidden_layers);
+    for li in 0..arch.num_hidden_layers {
+        layers.push(upload_gemma4_nvfp4_layer(arena, &pool, arch, li)?);
+        if li == 0 || li == arch.num_hidden_layers - 1 || (li + 1) % 10 == 0 {
+            eprintln!(
+                "[gemma4-nvfp4-load] layer {}/{} uploaded",
+                li + 1, arch.num_hidden_layers,
+            );
+        }
+    }
+
+    Ok(Gemma4Nvfp4LoadedModel { outside, layers })
 }
 
 fn corrupt(detail: String) -> RvllmError {

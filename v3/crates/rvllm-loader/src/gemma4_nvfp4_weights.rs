@@ -370,6 +370,29 @@ impl Gemma4Nvfp4LayerLoaded {
     }
 }
 
+/// Outside-the-stack text weights for the Gemma 4 NVFP4
+/// checkpoint. The model has `tie_word_embeddings=true`, so
+/// `lm_head` aliases `embed_tokens.T` at forward time — no
+/// separate tensor on disk.
+#[derive(Debug)]
+pub struct Gemma4Nvfp4OutsideText {
+    /// `[vocab=262144, hidden=5376]` bf16. Doubles as the
+    /// LM-head weight via the tied-embedding convention.
+    pub embed_tokens: crate::weights::F16Weight,
+    /// `[hidden=5376]` bf16. Final RMSNorm before lm_head.
+    pub final_norm: crate::weights::F16Weight,
+}
+
+/// Top-level Gemma 4 NVFP4 model after upload. Vision tower
+/// not loaded by Phase 3b — that's Phase 3c (vision splice
+/// path is orthogonal and can be wired in after the text
+/// forward is green).
+#[derive(Debug)]
+pub struct Gemma4Nvfp4LoadedModel {
+    pub outside: Gemma4Nvfp4OutsideText,
+    pub layers: Vec<Gemma4Nvfp4LayerLoaded>,
+}
+
 fn missing(name: &str) -> RvllmError {
     RvllmError::Loader {
         err: LoaderError::MissingTensor { name: name.to_string() },
