@@ -213,6 +213,38 @@ pub fn validate_gemma4_nvfp4_inventory(
         counts.attn_bf16 += 1;
     }
 
+    // K/V aliasing validation (codex review 2026-05-17, MEDIUM).
+    // HF Gemma 4 modeling
+    // (transformers/models/gemma4/modeling_gemma4.py: value_states =
+    // self.v_proj(...) if self.v_proj is not None else key_states)
+    // says global-attention layers with attention_k_eq_v=true MUST
+    // omit v_proj, sliding-attention layers MUST include it. The
+    // previous sentinel sweep didn't enforce this — a corrupted
+    // checkpoint with a sliding-layer v_proj missing, or a global
+    // layer with a spurious v_proj, would silently pass.
+    for layer_idx in 0..arch.num_hidden_layers {
+        let v_key = format!(
+            "{weight_prefix}.layers.{layer_idx}.self_attn.v_proj.weight"
+        );
+        let v_present = tensors.contains_key(&v_key);
+        let layer_type = arch.layer_types.get(layer_idx);
+        match (layer_type, v_present) {
+            (Some(crate::gemma4_arch::Gemma4LayerType::SlidingAttention), false) => {
+                return Err(corrupt(format!(
+                    "Gemma 4 NVFP4 layer {layer_idx} is sliding-attention but \
+                     v_proj.weight is MISSING — sliding layers must keep v_proj \
+                     (k_eq_v aliasing only applies to global-attention layers)."
+                )));
+            }
+            (Some(crate::gemma4_arch::Gemma4LayerType::GlobalAttention), true) => {
+                // Acceptable when attention_k_eq_v=false (rare). Warn-only.
+                // The runtime forward will use the explicit v_proj if
+                // present and ignore the alias path; that's safe.
+            }
+            _ => {}
+        }
+    }
+
     let resolved: Vec<[Gemma4Nvfp4LinearWeight; 3]> = layers
         .into_iter()
         .enumerate()

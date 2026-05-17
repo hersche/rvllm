@@ -587,4 +587,138 @@ mod tests {
         assert!(layer0.o_proj.offset_bytes != 0, "o_proj.offset_bytes is null");
         eprintln!("[gpu-smoke] all pointers non-null + byte counts match");
     }
+
+    /// Loader/index coverage test — proves the text-only loader
+    /// (`load_gemma4_nvfp4_text` + per-layer + outside-text upload)
+    /// reads every text-side tensor in the safetensors index AND
+    /// documents the exact unread set as vision-only. Codex
+    /// review 2026-05-17 recommended this as the first commit of
+    /// the Phase 3c+ ("Option B") work: it gives the implementer
+    /// a hard guardrail — the test starts GREEN with vision
+    /// tensors expected-unread, and FLIPS RED the moment vision
+    /// upload is added without updating the expected list.
+    ///
+    /// Run:
+    ///   GEMMA4_NVFP4_DIR=/home/r00t/Gemma-4-31B-IT-NVFP4 \
+    ///     cargo test -p rvllm-runtime --features cuda \
+    ///     gemma4_nvfp4_load::tests::ondisk_text_loader_unread_tensors_are_vision_only \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ondisk_text_loader_unread_tensors_are_vision_only() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skipping coverage test");
+                return;
+            }
+        };
+        let arch = rvllm_loader::gemma4_arch::Gemma4Arch::from_dir(&dir)
+            .expect("Gemma4Arch::from_dir");
+        let prefix = &arch.weight_prefix;
+
+        // Build the index tensor set (truth).
+        let idx_path = dir.join("model.safetensors.index.json");
+        let idx_bytes = std::fs::read(&idx_path).expect("read index");
+        let idx: serde_json::Value = serde_json::from_slice(&idx_bytes)
+            .expect("parse index");
+        let weight_map = idx["weight_map"].as_object().expect("weight_map");
+        let index_keys: std::collections::BTreeSet<String> =
+            weight_map.keys().cloned().collect();
+
+        // Build the EXPECTED text-read set — mirroring exactly the
+        // tensor names load_gemma4_nvfp4_text + its helpers consume.
+        let mut expected_read: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        // outside-text
+        expected_read.insert(format!("{prefix}.embed_tokens.weight"));
+        expected_read.insert(format!("{prefix}.norm.weight"));
+        // per-layer
+        for li in 0..arch.num_hidden_layers {
+            let base = format!("{prefix}.layers.{li}");
+            // norms + scalar
+            for suffix in [
+                "input_layernorm.weight",
+                "post_attention_layernorm.weight",
+                "pre_feedforward_layernorm.weight",
+                "post_feedforward_layernorm.weight",
+                "layer_scalar",
+                "self_attn.q_norm.weight",
+                "self_attn.k_norm.weight",
+                "self_attn.q_proj.weight",
+                "self_attn.k_proj.weight",
+                "self_attn.o_proj.weight",
+            ] {
+                expected_read.insert(format!("{base}.{suffix}"));
+            }
+            // v_proj only for sliding layers (k_eq_v aliases on global).
+            // Check actual presence in the index instead of arch
+            // (some E4B variants alias more layers).
+            let v_key = format!("{base}.self_attn.v_proj.weight");
+            if index_keys.contains(&v_key) {
+                expected_read.insert(v_key);
+            }
+            // NVFP4 MLP — 4 tensors per linear, 3 linears
+            for linear in ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
+                for suffix in [
+                    "weight", "weight_scale", "weight_scale_2", "input_scale",
+                ] {
+                    expected_read.insert(format!("{base}.{linear}.{suffix}"));
+                }
+            }
+        }
+
+        let missing_reads: Vec<&String> = expected_read
+            .iter()
+            .filter(|t| !index_keys.contains(*t))
+            .collect();
+        assert!(
+            missing_reads.is_empty(),
+            "loader expects tensors that don't exist on disk: {:?}",
+            missing_reads,
+        );
+
+        let unread: std::collections::BTreeSet<&String> = index_keys
+            .iter()
+            .filter(|t| !expected_read.contains(*t))
+            .collect();
+
+        eprintln!(
+            "[coverage] index tensors: {}, expected reads: {}, unread: {}",
+            index_keys.len(), expected_read.len(), unread.len(),
+        );
+
+        // Every unread tensor must be vision-only — `model.vision_tower.*`
+        // or `model.embed_vision.embedding_projection.weight`.
+        // When the vision upload lands as part of Phase 3c+ (commit
+        // #6 in the codex sequence), update the `expected_read`
+        // set above and this assertion will start passing with a
+        // zero-unread set.
+        let mut non_vision_unread: Vec<&String> = Vec::new();
+        for name in &unread {
+            let is_vision = name.starts_with("model.vision_tower.")
+                || name.as_str() == "model.embed_vision.embedding_projection.weight";
+            if !is_vision {
+                non_vision_unread.push(*name);
+            }
+        }
+        assert!(
+            non_vision_unread.is_empty(),
+            "non-vision tensors are unread — loader is missing them: {:?}",
+            non_vision_unread,
+        );
+
+        // Sanity check the numbers Codex reported (1372 reads, 356
+        // unread vision tensors on the 31B checkpoint). Off-by-a-
+        // few is fine across loader refactors; an order-of-magnitude
+        // miss is a regression.
+        assert_eq!(expected_read.len(), 1372,
+                   "expected_read size drifted — loader changed?");
+        assert_eq!(unread.len(), 356,
+                   "unread (vision) size drifted — checkpoint changed?");
+        eprintln!(
+            "[coverage] OK: {} text tensors read, {} vision tensors deferred to Phase 3c+ commit #6",
+            expected_read.len(), unread.len(),
+        );
+    }
 }

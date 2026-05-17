@@ -4961,28 +4961,41 @@ impl Qwen36Bringup {
             // Closer-all path (single fused rmsnorm + M=K fp8_gemm +
             // grid=K argmax + one fence + one rows*4 DtoH). Faster
             // per call than the K-times closer loop BUT
-            // hardware-bisected 2026-05-17 and found to produce
-            // small per-row argmax drift on this hardware:
+            // hardware-bisected 2026-05-17 with corrupted output
+            // on long generations:
             //   * Short outputs (≤60 tok): byte-identical to closer-
             //     loop output.
             //   * Long outputs (~120 tok factorial): closer-all
             //     produces a corrupted "duplicated header" preamble
-            //     before the real function body. Suggests a tiny
-            //     per-row argmax error rate that compounds over
-            //     many spec iters.
-            // Root cause hypothesis (not yet confirmed): the
-            // cuBLASLt warning at bring-up — "no blockwise FP8 algo
-            // on this arch (sm_121/GB10 expected). Caching NoAlgo —
-            // future dispatches skip quantise + heuristic and go
-            // straight to looped GEMV" — means fp8_gemm M=K falls
-            // back to a looped GEMV with a scale-layout
-            // interpretation that doesn't match the M=1 path used
-            // by the closer-loop. Fixing this requires per-position
-            // argmax diff between the two closers on the SAME
-            // hidden_region, plus likely a fix in
-            // qwen36_bring_up.rs::fp8_proj_dispatch or in
-            // rvllm-cutlass's M>1 looped-GEMV path.
-            // Until that lands: gate is OFF by default.
+            //     before the real function body.
+            //
+            // Root cause (codex review 2026-05-17, with citations):
+            // cublaslt.fp8_gemm at v3/crates/rvllm-cutlass/src/
+            // cublaslt.rs:972-987 wires `a_scale_ptr` and
+            // `b_scale_ptr` as SCALAR pointers (cuBLASLt's
+            // MATMUL_DESC_A_SCALE_POINTER / _B_SCALE_POINTER take
+            // a single fp32 per matmul). Only `b_channelscale`
+            // sets MATMUL_DESC_B_SCALE_MODE to outer-vector at
+            // line 989-998 — and that is the WEIGHT side, not the
+            // activation side. So when closer-all calls fp8_gemm
+            // with M=K=rows>1 and a [rows] f32 hidden_scale_region
+            // at line 8387-8398 here, cuBLASLt reads the FIRST
+            // f32 (row 0's activation scale) and applies it to
+            // every row. The per-row closer at qwen36_bring_up.rs
+            // :8233-8259 avoids this because each call passes
+            // num_tokens: 1 and a single scale, so the scalar
+            // mode is correct.
+            //
+            // Fix is NOT "fp8_gemm fallback layout" as the prior
+            // comment claimed. The right fix is either:
+            //   (a) loop the LM-head GEMM at M=1 per row inside
+            //       closer-all (defeats the perf goal but unblocks
+            //       correctness), or
+            //   (b) add a true per-row activation-scale mode to
+            //       rvllm-cutlass::fp8_gemm (likely via
+            //       MATMUL_DESC_A_SCALE_MODE = ROW or VECTOR),
+            //       then re-bisect.
+            // Until (b) lands: gate is OFF by default.
             let closer_all = std::env::var("RVLLM_QWEN36_SPEC_CLOSER_ALL")
                 .as_deref() == Ok("1");
             if closer_all {
