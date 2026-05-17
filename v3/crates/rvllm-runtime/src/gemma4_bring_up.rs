@@ -4688,12 +4688,24 @@ impl Gemma4Bringup {
             .unwrap_or_else(|_| default_scale_mode.into());
 
         for k_step in 0..(spec_k as usize) {
+            // HF parity (codex round-7 confirmed): HF's
+            // MultiTokenPredictionCandidateGenerator
+            // (transformers/generation/candidate_generator.py:1369-
+            // 1386) sets position_ids = [[prompt_len - 1]] ONCE
+            // before the K-loop and reuses it across all K
+            // iterations. last_token_id and last_hidden_state
+            // update per-iter; position does NOT.
+            // We previously passed drafter_position + k_step, which
+            // is wrong starting at k_step=1 (Q-RoPE phase drifts
+            // off the K/V positions in shadow). Constant position
+            // across K-steps matches HF.
+            let _ = k_step; // intentionally unused for position
             let step = crate::gemma4_drafter::DrafterForwardStep {
                 base_hidden_last_step: current_base_hidden,
                 last_token_embed: last_token_embed.device_ptr(),
                 sliding_kv,
                 full_kv,
-                position: drafter_position + k_step as u32,
+                position: drafter_position,  // codex round-7: constant across K-steps
                 out_logits: workspace.centroid_logits,
                 out_hidden: workspace.out_hidden,
                 out_token_id: workspace.out_token_id,
