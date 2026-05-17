@@ -53,6 +53,169 @@ use crate::gemma4_nvfp4_ops::{
 /// Loaded once at bring-up time from the existing sm_121 PTX
 /// manifest.
 ///
+/// Persistent NVFP4 KV cache + attention scratch state.
+/// Allocated once at `load` time ABOVE the per-call
+/// forward_checkpoint so each forward's scratch rewind doesn't
+/// touch the cache.
+///
+/// Per codex round-4 A1+A6: the
+/// `fused_rope_partial_nvfp4kv_bf16in_kernel` reads/writes
+/// `(slot * num_kv_heads + head_idx) * (head_dim/2)` bytes from
+/// a PER-LAYER base. We allocate one contiguous region per
+/// (layer, K|V, packed|scale) tuple and pass the base pointer
+/// in alongside `positions_ptr` + `slot_mapping_ptr`.
+///
+/// Block layout: identity blocks with `block_size=1` and
+/// `block_tables[i] = i`. Spec/rollback support is deferred
+/// to commit #6 — those scenarios need block reassignment +
+/// commit-before-emit rollback ordering analogous to the
+/// fp8-block path.
+///
+/// Memory footprint at max_pos=4096 on 31B:
+///   sliding (50 layers × 16 kv_heads × 256 head_dim × 4096
+///            × 2 K+V × 0.5625 byte/elem) ≈ 900 MiB
+///   global  (10 layers × 4 kv_heads × 512 head_dim × 4096
+///            × 2 × 0.5625) ≈ 90 MiB
+///   total ≈ 990 MiB
+#[derive(Debug)]
+pub struct Gemma4Nvfp4KvState {
+    /// Maximum context length the cache supports (max slot +1).
+    pub max_pos: u32,
+    /// Identity-block size. Always 1 in the bring-up.
+    pub block_size: u32,
+    /// `[max_pos]` i32 identity block table.
+    pub block_tables_ptr: u64,
+    /// `[1]` i32 current context length. Caller writes
+    /// `position + 1` before each decode launch.
+    pub context_lens_ptr: u64,
+    /// `[1]` i32 current position; written before RoPE+KV write.
+    pub positions_ptr: u64,
+    /// `[1]` i32 slot_mapping[0] = position; tells the
+    /// RoPE+KV-write kernel where to write the new K/V slot.
+    pub slot_mapping_ptr: u64,
+    /// `[1]` f32 fallback scalar Q scale (RVLLM_Q_SCALE; 2.0 in
+    /// the production NVFP4 profile). The RoPE+KV-write kernel
+    /// uses this when per-token Q scale is off.
+    pub q_scale_ptr: u64,
+    /// Per-layer K-cache base pointers. Slot indexing inside
+    /// each layer's region follows the kernel's
+    /// `(slot * num_kv_heads + head_idx) * (head_dim/2)` byte
+    /// layout. For attention_k_eq_v=true global layers, the
+    /// V pointer equals K (alias).
+    pub k_packed_layer_ptrs: Vec<u64>,
+    pub v_packed_layer_ptrs: Vec<u64>,
+    pub k_scale_layer_ptrs: Vec<u64>,
+    pub v_scale_layer_ptrs: Vec<u64>,
+    /// Total KV cache bytes (informational, logged at startup).
+    pub total_bytes: u64,
+}
+
+impl Gemma4Nvfp4KvState {
+    /// Allocate a fresh KV state on the given arena. Returns a
+    /// state with per-layer base pointers populated for every
+    /// `arch.layer_types` entry. Sliding layers use
+    /// `num_kv_heads_sliding × head_dim_sliding`; global layers
+    /// use `num_kv_heads_global × head_dim_global`. For
+    /// `attention_k_eq_v=true` global layers (the 31B
+    /// convention), V aliases K — but the bring-up still
+    /// allocates an explicit V buffer so the kernel's slot
+    /// addressing stays uniform.
+    pub fn allocate(
+        arena: &rvllm_mem::HbmArena<'_>,
+        arch: &rvllm_loader::gemma4_arch::Gemma4Arch,
+        max_pos: u32,
+    ) -> Result<Self> {
+        let block_size: u32 = 1;
+
+        let block_tables_region = arena.region(
+            "gemma4_nvfp4_kv_block_tables",
+            (max_pos as usize) * 4, 256)?;
+        let context_lens_region = arena.region(
+            "gemma4_nvfp4_kv_context_lens", 4, 16)?;
+        let positions_region = arena.region(
+            "gemma4_nvfp4_kv_positions", 4, 16)?;
+        let slot_mapping_region = arena.region(
+            "gemma4_nvfp4_kv_slot_mapping", 4, 16)?;
+        let q_scale_region = arena.region(
+            "gemma4_nvfp4_kv_q_scale", 4, 16)?;
+
+        // Initialize block_tables with identity mapping
+        // (i32 0..max_pos). Single HtoD copy at allocate
+        // time; never rewritten unless spec/rollback lands.
+        let mut bt_host = Vec::<u8>::with_capacity((max_pos as usize) * 4);
+        for i in 0..max_pos {
+            bt_host.extend_from_slice(&(i as i32).to_le_bytes());
+        }
+        unsafe { block_tables_region.copy_from_host(&bt_host)? };
+
+        // q_scale default = 2.0f (matches production
+        // RVLLM_Q_SCALE on the fp8-block spec profile).
+        let q_scale_default: f32 = std::env::var("RVLLM_Q_SCALE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(2.0_f32);
+        unsafe {
+            q_scale_region.copy_from_host(
+                &q_scale_default.to_le_bytes())?;
+        }
+
+        let mut k_packed_layer_ptrs = Vec::with_capacity(arch.num_hidden_layers);
+        let mut v_packed_layer_ptrs = Vec::with_capacity(arch.num_hidden_layers);
+        let mut k_scale_layer_ptrs = Vec::with_capacity(arch.num_hidden_layers);
+        let mut v_scale_layer_ptrs = Vec::with_capacity(arch.num_hidden_layers);
+        let mut total_bytes: u64 = (max_pos as u64) * 4 + 4 * 4; // tables + scalars
+
+        for layer_idx in 0..arch.num_hidden_layers {
+            let lt = &arch.layer_types[layer_idx];
+            let (n_kv_heads, head_dim) = match lt {
+                rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention => {
+                    (arch.num_kv_heads_sliding, arch.head_dim_sliding)
+                }
+                rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention => {
+                    (arch.num_kv_heads_global, arch.head_dim_global)
+                }
+            };
+            // Packed K + V bytes per slot per head: head_dim/2
+            // nibbles. Total per layer = max_pos * n_kv_heads *
+            // head_dim/2.
+            let packed_bytes_per_layer =
+                (max_pos as usize) * n_kv_heads * (head_dim / 2);
+            // Per-(slot, head) E4M3 microscales: 1 byte per
+            // group_of_16. groups per head = head_dim / 16.
+            let scale_bytes_per_layer =
+                (max_pos as usize) * n_kv_heads * (head_dim / 16);
+
+            let k_packed = arena.region(
+                "gemma4_nvfp4_kv_k_packed", packed_bytes_per_layer, 256)?;
+            let v_packed = arena.region(
+                "gemma4_nvfp4_kv_v_packed", packed_bytes_per_layer, 256)?;
+            let k_scale = arena.region(
+                "gemma4_nvfp4_kv_k_scale", scale_bytes_per_layer, 256)?;
+            let v_scale = arena.region(
+                "gemma4_nvfp4_kv_v_scale", scale_bytes_per_layer, 256)?;
+
+            k_packed_layer_ptrs.push(k_packed.device_ptr());
+            v_packed_layer_ptrs.push(v_packed.device_ptr());
+            k_scale_layer_ptrs.push(k_scale.device_ptr());
+            v_scale_layer_ptrs.push(v_scale.device_ptr());
+            total_bytes += 2 * (packed_bytes_per_layer + scale_bytes_per_layer) as u64;
+        }
+
+        Ok(Self {
+            max_pos,
+            block_size,
+            block_tables_ptr: block_tables_region.device_ptr(),
+            context_lens_ptr: context_lens_region.device_ptr(),
+            positions_ptr: positions_region.device_ptr(),
+            slot_mapping_ptr: slot_mapping_region.device_ptr(),
+            q_scale_ptr: q_scale_region.device_ptr(),
+            k_packed_layer_ptrs,
+            v_packed_layer_ptrs,
+            k_scale_layer_ptrs,
+            v_scale_layer_ptrs,
+            total_bytes,
+        })
+    }
+}
+
 /// Loaded-but-held: the `LoadedModule` values must outlive the
 /// `KernelFn` handles (the PTX module owns the function code).
 /// They live on `Gemma4Nvfp4Bringup` to bound that lifetime.
@@ -74,6 +237,25 @@ struct ForwardKernels {
     /// vocab > block_size via tid-strided pre-fold.
     _argmax_mod: LoadedModule,
     fn_argmax_f32: KernelFn,
+    /// `fused_rope_partial_nvfp4kv_bf16in_kernel` — bf16-input
+    /// fused RoPE + NVFP4 K/V pack + per-(slot, head) E4M3
+    /// microscale write + FP8 Q output. Handles both full and
+    /// partial RoPE via runtime `rotary_dim` arg (per codex
+    /// round-4 A1). Source at v3/kernels/.
+    _rope_kv_write_mod: LoadedModule,
+    #[allow(dead_code)] // wired by commit #5b2's forward integration
+    fn_rope_kv_write_bf16in: KernelFn,
+    /// `flash_attention_2_decode_nvfp4kv_bf16out_kernel` —
+    /// paged-attention decode reader. FP8 Q in (produced by
+    /// the RoPE+KV write above), bf16 attn_out. Source at
+    /// kernels/flash_attention_nvfp4kv_bf16out.cu.
+    _attn_decode_mod: LoadedModule,
+    #[allow(dead_code)]
+    fn_attn_decode_bf16out: KernelFn,
+    /// GQA-aware variant of the above. Used when num_q_heads >
+    /// num_kv_heads (always true on Gemma 4 31B layers).
+    #[allow(dead_code)]
+    fn_attn_decode_gqa_bf16out: KernelFn,
 }
 
 /// Restores the arena to the post-load high-water mark when a forward
@@ -183,6 +365,20 @@ impl Gemma4Nvfp4Bringup {
         let argmax_mod = loader.load_ptx("argmax")?;
         let fn_argmax_f32 = argmax_mod.get_function("argmax_kernel")?;
 
+        // Commit #5b1: attention kernel handles loaded but not
+        // yet wired into a forward (that's #5b2).
+        let rope_kv_write_mod =
+            loader.load_ptx("fused_rope_partial_nvfp4kv_bf16in")?;
+        let fn_rope_kv_write_bf16in = rope_kv_write_mod
+            .get_function("fused_rope_partial_nvfp4kv_bf16in_kernel")?;
+
+        let attn_decode_mod =
+            loader.load_ptx("flash_attention_nvfp4kv_bf16out")?;
+        let fn_attn_decode_bf16out = attn_decode_mod
+            .get_function("flash_attention_2_decode_nvfp4kv_bf16out_kernel")?;
+        let fn_attn_decode_gqa_bf16out = attn_decode_mod
+            .get_function("flash_attention_2_decode_nvfp4kv_gqa_bf16out_kernel")?;
+
         // MLP kernels (commit #3).
         let mlp_gemv_mod = loader.load_ptx("mistral35_w4a16_gemv_bf16")?;
         let fn_w4a16_gemv =
@@ -211,6 +407,11 @@ impl Gemma4Nvfp4Bringup {
             fn_rope_split_half_bf16,
             _argmax_mod: argmax_mod,
             fn_argmax_f32,
+            _rope_kv_write_mod: rope_kv_write_mod,
+            fn_rope_kv_write_bf16in,
+            _attn_decode_mod: attn_decode_mod,
+            fn_attn_decode_bf16out,
+            fn_attn_decode_gqa_bf16out,
         };
         let forward_checkpoint = arena.checkpoint();
 
@@ -235,6 +436,31 @@ impl Gemma4Nvfp4Bringup {
             arena: &self.arena,
             checkpoint: self.forward_checkpoint,
         }
+    }
+
+    /// Commit #5b1: allocate the persistent NVFP4 KV cache state
+    /// on the bring-up's arena. Call once after `load`, before
+    /// the first `forward_*_attn` (commit #5b2). The state is
+    /// allocated ABOVE the forward_checkpoint so scratch
+    /// rewinds don't free it.
+    ///
+    /// `max_pos` defaults to 4096 for production workloads;
+    /// raise it for long-context inference (the 31B checkpoint
+    /// supports up to 262144 but rope-table memory grows
+    /// linearly).
+    ///
+    /// The forward integration (`forward_layer0_attn`, the
+    /// 60-layer driver, multi-token prefill) lands in commit
+    /// #5b2 based on codex round-4's verbatim 6-step plan:
+    ///   1. Use this state struct.
+    ///   2. Load attention kernel handles (done in this commit).
+    ///   3. Add forward_layer0_attn using fused RoPE+KV write
+    ///      kernel + bf16-output decode.
+    ///   4. Smoke at positions 0 and 1.
+    ///   5. Extend to 60-layer driver.
+    ///   6. Multi-token prefill (per-token loop fallback first).
+    pub fn allocate_kv_state(&self, max_pos: u32) -> Result<Gemma4Nvfp4KvState> {
+        Gemma4Nvfp4KvState::allocate(&self.arena, &self.arch, max_pos)
     }
 
     /// Layer-0 QKV + Q/K-norm on a single token. Extends
@@ -1822,5 +2048,75 @@ mod tests {
         let vocab = bringup.arch.vocab_size;
         assert!((token_id as usize) < vocab,
             "e2e pos=0 produced token_id={token_id} >= vocab={vocab}");
+    }
+
+    /// Commit #5b1 smoke: allocate the NVFP4 KV state on a loaded
+    /// bring-up. Asserts every per-layer pointer is non-null,
+    /// scale pointers are non-null, and total_bytes is in the
+    /// expected ~990 MiB range at max_pos=4096.
+    ///
+    /// Run:
+    ///   GEMMA4_NVFP4_DIR=/home/r00t/Gemma-4-31B-IT-NVFP4 \
+    ///     cargo test -p rvllm-runtime --features cuda,gb10 \
+    ///     gemma4_nvfp4_bring_up::tests::ondisk_bringup_allocate_kv_state \
+    ///     -- --ignored --nocapture
+    ///
+    /// Does not run any forward — purely tests the KV allocator +
+    /// kernel handle loading (#5b1). Forward integration is #5b2.
+    #[test]
+    #[ignore]
+    fn ondisk_bringup_allocate_kv_state() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skipping #5b1 smoke");
+                return;
+            }
+        };
+        let kernels_dir = std::path::PathBuf::from(
+            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
+        );
+        let bringup = Gemma4Nvfp4Bringup::load(
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
+        ).expect("Gemma4Nvfp4Bringup::load");
+
+        let max_pos: u32 = 4096;
+        let kv = bringup.allocate_kv_state(max_pos)
+            .expect("allocate_kv_state");
+
+        assert_eq!(kv.max_pos, max_pos);
+        assert_eq!(kv.block_size, 1);
+        assert_ne!(kv.block_tables_ptr, 0, "block_tables null");
+        assert_ne!(kv.context_lens_ptr, 0, "context_lens null");
+        assert_ne!(kv.positions_ptr, 0, "positions null");
+        assert_ne!(kv.slot_mapping_ptr, 0, "slot_mapping null");
+        assert_ne!(kv.q_scale_ptr, 0, "q_scale null");
+
+        let n_layers = bringup.arch.num_hidden_layers;
+        assert_eq!(kv.k_packed_layer_ptrs.len(), n_layers);
+        assert_eq!(kv.v_packed_layer_ptrs.len(), n_layers);
+        assert_eq!(kv.k_scale_layer_ptrs.len(), n_layers);
+        assert_eq!(kv.v_scale_layer_ptrs.len(), n_layers);
+        for li in 0..n_layers {
+            assert_ne!(kv.k_packed_layer_ptrs[li], 0,
+                "k_packed[{li}] null");
+            assert_ne!(kv.v_packed_layer_ptrs[li], 0,
+                "v_packed[{li}] null");
+            assert_ne!(kv.k_scale_layer_ptrs[li], 0,
+                "k_scale[{li}] null");
+            assert_ne!(kv.v_scale_layer_ptrs[li], 0,
+                "v_scale[{li}] null");
+        }
+
+        let mib = kv.total_bytes as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "[#5b1-smoke] allocated NVFP4 KV state: layers={n_layers} \
+             max_pos={max_pos} total_bytes={} ({mib:.1} MiB)",
+            kv.total_bytes,
+        );
+        // Expected ~990 MiB at max_pos=4096 (see docstring on the
+        // Gemma4Nvfp4KvState struct). Bound generously.
+        assert!(mib > 500.0 && mib < 1500.0,
+            "total_bytes={mib:.1} MiB outside expected 500..1500 range");
     }
 }
