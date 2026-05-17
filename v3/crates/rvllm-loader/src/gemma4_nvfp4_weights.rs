@@ -413,13 +413,17 @@ impl Gemma4Nvfp4LayerLoaded {
 
 /// Outside-the-stack text weights for the Gemma 4 NVFP4
 /// checkpoint. The model has `tie_word_embeddings=true`, so
-/// `lm_head` aliases `embed_tokens.T` at forward time — no
-/// separate tensor on disk.
+/// `lm_head` aliases the raw `embed_tokens.T` at forward time. Runtime
+/// keeps a second, pre-scaled copy for embedding lookup because Gemma 4
+/// multiplies token embeddings by sqrt(hidden) before layer 0.
 #[derive(Debug)]
 pub struct Gemma4Nvfp4OutsideText {
-    /// `[vocab=262144, hidden=5376]` bf16. Doubles as the
-    /// LM-head weight via the tied-embedding convention.
+    /// `[vocab=262144, hidden=5376]` bf16, pre-scaled by sqrt(hidden).
+    /// Used only for token embedding lookup.
     pub embed_tokens: crate::weights::F16Weight,
+    /// `[vocab=262144, hidden=5376]` bf16, raw checkpoint values. Used
+    /// as the tied LM-head weight.
+    pub lm_head_tokens: crate::weights::F16Weight,
     /// `[hidden=5376]` bf16. Final RMSNorm before lm_head.
     pub final_norm: crate::weights::F16Weight,
     /// `[max_pos, head_dim_sliding/2]` f32. cos table for the

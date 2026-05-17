@@ -76,6 +76,22 @@ struct ForwardKernels {
     fn_argmax_f32: KernelFn,
 }
 
+/// Restores the arena to the post-load high-water mark when a forward
+/// helper returns or fails. Created before per-forward regions, so Rust
+/// drops those regions before this guard restores the bump pointer.
+struct ForwardScratchGuard<'a> {
+    arena: &'a HbmArena<'static>,
+    checkpoint: usize,
+}
+
+impl Drop for ForwardScratchGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: these bring-up forwards return host-owned Vec/u32 values.
+        // Any Region locals allocated after the guard are dropped first.
+        unsafe { self.arena.restore(self.checkpoint); }
+    }
+}
+
 /// Phase 3c+ text-only bring-up for `nvidia/Gemma-4-31B-IT-NVFP4`.
 ///
 /// Owns: a CUDA primary context (kept alive via the handle),
@@ -98,6 +114,9 @@ pub struct Gemma4Nvfp4Bringup {
     pub cublaslt: CublasLt,
     pub stream: Stream,
     pub arena: HbmArena<'static>,
+    /// Checkpoint taken after persistent allocations. Forward helpers
+    /// restore here so scratch allocations do not accumulate across calls.
+    pub forward_checkpoint: usize,
     /// Held to keep the primary CUDA context alive.
     _ctx: CudaContextHandle,
 }
@@ -193,6 +212,7 @@ impl Gemma4Nvfp4Bringup {
             _argmax_mod: argmax_mod,
             fn_argmax_f32,
         };
+        let forward_checkpoint = arena.checkpoint();
 
         Ok(Self {
             arch,
@@ -205,8 +225,16 @@ impl Gemma4Nvfp4Bringup {
             cublaslt,
             stream,
             arena,
+            forward_checkpoint,
             _ctx: ctx,
         })
+    }
+
+    fn forward_scratch_guard(&self) -> ForwardScratchGuard<'_> {
+        ForwardScratchGuard {
+            arena: &self.arena,
+            checkpoint: self.forward_checkpoint,
+        }
     }
 
     /// Layer-0 QKV + Q/K-norm on a single token. Extends
@@ -233,6 +261,7 @@ impl Gemma4Nvfp4Bringup {
         &self,
         token_id: u32,
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let _scratch_guard = self.forward_scratch_guard();
         let (q_f32, k_f32, v_f32) = self.forward_layer0_qkv_only(token_id)?;
         let layer0 = &self.model.layers[0];
         let head_dim = self.arch.head_dim_sliding as u32;
@@ -366,6 +395,7 @@ impl Gemma4Nvfp4Bringup {
         &self,
         token_id: u32,
     ) -> Result<u32> {
+        let _scratch_guard = self.forward_scratch_guard();
         let (q_post_rope_f32, _k_post_rope_f32, v_f32) =
             self.forward_layer0_qk_rope(token_id, 0)?;
         let _ = q_post_rope_f32; // Q is consumed by attention; not used in identity case
@@ -495,21 +525,21 @@ impl Gemma4Nvfp4Bringup {
     /// Final close-out: final_norm → tied LM head → argmax.
     ///
     ///   h_final  = final_norm(h_residual)        // bf16 in-place RMSNorm
-    ///   logits   = h_final @ embed_tokens.T      // bf16 GEMV via cuBLASLt → f32
+    ///   logits   = h_final @ raw_embed_tokens.T  // bf16 GEMV via cuBLASLt → f32
     ///   token_id = argmax(logits)
     ///
-    /// `tie_word_embeddings=true` on this checkpoint, so the
-    /// LM head uses `embed_tokens` (already sqrt(hidden)-pre-
-    /// scaled at load time per the round-3 D5 fix). cuBLASLt
-    /// computes A @ B^T under the TN swap, so passing
-    /// weight=embed_tokens [vocab, hidden] produces the right
-    /// math.
+    /// `tie_word_embeddings=true` on this checkpoint, so the LM head
+    /// uses the raw `embed_tokens.weight`. The separate forward
+    /// embedding buffer is sqrt(hidden)-pre-scaled for layer-0 input,
+    /// but HF applies that scale in the embedding module's forward(),
+    /// not to `lm_head.weight`.
     ///
     /// Returns the predicted next token id.
     pub fn forward_final_to_token(
         &self,
         h_residual_bf16_host: &[u16], // [hidden]
     ) -> Result<u32> {
+        let _scratch_guard = self.forward_scratch_guard();
         let hidden = self.arch.hidden_size as u32;
         let vocab = self.arch.vocab_size as u32;
         if h_residual_bf16_host.len() != hidden as usize {
@@ -546,12 +576,12 @@ impl Gemma4Nvfp4Bringup {
             )?;
         }
 
-        // (2) Tied LM head GEMV: h_normed @ embed_tokens.T → f32 [1, vocab].
+        // (2) Tied LM head GEMV: h_normed @ raw_embed_tokens.T → f32 [1, vocab].
         unsafe {
             gemma4_nvfp4_attn_proj(
                 &self.cublaslt,
                 h_region.device_ptr(),
-                self.model.outside.embed_tokens.offset_bytes,
+                self.model.outside.lm_head_tokens.offset_bytes,
                 logits_region.device_ptr(),
                 1, vocab as i32, hidden as i32, stream_u64,
             )?;
@@ -621,6 +651,7 @@ impl Gemma4Nvfp4Bringup {
         &self,
         h_residual_bf16_host: &[u16], // [hidden]
     ) -> Result<Vec<f32>> {
+        let _scratch_guard = self.forward_scratch_guard();
         let layer0 = &self.model.layers[0];
         let hidden = self.arch.hidden_size as u32;
         let intermediate = self.arch.intermediate_size as u32;
@@ -815,6 +846,7 @@ impl Gemma4Nvfp4Bringup {
         attn_out_bf16_host: &[u16], // [N_q]
         h_residual_bf16_host: &[u16], // [hidden]
     ) -> Result<Vec<f32>> {
+        let _scratch_guard = self.forward_scratch_guard();
         let layer0 = &self.model.layers[0];
         let n_q = layer0.o_proj.shape[1] as i32; // o_proj is [hidden, N_q]
         let hidden = self.arch.hidden_size as u32;
@@ -965,6 +997,7 @@ impl Gemma4Nvfp4Bringup {
         token_id: u32,
         position: u32,
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let _scratch_guard = self.forward_scratch_guard();
         let (q_normed_f32, k_normed_f32, v_f32) =
             self.forward_layer0_qk_norm(token_id)?;
         let head_dim = self.arch.head_dim_sliding as u32;
@@ -1082,6 +1115,7 @@ impl Gemma4Nvfp4Bringup {
         &self,
         token_id: u32,
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let _scratch_guard = self.forward_scratch_guard();
         let layer0 = &self.model.layers[0];
         let n_q = layer0.q_proj.shape[0] as i32;
         let n_kv = layer0.k_proj.shape[0] as i32;
@@ -1204,6 +1238,7 @@ impl Gemma4Nvfp4Bringup {
     /// without yet wiring attention math, MLP, or the per-layer
     /// loop.
     pub fn pre_attn_one_token(&self, token_id: u32) -> Result<Vec<f32>> {
+        let _scratch_guard = self.forward_scratch_guard();
         let layer0 = &self.model.layers[0];
         let n_q = layer0.q_proj.shape[0] as i32;
         let hidden = self.arch.hidden_size as u32;
@@ -1322,7 +1357,7 @@ mod tests {
         // include KV cache + spec scratch which we don't allocate here.
         let t0 = std::time::Instant::now();
         let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 32 * 1024 * 1024 * 1024, &kernels_dir,
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
         ).expect("Gemma4Nvfp4Bringup::load");
         let load_s = t0.elapsed().as_secs_f64();
         eprintln!(
@@ -1388,7 +1423,7 @@ mod tests {
             "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
         );
         let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 32 * 1024 * 1024 * 1024, &kernels_dir,
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
         ).expect("Gemma4Nvfp4Bringup::load");
 
         let token_id: u32 = 2;
@@ -1442,7 +1477,7 @@ mod tests {
             "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
         );
         let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 32 * 1024 * 1024 * 1024, &kernels_dir,
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
         ).expect("Gemma4Nvfp4Bringup::load");
 
         let head_dim = bringup.arch.head_dim_sliding;
@@ -1506,7 +1541,7 @@ mod tests {
             "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
         );
         let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 32 * 1024 * 1024 * 1024, &kernels_dir,
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
         ).expect("Gemma4Nvfp4Bringup::load");
 
         let head_dim = bringup.arch.head_dim_sliding;
@@ -1587,7 +1622,7 @@ mod tests {
             "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
         );
         let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 32 * 1024 * 1024 * 1024, &kernels_dir,
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
         ).expect("Gemma4Nvfp4Bringup::load");
 
         let hidden = bringup.arch.hidden_size;
@@ -1655,7 +1690,7 @@ mod tests {
             "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
         );
         let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 32 * 1024 * 1024 * 1024, &kernels_dir,
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
         ).expect("Gemma4Nvfp4Bringup::load");
 
         let hidden = bringup.arch.hidden_size;
@@ -1730,7 +1765,7 @@ mod tests {
             "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
         );
         let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 32 * 1024 * 1024 * 1024, &kernels_dir,
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
         ).expect("Gemma4Nvfp4Bringup::load");
 
         let hidden = bringup.arch.hidden_size;
@@ -1774,7 +1809,7 @@ mod tests {
             "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
         );
         let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 32 * 1024 * 1024 * 1024, &kernels_dir,
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
         ).expect("Gemma4Nvfp4Bringup::load");
 
         // BOS token at position=0.

@@ -441,15 +441,23 @@ pub fn upload_gemma4_nvfp4_outside_text(
     // NVFP4 bring-up was missing this, which made every downstream
     // smoke's QKV magnitudes qualitatively wrong vs. the production
     // path even though they passed the structural "finite + non-zero"
-    // assertions. Fix matches the fp8-block convention exactly: scale
-    // on the host before HtoD so the device path stays simple and
-    // every embed_tokens read (forward + tied lm_head) sees the
-    // scaled values uniformly.
+    // assertions. Scale on the host before HtoD so the device path
+    // stays simple.
+    //
+    // Keep this pre-scaled copy for embedding lookup only. The tied
+    // LM head must read the raw checkpoint weights: HF scales
+    // Gemma4TextScaledWordEmbedding.forward(), not the shared weight
+    // used by Gemma4ForCausalLM.lm_head.
     let embed_tokens = upload_embed_tokens_scaled(
         arena, pool,
         &format!("{prefix}.embed_tokens.weight"),
         &[arch.vocab_size, arch.hidden_size],
         (arch.hidden_size as f32).sqrt(),
+    )?;
+    let lm_head_tokens = upload_typed_tensor(
+        arena, pool, "gemma4n_lm_head_tokens",
+        &format!("{prefix}.embed_tokens.weight"),
+        DType::Bf16, Some(&[arch.vocab_size, arch.hidden_size])
     )?;
     let final_norm = upload_typed_tensor(
         arena, pool, "gemma4n_final_norm",
@@ -497,7 +505,7 @@ pub fn upload_gemma4_nvfp4_outside_text(
     );
 
     Ok(Gemma4Nvfp4OutsideText {
-        embed_tokens, final_norm,
+        embed_tokens, lm_head_tokens, final_norm,
         rope_cos_sliding, rope_sin_sliding,
         rope_cos_global, rope_sin_global,
     })
