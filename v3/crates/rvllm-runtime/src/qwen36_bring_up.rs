@@ -8398,6 +8398,23 @@ impl Qwen36Bringup {
             )?;
         }
         unsafe {
+            // NOTE: codex review proposed routing rows>1 through
+            // fp8_gemm_f16_per_row_act_scale (B_SCALE_MODE =
+            // OUTER_VEC_32F) to fix the closer-all per-row scale
+            // bug. The descriptor sets cleanly but
+            // cublasLtMatmul returns LaunchFailed on sm_121 / GB10
+            // for the FP8 + B-side outer-vector combo. Hypothesis:
+            // cuBLASLt's FP8 path on sm_121 only accepts
+            // A_SCALE_MODE=OUTER_VEC (weight side) and rejects the
+            // analog on the B (activation) side. Verifying that
+            // and finding the right cuBLASLt enum + hint flag is
+            // follow-up work; the entrypoint stays available so
+            // future probes can use it.
+            //
+            // Until then: closer-all keeps using plain fp8_gemm
+            // with the scalar-scale bug, which is why the gate is
+            // OFF by default and the closer-loop path is the
+            // production route.
             self.cublaslt.fp8_gemm(
                 hidden_fp8_region.device_ptr(),
                 self.model.outside.lm_head_fp8.offset_bytes,

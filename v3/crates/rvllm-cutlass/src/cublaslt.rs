@@ -139,7 +139,7 @@ impl CublasLt {
         b_scale: u64,
         stream: u64,
     ) -> Result<()> {
-        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f16, m, n, k, a_scale, b_scale, stream, false, 0, None)
+        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f16, m, n, k, a_scale, b_scale, stream, false, 0, None, false)
     }
 
     /// Plain FP8 E4M3 matmul with bf16 output: D_bf16 = A * B^T.
@@ -157,7 +157,7 @@ impl CublasLt {
         b_scale: u64,
         stream: u64,
     ) -> Result<()> {
-        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_bf16, m, n, k, a_scale, b_scale, stream, false, 1, None)
+        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_bf16, m, n, k, a_scale, b_scale, stream, false, 1, None, false)
     }
 
     /// Plain FP8 E4M3 matmul with f32 output: D_f32 = A * B^T.
@@ -176,7 +176,7 @@ impl CublasLt {
         b_scale: u64,
         stream: u64,
     ) -> Result<()> {
-        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f32, m, n, k, a_scale, b_scale, stream, false, 2, None)
+        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f32, m, n, k, a_scale, b_scale, stream, false, 2, None, false)
     }
 
     /// FP8 matmul with f32 output and per-channel weight scales (OUTER_VEC_32F).
@@ -194,7 +194,36 @@ impl CublasLt {
         b_channelscale: u64,
         stream: u64,
     ) -> Result<()> {
-        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f32, m, n, k, a_scale, 0, stream, false, 2, Some(b_channelscale))
+        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f32, m, n, k, a_scale, 0, stream, false, 2, Some(b_channelscale), false)
+    }
+
+    /// FP8 matmul with per-row activation scales (OUTER_VEC_32F on the
+    /// activation side). `a_scale_per_row` MUST point at an `[m]`-length
+    /// f32 device buffer; cuBLASLt reads one f32 per output row.
+    ///
+    /// Used by speculative-decode closer-all paths where the verify pass
+    /// produces an activation row per draft token, each with its own
+    /// fused-rmsnorm-derived scale. Without this mode cuBLASLt reads
+    /// only the first f32 and applies it to every row — silent per-
+    /// row argmax drift on M > 1.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fp8_gemm_f16_per_row_act_scale(
+        &self,
+        a_fp8: u64,
+        b_fp8: u64,
+        d_f16: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        a_scale_per_row: u64,
+        b_scale: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.fp8_gemm_inner(
+            a_fp8, b_fp8, 0, 0, d_f16, m, n, k,
+            a_scale_per_row, b_scale, stream, false, 0, None, true,
+        )
     }
 
     /// Blockwise FP8 matmul: D_f16 = A_fp8 * B_fp8^T, with
@@ -880,7 +909,7 @@ impl CublasLt {
         stream: u64,
     ) -> Result<()> {
         self.fp8_gemm_inner(
-            a_fp8, b_fp8, bias_f16, 0, d_f16, m, n, k, a_scale, b_scale, stream, false, 0, None,
+            a_fp8, b_fp8, bias_f16, 0, d_f16, m, n, k, a_scale, b_scale, stream, false, 0, None, false,
         )
     }
 
@@ -902,7 +931,7 @@ impl CublasLt {
         stream: u64,
     ) -> Result<()> {
         self.fp8_gemm_inner(
-            a_fp8, b_fp8, 0, residual_f16, d_f16, m, n, k, a_scale, b_scale, stream, true, 0, None,
+            a_fp8, b_fp8, 0, residual_f16, d_f16, m, n, k, a_scale, b_scale, stream, true, 0, None, false,
         )
     }
 
@@ -927,6 +956,11 @@ impl CublasLt {
         beta_one: bool,
         d_out_type: u8, // 0=f16, 1=bf16, 2=f32
         b_channelscale: Option<u64>, // per-channel weight scale (OUTER_VEC_32F)
+        a_per_row_scale: bool, // when true, treat `a_scale` as an [m]-length
+                               // f32 vector and set B_SCALE_MODE = OUTER_VEC_32F
+                               // (cuBLAS B side = our activation). Mutually
+                               // exclusive with using a_scale as a scalar;
+                               // caller is responsible for the right layout.
     ) -> Result<()> {
         let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
         let rc = lt::cublasLtMatmulDescCreate(
@@ -992,6 +1026,25 @@ impl CublasLt {
             set_attr(
                 desc,
                 unsafe { std::mem::transmute::<u32, lt::cublasLtMatmulDescAttributes_t>(attr_a_scale_mode) },
+                &scale_mode as *const _ as *const _,
+                std::mem::size_of_val(&scale_mode),
+            )?;
+        }
+        // Codex review 2026-05-17 (Qwen 3.6 closer-all root cause):
+        // when the activation has a per-row scale (one f32 per
+        // output token), set B_SCALE_MODE = OUTER_VEC_32F. Without
+        // this, cuBLASLt reads only the first f32 from a_scale and
+        // applies it to every row. cuBLAS B = our activation under
+        // the TN swap (see comment above the A/B scale pointer
+        // wiring), so the right attribute is B_SCALE_MODE (=32),
+        // distinct from the A_SCALE_MODE flag the b_channelscale
+        // branch sets for the weight side.
+        if a_per_row_scale {
+            let scale_mode: u32 = 3; // OUTER_VEC_32F
+            let attr_b_scale_mode: u32 = 32; // CUBLASLT_MATMUL_DESC_B_SCALE_MODE
+            set_attr(
+                desc,
+                unsafe { std::mem::transmute::<u32, lt::cublasLtMatmulDescAttributes_t>(attr_b_scale_mode) },
                 &scale_mode as *const _ as *const _,
                 std::mem::size_of_val(&scale_mode),
             )?;

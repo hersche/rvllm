@@ -237,9 +237,18 @@ pub fn validate_gemma4_nvfp4_inventory(
                 )));
             }
             (Some(crate::gemma4_arch::Gemma4LayerType::GlobalAttention), true) => {
-                // Acceptable when attention_k_eq_v=false (rare). Warn-only.
-                // The runtime forward will use the explicit v_proj if
+                // Acceptable when attention_k_eq_v=false (rare). The
+                // runtime forward will use the explicit v_proj if
                 // present and ignore the alias path; that's safe.
+                // Codex review caught a stale "warn-only" comment
+                // here — emit the warn so an operator inspecting an
+                // unfamiliar checkpoint sees the divergence from the
+                // production attention_k_eq_v=true pattern.
+                eprintln!(
+                    "[gemma4-nvfp4] layer {layer_idx} (GlobalAttention) has \
+                     v_proj present — attention_k_eq_v is likely false for \
+                     this layer; forward will use explicit v_proj."
+                );
             }
             _ => {}
         }

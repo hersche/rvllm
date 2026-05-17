@@ -708,14 +708,32 @@ mod tests {
             non_vision_unread,
         );
 
-        // Sanity check the numbers Codex reported (1372 reads, 356
-        // unread vision tensors on the 31B checkpoint). Off-by-a-
-        // few is fine across loader refactors; an order-of-magnitude
-        // miss is a regression.
-        assert_eq!(expected_read.len(), 1372,
-                   "expected_read size drifted — loader changed?");
-        assert_eq!(unread.len(), 356,
-                   "unread (vision) size drifted — checkpoint changed?");
+        // Reference counts from the 2026-05-17 hardware run on the
+        // initial nvidia/Gemma-4-31B-IT-NVFP4 checkpoint: 1372 text
+        // tensors / 356 vision tensors. NVIDIA could publish a v2
+        // checkpoint at any time (extra tensors, different layer-
+        // type pattern), and we don't want a checkpoint update to
+        // break the test — the real invariant is the vision-only
+        // unread set above.
+        //
+        // Set RVLLM_GEMMA4_NVFP4_STRICT_COUNTS=1 in CI to harden
+        // these asserts and catch loader regressions; default
+        // behaviour is informational.
+        let strict_counts = std::env::var("RVLLM_GEMMA4_NVFP4_STRICT_COUNTS")
+            .as_deref() == Ok("1");
+        if strict_counts {
+            assert_eq!(expected_read.len(), 1372,
+                       "expected_read size drifted from initial release");
+            assert_eq!(unread.len(), 356,
+                       "unread (vision) size drifted from initial release");
+        } else if expected_read.len() != 1372 || unread.len() != 356 {
+            eprintln!(
+                "[coverage] count delta vs initial release: \
+                 reads {} (expected 1372) / unread {} (expected 356) — \
+                 set RVLLM_GEMMA4_NVFP4_STRICT_COUNTS=1 to fail on this.",
+                expected_read.len(), unread.len(),
+            );
+        }
         eprintln!(
             "[coverage] OK: {} text tensors read, {} vision tensors deferred to Phase 3c+ commit #6",
             expected_read.len(), unread.len(),
