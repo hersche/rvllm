@@ -5235,6 +5235,24 @@ impl Gemma4Bringup {
             };
             self.skip_prefix_cache_publish
                 .store(true, std::sync::atomic::Ordering::Release);
+            // Perf fix (companion to Round-8 last_tokens pre-populate):
+            // bypass the chunk-cap on prefix-cache reuse. Without this,
+            // committed_prefix_len from the initial-prefill publish stays
+            // at floor(prompt_len/chunk_size)*chunk_size = 0 for short
+            // prompts (prompt_len < RVLLM_PREFILL_CHUNK_SIZE), and the
+            // natural-match path caps reuse to 0 → re-prefills the entire
+            // session every iter (observed: prefill_one_avg_ms=3737ms on
+            // 31B with chunk=128, prompt=21). force_common_prefix_override
+            // tells run_generate to reuse exactly session.tokens.len()
+            // positions; the KV at those slots was written by the initial
+            // chunked prefill (slots [0, prompt_len)) and by the preceding
+            // verify_batched (slots [prompt_len, prompt_len+accept_len))
+            // — all under chunk-prefill quantization, no decode-step
+            // writes intervened (force_prefill_only is on). Same safety
+            // envelope verify_batched_from_state already operates under.
+            self.force_common_prefix_override
+                .store(session.tokens.len() as u32,
+                       std::sync::atomic::Ordering::Release);
 
             let _ = self.run_generate(
                 fn_embed,

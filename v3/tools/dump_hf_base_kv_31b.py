@@ -96,12 +96,23 @@ def main() -> None:
     # Cache stores per-layer (K, V). transformers 5.8 DynamicCache uses
     # pkv.layers[li].keys / pkv.layers[li].values (each [bsz, num_kv_heads,
     # seq_len, head_dim]). Older versions have .key_cache / .value_cache.
-    if hasattr(pkv, "layers"):
+    # `hasattr` was unreliable here (DynamicCache exposes a `layers`
+    # attribute lazily on some paths) — probe by attempting the access
+    # and fall back, instead of trusting hasattr.
+    layers_attr = getattr(pkv, "layers", None)
+    key_cache_attr = getattr(pkv, "key_cache", None)
+    if layers_attr is not None and len(layers_attr) > 0:
         get_kv = lambda li: (pkv.layers[li].keys, pkv.layers[li].values)
-    elif hasattr(pkv, "key_cache"):
+    elif key_cache_attr is not None and len(key_cache_attr) > 0:
         get_kv = lambda li: (pkv.key_cache[li], pkv.value_cache[li])
+    elif hasattr(pkv, "to_legacy_cache"):
+        legacy = pkv.to_legacy_cache()
+        get_kv = lambda li: legacy[li]
     else:
-        get_kv = lambda li: pkv[li]
+        raise RuntimeError(
+            f"unknown past_key_values layout: {type(pkv).__name__} "
+            f"(layers={layers_attr!r}, key_cache={key_cache_attr!r})"
+        )
 
     for label, li in [("sliding", sliding_src), ("global", full_src)]:
         K, V = get_kv(li)
