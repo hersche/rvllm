@@ -4667,16 +4667,25 @@ impl Gemma4Bringup {
         // The local HF-parity reference (v3/tools/manual_drafter_reference.py
         // lines 176, 264, 290) computes drafter cross-attention as
         //     scores = (q · k) * (1.0 / sqrt(head_dim))
-        // for BOTH sliding and global source layers — i.e. the
-        // standard attention scale. The Round-4 default of "mtp"
-        // (scale = 1.0) was based on a misread of a legacy code
-        // comment claiming vLLM uses 1.0 for Gemma4MTPAttention;
-        // hardware smoke + the reference script both disagree.
-        // Reverting to "stable" (= 1/sqrt(head_dim)) keeps the
-        // drafter distribution aligned with HF until a proper
-        // HF-parity dump definitively settles the question.
+        // Codex Round 4 Q1 + 2026-05-17 PyTorch-vs-HF-vs-rvllm dump
+        // round: HF Gemma4 attention uses `self.scaling = 1.0` (per
+        // modeling_gemma4.py:1178). Confirmed by side-by-side dump:
+        // PyTorch ref with MANUAL_ATTN_SCALE=1.0 matches HF EXACTLY
+        // through all of drafter L0..L3 (rms + head8 to 3 decimals),
+        // and rvllm under RVLLM_SPEC_FA_SCALE=mtp draft[0]=18351
+        // matches HF's argmax for the same prompt. DEFAULT is now
+        // "mtp" (= scale 1.0) for use_ordered_embeddings=false (31B)
+        // drafters. E4B (use_ordered_embeddings=true) keeps the
+        // existing "stable" (1/sqrt(d_k)) since it was validated to
+        // 1.5 accept_per_verify in production. Operator override
+        // via RVLLM_SPEC_FA_SCALE={stable, mtp} still honored.
+        let default_scale_mode = {
+            let guard = self.drafter.lock().unwrap();
+            let d = guard.as_ref().expect("drafter resident");
+            if d.arch.use_ordered_embeddings { "stable" } else { "mtp" }
+        };
         let scale_mode = std::env::var("RVLLM_SPEC_FA_SCALE")
-            .unwrap_or_else(|_| "stable".into());
+            .unwrap_or_else(|_| default_scale_mode.into());
 
         for k_step in 0..(spec_k as usize) {
             let step = crate::gemma4_drafter::DrafterForwardStep {

@@ -306,7 +306,8 @@ def main():
         rotary_dim_n = int(eff_hd_n * partial_n)
         n_kv_heads_n = K_n.shape[1]
         gqa_factor_n = num_heads // n_kv_heads_n
-        scale_n = 1.0 / (eff_hd_n ** 0.5)
+        # Honor MANUAL_ATTN_SCALE env across ALL layers, not just L0.
+        scale_n = float(os.environ.get("MANUAL_ATTN_SCALE", 1.0 / (eff_hd_n ** 0.5)))
         q_rows_n = num_heads * eff_hd_n
 
         # Layer L_next forward
@@ -324,10 +325,14 @@ def main():
 
         residual_in = h_cur
         h_norm_n = gemma_rmsnorm(h_cur, W_in_ln, eps)
+        log(f"L{L_next} post_input_ln", h_norm_n)
         q_n = (h_norm_n.float() @ W_q.float().T).to(torch.bfloat16)
+        log(f"L{L_next} post_q_proj", q_n)
         q_n_heads = q_n.view(num_heads, eff_hd_n)
         q_n_normed = gemma_rmsnorm(q_n_heads, W_qn, eps)
+        log(f"L{L_next} post_q_norm", q_n_normed)
         q_n_roped = gemma_partial_rope(q_n_normed, args.position, rope_theta_n, rotary_dim_n, eff_hd_n)
+        log(f"L{L_next} post_q_rope", q_n_roped)
         # cross-attn
         attn_n = torch.zeros(num_heads, eff_hd_n, dtype=torch.float32, device=device)
         for h_i in range(num_heads):
@@ -336,20 +341,28 @@ def main():
             pr = sc.softmax(dim=-1)
             attn_n[h_i] = torch.einsum("t,td->d", pr, V_n[:, kv_h_i, :].float())
         attn_n_bf16 = attn_n.to(torch.bfloat16).reshape(-1)
+        log(f"L{L_next} attn_out", attn_n_bf16)
         proj_pre_n = (attn_n_bf16.float() @ W_op.float().T).to(torch.bfloat16)
+        log(f"L{L_next} post_o_proj", proj_pre_n)
         proj_norm_n = gemma_rmsnorm(proj_pre_n, W_pal, eps)
+        log(f"L{L_next} post_attn_layernorm", proj_norm_n)
         h_after_attn = (residual_in.float() + proj_norm_n.float()).to(torch.bfloat16)
+        log(f"L{L_next} after_attn_finisher", h_after_attn)
         # MLP
         h_ff_in = gemma_rmsnorm(h_after_attn, W_pfl, eps)
+        log(f"L{L_next} post_pre_ff_norm", h_ff_in)
         gate_n = (h_ff_in.float() @ W_g.float().T)
         up_n = (h_ff_in.float() @ W_u.float().T)
         gelu_gate_n = torch.nn.functional.gelu(gate_n, approximate="tanh")
         silu_out_n = gelu_gate_n * up_n
         mlp_out_n = (silu_out_n @ W_d.float().T).to(torch.bfloat16)
+        log(f"L{L_next} mlp_out", mlp_out_n)
         mlp_normed_n = gemma_rmsnorm(mlp_out_n, W_pol, eps)
+        log(f"L{L_next} post_ff_layernorm", mlp_normed_n)
         h_after_mlp = (h_after_attn.float() + mlp_normed_n.float()).to(torch.bfloat16)
+        log(f"L{L_next} after_residual_2 (pre_scalar)", h_after_mlp)
         h_cur = (h_after_mlp.float() * ls_n).to(torch.bfloat16)
-        log(f"L{L_next} output (after_layer_scalar)", h_cur)
+        log(f"L{L_next} after_layer_scalar", h_cur)
 
     # final_norm
     W_final = state["model.norm.weight"]
