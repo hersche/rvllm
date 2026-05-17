@@ -311,6 +311,76 @@ New file: `~/.rvllm/profiles/mobile-31b-rvllm-fp8kv-spec.env`
 KV-dtype-invariance test; kept on disk as a baseline for future
 work.
 
+### Round 4 (2026-05-17) — Q content effectively ignored, scale arg works
+
+New evidence from this session (commit `12970cd` adds the
+`RVLLM_SPEC_ZERO_Q` knob in the batched session loop):
+
+* `RVLLM_SPEC_ZERO_Q=1` (zero workspace.q immediately before
+  cross-attn) → drafts BIT-IDENTICAL to non-zero Q.
+* `RVLLM_SPEC_Q_ROPE_MODE` ∈ {current, pos0, no_rope} → all three
+  produce IDENTICAL drafts (pre-existing knob, same result).
+* `RVLLM_GEMMA4_SPEC_LAYER_TRACE` cross-check: attn_out RMS DOES
+  differ between Q-zeroed (0.61) and Q-normal (0.51) — the
+  cross-attn IS consuming Q. The difference is just too small
+  to flip the LM-head argmax over 262144 vocab.
+
+Codex Round 4 (cited HF source for every claim) ruled out most
+hypotheses and pinned ONE concrete HF mismatch: HF Gemma4 sets
+`self.scaling = 1.0` at `modeling_gemma4.py:1178`, NOT
+`1/sqrt(head_dim)`. rvllm defaults to "stable" (1/sqrt(d_k)) for
+drafter cross-attn — a 16× (sliding) / 22.6× (global) QK-logit
+difference vs HF.
+
+Hardware test of `RVLLM_SPEC_FA_SCALE=mtp` (scale=1.0) vs default
+`stable` (1/sqrt(d_k)) — confirmed scale arg IS reaching kernel:
+
+| Site | stable | mtp |
+|---|---|---|
+| L0 attn_out RMS | 0.61 | 0.68 |
+| L0 attn_out head8[0] | -0.142 | -0.521 |
+| L3 attn_out RMS | 0.52 | 0.65 |
+| post_final_norm RMS | 6.17 | 6.18 |
+| post_final_norm max | 89.81 | 90.62 |
+| post_final_norm direction head8[2] | 42.56 | 43.38 |
+| drafter draft[0] | 2021 | 2021 |
+
+So scale matters at attn_out level (RMS +10–25%, direction
+shifts 3×) BUT the drafter forward chain (residual_1 + post-attn-
+norm + MLP + post_ff_norm + residual_2 + layer_scalar + final_norm)
+SMOOTHS the difference out so post_final_norm direction is
+nearly identical. LM-head argmax over 262144 vocab picks the
+same token.
+
+The drafter forward chain is essentially robust to cross-attn
+output variations. Either:
+1. rvllm is missing an AMPLIFICATION step in the drafter chain
+   that HF applies (e.g. a per-token scale tied to drafter's own
+   embed_tokens magnitude, or a different residual blend).
+2. Or HF's trained layer_scalar values + cross-attn output IN HF
+   have a magnitude relationship that produces meaningful
+   differences at post_final_norm; ours has different magnitude
+   relationship somewhere upstream.
+
+Next decisive step (codex Round 4 Q5): adapt
+`v3/tools/manual_drafter_reference.py` (E4B masked-head template,
+already exists) for the 31B full-vocab head, feed it
+rvllm-dumped base_hidden_last + last_token_embed + shadow K/V,
+and dump T1..T11 in PyTorch. Compare against rvllm's
+layer-trace probes. Where they FIRST diverge identifies the
+bug. Avoids loading 70 GB HF base.
+
+Active env knobs (all default OFF, env-gated):
+* `RVLLM_GEMMA4_SPEC_SOURCE_PAIR=<s>,<f>`
+* `RVLLM_GEMMA4_SPEC_DRAFT_TRACE=1`
+* `RVLLM_GEMMA4_SPEC_LAYER_TRACE=1`
+* `RVLLM_SPEC_DEBUG_Q_BISECT=1`
+* `RVLLM_SPEC_Q_ROPE_MODE` ∈ {current, pos0, no_rope}
+* `RVLLM_SPEC_ZERO_Q=1` (batched session loop ONLY, since
+  commit `12970cd`)
+* `RVLLM_SPEC_FA_SCALE` ∈ {stable=1/sqrt(d_k), mtp=1.0}
+* `RVLLM_GEMMA4_SPEC_EMBED_SCALE_31B` (DEPRECATED, double-scales)
+
 ### Active diagnostic env knobs (env-gated, all default OFF)
 
 * `RVLLM_GEMMA4_SPEC_SOURCE_PAIR=<sliding>,<full>` — override the
