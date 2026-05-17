@@ -2726,46 +2726,247 @@ impl Gemma4Nvfp4Bringup {
             }).collect()
         };
 
+        // Commit #5e: per-layer dump for numerical validation.
+        // When `G4N_DUMP_DIR` is set, write every intermediate
+        // residual + attn_out as `step_NN_<stage>.bin` (raw bf16)
+        // and the final logits as `final_logits.f32.bin`. The
+        // dumps are consumable by `v3/tools/cmp_g4n_residuals.py`
+        // for HF-vs-rvllm cosine comparisons. No-op when the
+        // env is unset, so production paths pay nothing.
+        let dump_dir: Option<std::path::PathBuf> =
+            std::env::var("G4N_DUMP_DIR").ok().map(std::path::PathBuf::from);
+        let dump_bf16 = |label: &str, data: &[u16]| -> Result<()> {
+            if let Some(d) = dump_dir.as_ref() {
+                std::fs::create_dir_all(d).map_err(|e|
+                    corrupt_runtime_err(format!(
+                        "G4N_DUMP_DIR create {d:?}: {e}")))?;
+                let path = d.join(format!("{label}.bf16.bin"));
+                let bytes: &[u8] = unsafe { std::slice::from_raw_parts(
+                    data.as_ptr() as *const u8, data.len() * 2) };
+                std::fs::write(&path, bytes).map_err(|e|
+                    corrupt_runtime_err(format!(
+                        "G4N_DUMP_DIR write {path:?}: {e}")))?;
+            }
+            Ok(())
+        };
+
+        let trace_on = std::env::var("G4N_FORWARD_TRACE")
+            .ok().as_deref() == Some("1");
+        let log_stats = |li: usize, stage: &str, data: &[u16]| {
+            if !trace_on { return; }
+            let mut mean_abs: f32 = 0.0;
+            let mut max_abs: f32 = 0.0;
+            let mut nan = 0usize;
+            let mut inf = 0usize;
+            for &b in data {
+                let v = f32::from_bits((b as u32) << 16);
+                if v.is_nan() { nan += 1; continue; }
+                if v.is_infinite() { inf += 1; continue; }
+                mean_abs += v.abs();
+                if v.abs() > max_abs { max_abs = v.abs(); }
+            }
+            mean_abs /= data.len() as f32;
+            eprintln!(
+                "[g4n-trace] layer {li:02} {stage:>10}: mean_abs={mean_abs:.4} \
+                 max_abs={max_abs:.4} nan={nan} inf={inf}"
+            );
+        };
+
         let mut residual_bf16 = self.embed_one_token_bf16(token_id)?;
+        dump_bf16("step_00_embed", &residual_bf16)?;
 
         for li in 0..self.arch.num_hidden_layers {
             let attn_out_f32 = self.forward_layer_attn_from_residual(
                 li, &residual_bf16, position, kv)?;
             let attn_out_bf16 = f32_to_bf16_vec(&attn_out_f32);
+            dump_bf16(&format!("step_{:02}_attn_out", li), &attn_out_bf16)?;
 
             let resid_after_attn_f32 = self.forward_layer_post_attn(
                 li, &attn_out_bf16, &residual_bf16)?;
             let resid_after_attn_bf16 = f32_to_bf16_vec(&resid_after_attn_f32);
+            dump_bf16(&format!("step_{:02}_post_attn", li),
+                      &resid_after_attn_bf16)?;
 
             let resid_after_mlp_f32 = self.forward_layer_post_attn_mlp(
                 li, &resid_after_attn_bf16)?;
             residual_bf16 = f32_to_bf16_vec(&resid_after_mlp_f32);
+            dump_bf16(&format!("step_{:02}_post_mlp", li), &residual_bf16)?;
 
-            // Optional periodic dump for triage of long-running
-            // bring-up. Off by default; opt-in via env.
-            if std::env::var("G4N_FORWARD_TRACE").ok().as_deref() == Some("1")
-                && (li % 10 == 0 || li == self.arch.num_hidden_layers - 1)
-            {
-                let mut mean_abs: f32 = 0.0;
-                let mut max_abs: f32 = 0.0;
-                let mut nan = 0usize;
-                let mut inf = 0usize;
-                for &b in &residual_bf16 {
-                    let v = f32::from_bits((b as u32) << 16);
-                    if v.is_nan() { nan += 1; continue; }
-                    if v.is_infinite() { inf += 1; continue; }
-                    mean_abs += v.abs();
-                    if v.abs() > max_abs { max_abs = v.abs(); }
-                }
-                mean_abs /= residual_bf16.len() as f32;
-                eprintln!(
-                    "[g4n-trace] layer {li}: residual mean_abs={mean_abs:.4} \
-                     max_abs={max_abs:.4} nan={nan} inf={inf}"
-                );
+            // Periodic trace (every 10 layers + last).
+            if trace_on && (li % 10 == 0
+                            || li == self.arch.num_hidden_layers - 1) {
+                log_stats(li, "post_mlp", &residual_bf16);
             }
         }
 
-        self.forward_final_to_token(&residual_bf16)
+        // Final-norm + tied LM head with optional dump of the
+        // post-norm hidden state and the f32 logits before argmax.
+        if let Some(d) = dump_dir.as_ref() {
+            // We need the post-final-norm bf16 + the f32 logits in
+            // SAME buffer addresses the production forward uses, so
+            // we have to recreate that op chain here (the
+            // `forward_final_to_token` method does it all in one
+            // shot; dumping requires teeing intermediates).
+            self.forward_final_to_token_with_dump(&residual_bf16, d)
+        } else {
+            self.forward_final_to_token(&residual_bf16)
+        }
+    }
+
+    /// Commit #5e: dump-mode variant of `forward_final_to_token`
+    /// that writes `step_final_norm.bf16.bin` (post-norm hidden
+    /// state) and `step_final_logits.f32.bin` (LM head output
+    /// before argmax) into the given directory, then runs the
+    /// argmax and returns the token id. Same kernel chain as the
+    /// non-dump variant — only DtoH + disk writes are added.
+    fn forward_final_to_token_with_dump(
+        &self,
+        h_residual_bf16_host: &[u16],
+        dump_dir: &std::path::Path,
+    ) -> Result<u32> {
+        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        let _scratch_guard = self.forward_scratch_guard();
+        let hidden = self.arch.hidden_size as u32;
+        let vocab = self.arch.vocab_size as u32;
+        if h_residual_bf16_host.len() != hidden as usize {
+            return Err(corrupt_runtime_err(format!(
+                "forward_final_to_token_with_dump: residual length {} != hidden {}",
+                h_residual_bf16_host.len(), hidden)));
+        }
+
+        let h_region = self.arena.region(
+            "g4n_final_dump_h", (hidden as usize) * 2, 256)?;
+        let logits_region = self.arena.region(
+            "g4n_final_dump_logits", (vocab as usize) * 4, 256)?;
+        let token_region = self.arena.region(
+            "g4n_final_dump_token", 4, 16)?;
+        unsafe {
+            let r: &[u8] = std::slice::from_raw_parts(
+                h_residual_bf16_host.as_ptr() as *const u8,
+                h_residual_bf16_host.len() * 2);
+            h_region.copy_from_host(r)?;
+        }
+        let stream_u64 = self.stream.raw();
+
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+            }
+            .launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                h_region.device_ptr(),
+                self.model.outside.final_norm.offset_bytes,
+                stream_u64,
+            )?;
+        }
+        self.stream.fence()?;
+
+        // Dump post-final-norm hidden state (bf16).
+        let mut h_normed_bf16 = vec![0u16; hidden as usize];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                h_normed_bf16.as_mut_ptr() as *mut _,
+                h_region.device_ptr(),
+                (hidden as usize) * 2);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "forward_final_to_token_with_dump: h_normed DtoH",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+        }
+        std::fs::create_dir_all(dump_dir).map_err(|e|
+            corrupt_runtime_err(format!(
+                "dump_dir create {dump_dir:?}: {e}")))?;
+        unsafe {
+            let bytes: &[u8] = std::slice::from_raw_parts(
+                h_normed_bf16.as_ptr() as *const u8,
+                h_normed_bf16.len() * 2);
+            std::fs::write(
+                dump_dir.join("step_final_norm.bf16.bin"), bytes
+            ).map_err(|e| corrupt_runtime_err(format!(
+                "dump final_norm: {e}")))?;
+        }
+
+        // Tied LM head GEMV.
+        unsafe {
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt,
+                h_region.device_ptr(),
+                self.model.outside.lm_head_tokens.offset_bytes,
+                logits_region.device_ptr(),
+                1, vocab as i32, hidden as i32, stream_u64,
+            )?;
+        }
+        self.stream.fence()?;
+
+        // Dump f32 logits.
+        let mut logits_f32 = vec![0f32; vocab as usize];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                logits_f32.as_mut_ptr() as *mut _,
+                logits_region.device_ptr(),
+                (vocab as usize) * 4);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "forward_final_to_token_with_dump: logits DtoH",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+        }
+        unsafe {
+            let bytes: &[u8] = std::slice::from_raw_parts(
+                logits_f32.as_ptr() as *const u8,
+                logits_f32.len() * 4);
+            std::fs::write(
+                dump_dir.join("step_final_logits.f32.bin"), bytes
+            ).map_err(|e| corrupt_runtime_err(format!(
+                "dump final_logits: {e}")))?;
+        }
+
+        // argmax.
+        unsafe {
+            let mut logits_ptr = logits_region.device_ptr();
+            let mut out_ptr = token_region.device_ptr();
+            let mut vs = vocab as i32;
+            let args: [*mut core::ffi::c_void; 3] = [
+                (&mut logits_ptr) as *mut u64 as *mut _,
+                (&mut out_ptr) as *mut u64 as *mut _,
+                (&mut vs) as *mut i32 as *mut _,
+            ];
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_argmax_f32,
+                (1, 1, 1), (1024, 1, 1), 0, stream_u64, &args,
+            )?;
+        }
+        self.stream.fence()?;
+
+        let mut tok = [0i32; 1];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                tok.as_mut_ptr() as *mut _, token_region.device_ptr(), 4);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "forward_final_to_token_with_dump: token DtoH",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+        }
+        let id = tok[0];
+        if id < 0 || (id as u32) >= vocab {
+            return Err(corrupt_runtime_err(format!(
+                "forward_final_to_token_with_dump: argmax out-of-range \
+                 token id={id} vocab={vocab}")));
+        }
+
+        // Also dump the token id as an i32 so the Python diff
+        // script can show "rvllm token vs reference token" at a
+        // glance.
+        std::fs::write(dump_dir.join("step_final_token.i32.bin"),
+                       (id as i32).to_le_bytes()).map_err(|e|
+            corrupt_runtime_err(format!("dump token: {e}")))?;
+
+        Ok(id as u32)
     }
 }
 
