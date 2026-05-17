@@ -422,6 +422,24 @@ pub struct Gemma4Nvfp4OutsideText {
     pub embed_tokens: crate::weights::F16Weight,
     /// `[hidden=5376]` bf16. Final RMSNorm before lm_head.
     pub final_norm: crate::weights::F16Weight,
+    /// `[max_pos, head_dim_sliding/2]` f32. cos table for the
+    /// sliding-attention RoPE (theta=10000).
+    pub rope_cos_sliding: crate::weights::F16Weight,
+    /// `[max_pos, head_dim_sliding/2]` f32. sin table for the
+    /// sliding-attention RoPE.
+    pub rope_sin_sliding: crate::weights::F16Weight,
+    /// `[max_pos, head_dim_global/2]` f32. cos table for the
+    /// global-attention RoPE (theta=1_000_000). Note that
+    /// global layers use PARTIAL rope on `rotary_dim_global()`
+    /// channels (=128 on 31B); only the first
+    /// `rotary_dim_global()/2` columns per row are read by the
+    /// partial-rope kernel, but we allocate the full
+    /// head_dim_global/2 to keep the table layout uniform with
+    /// the sliding side. Extra columns are zeros.
+    pub rope_cos_global: crate::weights::F16Weight,
+    /// `[max_pos, head_dim_global/2]` f32 sin table for the
+    /// global-attention RoPE.
+    pub rope_sin_global: crate::weights::F16Weight,
 }
 
 /// Top-level Gemma 4 NVFP4 model after upload. Vision tower

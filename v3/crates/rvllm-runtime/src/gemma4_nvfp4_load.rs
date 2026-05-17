@@ -456,7 +456,116 @@ pub fn upload_gemma4_nvfp4_outside_text(
         &format!("{prefix}.norm.weight"),
         DType::Bf16, Some(&[arch.hidden_size])
     )?;
-    Ok(Gemma4Nvfp4OutsideText { embed_tokens, final_norm })
+
+    // RoPE cos/sin tables — built host-side then uploaded as f32
+    // [max_pos, head_dim/2]. Sliding uses theta=10000 across
+    // head_dim_sliding (full RoPE on 256 channels). Global uses
+    // theta=1_000_000 with PARTIAL RoPE on rotary_dim_global
+    // (128 of head_dim_global=512). We allocate the full
+    // head_dim_global/2 = 256 columns per global row but only
+    // populate the first 64 (rotary_dim_global/2); the rest stay
+    // zero — the partial-RoPE kernel reads only the rotary_dim
+    // prefix of each row.
+    let max_pos = arch.max_position_embeddings as usize;
+    let (rope_cos_sliding, rope_sin_sliding) = build_and_upload_rope_tables(
+        arena, "gemma4n_rope_sliding",
+        arch.rope_theta_sliding,
+        arch.head_dim_sliding,
+        arch.head_dim_sliding, // sliding is FULL rope → rotary_dim = head_dim
+        max_pos,
+    )?;
+    let rotary_dim_global = {
+        let rd = (arch.head_dim_global as f32
+                  * arch.partial_rotary_factor_global) as usize;
+        // Force even (kernel pairs i and i+rd/2).
+        rd & !1
+    };
+    let (rope_cos_global, rope_sin_global) = build_and_upload_rope_tables(
+        arena, "gemma4n_rope_global",
+        arch.rope_theta_global,
+        arch.head_dim_global,
+        rotary_dim_global,
+        max_pos,
+    )?;
+    eprintln!(
+        "[gemma4-nvfp4-load] rope tables built: max_pos={} \
+         sliding(theta={} head_dim={} rotary_dim={}) \
+         global(theta={} head_dim={} rotary_dim={})",
+        max_pos,
+        arch.rope_theta_sliding, arch.head_dim_sliding, arch.head_dim_sliding,
+        arch.rope_theta_global,  arch.head_dim_global,  rotary_dim_global,
+    );
+
+    Ok(Gemma4Nvfp4OutsideText {
+        embed_tokens, final_norm,
+        rope_cos_sliding, rope_sin_sliding,
+        rope_cos_global, rope_sin_global,
+    })
+}
+
+/// Build cos/sin RoPE tables for vanilla (no-YaRN) RoPE. Returns
+/// a pair of F16Weight handles backed by f32 device buffers of
+/// shape `[max_pos, head_dim/2]`. The first `rotary_dim/2`
+/// columns hold valid values; the rest are zeros for the partial-
+/// rope case (rotary_dim < head_dim, e.g. global layers on
+/// Gemma 4 31B).
+fn build_and_upload_rope_tables(
+    arena: &HbmArena<'_>,
+    region_label: &'static str,
+    theta: f32,
+    head_dim: usize,
+    rotary_dim: usize,
+    max_pos: usize,
+) -> Result<(rvllm_loader::weights::F16Weight, rvllm_loader::weights::F16Weight)> {
+    let half = head_dim / 2;
+    let rd_half = rotary_dim / 2;
+    if rd_half > half {
+        return Err(corrupt(format!(
+            "{region_label}: rotary_dim {} > head_dim {}", rotary_dim, head_dim
+        )));
+    }
+    // inv_freq[i] = 1 / theta^(2i / rotary_dim) for i in 0..rd_half.
+    // Standard RoPE formula — the rotary_dim (not head_dim) drives
+    // the geometric progression of frequencies for partial RoPE.
+    let inv_freq: Vec<f32> = (0..rd_half)
+        .map(|i| 1.0 / theta.powf((2 * i) as f32 / rotary_dim as f32))
+        .collect();
+
+    let mut cos_host: Vec<f32> = vec![0.0; max_pos * half];
+    let mut sin_host: Vec<f32> = vec![0.0; max_pos * half];
+    for pos in 0..max_pos {
+        for i in 0..rd_half {
+            let angle = pos as f32 * inv_freq[i];
+            cos_host[pos * half + i] = angle.cos();
+            sin_host[pos * half + i] = angle.sin();
+        }
+        // Columns [rd_half, half) stay 0.0 — partial-RoPE kernels
+        // skip them, sliding (full-RoPE) never has empty columns.
+    }
+    let cos_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(cos_host.as_ptr() as *const u8,
+                                    cos_host.len() * 4)
+    };
+    let sin_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(sin_host.as_ptr() as *const u8,
+                                    sin_host.len() * 4)
+    };
+    let cos_region = arena.region(region_label, cos_bytes.len(), 16)?;
+    let sin_region = arena.region(region_label, sin_bytes.len(), 16)?;
+    unsafe {
+        cos_region.copy_from_host(cos_bytes)?;
+        sin_region.copy_from_host(sin_bytes)?;
+    }
+    Ok((
+        rvllm_loader::weights::F16Weight {
+            offset_bytes: cos_region.device_ptr(),
+            shape: vec![max_pos, half],
+        },
+        rvllm_loader::weights::F16Weight {
+            offset_bytes: sin_region.device_ptr(),
+            shape: vec![max_pos, half],
+        },
+    ))
 }
 
 /// Pre-scaled bf16 embed_tokens upload. Reads the raw bf16 tensor,

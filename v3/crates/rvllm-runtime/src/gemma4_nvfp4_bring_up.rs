@@ -61,10 +61,14 @@ struct ForwardKernels {
     fn_embedding_gather_bf16: KernelFn,
     _rmsnorm_mod: LoadedModule,
     fn_rmsnorm_inplace_bf16: KernelFn,
-    /// Reserved for #4b residual add (vector_add_bf16).
+    /// Reserved for #4e residual add (vector_add_bf16).
     _vector_add_mod: LoadedModule,
     #[allow(dead_code)]
     fn_vector_add_bf16: KernelFn,
+    /// `rope_split_half_bf16_kernel` — pure bf16 RoPE on
+    /// `[n_heads, head_dim]` in-place. No KV side-effect.
+    _rope_mod: LoadedModule,
+    fn_rope_split_half_bf16: KernelFn,
 }
 
 /// Phase 3c+ text-only bring-up for `nvidia/Gemma-4-31B-IT-NVFP4`.
@@ -148,6 +152,10 @@ impl Gemma4Nvfp4Bringup {
         let fn_vector_add_bf16 =
             vector_add_mod.get_function("vector_add_bf16_kernel")?;
 
+        let rope_mod = loader.load_ptx("rope_split_half_bf16")?;
+        let fn_rope_split_half_bf16 =
+            rope_mod.get_function("rope_split_half_bf16_kernel")?;
+
         // MLP kernels (commit #3).
         let mlp_gemv_mod = loader.load_ptx("mistral35_w4a16_gemv_bf16")?;
         let fn_w4a16_gemv =
@@ -172,6 +180,8 @@ impl Gemma4Nvfp4Bringup {
             fn_rmsnorm_inplace_bf16,
             _vector_add_mod: vector_add_mod,
             fn_vector_add_bf16,
+            _rope_mod: rope_mod,
+            fn_rope_split_half_bf16,
         };
 
         Ok(Self {
@@ -316,6 +326,109 @@ impl Gemma4Nvfp4Bringup {
         }).collect();
 
         Ok((q_normed, k_normed, v_f32))
+    }
+
+    /// Layer-0 RoPE on post-norm Q/K. Extends qk_norm by
+    /// applying `rope_split_half_bf16` at `position`. Sliding
+    /// layer 0 uses FULL RoPE on head_dim=256, theta=10000.
+    /// At position=0 RoPE is the identity (cos=1, sin=0) — the
+    /// smoke uses that to assert byte-equality between the pre-
+    /// and post-RoPE Q/K under bf16 narrow tolerance.
+    pub fn forward_layer0_qk_rope(
+        &self,
+        token_id: u32,
+        position: u32,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let (q_normed_f32, k_normed_f32, v_f32) =
+            self.forward_layer0_qk_norm(token_id)?;
+        let head_dim = self.arch.head_dim_sliding as u32;
+        let num_q_heads = (q_normed_f32.len() / head_dim as usize) as u32;
+        let num_kv_heads = (k_normed_f32.len() / head_dim as usize) as u32;
+
+        // f32 → bf16 host narrow (commit #4c convention; GPU
+        // f32_to_bf16 wiring is a separate follow-up commit).
+        let narrow_to_bf16 = |xs: &[f32]| -> Vec<u16> {
+            xs.iter().map(|&x| {
+                let bits = x.to_bits();
+                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+                (rounded >> 16) as u16
+            }).collect()
+        };
+        let q_bf16: Vec<u16> = narrow_to_bf16(&q_normed_f32);
+        let k_bf16: Vec<u16> = narrow_to_bf16(&k_normed_f32);
+
+        let q_region = self.arena.region(
+            "gemma4_nvfp4_rope_q", q_bf16.len() * 2, 256)?;
+        let k_region = self.arena.region(
+            "gemma4_nvfp4_rope_k", k_bf16.len() * 2, 256)?;
+        unsafe {
+            let q_bytes: &[u8] = std::slice::from_raw_parts(
+                q_bf16.as_ptr() as *const u8, q_bf16.len() * 2);
+            let k_bytes: &[u8] = std::slice::from_raw_parts(
+                k_bf16.as_ptr() as *const u8, k_bf16.len() * 2);
+            q_region.copy_from_host(q_bytes)?;
+            k_region.copy_from_host(k_bytes)?;
+        }
+
+        let stream_u64 = self.stream.raw();
+        let cos_ptr = self.model.outside.rope_cos_sliding.offset_bytes;
+        let sin_ptr = self.model.outside.rope_sin_sliding.offset_bytes;
+
+        // Launch rope_split_half_bf16 per Q then per K.
+        //   grid = (n_heads, 1, 1)
+        //   block = (head_dim / 2, 1, 1)
+        let launch_rope = |qk_ptr: u64, n_heads: u32| -> Result<()> {
+            let mut qk = qk_ptr;
+            let mut cos = cos_ptr;
+            let mut sin = sin_ptr;
+            let mut hd = head_dim as i32;
+            let mut pos = position as i32;
+            let args: [*mut core::ffi::c_void; 5] = [
+                (&mut qk) as *mut u64 as *mut _,
+                (&mut cos) as *mut u64 as *mut _,
+                (&mut sin) as *mut u64 as *mut _,
+                (&mut hd) as *mut i32 as *mut _,
+                (&mut pos) as *mut i32 as *mut _,
+            ];
+            unsafe {
+                rvllm_fused::launch_raw(
+                    self.forward_kernels.fn_rope_split_half_bf16,
+                    (n_heads, 1, 1),
+                    (head_dim / 2, 1, 1),
+                    0, stream_u64, &args,
+                )
+            }
+        };
+        launch_rope(q_region.device_ptr(), num_q_heads)?;
+        launch_rope(k_region.device_ptr(), num_kv_heads)?;
+        self.stream.fence()?;
+
+        // Read back + convert to f32.
+        let mut q_out_bf16 = vec![0u16; q_bf16.len()];
+        let mut k_out_bf16 = vec![0u16; k_bf16.len()];
+        unsafe {
+            use cudarc::driver::sys::*;
+            for (host, dev, n) in [
+                (q_out_bf16.as_mut_ptr() as *mut _, q_region.device_ptr(), q_out_bf16.len() * 2),
+                (k_out_bf16.as_mut_ptr() as *mut _, k_region.device_ptr(), k_out_bf16.len() * 2),
+            ] {
+                let rc = cuMemcpyDtoH_v2(host, dev, n);
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qk_rope: DtoH failed",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+        }
+        let q_out: Vec<f32> = q_out_bf16.iter().map(|&b| {
+            f32::from_bits((b as u32) << 16)
+        }).collect();
+        let k_out: Vec<f32> = k_out_bf16.iter().map(|&b| {
+            f32::from_bits((b as u32) << 16)
+        }).collect();
+        Ok((q_out, k_out, v_f32))
     }
 
     /// Layer-0 QKV projection on a single token. Extends the
@@ -738,6 +851,88 @@ mod tests {
             );
             assert!(mean_rms > 0.01 && mean_rms < 100.0,
                     "{name} mean_rms={mean_rms} outside plausible [0.01, 100]");
+        }
+    }
+
+    /// Commit #4d smoke: RoPE on post-norm Q/K at position=0.
+    /// RoPE is norm-preserving (orthogonal rotation), so the
+    /// per-head RMS after RoPE must equal the per-head RMS
+    /// after Q/K-norm. At position=0 specifically, cos=1 + sin=0
+    /// → RoPE is the identity, so the values should be byte-
+    /// equal to the pre-RoPE values modulo bf16 narrow noise.
+    ///
+    /// Run:
+    ///   GEMMA4_NVFP4_DIR=/home/r00t/Gemma-4-31B-IT-NVFP4 \
+    ///     cargo test -p rvllm-runtime --features cuda,gb10 \
+    ///     gemma4_nvfp4_bring_up::tests::ondisk_bringup_qk_rope_at_zero \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ondisk_bringup_qk_rope_at_zero() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skipping qk_rope smoke");
+                return;
+            }
+        };
+        let kernels_dir = std::path::PathBuf::from(
+            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
+        );
+        let bringup = Gemma4Nvfp4Bringup::load(
+            &dir, 32 * 1024 * 1024 * 1024, &kernels_dir,
+        ).expect("Gemma4Nvfp4Bringup::load");
+
+        let head_dim = bringup.arch.head_dim_sliding;
+
+        let (q_pre, k_pre, _v) = bringup.forward_layer0_qk_norm(2)
+            .expect("forward_layer0_qk_norm");
+        let (q_post, k_post, _v2) = bringup.forward_layer0_qk_rope(2, 0)
+            .expect("forward_layer0_qk_rope(pos=0)");
+
+        for (name, pre, post, n_heads) in [
+            ("q", &q_pre, &q_post, q_pre.len() / head_dim),
+            ("k", &k_pre, &k_post, k_pre.len() / head_dim),
+        ] {
+            let nan = post.iter().filter(|x| x.is_nan()).count();
+            let inf = post.iter().filter(|x| x.is_infinite()).count();
+            assert_eq!(nan, 0, "{name} post-RoPE NaN");
+            assert_eq!(inf, 0, "{name} post-RoPE Inf");
+
+            // Per-head RMS preservation: RoPE rotates each (i, i+half)
+            // pair by a unit complex number — magnitude is preserved
+            // exactly in f32, with small bf16 narrow error.
+            let mut max_rms_drift: f32 = 0.0;
+            for h in 0..n_heads {
+                let row_pre = &pre[h * head_dim..(h + 1) * head_dim];
+                let row_post = &post[h * head_dim..(h + 1) * head_dim];
+                let rms_pre = (row_pre.iter().map(|x| x * x).sum::<f32>()
+                               / head_dim as f32).sqrt();
+                let rms_post = (row_post.iter().map(|x| x * x).sum::<f32>()
+                                / head_dim as f32).sqrt();
+                max_rms_drift = max_rms_drift.max((rms_pre - rms_post).abs());
+            }
+
+            // At position=0 cos=1, sin=0 so RoPE is the identity.
+            // The pre / post values should agree element-wise modulo
+            // bf16 round-trip through the GPU buffer (one extra narrow
+            // beyond the pre-RoPE narrow). Element-wise max diff:
+            let max_elem_diff = pre.iter().zip(post.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+
+            eprintln!(
+                "[qk-rope-smoke] {name}: n_heads={n_heads} \
+                 max_rms_drift={max_rms_drift:.6} \
+                 max_elem_diff={max_elem_diff:.6}",
+            );
+            // bf16 mantissa is 7 bits → relative precision ~0.8%.
+            // For values up to ~10 the absolute error is ~0.08.
+            // Allow generous headroom — anything > 0.5 indicates a bug.
+            assert!(max_rms_drift < 0.5,
+                    "{name} RoPE NOT norm-preserving: max_rms_drift={max_rms_drift}");
+            assert!(max_elem_diff < 0.5,
+                    "{name} RoPE@pos=0 NOT identity: max_elem_diff={max_elem_diff}");
         }
     }
 }
