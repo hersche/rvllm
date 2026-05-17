@@ -691,6 +691,15 @@ pub struct Gemma4FusedModules {
     /// in that case.
     pub hadamard_unrotate_f16_mod: Option<LoadedModule>,
     pub fn_hadamard_unrotate_f16: Option<KernelFn>,
+    /// Companion to `fn_hadamard_unrotate_f16`: applies R = H · diag(D)
+    /// (signs FIRST then FWHT — same sequence as the rope kernel's K
+    /// rotation). Used by the spec-decode drafter to rotate its
+    /// Q-side into the same Hadamard frame as the base's shadow K
+    /// when `RVLLM_NVFP4_HADAMARD=1`. PTX may be absent on older
+    /// kernel trees; the drafter falls back to "no Q rotation" and
+    /// will produce 0 accept_per_verify on NVFP4-Hadamard 31B base.
+    pub hadamard_rotate_f16_mod: Option<LoadedModule>,
+    pub fn_hadamard_rotate_f16: Option<KernelFn>,
     /// AWQ INT4 W4A16 GEMV kernel (cycle 45 step 4.5c). PTX may be
     /// absent on older kernel trees / non-Blackwell branches; fall
     /// through to `None` and the dispatch site treats AWQ as
@@ -1350,6 +1359,7 @@ pub struct Gemma4Bringup {
 /// `base + l * head_dim` (head_dim is uniform across Gemma 4 layers
 /// at the rope-input level — both sliding and global use the same
 /// per-head dimension; `arch.max_head_dim()` covers both).
+#[derive(Clone, Copy)]
 pub struct NvFp4HadamardAlloc {
     pub base_ptr: u64,
     pub bytes: u64,
@@ -4778,6 +4788,25 @@ impl Gemma4Bringup {
                     };
                     self.run_drafter_layer_q_side(
                         drafter, &workspace, li, step.position)?;
+                    // Hadamard parity: rotate drafter Q into the same
+                    // R = H·diag(D) frame as the base's shadow K when
+                    // RVLLM_NVFP4_HADAMARD=1. No-op when the gate is
+                    // off or the kernel isn't loaded. The source layer
+                    // index depends on the drafter layer's type:
+                    //   drafter sliding → base sources.sliding_source_layer (58 on 31B)
+                    //   drafter full    → base sources.full_source_layer    (59 on 31B)
+                    let source_layer_idx = if is_global {
+                        sources.full_source_layer
+                    } else {
+                        sources.sliding_source_layer
+                    };
+                    self.apply_hadamard_to_drafter_q(
+                        &workspace,
+                        source_layer_idx,
+                        drafter.arch.num_attention_heads as u32,
+                        layer.effective_head_dim as u32,
+                        stream,
+                    )?;
                     // Diagnostic: RVLLM_SPEC_ZERO_Q=1 zeros workspace.q
                     // RIGHT BEFORE cross-attn. If drafter output stays
                     // bit-identical, the FA-2 launcher is not actually
@@ -8902,6 +8931,93 @@ impl Gemma4Bringup {
             "completed Gemma 4 speculative drafter layer Q-side \
              (input_layernorm + q_proj + q_norm + RoPE)",
         );
+        Ok(())
+    }
+
+    /// Hadamard-rotate drafter Q so it lives in the same frame as the
+    /// base's NVFP4 shadow K (which the rope kernel rotated by R = H·diag(D)
+    /// per-layer before pack). Without this, drafter Q · shadow K^T sees
+    /// orthogonal frames → cos ≈ 0 → softmax(QK) collapses to uniform →
+    /// attn_out ≈ mean(V), drafter prediction becomes input-independent.
+    /// E4B is unaffected because RVLLM_NVFP4_HADAMARD=0 on E4B
+    /// production profiles.
+    ///
+    /// `source_layer_idx` is the BASE layer the drafter cross-attends to
+    /// (sliding_source for drafter sliding layers, full_source for the
+    /// drafter global layer) — Hadamard signs are PER-BASE-LAYER, so this
+    /// must match the layer whose K we're attending to.
+    ///
+    /// No-op when:
+    ///   * RVLLM_NVFP4_HADAMARD env is off (base K wasn't rotated)
+    ///   * `self.nvfp4_hadamard` allocation absent
+    ///   * `fn_hadamard_rotate_f16` PTX absent (older kernel tree)
+    #[cfg(feature = "cuda")]
+    unsafe fn apply_hadamard_to_drafter_q(
+        &self,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        source_layer_idx: u32,
+        num_heads: u32,
+        eff_hd: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if !nvfp4_hadamard_enabled() {
+            return Ok(());
+        }
+        let alloc = {
+            let guard = self.nvfp4_hadamard.lock().unwrap();
+            match guard.as_ref() {
+                Some(a) => *a,
+                None => return Ok(()),
+            }
+        };
+        let kernel = match self.fused.fn_hadamard_rotate_f16 {
+            Some(k) => k,
+            None => {
+                static WARN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                WARN.get_or_init(|| {
+                    eprintln!(
+                        "[spec-decode] WARNING: RVLLM_NVFP4_HADAMARD=1 but \
+                         hadamard_rotate_f16.ptx not loaded; drafter Q won't \
+                         be rotated and accept_per_verify will be ~0. \
+                         Rebuild kernels via bash kernels/build.sh sm_121."
+                    );
+                });
+                return Ok(());
+            }
+        };
+        let signs_ptr = alloc.base_ptr
+            + (source_layer_idx as u64) * (alloc.head_dim as u64);
+        let mut q_ptr: u64 = workspace.q;
+        let mut signs: u64 = signs_ptr;
+        let mut nt: i32 = 1;
+        let mut nh: i32 = num_heads as i32;
+        let mut hd: i32 = eff_hd as i32;
+        let args: [*mut core::ffi::c_void; 5] = [
+            &mut q_ptr as *mut _ as *mut _,
+            &mut signs as *mut _ as *mut _,
+            &mut nt    as *mut _ as *mut _,
+            &mut nh    as *mut _ as *mut _,
+            &mut hd    as *mut _ as *mut _,
+        ];
+        use cudarc::driver::sys::*;
+        // Grid: (num_tokens=1, num_heads, 1). Block: (head_dim, 1, 1)
+        // — one thread per channel; smem buffer = head_dim floats.
+        let rc = cuLaunchKernel(
+            kernel.raw() as CUfunction,
+            1, num_heads, 1,
+            eff_hd, 1, 1,
+            0,
+            stream as CUstream,
+            args.as_ptr() as *mut *mut core::ffi::c_void,
+            core::ptr::null_mut(),
+        );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "drafter Q hadamard_rotate_f16 launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
         Ok(())
     }
 
@@ -16768,6 +16884,15 @@ fn load_gemma4_fused(
         .as_ref()
         .and_then(|m| m.get_function("hadamard_unrotate_f16_kernel").ok());
 
+    // Companion: forward R = H·diag(D) rotation, signs FIRST then
+    // FWHT — same sequence as the rope kernel's K rotation. Used by
+    // the spec-decode drafter to rotate Q into the same Hadamard
+    // frame as the shadow K dequant when RVLLM_NVFP4_HADAMARD=1.
+    let hadamard_rotate_f16_mod = loader.load_ptx("hadamard_rotate_f16").ok();
+    let fn_hadamard_rotate_f16 = hadamard_rotate_f16_mod
+        .as_ref()
+        .and_then(|m| m.get_function("hadamard_rotate_f16_kernel").ok());
+
     // Cycle 45 step 4.5c: AWQ INT4 W4A16 GEMV. Optional — `None` is fine
     // and silently disables the AWQ load path. load_gemma4_model rejects
     // an AwqConfig-bearing checkpoint when this is `None`.
@@ -16941,6 +17066,8 @@ fn load_gemma4_fused(
         fn_fp8_gemv_wpr_native_bf16in,
         hadamard_unrotate_f16_mod,
         fn_hadamard_unrotate_f16,
+        hadamard_rotate_f16_mod,
+        fn_hadamard_rotate_f16,
         awq_int4_gemv_f16_mod,
         fn_awq_int4_gemv_f16,
         awq_int4_gemm_sm120_wmma_mod,
