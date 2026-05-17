@@ -1376,18 +1376,72 @@ impl Gemma4Nvfp4Bringup {
         }
 
         let stream_u64 = self.stream.raw();
-        let cos_ptr = self.model.outside.rope_cos_sliding.offset_bytes;
-        let sin_ptr = self.model.outside.rope_sin_sliding.offset_bytes;
+
+        // The global RoPE tables are f16 (floor commit 3), but the
+        // legacy `rope_split_half_bf16` kernel reads `float*` cos/sin.
+        // Probe is rare + table row is tiny (head_dim/2 = 128 floats),
+        // so we materialize a single-row f32 table per probe call:
+        // DtoH the f16 row at `position`, widen to f32, HtoD into a
+        // scratch region, set `pos=0` in the kernel args (kernel reads
+        // cos_table[pos * (head_dim/2) + freq]).
+        let half = (head_dim as usize) / 2;
+        let mut cos_row_f16 = vec![0u16; half];
+        let mut sin_row_f16 = vec![0u16; half];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let row_bytes = (half as usize) * 2;
+            let row_off = (position as usize) * row_bytes;
+            let rc = cuMemcpyDtoH_v2(
+                cos_row_f16.as_mut_ptr() as *mut _,
+                self.model.outside.rope_cos_sliding.offset_bytes
+                    + row_off as u64,
+                row_bytes);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "forward_layer0_qk_rope: cos row DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+            let rc = cuMemcpyDtoH_v2(
+                sin_row_f16.as_mut_ptr() as *mut _,
+                self.model.outside.rope_sin_sliding.offset_bytes
+                    + row_off as u64,
+                row_bytes);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "forward_layer0_qk_rope: sin row DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        let cos_row_f32: Vec<f32> = cos_row_f16.iter()
+            .map(|&b| half::f16::from_bits(b).to_f32()).collect();
+        let sin_row_f32: Vec<f32> = sin_row_f16.iter()
+            .map(|&b| half::f16::from_bits(b).to_f32()).collect();
+        let cos_scratch = self.arena.region(
+            "g4n_probe_cos_f32", half * 4, 16)?;
+        let sin_scratch = self.arena.region(
+            "g4n_probe_sin_f32", half * 4, 16)?;
+        unsafe {
+            let cb: &[u8] = std::slice::from_raw_parts(
+                cos_row_f32.as_ptr() as *const u8, half * 4);
+            let sb: &[u8] = std::slice::from_raw_parts(
+                sin_row_f32.as_ptr() as *const u8, half * 4);
+            cos_scratch.copy_from_host(cb)?;
+            sin_scratch.copy_from_host(sb)?;
+        }
+        let cos_ptr = cos_scratch.device_ptr();
+        let sin_ptr = sin_scratch.device_ptr();
 
         // Launch rope_split_half_bf16 per Q then per K.
-        //   grid = (n_heads, 1, 1)
-        //   block = (head_dim / 2, 1, 1)
+        // pos=0 in args because the scratch holds only the row
+        // for `position`.
         let launch_rope = |qk_ptr: u64, n_heads: u32| -> Result<()> {
             let mut qk = qk_ptr;
             let mut cos = cos_ptr;
             let mut sin = sin_ptr;
             let mut hd = head_dim as i32;
-            let mut pos = position as i32;
+            let mut pos: i32 = 0;
             let args: [*mut core::ffi::c_void; 5] = [
                 (&mut qk) as *mut u64 as *mut _,
                 (&mut cos) as *mut u64 as *mut _,
@@ -1741,6 +1795,9 @@ impl Gemma4Nvfp4Bringup {
                 "forward_layer0_attn: gqa_ratio={} > MAX_GQA_DECODE=4",
                 gqa)));
         }
+        // Sliding layer 0: full RoPE on head_dim. The rotary_dim
+        // arg is still threaded to the kernel.
+        let rotary_dim = head_dim;
 
         // ---- 2. Parameter-free V-RMSNorm on host --------------------------
         //   y_h[d] = v_h[d] * rsqrt(mean_d(v_h^2) + eps)
@@ -1786,40 +1843,22 @@ impl Gemma4Nvfp4Bringup {
             v_region.copy_from_host(vb)?;
         }
 
-        // ---- 4. Per-position f16 cos/sin mini-tables + state writes ------
-        // Sliding-layer 0 uses FULL RoPE: rotary_dim = head_dim.
-        let rotary_dim = head_dim;
-        let half_rotary = rotary_dim / 2;
-        let theta = self.arch.rope_theta_sliding as f64;
-        let p = position as f64;
-        let mut cos_f16: Vec<u16> = Vec::with_capacity(half_rotary);
-        let mut sin_f16: Vec<u16> = Vec::with_capacity(half_rotary);
-        for i in 0..half_rotary {
-            let inv_freq = 1.0 / theta.powf((2 * i) as f64 / rotary_dim as f64);
-            let angle = p * inv_freq;
-            cos_f16.push(f32_to_f16_bits(angle.cos() as f32));
-            sin_f16.push(f32_to_f16_bits(angle.sin() as f32));
-        }
-        let cos_region = self.arena.region(
-            "g4n_attn_cos_f16", half_rotary * 2, 256)?;
-        let sin_region = self.arena.region(
-            "g4n_attn_sin_f16", half_rotary * 2, 256)?;
-        unsafe {
-            let cb: &[u8] = std::slice::from_raw_parts(
-                cos_f16.as_ptr() as *const u8, cos_f16.len() * 2);
-            let sb: &[u8] = std::slice::from_raw_parts(
-                sin_f16.as_ptr() as *const u8, sin_f16.len() * 2);
-            cos_region.copy_from_host(cb)?;
-            sin_region.copy_from_host(sb)?;
-        }
+        // ---- 4. Pre-built f16 cos/sin tables + state writes -------------
+        // Floor commit 3: use the global f16 RoPE tables built once at
+        // load time (~384 MiB total for sliding + global on 31B). The
+        // per-launch mini-table builder is gone — positions[t] now
+        // indexes the absolute row directly. Sliding-layer 0 uses
+        // full RoPE (rotary_dim = head_dim = 256) and theta=10K, so
+        // we point at rope_cos_sliding / rope_sin_sliding.
+        let cos_ptr = self.model.outside.rope_cos_sliding.offset_bytes;
+        let sin_ptr = self.model.outside.rope_sin_sliding.offset_bytes;
 
-        // Per-token metadata fill via stream-ordered kernel. The
-        // mini-table mode uses positions[t] = t (kernel reads
-        // cos_table[positions[t] * half_rotary + freq] and the
-        // per-launch table holds rows for actual positions).
-        // slot_mapping/context_lens use absolute slots.
+        // Stream-ordered metadata fill. position_offset = position so
+        // positions[0] = position (mode B: full f16 tables index by
+        // absolute row), slot_mapping[0] = position, context_lens[0]
+        // = position+1.
         self.fill_pos_slots(kv,
-            /*position_offset=*/0,
+            /*position_offset=*/position as i32,
             /*start_slot=*/position as i32,
             /*num_tokens=*/1,
         )?;
@@ -1841,8 +1880,8 @@ impl Gemma4Nvfp4Bringup {
             let mut vp: u64 = v_packed;
             let mut ks: u64 = k_scale;
             let mut vs: u64 = v_scale;
-            let mut cos_ptr: u64 = cos_region.device_ptr();
-            let mut sin_ptr: u64 = sin_region.device_ptr();
+            let mut cos_ptr_local: u64 = cos_ptr;
+            let mut sin_ptr_local: u64 = sin_ptr;
             let mut positions_ptr: u64 = kv.positions_ptr;
             let mut slot_ptr: u64 = kv.slot_mapping_ptr;
             let mut q_scale_ptr: u64 = kv.q_scale_ptr;
@@ -1871,8 +1910,8 @@ impl Gemma4Nvfp4Bringup {
                 (&mut vp) as *mut u64 as *mut core::ffi::c_void,
                 (&mut ks) as *mut u64 as *mut core::ffi::c_void,
                 (&mut vs) as *mut u64 as *mut core::ffi::c_void,
-                (&mut cos_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut sin_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cos_ptr_local) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sin_ptr_local) as *mut u64 as *mut core::ffi::c_void,
                 (&mut positions_ptr) as *mut u64 as *mut core::ffi::c_void,
                 (&mut slot_ptr) as *mut u64 as *mut core::ffi::c_void,
                 (&mut q_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
@@ -2047,13 +2086,20 @@ impl Gemma4Nvfp4Bringup {
         let is_global = matches!(
             self.arch.layer_types[layer_idx], Gemma4LayerType::GlobalAttention);
 
-        // Per-layer-type config.
-        let (head_dim, rotary_dim, theta, window_size_left) = if is_global {
+        // Per-layer-type config + persistent f16 RoPE tables.
+        // `theta` is kept for diagnostic dumps but no longer
+        // drives a per-launch table build — the global tables
+        // are computed once at load time.
+        #[allow(unused_variables)]
+        let (head_dim, rotary_dim, theta, window_size_left,
+             cos_table_dev, sin_table_dev) = if is_global {
             (
                 self.arch.head_dim_global,
                 self.arch.rotary_dim_global(),
                 self.arch.rope_theta_global as f64,
                 -1i32, // full attention — no sliding window
+                self.model.outside.rope_cos_global.offset_bytes,
+                self.model.outside.rope_sin_global.offset_bytes,
             )
         } else {
             (
@@ -2061,6 +2107,8 @@ impl Gemma4Nvfp4Bringup {
                 self.arch.head_dim_sliding, // sliding = full RoPE
                 self.arch.rope_theta_sliding as f64,
                 (self.arch.sliding_window_size as i32) - 1,
+                self.model.outside.rope_cos_sliding.offset_bytes,
+                self.model.outside.rope_sin_sliding.offset_bytes,
             )
         };
 
@@ -2275,34 +2323,20 @@ impl Gemma4Nvfp4Bringup {
         let attn_out_region = self.arena.region(
             "g4n_lN_attn_out_bf16", num_q_heads * head_dim * 2, 256)?;
 
-        // -- Per-position f16 cos/sin mini-tables + i32 state writes -----
-        let half_rotary = rotary_dim / 2;
-        let p = position as f64;
-        let mut cos_f16: Vec<u16> = Vec::with_capacity(half_rotary);
-        let mut sin_f16: Vec<u16> = Vec::with_capacity(half_rotary);
-        for i in 0..half_rotary {
-            let inv_freq = 1.0 / theta.powf((2 * i) as f64 / rotary_dim as f64);
-            let angle = p * inv_freq;
-            cos_f16.push(f32_to_f16_bits(angle.cos() as f32));
-            sin_f16.push(f32_to_f16_bits(angle.sin() as f32));
+        // Floor commit 3: use the global f16 RoPE table for this
+        // layer's type (sliding or global). Mode B fill —
+        // positions[t] = absolute slot — so the kernel reads
+        // `cos_table[positions[t] * (rotary_dim/2) + freq]`
+        // directly. Sanity check the position is within the
+        // table's allocated rows.
+        if (position as usize) >= self.arch.max_position_embeddings {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer_attn_from_residual: position={} >= \
+                 max_position_embeddings={}", position,
+                self.arch.max_position_embeddings)));
         }
-        let cos_region = self.arena.region(
-            "g4n_lN_cos_f16", half_rotary * 2, 256)?;
-        let sin_region = self.arena.region(
-            "g4n_lN_sin_f16", half_rotary * 2, 256)?;
-        unsafe {
-            let cb: &[u8] = std::slice::from_raw_parts(
-                cos_f16.as_ptr() as *const u8, cos_f16.len() * 2);
-            let sb: &[u8] = std::slice::from_raw_parts(
-                sin_f16.as_ptr() as *const u8, sin_f16.len() * 2);
-            cos_region.copy_from_host(cb)?;
-            sin_region.copy_from_host(sb)?;
-        }
-        // Stream-ordered metadata fill (see fill_pos_slots
-        // docstring + g4n_fill_pos_slots_i32.cu for the race
-        // this replaces).
         self.fill_pos_slots(kv,
-            /*position_offset=*/0,
+            /*position_offset=*/position as i32,
             /*start_slot=*/position as i32,
             /*num_tokens=*/1,
         )?;
@@ -2321,8 +2355,8 @@ impl Gemma4Nvfp4Bringup {
             let mut vp: u64 = v_packed;
             let mut ks: u64 = k_scale;
             let mut vs: u64 = v_scale;
-            let mut cos_ptr: u64 = cos_region.device_ptr();
-            let mut sin_ptr: u64 = sin_region.device_ptr();
+            let mut cos_ptr_local: u64 = cos_table_dev;
+            let mut sin_ptr_local: u64 = sin_table_dev;
             let mut positions_ptr: u64 = kv.positions_ptr;
             let mut slot_ptr: u64 = kv.slot_mapping_ptr;
             let mut q_scale_ptr: u64 = kv.q_scale_ptr;
@@ -2351,8 +2385,8 @@ impl Gemma4Nvfp4Bringup {
                 (&mut vp) as *mut u64 as *mut core::ffi::c_void,
                 (&mut ks) as *mut u64 as *mut core::ffi::c_void,
                 (&mut vs) as *mut u64 as *mut core::ffi::c_void,
-                (&mut cos_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut sin_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cos_ptr_local) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sin_ptr_local) as *mut u64 as *mut core::ffi::c_void,
                 (&mut positions_ptr) as *mut u64 as *mut core::ffi::c_void,
                 (&mut slot_ptr) as *mut u64 as *mut core::ffi::c_void,
                 (&mut q_scale_ptr) as *mut u64 as *mut core::ffi::c_void,

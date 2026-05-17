@@ -512,11 +512,28 @@ pub fn upload_gemma4_nvfp4_outside_text(
 }
 
 /// Build cos/sin RoPE tables for vanilla (no-YaRN) RoPE. Returns
-/// a pair of F16Weight handles backed by f32 device buffers of
-/// shape `[max_pos, head_dim/2]`. The first `rotary_dim/2`
-/// columns hold valid values; the rest are zeros for the partial-
-/// rope case (rotary_dim < head_dim, e.g. global layers on
-/// Gemma 4 31B).
+/// a pair of F16Weight handles backed by **f16** device buffers of
+/// shape `[max_pos, rotary_dim/2]`.
+///
+/// Codex commit 3 (floor → #5f): two bug fixes folded together.
+///
+/// (1) Tables migrated from f32 to f16 — matches the NVFP4 RoPE
+///     kernel's `__half*` cos/sin arg ABI
+///     (fused_rope_partial_nvfp4kv_bf16in.cu:133-134). Halves the
+///     table footprint at max_pos=262144 (~768 MiB → ~384 MiB).
+///
+/// (2) Row stride = rotary_dim/2 (NOT head_dim/2) AND inv_freq
+///     uses the proportional-RoPE formula `1 / theta^(2i /
+///     head_dim)` — matches the kernel's index
+///     `cos_table[pos * (rotary_dim/2) + freq]` and matches the
+///     production loader (gemma4_load.rs::rope_cos_sin_bytes:
+///     1054-1077). The pre-floor table had stride head_dim/2 and
+///     used 2i/rotary_dim, both wrong for global layers
+///     (head_dim=512, rotary_dim=128) — silently produced
+///     correct-by-accident outputs only because the mini-table
+///     workaround forced positions[0]=0, making cos/sin = 1/0
+///     and the rotation an identity. With absolute positions
+///     (floor commit 3), the bug becomes visible.
 fn build_and_upload_rope_tables(
     arena: &HbmArena<'_>,
     region_label: &'static str,
@@ -525,38 +542,32 @@ fn build_and_upload_rope_tables(
     rotary_dim: usize,
     max_pos: usize,
 ) -> Result<(rvllm_loader::weights::F16Weight, rvllm_loader::weights::F16Weight)> {
-    let half = head_dim / 2;
-    let rd_half = rotary_dim / 2;
-    if rd_half > half {
+    let half = rotary_dim / 2;
+    if rotary_dim > head_dim {
         return Err(corrupt(format!(
             "{region_label}: rotary_dim {} > head_dim {}", rotary_dim, head_dim
         )));
     }
-    // inv_freq[i] = 1 / theta^(2i / rotary_dim) for i in 0..rd_half.
-    // Standard RoPE formula — the rotary_dim (not head_dim) drives
-    // the geometric progression of frequencies for partial RoPE.
-    let inv_freq: Vec<f32> = (0..rd_half)
-        .map(|i| 1.0 / theta.powf((2 * i) as f32 / rotary_dim as f32))
+    let inv_freq: Vec<f32> = (0..half)
+        .map(|i| 1.0 / theta.powf((2 * i) as f32 / head_dim as f32))
         .collect();
 
-    let mut cos_host: Vec<f32> = vec![0.0; max_pos * half];
-    let mut sin_host: Vec<f32> = vec![0.0; max_pos * half];
+    let mut cos_host: Vec<half::f16> = vec![half::f16::ZERO; max_pos * half];
+    let mut sin_host: Vec<half::f16> = vec![half::f16::ZERO; max_pos * half];
     for pos in 0..max_pos {
-        for i in 0..rd_half {
+        for i in 0..half {
             let angle = pos as f32 * inv_freq[i];
-            cos_host[pos * half + i] = angle.cos();
-            sin_host[pos * half + i] = angle.sin();
+            cos_host[pos * half + i] = half::f16::from_f32(angle.cos());
+            sin_host[pos * half + i] = half::f16::from_f32(angle.sin());
         }
-        // Columns [rd_half, half) stay 0.0 — partial-RoPE kernels
-        // skip them, sliding (full-RoPE) never has empty columns.
     }
     let cos_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(cos_host.as_ptr() as *const u8,
-                                    cos_host.len() * 4)
+                                    cos_host.len() * 2)
     };
     let sin_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(sin_host.as_ptr() as *const u8,
-                                    sin_host.len() * 4)
+                                    sin_host.len() * 2)
     };
     let cos_region = arena.region(region_label, cos_bytes.len(), 16)?;
     let sin_region = arena.region(region_label, sin_bytes.len(), 16)?;
