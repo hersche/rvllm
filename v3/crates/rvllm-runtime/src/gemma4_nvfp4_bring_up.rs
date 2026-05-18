@@ -733,6 +733,39 @@ impl Gemma4Nvfp4Bringup {
         self.forward_checkpoint = self.arena.checkpoint();
     }
 
+    /// Stream-6b spec primitive #4: greedy accept count.
+    ///
+    /// Given `drafts[0..K]` (drafter speculations for positions
+    /// L+1..L+K) and `verifies[0..K]` (base argmaxes at the same
+    /// positions, produced by running base on the cascade), find
+    /// the longest matching prefix length.
+    ///
+    /// Spec-decode semantics:
+    ///   * `n_accepted = K` (full match): all drafts accepted.
+    ///     Orchestration commits drafts[0..K] AND the bonus base
+    ///     argmax that comes from running base one more step.
+    ///   * `0 <= n_accepted < K`: commit drafts[0..n_accepted]
+    ///     (= verifies[0..n_accepted] by construction) and
+    ///     `verifies[n_accepted]` as the bonus correction. Any
+    ///     K/V slots base may have written past
+    ///     `L + n_accepted + 1` are invalid and must be rolled
+    ///     back by the orchestration (no-op for the K=1 path
+    ///     where base only ever writes one slot per verify).
+    ///
+    /// Pure: no GPU work, no arena ops. Lives on the bringup
+    /// only for namespacing alongside the other spec primitives.
+    pub fn spec_greedy_accept_count(
+        drafts: &[u32],
+        verifies: &[u32],
+    ) -> usize {
+        let k = drafts.len().min(verifies.len());
+        let mut n = 0usize;
+        while n < k && drafts[n] == verifies[n] {
+            n += 1;
+        }
+        n
+    }
+
     /// Stream-6b spec primitive #3: base verify of one token at
     /// `position`. Runs the full 60-layer base forward, writes
     /// the layer K/V into `kv` at `position`, snapshots the
@@ -7323,5 +7356,58 @@ mod tests {
              either the shadow KV population didn't reach the \
              cross-attn read, or pre_projection_in's hidden half \
              didn't get the snapshot from verify_base_one_token");
+
+        // Stream-6b primitive #4 end-to-end: complete one spec
+        // K=1 round and score it via `spec_greedy_accept_count`.
+        //
+        // State before this block:
+        //   * kv slot 0 was written by verify_base_one_token(BOS,
+        //     pos=0) → base_argmax = 1852 (committed at slot 0).
+        //   * drafter just speculated `tok_real` for position 1
+        //     given (t_committed=1852, base_hidden_last from
+        //     slot 0's snapshot).
+        //
+        // Now run the base verify at position 1 with input =
+        // 1852 (the committed token from slot 0's prediction).
+        // It writes slot 1 and returns the base's argmax for
+        // position 2. The accept comparison is between
+        // `tok_real` (drafter's speculation for position 1) and
+        // 1852 (= what the base's prefill argmax said about
+        // position 1 — i.e. the verify input itself).
+        //
+        // For K=1 the "verify input" IS the verify target, so
+        // a clean way to test the primitive is: pretend the
+        // drafter's prediction (tok_real) was for the same
+        // position as base's prefill argmax (1852). Compare them
+        // and score.
+        drop(guard);
+        let drafts = vec![tok_real];
+        let verifies = vec![base_argmax];
+        let n_accepted = Gemma4Nvfp4Bringup::spec_greedy_accept_count(
+            &drafts, &verifies);
+        eprintln!(
+            "[#6a-smoke] spec_greedy_accept_count(\
+             drafts={drafts:?}, verifies={verifies:?}) → \
+             n_accepted={n_accepted}");
+        assert!(n_accepted <= 1,
+            "n_accepted ({n_accepted}) > K=1");
+        // Also exercise the trivial branches so the helper isn't
+        // only covered for the rejected-draft case.
+        assert_eq!(
+            Gemma4Nvfp4Bringup::spec_greedy_accept_count(
+                &[10, 20, 30], &[10, 20, 30]),
+            3, "all-match K=3");
+        assert_eq!(
+            Gemma4Nvfp4Bringup::spec_greedy_accept_count(
+                &[10, 20, 30], &[10, 20, 99]),
+            2, "longest matching prefix K=3");
+        assert_eq!(
+            Gemma4Nvfp4Bringup::spec_greedy_accept_count(
+                &[10], &[99]),
+            0, "no match");
+        assert_eq!(
+            Gemma4Nvfp4Bringup::spec_greedy_accept_count(
+                &[], &[]),
+            0, "empty");
     }
 }
