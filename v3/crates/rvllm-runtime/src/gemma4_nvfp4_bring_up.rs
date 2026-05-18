@@ -402,6 +402,7 @@ pub struct Gemma4Nvfp4Bringup {
     attn_backend_global: rvllm_attention::AttentionBackend,
     /// PTX modules backing `mlp_kernels`. Kept alive here.
     _mlp_w4a16_gemv_mod: LoadedModule,
+    _mlp_w4a16_gemm_mn_mod: LoadedModule,
     _mlp_w4a16_gate_up_mod: LoadedModule,
     _mlp_gelu_tanh_mul_mod: LoadedModule,
     pub cublaslt: CublasLt,
@@ -607,6 +608,9 @@ impl Gemma4Nvfp4Bringup {
         // MLP kernels (commit #3).
         let mlp_gemv_mod = loader.load_ptx("mistral35_w4a16_gemv_bf16")?;
         let fn_w4a16_gemv = mlp_gemv_mod.get_function("mistral35_w4a16_gemv_bf16_kernel")?;
+        let mlp_gemm_mn_mod = loader.load_ptx("mistral35_w4a16_gemm_mn_bf16")?;
+        let fn_w4a16_gemm_mn =
+            mlp_gemm_mn_mod.get_function("mistral35_w4a16_gemm_mn_bf16_kernel")?;
         let mlp_gate_up_mod = loader.load_ptx("mistral35_w4a16_gate_up_gemv_bf16")?;
         let fn_w4a16_gate_up_gemv =
             mlp_gate_up_mod.get_function("mistral35_w4a16_gate_up_gemv_bf16_kernel")?;
@@ -615,6 +619,7 @@ impl Gemma4Nvfp4Bringup {
 
         let mlp_kernels = Gemma4Nvfp4MlpKernels {
             fn_w4a16_gemv,
+            fn_w4a16_gemm_mn,
             fn_w4a16_gate_up_gemv,
             fn_gelu_tanh_mul,
         };
@@ -672,6 +677,7 @@ impl Gemma4Nvfp4Bringup {
             attn_backend_sliding,
             attn_backend_global,
             _mlp_w4a16_gemv_mod: mlp_gemv_mod,
+            _mlp_w4a16_gemm_mn_mod: mlp_gemm_mn_mod,
             _mlp_w4a16_gate_up_mod: mlp_gate_up_mod,
             _mlp_gelu_tanh_mul_mod: mlp_gelu_mod,
             cublaslt,
@@ -992,13 +998,39 @@ impl Gemma4Nvfp4Bringup {
             }
         }
 
+        let spec_timing = std::env::var("G4N_SPEC_TIMING").ok().as_deref() == Some("1");
+        let total_t0 = std::time::Instant::now();
+        let mut prefill_elapsed = std::time::Duration::ZERO;
+        let mut shadow_elapsed = std::time::Duration::ZERO;
+        let mut drafter_elapsed = std::time::Duration::ZERO;
+        let mut verify_elapsed = std::time::Duration::ZERO;
+        let mut bailout_elapsed = std::time::Duration::ZERO;
+        let mut draft_steps_total = 0usize;
+        let mut verify_rows_total = 0usize;
+        let mut shadow_slots_total = 0usize;
+        let mut bailout_tokens = 0usize;
+
         // Prefill prompt and snapshot the prompt-final base hidden for
         // drafter step 0.
+        let prefill_t0 = std::time::Instant::now();
         let mut t_committed = self.forward_prompt_to_token(prompt_ids, 0, kv)?;
+        prefill_elapsed += prefill_t0.elapsed();
         let mut emitted: Vec<u32> = vec![t_committed];
         let mut ctx_len: u32 = prompt_ids.len() as u32;
 
         if emitted.len() >= max_new {
+            if spec_timing {
+                eprintln!(
+                    "[g4n-spec-timing] prompt={} max_new={} K={} emitted={} \
+                     iters=0 accepted=0 prefill_ms={:.3} total_ms={:.3}",
+                    prompt_ids.len(),
+                    max_new,
+                    spec_k,
+                    emitted.len(),
+                    prefill_elapsed.as_secs_f64() * 1000.0,
+                    total_t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             return Ok(SpecSessionStats {
                 emitted,
                 n_iters: 0,
@@ -1017,10 +1049,13 @@ impl Gemma4Nvfp4Bringup {
 
         let mut shadow_valid_len = ctx_len;
         {
+            let shadow_t0 = std::time::Instant::now();
             let guard = self.drafter.lock().unwrap();
             let rt = guard.as_ref().unwrap();
             self.populate_drafter_shadow_kv_with_rt(
                 rt, kv, 0, shadow_valid_len)?;
+            shadow_elapsed += shadow_t0.elapsed();
+            shadow_slots_total += shadow_valid_len as usize;
         }
 
         let mut n_iters = 0usize;
@@ -1040,6 +1075,7 @@ impl Gemma4Nvfp4Bringup {
             };
             let iter_ctx_start = ctx_len;
 
+            let drafter_t0 = std::time::Instant::now();
             let drafts = {
                 let guard = self.drafter.lock().unwrap();
                 let rt = guard.as_ref().unwrap();
@@ -1052,13 +1088,18 @@ impl Gemma4Nvfp4Bringup {
                     kv,
                 )?
             };
+            drafter_elapsed += drafter_t0.elapsed();
+            draft_steps_total += drafts.len();
 
             let mut verify_inputs = Vec::with_capacity(drafts.len() + 1);
             verify_inputs.push(t_committed);
             verify_inputs.extend_from_slice(&drafts);
 
+            let verify_t0 = std::time::Instant::now();
             let (verifies, n_acc) =
                 self.verify_base_tokens_batched_with_accept(&verify_inputs, ctx_len, kv, &drafts)?;
+            verify_elapsed += verify_t0.elapsed();
+            verify_rows_total += verify_inputs.len();
             if verifies.len() != drafts.len() + 1 {
                 return Err(corrupt_runtime_err(format!(
                     "run_spec_session_nvfp4_greedy_k: verify returned {} \
@@ -1111,8 +1152,11 @@ impl Gemma4Nvfp4Bringup {
                 }
                 let guard = self.drafter.lock().unwrap();
                 let rt = guard.as_ref().unwrap();
+                let shadow_t0 = std::time::Instant::now();
                 self.populate_drafter_shadow_kv_with_rt(
                     rt, kv, iter_ctx_start, committed_now_u32)?;
+                shadow_elapsed += shadow_t0.elapsed();
+                shadow_slots_total += committed_now_u32 as usize;
                 shadow_valid_len = iter_ctx_start + committed_now_u32;
             }
             ctx_len += committed_now as u32;
@@ -1124,14 +1168,54 @@ impl Gemma4Nvfp4Bringup {
             }
 
             if zero_accept_bailout_iters > 0 && zero_accept_iters >= zero_accept_bailout_iters {
+                let bailout_t0 = std::time::Instant::now();
                 while emitted.len() < max_new {
                     let next = self.forward_full_to_token(t_committed, ctx_len, kv)?;
                     emitted.push(next);
                     t_committed = next;
                     ctx_len += 1;
+                    bailout_tokens += 1;
                 }
+                bailout_elapsed += bailout_t0.elapsed();
                 break;
             }
+        }
+
+        if spec_timing {
+            let total_elapsed = total_t0.elapsed();
+            let spec_tokens = emitted.len().saturating_sub(1 + bailout_tokens);
+            let other_elapsed = total_elapsed
+                .saturating_sub(prefill_elapsed)
+                .saturating_sub(shadow_elapsed)
+                .saturating_sub(drafter_elapsed)
+                .saturating_sub(verify_elapsed)
+                .saturating_sub(bailout_elapsed);
+            eprintln!(
+                "[g4n-spec-timing] prompt={} max_new={} K={} emitted={} \
+                 spec_tokens={} bailout_tokens={} iters={} accepted={} \
+                 draft_steps={} verify_rows={} shadow_slots={} \
+                 prefill_ms={:.3} drafter_ms={:.3} verify_ms={:.3} \
+                 shadow_ms={:.3} bailout_ms={:.3} other_ms={:.3} \
+                 total_ms={:.3}",
+                prompt_ids.len(),
+                max_new,
+                spec_k,
+                emitted.len(),
+                spec_tokens,
+                bailout_tokens,
+                n_iters,
+                n_accepted_total,
+                draft_steps_total,
+                verify_rows_total,
+                shadow_slots_total,
+                prefill_elapsed.as_secs_f64() * 1000.0,
+                drafter_elapsed.as_secs_f64() * 1000.0,
+                verify_elapsed.as_secs_f64() * 1000.0,
+                shadow_elapsed.as_secs_f64() * 1000.0,
+                bailout_elapsed.as_secs_f64() * 1000.0,
+                other_elapsed.as_secs_f64() * 1000.0,
+                total_elapsed.as_secs_f64() * 1000.0
+            );
         }
 
         Ok(SpecSessionStats {
@@ -6479,7 +6563,7 @@ impl Gemma4Nvfp4Bringup {
                 .region("g4n_batch_pamlp_normed", n * (hidden as usize) * 2, 256)?;
         let scratch_region = self.arena.region(
             "g4n_batch_pamlp_scratch",
-            (2 * intermediate as usize) * 2,
+            n * (2 * intermediate as usize) * 2,
             256,
         )?;
         let mlp_out_region =
@@ -6511,26 +6595,17 @@ impl Gemma4Nvfp4Bringup {
                 layer.pre_feedforward_layernorm.offset_bytes,
                 stream_u64,
             )?;
-            // Per-token MLP loop. M=1 W4A16 kernels — batching the
-            // MLP needs a new kernel (~300 LOC follow-up). At N=3
-            // this is 3 MLP launches; at N=100 it's 100. For
-            // typical prompts the win from batched attention
-            // already dominates.
-            let hidden_bytes = (hidden as usize) * 2;
-            for t in 0..n {
-                let h_t = h_normed_region.device_ptr() + (t * hidden_bytes) as u64;
-                let mlp_t = mlp_out_region.device_ptr() + (t * hidden_bytes) as u64;
-                crate::gemma4_nvfp4_ops::gemma4_nvfp4_mlp_forward(
-                    &self.mlp_kernels,
-                    h_t,
-                    mlp_t,
-                    &layer.gate_proj,
-                    &layer.up_proj,
-                    &layer.down_proj,
-                    scratch_region.device_ptr(),
-                    stream_u64,
-                )?;
-            }
+            crate::gemma4_nvfp4_ops::gemma4_nvfp4_mlp_forward_batched(
+                &self.mlp_kernels,
+                h_normed_region.device_ptr(),
+                mlp_out_region.device_ptr(),
+                &layer.gate_proj,
+                &layer.up_proj,
+                &layer.down_proj,
+                scratch_region.device_ptr(),
+                num_tokens,
+                stream_u64,
+            )?;
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
                 num_tokens,
                 hidden,

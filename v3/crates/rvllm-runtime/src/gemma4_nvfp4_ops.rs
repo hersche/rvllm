@@ -96,6 +96,9 @@ pub struct Gemma4Nvfp4MlpKernels {
     /// Used for `down_proj` (and as a fallback when the fused
     /// gate+up path isn't available).
     pub fn_w4a16_gemv: KernelFn,
+    /// `mistral35_w4a16_gemm_mn_bf16_kernel` — M>1 W4A16 GEMM.
+    /// Used by K-step batched verify to avoid per-token MLP loops.
+    pub fn_w4a16_gemm_mn: KernelFn,
     /// `mistral35_w4a16_gate_up_gemv_bf16_kernel` — fused gate+up
     /// (one launch produces both [i_size] outputs). Mistral
     /// confirms shape-generic at runtime (i_size + K are kernel
@@ -139,6 +142,53 @@ pub unsafe fn gemma4_nvfp4_w4a16_gemv(
         (weight.shape.n as u32, 1, 1),
         (256, 1, 1),
         0, stream, &args,
+    )
+}
+
+/// One bf16 W4A16 M>1 GEMM:
+/// `out_bf16[M, N] = act_bf16[M, K] @ dequant(W[N, K])^T`.
+pub unsafe fn gemma4_nvfp4_w4a16_gemm_mn(
+    fn_w4a16_gemm_mn: KernelFn,
+    act_bf16: u64,
+    weight: &Gemma4Nvfp4LinearLoaded,
+    out_bf16: u64,
+    m: u32,
+    stream: u64,
+) -> Result<()> {
+    if m == 0 {
+        return Err(rvllm_core::RvllmError::cuda(
+            "gemma4_nvfp4_w4a16_gemm_mn: M must be > 0",
+            rvllm_core::CudaErrorKind::Other,
+            rvllm_core::CudaCtx::setup(),
+        ));
+    }
+    let mut out = out_bf16;
+    let mut wp = weight.packed_ptr;
+    let mut ws = weight.sfb_natural_ptr;
+    let mut gs = weight.global_scale_ptr;
+    let mut act = act_bf16;
+    let mut m_arg = m as i32;
+    let mut n = weight.shape.n as i32;
+    let mut k = weight.shape.k as i32;
+    let args: [*mut std::ffi::c_void; 8] = [
+        (&mut out) as *mut u64 as *mut _,
+        (&mut wp) as *mut u64 as *mut _,
+        (&mut ws) as *mut u64 as *mut _,
+        (&mut gs) as *mut u64 as *mut _,
+        (&mut act) as *mut u64 as *mut _,
+        (&mut m_arg) as *mut i32 as *mut _,
+        (&mut n) as *mut i32 as *mut _,
+        (&mut k) as *mut i32 as *mut _,
+    ];
+    const M_TILE: u32 = 8;
+    let grid_y = (m + M_TILE - 1) / M_TILE;
+    rvllm_fused::launch_raw(
+        fn_w4a16_gemm_mn,
+        (weight.shape.n as u32, grid_y, 1),
+        (256, 1, 1),
+        0,
+        stream,
+        &args,
     )
 }
 
@@ -259,6 +309,75 @@ pub unsafe fn gemma4_nvfp4_mlp_forward(
     gemma4_nvfp4_w4a16_gemv(
         kernels.fn_w4a16_gemv,
         gate_out_ptr, down, out_bf16, stream,
+    )?;
+    Ok(())
+}
+
+/// Batched MLP block forward:
+/// `out[M, H] = down(gelu_tanh(gate(act[M, H])) * up(act[M, H]))`.
+///
+/// `scratch_bf16` must provide `2 * M * intermediate_size` bf16 slots.
+pub unsafe fn gemma4_nvfp4_mlp_forward_batched(
+    kernels: &Gemma4Nvfp4MlpKernels,
+    act_bf16: u64,
+    out_bf16: u64,
+    gate: &Gemma4Nvfp4LinearLoaded,
+    up: &Gemma4Nvfp4LinearLoaded,
+    down: &Gemma4Nvfp4LinearLoaded,
+    scratch_bf16: u64,
+    m: u32,
+    stream: u64,
+) -> Result<()> {
+    if gate.shape != up.shape {
+        return Err(rvllm_core::RvllmError::cuda(
+            "gemma4_nvfp4_mlp_forward_batched: gate/up shapes differ",
+            rvllm_core::CudaErrorKind::Other,
+            rvllm_core::CudaCtx::setup(),
+        ));
+    }
+    if m == 0 {
+        return Err(rvllm_core::RvllmError::cuda(
+            "gemma4_nvfp4_mlp_forward_batched: M must be > 0",
+            rvllm_core::CudaErrorKind::Other,
+            rvllm_core::CudaCtx::setup(),
+        ));
+    }
+    let i_size = gate.shape.n;
+    let elem_count = (m as usize) * i_size;
+    let gate_out_ptr = scratch_bf16;
+    let up_out_ptr = scratch_bf16 + (elem_count * 2) as u64;
+
+    gemma4_nvfp4_w4a16_gemm_mn(
+        kernels.fn_w4a16_gemm_mn,
+        act_bf16,
+        gate,
+        gate_out_ptr,
+        m,
+        stream,
+    )?;
+    gemma4_nvfp4_w4a16_gemm_mn(
+        kernels.fn_w4a16_gemm_mn,
+        act_bf16,
+        up,
+        up_out_ptr,
+        m,
+        stream,
+    )?;
+    gemma4_nvfp4_gelu_tanh_mul(
+        kernels.fn_gelu_tanh_mul,
+        gate_out_ptr,
+        gate_out_ptr,
+        up_out_ptr,
+        elem_count as u32,
+        stream,
+    )?;
+    gemma4_nvfp4_w4a16_gemm_mn(
+        kernels.fn_w4a16_gemm_mn,
+        gate_out_ptr,
+        down,
+        out_bf16,
+        m,
+        stream,
     )?;
     Ok(())
 }
