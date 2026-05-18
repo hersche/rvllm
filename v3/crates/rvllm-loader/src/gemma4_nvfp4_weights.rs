@@ -454,6 +454,18 @@ pub struct Gemma4Nvfp4OutsideText {
 pub struct Gemma4Nvfp4LoadedModel {
     pub outside: Gemma4Nvfp4OutsideText,
     pub layers: Vec<Gemma4Nvfp4LayerLoaded>,
+    /// Stream-#7: SigLIP-style vision tower weights. `None`
+    /// when the checkpoint has no `model.vision_tower.*`
+    /// tensors (text-only variants) or when the loader was
+    /// skipped. The weights themselves are bf16 (vision tower
+    /// is not NVFP4-quantized) so the production
+    /// `load_gemma_vision` (rvllm-loader::gemma4_load) loads
+    /// them identically here. Forward wiring into Option B's
+    /// `forward_prompt_to_token` is deferred — admission gate
+    /// at `cuda_worker.rs` still rejects vision requests for
+    /// Gemma4Nvfp4 with the "Stream-7" message until the
+    /// splice lands.
+    pub vision: Option<crate::gemma4_weights::Gemma4Vision>,
 }
 
 fn missing(name: &str) -> RvllmError {

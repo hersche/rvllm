@@ -682,7 +682,46 @@ pub fn load_gemma4_nvfp4_text(
         }
     }
 
-    Ok(Gemma4Nvfp4LoadedModel { outside, layers })
+    // Stream-#7: optional vision tower. Vision weights are
+    // bf16 (NOT NVFP4) in both the production fp8-block
+    // checkpoint AND nvidia/Gemma-4-31B-IT-NVFP4, so the
+    // production loader works verbatim. Wrap pool accessors
+    // to match the loader's `Fn(&str) -> Result<(usize,
+    // TensorEntry)>` + `Fn(usize, &TensorEntry) -> &[u8]`
+    // signatures (Option B's `must_get` returns `&TensorEntry`
+    // so we clone — TensorEntry is `#[derive(Clone)]`).
+    let vision = {
+        let must_get_fn = |name: &str| -> Result<(usize, TensorEntry)> {
+            let (si, e) = pool.must_get(name)?;
+            Ok((si, e.clone()))
+        };
+        let bytes_of_fn = |si: usize, e: &TensorEntry| -> &[u8] {
+            pool.bytes_of(si, e)
+        };
+        match rvllm_loader::gemma4_load::load_gemma_vision(
+            arena, &must_get_fn, &bytes_of_fn,
+            model_dir, arch.vision_config.as_ref(),
+        ) {
+            Ok(v) => {
+                eprintln!(
+                    "[gemma4-nvfp4-load] vision tower loaded \
+                     ({} SigLIP-style blocks)",
+                    v.blocks.len()
+                );
+                Some(v)
+            }
+            Err(_) => {
+                eprintln!(
+                    "[gemma4-nvfp4-load] vision tower SKIPPED \
+                     (no model.vision_tower.* tensors or no \
+                      vision_config)"
+                );
+                None
+            }
+        }
+    };
+
+    Ok(Gemma4Nvfp4LoadedModel { outside, layers, vision })
 }
 
 fn corrupt(detail: String) -> RvllmError {

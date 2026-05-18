@@ -743,7 +743,7 @@ pub fn load_gemma4_model(
     })
 }
 
-fn load_gemma_vision<'a, F1, F2>(
+pub fn load_gemma_vision<'a, F1, F2>(
     arena: &HbmArena,
     must_get: &F1,
     bytes_of: &F2,
