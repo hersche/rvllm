@@ -342,6 +342,11 @@ struct ForwardKernels {
     fn_scale_inplace_f16: KernelFn,
     _rope_partial_f16kv_mod: LoadedModule,
     fn_rope_partial_f16kv: KernelFn,
+    /// Stream-6b spec primitive #1: bf16→f16 saturating cast,
+    /// used to snapshot the base's post-final-norm hidden into
+    /// the drafter-readable f16 `base_last_hidden_ptr` buffer.
+    _bf16_to_f16_sat_mod: LoadedModule,
+    fn_bf16_to_f16_sat: KernelFn,
 }
 
 /// Restores the arena to the post-load high-water mark when a forward
@@ -412,6 +417,18 @@ pub struct Gemma4Nvfp4Bringup {
     /// `Mutex<Option<_>>` so construction is at-most-once and
     /// thread-safe under the cuda_worker's single thread.
     pub drafter: std::sync::Mutex<Option<crate::gemma4_drafter::Gemma4DrafterRuntime>>,
+    /// Stream-6b spec primitive #1: persistent f16 device buffer
+    /// holding the BASE's post-final-norm hidden state for the
+    /// last generated token. Drafter consumes this as
+    /// `base_hidden_last` (the second half of
+    /// `pre_projection_in`). Allocated lazily by
+    /// `ensure_base_last_hidden_buffer()` (above
+    /// `forward_checkpoint`, so arena.restore() doesn't reclaim
+    /// it between forwards). Zero until the first
+    /// `forward_final_to_token` lands a snapshot. `0` = not
+    /// allocated → snapshot is a no-op (production path is
+    /// undisturbed when spec decode isn't requested).
+    pub base_last_hidden_ptr: std::sync::atomic::AtomicU64,
     /// Held to keep the primary CUDA context alive.
     _ctx: CudaContextHandle,
 }
@@ -540,6 +557,15 @@ impl Gemma4Nvfp4Bringup {
         let fn_rope_partial_f16kv = rope_partial_f16kv_mod
             .get_function("fused_rope_partial_f16kv_kernel")?;
 
+        // Stream-6b spec primitive #1: bf16→f16 saturating cast.
+        // Used to snapshot the base's post-final-norm hidden
+        // (bf16 in Option B's residual stream) into the f16
+        // buffer the drafter consumes as `base_hidden_last`
+        // (mirrors production's `base_last_hidden_ptr`).
+        let bf16_to_f16_sat_mod = loader.load_ptx("bf16_to_f16_sat")?;
+        let fn_bf16_to_f16_sat = bf16_to_f16_sat_mod
+            .get_function("bf16_to_f16_sat_kernel")?;
+
         // Stream #5f-PRIME: still load this handle ourselves
         // for the per-launcher path (deprecated by the
         // AttentionBackend below but kept until callers move).
@@ -625,6 +651,8 @@ impl Gemma4Nvfp4Bringup {
             fn_scale_inplace_f16,
             _rope_partial_f16kv_mod: rope_partial_f16kv_mod,
             fn_rope_partial_f16kv,
+            _bf16_to_f16_sat_mod: bf16_to_f16_sat_mod,
+            fn_bf16_to_f16_sat,
         };
         let forward_checkpoint = arena.checkpoint();
 
@@ -645,8 +673,49 @@ impl Gemma4Nvfp4Bringup {
             kv_state_allocated: false,
             kernels: loader,
             drafter: std::sync::Mutex::new(None),
+            base_last_hidden_ptr: std::sync::atomic::AtomicU64::new(0),
             _ctx: ctx,
         })
+    }
+
+    /// Stream-6b spec primitive #1: allocate the persistent f16
+    /// `base_last_hidden` buffer ABOVE the forward checkpoint, so
+    /// `forward_scratch_guard`'s arena.restore() does NOT reclaim
+    /// it between requests. Idempotent — second call is a no-op.
+    /// Spec-decode callers must call this before the first
+    /// forward they want to snapshot.
+    pub fn ensure_base_last_hidden_buffer(&mut self) -> Result<()> {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        if self.base_last_hidden_ptr.load(Acquire) != 0 {
+            return Ok(());
+        }
+        let h = self.arch.hidden_size;
+        let region = self.arena.region(
+            "g4n_base_last_hidden_f16", h * 2, 16)?;
+        // Zero-init so a drafter step that runs before the first
+        // base forward sees a defined (all-zero) hidden half.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemsetD8_v2(
+                region.device_ptr(), 0, h * 2);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(corrupt_runtime_err(
+                    "ensure_base_last_hidden_buffer: zero-init".into()));
+            }
+        }
+        // Re-checkpoint above this allocation so subsequent
+        // forward calls' arena.restore() leaves the buffer intact.
+        self.forward_checkpoint = self.arena.checkpoint();
+        self.base_last_hidden_ptr.store(region.device_ptr(), Release);
+        Ok(())
+    }
+
+    /// Stream-6b spec primitive #1: read-only getter for the
+    /// drafter side. Returns `0` if `ensure_base_last_hidden
+    /// _buffer` has not been called yet.
+    pub fn base_last_hidden_device_ptr(&self) -> u64 {
+        self.base_last_hidden_ptr
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Stream-ordered fill of the per-token metadata buffers
@@ -2181,6 +2250,27 @@ impl Gemma4Nvfp4Bringup {
                 self.model.outside.final_norm.offset_bytes,
                 stream_u64,
             )?;
+        }
+
+        // Stream-6b spec primitive #1: snapshot the post-final-
+        // norm hidden as f16 into `base_last_hidden_ptr` for
+        // drafter consumption. No-op when the buffer hasn't been
+        // allocated (non-spec sessions). The cast is stream-
+        // ordered so the drafter forward enqueued after this
+        // sees the updated bytes.
+        let base_last_hidden = self.base_last_hidden_device_ptr();
+        if base_last_hidden != 0 {
+            unsafe {
+                rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch {
+                    n: hidden,
+                }
+                .launch(
+                    self.forward_kernels.fn_bf16_to_f16_sat,
+                    base_last_hidden,
+                    h_region.device_ptr(),
+                    stream_u64,
+                )?;
+            }
         }
 
         // (2) Tied LM head GEMV: h_normed @ raw_embed_tokens.T → f32 [1, vocab].
