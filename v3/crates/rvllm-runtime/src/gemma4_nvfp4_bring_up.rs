@@ -2596,23 +2596,9 @@ impl Gemma4Nvfp4Bringup {
         use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
         let _scratch_guard = self.forward_scratch_guard();
         let hidden = self.arch.hidden_size as u32;
-        let tok_region = self.arena.region("g4n_embed_tok", 4, 16)?;
-        unsafe { tok_region.copy_from_host(&(token_id as i32).to_le_bytes())?; }
         let h_region = self.arena.region(
             "g4n_embed_residual_bf16", (hidden as usize) * 2, 256)?;
-        let stream_u64 = self.stream.raw();
-        unsafe {
-            rvllm_fused::EmbeddingGatherLaunch {
-                num_tokens: 1, hidden,
-                vocab: self.arch.vocab_size as u32,
-            }
-            .launch(
-                self.forward_kernels.fn_embedding_gather_bf16,
-                h_region.device_ptr(),
-                self.model.outside.embed_tokens.offset_bytes,
-                tok_region.device_ptr(), stream_u64,
-            )?;
-        }
+        self.embed_one_token_to_device(token_id, h_region.device_ptr())?;
         self.stream.fence()?;
         let mut out = vec![0u16; hidden as usize];
         unsafe {
@@ -2627,6 +2613,33 @@ impl Gemma4Nvfp4Bringup {
             }
         }
         Ok(out)
+    }
+
+    /// Stream 5a-step2: device-resident embed lookup.
+    /// Writes the embedded bf16 residual for `token_id` into
+    /// `dst_dev` (caller-allocated, length `hidden_size * 2`
+    /// bytes). No fence — caller decides when to sync. Used by
+    /// the inter-layer-device-residual drivers.
+    fn embed_one_token_to_device(
+        &self, token_id: u32, dst_dev: u64,
+    ) -> Result<()> {
+        let hidden = self.arch.hidden_size as u32;
+        let tok_region = self.arena.region("g4n_embed_tok", 4, 16)?;
+        unsafe { tok_region.copy_from_host(&(token_id as i32).to_le_bytes())?; }
+        let stream_u64 = self.stream.raw();
+        unsafe {
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens: 1, hidden,
+                vocab: self.arch.vocab_size as u32,
+            }
+            .launch(
+                self.forward_kernels.fn_embedding_gather_bf16,
+                dst_dev,
+                self.model.outside.embed_tokens.offset_bytes,
+                tok_region.device_ptr(), stream_u64,
+            )?;
+        }
+        Ok(())
     }
 
     /// Commit #5c: per-layer post-attention close-out
@@ -2875,6 +2888,492 @@ impl Gemma4Nvfp4Bringup {
             .map(|&b| f32::from_bits((b as u32) << 16)).collect())
     }
 
+    /// Stream 5a-step2: device-mode attention forward. Takes a
+    /// bf16 residual already on device, writes the bf16 attn_out
+    /// into a caller-provided device region. NO scratch_guard
+    /// (caller owns lifetime), NO initial HtoD, NO terminal fence
+    /// + DtoH. Mirrors `forward_layer_attn_from_residual` body
+    /// minus the boundary I/O. The driver
+    /// (`forward_full_to_token`) calls this with a persistent
+    /// residual_dev so the inter-layer round-trip vanishes.
+    ///
+    /// SAFETY: `residual_dev` and `attn_out_dev` must point at
+    /// arena regions of the correct size (hidden_size*2 and
+    /// num_q_heads_for(layer_idx)*head_dim_for(layer_idx)*2
+    /// respectively). The method reads residual_dev but DOES
+    /// NOT mutate it — the input_layernorm runs on a local
+    /// scratch copy so the caller's residual stays available
+    /// for the post-attn residual add.
+    fn forward_layer_attn_from_residual_dev(
+        &self,
+        layer_idx: usize,
+        residual_dev: u64,
+        position: u32,
+        kv: &Gemma4Nvfp4KvState,
+        attn_out_dev: u64,
+    ) -> Result<()> {
+        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_loader::gemma4_arch::Gemma4LayerType;
+
+        if layer_idx >= self.arch.num_hidden_layers {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer_attn_from_residual_dev: layer_idx={} >= {}",
+                layer_idx, self.arch.num_hidden_layers)));
+        }
+        if position >= kv.max_pos {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer_attn_from_residual_dev: position={} >= kv.max_pos={}",
+                position, kv.max_pos)));
+        }
+        let layer = &self.model.layers[layer_idx];
+        let hidden = self.arch.hidden_size as u32;
+        let is_global = matches!(
+            self.arch.layer_types[layer_idx], Gemma4LayerType::GlobalAttention);
+        #[allow(unused_variables)]
+        let (head_dim, rotary_dim, _theta, window_size_left,
+             cos_table_dev, sin_table_dev) = if is_global {
+            (self.arch.head_dim_global,
+             self.arch.rotary_dim_global(),
+             self.arch.rope_theta_global as f64,
+             -1i32,
+             self.model.outside.rope_cos_global.offset_bytes,
+             self.model.outside.rope_sin_global.offset_bytes)
+        } else {
+            (self.arch.head_dim_sliding,
+             self.arch.head_dim_sliding,
+             self.arch.rope_theta_sliding as f64,
+             (self.arch.sliding_window_size as i32) - 1,
+             self.model.outside.rope_cos_sliding.offset_bytes,
+             self.model.outside.rope_sin_sliding.offset_bytes)
+        };
+        let n_q = layer.q_proj.shape[0] as i32;
+        let n_kv = layer.k_proj.shape[0] as i32;
+        let v_proj_weight: Option<&rvllm_loader::weights::F16Weight>;
+        let n_v: i32;
+        if is_global {
+            if layer.v_proj.is_some() {
+                return Err(corrupt_runtime_err(format!(
+                    "forward_layer_attn_from_residual_dev: layer {layer_idx} \
+                     is Global but v_proj IS present")));
+            }
+            v_proj_weight = None;
+            n_v = n_kv;
+        } else {
+            let vw = layer.v_proj.as_ref().ok_or_else(|| corrupt_runtime_err(
+                format!("forward_layer_attn_from_residual_dev: layer {layer_idx} \
+                         is sliding but v_proj is absent")))?;
+            n_v = vw.shape[0] as i32;
+            v_proj_weight = Some(vw);
+            if n_kv != n_v {
+                return Err(corrupt_runtime_err(format!(
+                    "forward_layer_attn_from_residual_dev: K/V dim mismatch \
+                     ({n_kv} vs {n_v})")));
+            }
+        }
+        let num_q_heads = (n_q as usize) / head_dim;
+        let num_kv_heads = (n_kv as usize) / head_dim;
+        let gqa = num_q_heads / num_kv_heads;
+        let use_gqa_kernel = gqa <= 4;
+        if (position as usize) >= self.arch.max_position_embeddings {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer_attn_from_residual_dev: position={} >= \
+                 max_position_embeddings={}", position,
+                self.arch.max_position_embeddings)));
+        }
+
+        let stream_u64 = self.stream.raw();
+
+        // Local h_normed scratch (caller's residual preserved).
+        let h_normed_region = self.arena.region(
+            "g4n_dev_h_normed", (hidden as usize) * 2, 256)?;
+        unsafe {
+            // DtoD copy of residual_dev → h_normed.
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                h_normed_region.device_ptr(), residual_dev,
+                (hidden as usize) * 2, stream_u64 as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "forward_layer_attn_from_residual_dev: residual DtoD copy",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                h_normed_region.device_ptr(),
+                layer.input_layernorm.offset_bytes,
+                stream_u64,
+            )?;
+        }
+
+        // Q/K/V projections + device narrow + norms (same kernel
+        // chain as the host-API method, just no boundary I/O).
+        let q_f32_region = self.arena.region(
+            "g4n_dev_q_f32", (n_q as usize) * 4, 256)?;
+        let k_f32_region = self.arena.region(
+            "g4n_dev_k_f32", (n_kv as usize) * 4, 256)?;
+        let v_f32_region = self.arena.region(
+            "g4n_dev_v_f32", (n_v as usize) * 4, 256)?;
+        unsafe {
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt, h_normed_region.device_ptr(),
+                layer.q_proj.offset_bytes, q_f32_region.device_ptr(),
+                1, n_q, hidden as i32, stream_u64)?;
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt, h_normed_region.device_ptr(),
+                layer.k_proj.offset_bytes, k_f32_region.device_ptr(),
+                1, n_kv, hidden as i32, stream_u64)?;
+            match v_proj_weight {
+                Some(vw) => {
+                    gemma4_nvfp4_attn_proj(
+                        &self.cublaslt, h_normed_region.device_ptr(),
+                        vw.offset_bytes, v_f32_region.device_ptr(),
+                        1, n_v, hidden as i32, stream_u64)?;
+                }
+                None => {
+                    use cudarc::driver::sys::*;
+                    let rc = cuMemcpyDtoDAsync_v2(
+                        v_f32_region.device_ptr(),
+                        k_f32_region.device_ptr(),
+                        (n_v as usize) * 4,
+                        stream_u64 as CUstream);
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(RvllmError::cuda(
+                            "forward_layer_attn_from_residual_dev: k_eq_v DtoD",
+                            CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    }
+                }
+            }
+        }
+
+        let q_region = self.arena.region(
+            "g4n_dev_q_bf16", (n_q as usize) * 2, 256)?;
+        let k_region = self.arena.region(
+            "g4n_dev_k_bf16", (n_kv as usize) * 2, 256)?;
+        let v_region = self.arena.region(
+            "g4n_dev_v_bf16", (n_v as usize) * 2, 256)?;
+        let q_fp8_region = self.arena.region(
+            "g4n_dev_q_fp8", n_q as usize, 256)?;
+        self.launch_f32_to_bf16(
+            q_region.device_ptr(), q_f32_region.device_ptr(), n_q as u32)?;
+        self.launch_f32_to_bf16(
+            k_region.device_ptr(), k_f32_region.device_ptr(), n_kv as u32)?;
+        self.launch_f32_to_bf16(
+            v_region.device_ptr(), v_f32_region.device_ptr(), n_v as u32)?;
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: num_q_heads as u32, hidden: head_dim as u32,
+                eps: self.arch.rms_norm_eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                q_region.device_ptr(), layer.q_norm.offset_bytes, stream_u64)?;
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: num_kv_heads as u32, hidden: head_dim as u32,
+                eps: self.arch.rms_norm_eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                k_region.device_ptr(), layer.k_norm.offset_bytes, stream_u64)?;
+        }
+        self.launch_vnorm_bf16(
+            v_region.device_ptr(), num_kv_heads as u32, head_dim as u32)?;
+        self.fill_pos_slots(kv,
+            /*position_offset=*/position as i32,
+            /*start_slot=*/position as i32,
+            /*num_tokens=*/1)?;
+
+        let k_packed = kv.k_packed_layer_ptrs[layer_idx];
+        let v_packed = kv.v_packed_layer_ptrs[layer_idx];
+        let k_scale  = kv.k_scale_layer_ptrs[layer_idx];
+        let v_scale  = kv.v_scale_layer_ptrs[layer_idx];
+        unsafe {
+            let mut q_in: u64 = q_region.device_ptr();
+            let mut k_in: u64 = k_region.device_ptr();
+            let mut v_in: u64 = v_region.device_ptr();
+            let mut q_out: u64 = q_fp8_region.device_ptr();
+            let mut kp: u64 = k_packed; let mut vp: u64 = v_packed;
+            let mut ks: u64 = k_scale; let mut vs: u64 = v_scale;
+            let mut cos_p: u64 = cos_table_dev;
+            let mut sin_p: u64 = sin_table_dev;
+            let mut positions_ptr: u64 = kv.positions_ptr;
+            let mut slot_ptr: u64 = kv.slot_mapping_ptr;
+            let mut q_scale_ptr: u64 = kv.q_scale_ptr;
+            let mut q_scale_cache_ptr: u64 = 0;
+            let mut hadamard_q: u64 = 0; let mut hadamard_k: u64 = 0;
+            let mut debug_k_prequant: u64 = 0;
+            let mut debug_v_prequant: u64 = 0;
+            let mut nt: i32 = 1;
+            let mut nh: i32 = num_q_heads as i32;
+            let mut nkvh: i32 = num_kv_heads as i32;
+            let mut hd: i32 = head_dim as i32;
+            let mut rd: i32 = rotary_dim as i32;
+            let (mut scale_policy, mut v_scale_policy) =
+                read_nvfp4_kv_policies();
+            let mut rotate_v: i32 = 0;
+            let mut stoch_round_v: i32 = 0;
+            let args = [
+                (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut kp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut ks) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vs) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut positions_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut slot_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_scale_cache_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut scale_policy) as *mut i32 as *mut core::ffi::c_void,
+                (&mut v_scale_policy) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hadamard_q) as *mut u64 as *mut core::ffi::c_void,
+                (&mut hadamard_k) as *mut u64 as *mut core::ffi::c_void,
+                (&mut rotate_v) as *mut i32 as *mut core::ffi::c_void,
+                (&mut debug_k_prequant) as *mut u64 as *mut core::ffi::c_void,
+                (&mut debug_v_prequant) as *mut u64 as *mut core::ffi::c_void,
+                (&mut stoch_round_v) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let max_heads = num_q_heads.max(num_kv_heads) as u32;
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_rope_kv_write_bf16in,
+                (1u32, max_heads, 1u32),
+                (head_dim as u32, 1u32, 1u32),
+                0, stream_u64, &args)?;
+        }
+
+        unsafe {
+            let mut output: u64 = attn_out_dev;
+            let mut query: u64 = q_fp8_region.device_ptr();
+            let mut kp: u64 = k_packed; let mut vp: u64 = v_packed;
+            let mut ks: u64 = k_scale; let mut vs: u64 = v_scale;
+            let mut q_scale_cache_ptr: u64 = 0;
+            let mut block_tables: u64 = kv.block_tables_ptr;
+            let mut context_lens: u64 = kv.context_lens_ptr;
+            let mut q_descale: u64 = kv.q_scale_ptr;
+            let mut scale: f32 = 1.0;
+            let mut nh: i32 = num_q_heads as i32;
+            let mut nkvh: i32 = num_kv_heads as i32;
+            let mut hd: i32 = head_dim as i32;
+            let mut block_size: i32 = kv.block_size as i32;
+            let mut max_blocks_per_seq: i32 = kv.max_pos as i32;
+            let mut window_size_left: i32 = window_size_left;
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut query) as *mut u64 as *mut core::ffi::c_void,
+                (&mut kp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut ks) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vs) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_scale_cache_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut block_tables) as *mut u64 as *mut core::ffi::c_void,
+                (&mut context_lens) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_descale) as *mut u64 as *mut core::ffi::c_void,
+                (&mut scale) as *mut f32 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut block_size) as *mut i32 as *mut core::ffi::c_void,
+                (&mut max_blocks_per_seq) as *mut i32 as *mut core::ffi::c_void,
+                (&mut window_size_left) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let fa2_bc: u32 = 32;
+            let fa2_threads: u32 = 128;
+            let (kernel, grid_y, smem_bytes) = if use_gqa_kernel {
+                let max_gqa: u32 = 4;
+                let smem = 2 * fa2_bc * (head_dim as u32) * 2
+                    + (max_gqa * fa2_bc + fa2_threads / 32) * 4;
+                (self.forward_kernels.fn_attn_decode_gqa_bf16out,
+                 num_kv_heads as u32, smem)
+            } else {
+                let smem = 2 * fa2_bc * (head_dim as u32) * 2
+                    + (fa2_bc + fa2_threads / 32) * 4;
+                (self.forward_kernels.fn_attn_decode_bf16out,
+                 num_q_heads as u32, smem)
+            };
+            if smem_bytes >= 48 * 1024 {
+                use cudarc::driver::sys::*;
+                let rc = cuFuncSetAttribute(
+                    kernel.raw() as CUfunction,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    smem_bytes as i32);
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(RvllmError::cuda(
+                        "forward_layer_attn_from_residual_dev: \
+                         cuFuncSetAttribute",
+                        CudaErrorKind::LaunchFailed, CudaCtx::setup()));
+                }
+            }
+            rvllm_fused::launch_raw(
+                kernel,
+                (1u32, grid_y, 1u32),
+                (fa2_threads, 1u32, 1u32),
+                smem_bytes, stream_u64, &args)?;
+        }
+        Ok(())
+    }
+
+    /// Stream 5a-step2: device-mode post-attention close-out
+    /// (o_proj + post_attention_layernorm + residual add).
+    /// Takes attn_out_dev (bf16) + residual_dev (bf16, updated
+    /// in place). No boundary I/O, no fence.
+    fn forward_layer_post_attn_dev(
+        &self,
+        layer_idx: usize,
+        attn_out_dev: u64,
+        residual_dev: u64,
+    ) -> Result<()> {
+        if layer_idx >= self.arch.num_hidden_layers {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer_post_attn_dev: layer_idx={} >= {}",
+                layer_idx, self.arch.num_hidden_layers)));
+        }
+        let layer = &self.model.layers[layer_idx];
+        let n_q = layer.o_proj.shape[1] as i32;
+        let hidden = self.arch.hidden_size as u32;
+        let stream_u64 = self.stream.raw();
+        let o_f32_region = self.arena.region(
+            "g4n_dev_post_attn_o_f32", (hidden as usize) * 4, 256)?;
+        let o_bf16_region = self.arena.region(
+            "g4n_dev_post_attn_o_bf16", (hidden as usize) * 2, 256)?;
+        unsafe {
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt, attn_out_dev,
+                layer.o_proj.offset_bytes,
+                o_f32_region.device_ptr(),
+                1, hidden as i32, n_q, stream_u64)?;
+        }
+        self.launch_f32_to_bf16(
+            o_bf16_region.device_ptr(),
+            o_f32_region.device_ptr(),
+            hidden)?;
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                o_bf16_region.device_ptr(),
+                layer.post_attention_layernorm.offset_bytes,
+                stream_u64)?;
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }
+                .launch(
+                    self.forward_kernels.fn_vector_add_bf16,
+                    residual_dev,
+                    o_bf16_region.device_ptr(),
+                    stream_u64)?;
+        }
+        Ok(())
+    }
+
+    /// Stream 5a-step2: device-mode post-MLP close-out. Updates
+    /// residual_dev (bf16) in place. The layer_scalar host scale
+    /// loop still costs ONE fence + DtoH(hidden*2 + 2) + HtoD per
+    /// layer — Stream 5b (bf16 scaled_add kernel) eliminates it.
+    fn forward_layer_post_attn_mlp_dev(
+        &self,
+        layer_idx: usize,
+        residual_dev: u64,
+    ) -> Result<()> {
+        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        if layer_idx >= self.arch.num_hidden_layers {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer_post_attn_mlp_dev: layer_idx={} >= {}",
+                layer_idx, self.arch.num_hidden_layers)));
+        }
+        let layer = &self.model.layers[layer_idx];
+        let hidden = self.arch.hidden_size as u32;
+        let intermediate = self.arch.intermediate_size as u32;
+        let stream_u64 = self.stream.raw();
+
+        let h_normed_region = self.arena.region(
+            "g4n_dev_pamlp_normed", (hidden as usize) * 2, 256)?;
+        let scratch_region = self.arena.region(
+            "g4n_dev_pamlp_scratch", (2 * intermediate as usize) * 2, 256)?;
+        let mlp_out_region = self.arena.region(
+            "g4n_dev_pamlp_out", (hidden as usize) * 2, 256)?;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                h_normed_region.device_ptr(), residual_dev,
+                (hidden as usize) * 2, stream_u64 as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "forward_layer_post_attn_mlp_dev: residual DtoD",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                h_normed_region.device_ptr(),
+                layer.pre_feedforward_layernorm.offset_bytes,
+                stream_u64)?;
+            crate::gemma4_nvfp4_ops::gemma4_nvfp4_mlp_forward(
+                &self.mlp_kernels,
+                h_normed_region.device_ptr(),
+                mlp_out_region.device_ptr(),
+                &layer.gate_proj, &layer.up_proj, &layer.down_proj,
+                scratch_region.device_ptr(), stream_u64)?;
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                mlp_out_region.device_ptr(),
+                layer.post_feedforward_layernorm.offset_bytes,
+                stream_u64)?;
+        }
+
+        // Layer_scalar host scale — the last per-layer fence
+        // before Stream 5b's bf16 scaled_add kernel removes it.
+        let mut mlp_normed_bf16 = vec![0u16; hidden as usize];
+        let mut scalar_bf16 = [0u16; 1];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                mlp_normed_bf16.as_mut_ptr() as *mut _,
+                mlp_out_region.device_ptr(),
+                (hidden as usize) * 2);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "forward_layer_post_attn_mlp_dev: mlp_normed DtoH",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+            let rc = cuMemcpyDtoH_v2(
+                scalar_bf16.as_mut_ptr() as *mut _,
+                layer.layer_scalar.offset_bytes, 2);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "forward_layer_post_attn_mlp_dev: layer_scalar DtoH",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+        }
+        let layer_scalar_f32 = f32::from_bits((scalar_bf16[0] as u32) << 16);
+        let scaled_bf16: Vec<u16> = mlp_normed_bf16.iter().map(|&b| {
+            let v = f32::from_bits((b as u32) << 16) * layer_scalar_f32;
+            let bits = v.to_bits();
+            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+            (rounded >> 16) as u16
+        }).collect();
+        unsafe {
+            let s: &[u8] = std::slice::from_raw_parts(
+                scaled_bf16.as_ptr() as *const u8, scaled_bf16.len() * 2);
+            mlp_out_region.copy_from_host(s)?;
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }
+                .launch(
+                    self.forward_kernels.fn_vector_add_bf16,
+                    residual_dev,
+                    mlp_out_region.device_ptr(),
+                    stream_u64)?;
+        }
+        Ok(())
+    }
+
     /// Commit #5c: 60-layer driver for a single-token decode at
     /// `position`. Chains:
     ///   embed_tokens[token_id] → for each of `num_hidden_layers`:
@@ -2883,11 +3382,13 @@ impl Gemma4Nvfp4Bringup {
     ///     residual = forward_layer_post_attn_mlp(layer_idx, residual)
     ///   → forward_final_to_token(residual) → argmax token id
     ///
-    /// All inter-layer state lives on the host as bf16 (DtoH ↔
-    /// HtoD between layers). This is structurally correct but
-    /// inefficient — each layer round-trips the residual through
-    /// PCIe. A future "stay-on-device" forward keeps residual +
-    /// attn_out in HBM and skips ~120 DtoH/HtoD copies per token.
+    /// Stream 5a-step2 (this commit): single-token forward now
+    /// uses the device-resident _dev variants of each per-layer
+    /// step. Residual stays on device across all 60 layers, so
+    /// the prior per-method fence + DtoH + HtoD cycle is gone.
+    /// The N-token prompt path (`forward_prompt_to_token`) still
+    /// uses the host-API chain; the same refactor for it lands
+    /// in a follow-up once the dump-mode path is reconciled.
     ///
     /// `kv` MUST have `max_pos > position`. Caller manages the
     /// position counter across multi-token decode loops.
@@ -2966,45 +3467,89 @@ impl Gemma4Nvfp4Bringup {
             );
         };
 
-        let mut residual_bf16 = self.embed_one_token_bf16(token_id)?;
-        dump_bf16("step_00_embed", &residual_bf16)?;
+        // Dump-mode path: G4N_DUMP_DIR is opt-in for diagnostic
+        // cosine validation against an HF reference. Use the
+        // host-API chain so each .bin lands at the same boundary
+        // as before. Slower, but expected since dump mode is
+        // diagnostic-only.
+        if dump_dir.is_some() {
+            let mut residual_bf16 = self.embed_one_token_bf16(token_id)?;
+            dump_bf16("step_00_embed", &residual_bf16)?;
+            for li in 0..self.arch.num_hidden_layers {
+                let attn_out_f32 = self.forward_layer_attn_from_residual(
+                    li, &residual_bf16, position, kv)?;
+                let attn_out_bf16 = f32_to_bf16_vec(&attn_out_f32);
+                dump_bf16(&format!("step_{:02}_attn_out", li), &attn_out_bf16)?;
+                let resid_after_attn_f32 = self.forward_layer_post_attn(
+                    li, &attn_out_bf16, &residual_bf16)?;
+                let resid_after_attn_bf16 = f32_to_bf16_vec(&resid_after_attn_f32);
+                dump_bf16(&format!("step_{:02}_post_attn", li),
+                          &resid_after_attn_bf16)?;
+                let resid_after_mlp_f32 = self.forward_layer_post_attn_mlp(
+                    li, &resid_after_attn_bf16)?;
+                residual_bf16 = f32_to_bf16_vec(&resid_after_mlp_f32);
+                dump_bf16(&format!("step_{:02}_post_mlp", li), &residual_bf16)?;
+                if trace_on && (li % 10 == 0
+                                || li == self.arch.num_hidden_layers - 1) {
+                    log_stats(li, "post_mlp", &residual_bf16);
+                }
+            }
+            return self.forward_final_to_token_with_dump(
+                &residual_bf16, dump_dir.as_ref().unwrap());
+        }
 
+        // Production path (no dump): device-resident residual
+        // across all 60 layers via the _dev inner methods.
+        let _scratch_guard = self.forward_scratch_guard();
+        let hidden = self.arch.hidden_size as u32;
+        // attn_out scratch sized for the LARGEST per-layer
+        // n_q across layer types (global = 32*512 = 16384 bf16
+        // elems; sliding = 32*256 = 8192).
+        let max_n_q: usize = self.model.layers.iter()
+            .map(|l| l.q_proj.shape[0]).max().unwrap_or(0);
+        let residual_dev = self.arena.region(
+            "g4n_drv_residual_bf16", (hidden as usize) * 2, 256)?;
+        let attn_out_dev = self.arena.region(
+            "g4n_drv_attn_out_bf16", max_n_q * 2, 256)?;
+        self.embed_one_token_to_device(token_id, residual_dev.device_ptr())?;
         for li in 0..self.arch.num_hidden_layers {
-            let attn_out_f32 = self.forward_layer_attn_from_residual(
-                li, &residual_bf16, position, kv)?;
-            let attn_out_bf16 = f32_to_bf16_vec(&attn_out_f32);
-            dump_bf16(&format!("step_{:02}_attn_out", li), &attn_out_bf16)?;
-
-            let resid_after_attn_f32 = self.forward_layer_post_attn(
-                li, &attn_out_bf16, &residual_bf16)?;
-            let resid_after_attn_bf16 = f32_to_bf16_vec(&resid_after_attn_f32);
-            dump_bf16(&format!("step_{:02}_post_attn", li),
-                      &resid_after_attn_bf16)?;
-
-            let resid_after_mlp_f32 = self.forward_layer_post_attn_mlp(
-                li, &resid_after_attn_bf16)?;
-            residual_bf16 = f32_to_bf16_vec(&resid_after_mlp_f32);
-            dump_bf16(&format!("step_{:02}_post_mlp", li), &residual_bf16)?;
-
-            // Periodic trace (every 10 layers + last).
+            self.forward_layer_attn_from_residual_dev(
+                li, residual_dev.device_ptr(), position, kv,
+                attn_out_dev.device_ptr())?;
+            self.forward_layer_post_attn_dev(
+                li, attn_out_dev.device_ptr(), residual_dev.device_ptr())?;
+            self.forward_layer_post_attn_mlp_dev(
+                li, residual_dev.device_ptr())?;
             if trace_on && (li % 10 == 0
                             || li == self.arch.num_hidden_layers - 1) {
-                log_stats(li, "post_mlp", &residual_bf16);
+                // Trace requires DtoH — opt-in only, so the
+                // per-decade-of-layers sync is acceptable.
+                self.stream.fence()?;
+                let mut h = vec![0u16; hidden as usize];
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(
+                        h.as_mut_ptr() as *mut _,
+                        residual_dev.device_ptr(),
+                        (hidden as usize) * 2);
+                }
+                log_stats(li, "post_mlp", &h);
             }
         }
-
-        // Final-norm + tied LM head with optional dump of the
-        // post-norm hidden state and the f32 logits before argmax.
-        if let Some(d) = dump_dir.as_ref() {
-            // We need the post-final-norm bf16 + the f32 logits in
-            // SAME buffer addresses the production forward uses, so
-            // we have to recreate that op chain here (the
-            // `forward_final_to_token` method does it all in one
-            // shot; dumping requires teeing intermediates).
-            self.forward_final_to_token_with_dump(&residual_bf16, d)
-        } else {
-            self.forward_final_to_token(&residual_bf16)
+        self.stream.fence()?;
+        let mut residual_host = vec![0u16; hidden as usize];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                residual_host.as_mut_ptr() as *mut _,
+                residual_dev.device_ptr(),
+                (hidden as usize) * 2);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(corrupt_runtime_err(
+                    "forward_full_to_token: residual DtoH".into()));
+            }
         }
+        self.forward_final_to_token(&residual_host)
     }
 
     /// Commit #5f: multi-token prompt processing on Option B.
