@@ -644,3 +644,20 @@ blocking the prefill rollout above.
 - **bf16 vision forward**: kernels are committed, wiring is not.
   Don't enable until the per-sub-step debug plan in
   `v3/GEMMA_VISION_AUDIT.md` is run through.
+
+## Option B (Gemma 4 31B NVFP4) — deferred-work register
+
+Active branch `rusty_sm121_qwen36_26b`. Floor + Stream-5a/b
+landed (`bc89650..32d0b0e`). #5f-PRIME and #5g scaffolds at
+`fac2114` and `49a4ff0`. 60-layer single-token forward +
+device-resident residual + scaled-add kernel + Option B routed
+through `cuda_worker` text-only at 0.31 s/token. All 14 ondisk
+smokes pass; argmax stable. Remaining streams from the codex
+review:
+
+| Stream | Status | Next concrete step |
+|---|---|---|
+| #5f-PRIME (unified NVFP4 prefill) | Kernel handle loaded; not wired. | Inline launcher mirroring `PagedPrefillNvfp4Launcher::launch_nvfp4kv_unified_sm121` (~200 LOC) + batched M>1 MLP path (~300-500 LOC). Routes `forward_prompt_to_token` through unified prefill for N>1. |
+| Stream-6a (BaseKvSource trait) | `Gemma4Nvfp4Bringup::drafter_base_kv_view` returns a `DrafterBaseKvView`. Production drafter not yet consuming it. | Define `BaseKvSource` trait, implement for production `KvCache` + `Gemma4Nvfp4KvState`. Parameterize `populate_shadow_kv*_from_base` (gemma4_bring_up.rs:4583, 5742). Flip the `cuda_worker.rs` `spec_decode=1` rejection for `Gemma4Nvfp4`. |
+| Stream-6b (Hadamard drafter Q rotation) | Off on Option B (sign tables not allocated). | If Hadamard later turns on for Option B (production NVFP4 profile uses it), the drafter's Q must be rotated by the same per-layer R before cross-attn via `hadamard_rotate_f16_kernel`. Per-layer sign vectors live in production's `Gemma4LayerScratch.hadamard_signs_k`; Option B needs the same allocation + production-side rotate/unrotate (gemma4_bring_up.rs:4790-4860, :8985). Blocked by Stream-6a. |
+| Stream-7 (vision real splice) | Admission rejects vision for Gemma4Nvfp4 (commit `71cdcac`). Real splice deferred. | Attach Gemma ViT weights to `Gemma4Nvfp4LoadedModel` (loader change in `gemma4_nvfp4_load.rs` + new vision field). The ViT is weight-format-agnostic, runs in bf16. Splice output rows into Option B's device residual buffer between `embed_one_token_to_device` and the layer loop. Needs the multi-token device path from #5f-PRIME OR per-token-loop with vision-slot indexing. |
