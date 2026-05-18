@@ -1009,6 +1009,27 @@ impl Gemma4Nvfp4Bringup {
         let mut verify_rows_total = 0usize;
         let mut shadow_slots_total = 0usize;
         let mut bailout_tokens = 0usize;
+        let adaptive_k_enabled =
+            std::env::var("G4N_SPEC_ADAPTIVE_K").ok().as_deref() != Some("0")
+                && spec_k > 1;
+        let adaptive_min_k = std::env::var("G4N_SPEC_ADAPTIVE_MIN_K")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(3)
+            .clamp(1, spec_k);
+        let adaptive_window_iters = std::env::var("G4N_SPEC_ADAPTIVE_WINDOW_ITERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4)
+            .max(1);
+        let mut adaptive_k = if adaptive_k_enabled {
+            spec_k.min(3).max(adaptive_min_k.min(spec_k))
+        } else {
+            spec_k
+        };
+        let mut adaptive_window_iter_count = 0usize;
+        let mut adaptive_window_accept_count = 0usize;
+        let mut adaptive_k_sum = 0usize;
 
         // Prefill prompt and snapshot the prompt-final base hidden for
         // drafter step 0.
@@ -1068,11 +1089,17 @@ impl Gemma4Nvfp4Bringup {
 
         while emitted.len() < max_new {
             let remaining = max_new - emitted.len();
+            let target_k = if adaptive_k_enabled {
+                adaptive_k
+            } else {
+                spec_k
+            };
             let k_eff = if remaining > 1 {
-                spec_k.min(remaining - 1)
+                target_k.min(remaining - 1)
             } else {
                 1
             };
+            adaptive_k_sum += k_eff;
             let iter_ctx_start = ctx_len;
 
             let drafter_t0 = std::time::Instant::now();
@@ -1167,6 +1194,22 @@ impl Gemma4Nvfp4Bringup {
                 zero_accept_iters = 0;
             }
 
+            if adaptive_k_enabled {
+                adaptive_window_iter_count += 1;
+                adaptive_window_accept_count += n_acc;
+                if adaptive_window_iter_count >= adaptive_window_iters {
+                    let lhs = adaptive_window_accept_count * 100;
+                    let rhs = adaptive_window_iter_count * adaptive_k;
+                    if adaptive_k > adaptive_min_k && lhs < rhs * 55 {
+                        adaptive_k -= 1;
+                    } else if adaptive_k < spec_k && lhs >= rhs * 90 {
+                        adaptive_k += 1;
+                    }
+                    adaptive_window_iter_count = 0;
+                    adaptive_window_accept_count = 0;
+                }
+            }
+
             if zero_accept_bailout_iters > 0 && zero_accept_iters >= zero_accept_bailout_iters {
                 let bailout_t0 = std::time::Instant::now();
                 while emitted.len() < max_new {
@@ -1193,7 +1236,7 @@ impl Gemma4Nvfp4Bringup {
             eprintln!(
                 "[g4n-spec-timing] prompt={} max_new={} K={} emitted={} \
                  spec_tokens={} bailout_tokens={} iters={} accepted={} \
-                 draft_steps={} verify_rows={} shadow_slots={} \
+                 draft_steps={} verify_rows={} shadow_slots={} k_avg={:.3} \
                  prefill_ms={:.3} drafter_ms={:.3} verify_ms={:.3} \
                  shadow_ms={:.3} bailout_ms={:.3} other_ms={:.3} \
                  total_ms={:.3}",
@@ -1208,6 +1251,11 @@ impl Gemma4Nvfp4Bringup {
                 draft_steps_total,
                 verify_rows_total,
                 shadow_slots_total,
+                if n_iters > 0 {
+                    adaptive_k_sum as f64 / n_iters as f64
+                } else {
+                    0.0
+                },
                 prefill_elapsed.as_secs_f64() * 1000.0,
                 drafter_elapsed.as_secs_f64() * 1000.0,
                 verify_elapsed.as_secs_f64() * 1000.0,
