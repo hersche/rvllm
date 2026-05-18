@@ -349,6 +349,16 @@ pub struct Gemma4Nvfp4Bringup {
     pub model: Gemma4Nvfp4LoadedModel,
     pub mlp_kernels: Gemma4Nvfp4MlpKernels,
     forward_kernels: ForwardKernels,
+    /// Stream-#5f-PRIME: per-head-dim attention backends. The
+    /// production `PagedPrefillNvfp4Launcher::launch_nvfp4kv
+    /// _unified_sm121` (prefill.rs:1041) takes an
+    /// `AttentionBackend` whose `head_dim()` must match
+    /// `params.head_dim`. Production Gemma 4 loads two
+    /// instances at startup (sliding + global); we mirror
+    /// the same pattern so per-layer dispatch works without
+    /// re-validation per call.
+    attn_backend_sliding: rvllm_attention::AttentionBackend,
+    attn_backend_global: rvllm_attention::AttentionBackend,
     /// PTX modules backing `mlp_kernels`. Kept alive here.
     _mlp_w4a16_gemv_mod: LoadedModule,
     _mlp_w4a16_gate_up_mod: LoadedModule,
@@ -466,19 +476,9 @@ impl Gemma4Nvfp4Bringup {
         let fn_scaled_add_bf16 =
             scaled_add_bf16_mod.get_function("g4n_scaled_add_bf16_kernel")?;
 
-        // #5f-PRIME scaffold: best-effort load of the unified
-        // NVFP4 prefill kernel. Already in the production
-        // manifest (kernels/flash_attention_unified_prefill_nvfp4kv.cu);
-        // Option B just registers the handle here so a future
-        // commit can wire `forward_prompt_to_token` to call it
-        // instead of looping the decode kernel N times. Wiring
-        // requires Fa2PtxKernels (the full attention backend)
-        // OR an inline launcher mirroring
-        // PagedPrefillNvfp4Launcher::launch_nvfp4kv_unified_sm121,
-        // PLUS a batched M>1 MLP path (current MLP kernels are
-        // M=1 GEMV); ~500-800 LOC of follow-up. Until then the
-        // handle stays unwired and the per-token-decode-loop
-        // fallback runs (codex Stream-5+6+7 scope).
+        // Stream #5f-PRIME: still load this handle ourselves
+        // for the per-launcher path (deprecated by the
+        // AttentionBackend below but kept until callers move).
         let (unified_prefill_nvfp4kv_mod,
              fn_prefill_nvfp4kv_unified_bf16out) =
             match loader.load_ptx("flash_attention_unified_prefill_nvfp4kv") {
@@ -492,6 +492,19 @@ impl Gemma4Nvfp4Bringup {
                 }
                 Err(_) => (None, None),
             };
+
+        // Stream-#5f-PRIME: production attention backends, one
+        // per head_dim. Loading Fa2PtxKernels pulls in extra
+        // PTX modules (decode + prefill + bf16 variants + …)
+        // but they're small. The backend is what the
+        // `PagedPrefillNvfp4Launcher` consumes for the
+        // batched-N attention path.
+        let attn_backend_sliding = rvllm_attention::AttentionBackend::Fa2Ptx(
+            rvllm_attention::Fa2PtxKernels::load(
+                &loader, arch.head_dim_sliding as u32)?);
+        let attn_backend_global = rvllm_attention::AttentionBackend::Fa2Ptx(
+            rvllm_attention::Fa2PtxKernels::load(
+                &loader, arch.head_dim_global as u32)?);
 
         // MLP kernels (commit #3).
         let mlp_gemv_mod = loader.load_ptx("mistral35_w4a16_gemv_bf16")?;
@@ -544,6 +557,8 @@ impl Gemma4Nvfp4Bringup {
             model,
             mlp_kernels,
             forward_kernels,
+            attn_backend_sliding,
+            attn_backend_global,
             _mlp_w4a16_gemv_mod: mlp_gemv_mod,
             _mlp_w4a16_gate_up_mod: mlp_gate_up_mod,
             _mlp_gelu_tanh_mul_mod: mlp_gelu_mod,
@@ -3365,6 +3380,340 @@ impl Gemma4Nvfp4Bringup {
         Ok(())
     }
 
+    /// Stream-#5f-PRIME: BATCHED layer-attention. Processes
+    /// `num_tokens` tokens through one layer's attention in a
+    /// single unified-prefill kernel launch instead of N
+    /// separate decode launches. Same kernel chain as the
+    /// single-token `_dev` variant for everything except the
+    /// final attention op:
+    ///
+    ///   input_layernorm (num_tokens=N) → Q/K/V GEMM (M=N) →
+    ///   f32→bf16 (N×dim) → Q-norm + K-norm (per-(token,head))
+    ///   → V-norm (per-(token,head)) → fill_pos_slots
+    ///   (num_tokens=N, position_offset=start, start_slot=start)
+    ///   → rope_kv_write (grid (N, max_heads, 1)) →
+    ///   PagedPrefillNvfp4Launcher::launch_nvfp4kv_unified_sm121
+    ///   (one launch over N q-rows)
+    ///
+    /// SAFETY: `residual_dev` size = num_tokens * hidden_size * 2
+    /// bytes; `attn_out_dev` size = num_tokens * num_q_heads *
+    /// head_dim * 2 bytes. Caller owns lifetime.
+    fn forward_layer_attn_batched_prefill_dev(
+        &self,
+        layer_idx: usize,
+        num_tokens: u32,
+        residual_dev: u64,
+        position_start: u32,
+        kv: &Gemma4Nvfp4KvState,
+        attn_out_dev: u64,
+    ) -> Result<()> {
+        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_loader::gemma4_arch::Gemma4LayerType;
+
+        if num_tokens == 0 {
+            return Err(corrupt_runtime_err(
+                "forward_layer_attn_batched_prefill_dev: num_tokens=0".into()));
+        }
+        if layer_idx >= self.arch.num_hidden_layers {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer_attn_batched_prefill_dev: layer_idx={} >= {}",
+                layer_idx, self.arch.num_hidden_layers)));
+        }
+        if num_tokens > kv.max_query_tokens {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer_attn_batched_prefill_dev: num_tokens={} > \
+                 kv.max_query_tokens={} (rebuild KV state via \
+                 allocate_kv_state_with_chunk)",
+                num_tokens, kv.max_query_tokens)));
+        }
+        if (position_start as u64) + (num_tokens as u64) > (kv.max_pos as u64) {
+            return Err(corrupt_runtime_err(format!(
+                "forward_layer_attn_batched_prefill_dev: position_start={} + \
+                 num_tokens={} > kv.max_pos={}",
+                position_start, num_tokens, kv.max_pos)));
+        }
+        let layer = &self.model.layers[layer_idx];
+        let hidden = self.arch.hidden_size as u32;
+        let is_global = matches!(
+            self.arch.layer_types[layer_idx], Gemma4LayerType::GlobalAttention);
+        #[allow(unused_variables)]
+        let (head_dim, rotary_dim, _theta, window_size_left,
+             cos_table_dev, sin_table_dev, backend) = if is_global {
+            (self.arch.head_dim_global,
+             self.arch.rotary_dim_global(),
+             self.arch.rope_theta_global as f64,
+             -1i32,
+             self.model.outside.rope_cos_global.offset_bytes,
+             self.model.outside.rope_sin_global.offset_bytes,
+             &self.attn_backend_global)
+        } else {
+            (self.arch.head_dim_sliding,
+             self.arch.head_dim_sliding,
+             self.arch.rope_theta_sliding as f64,
+             (self.arch.sliding_window_size as i32) - 1,
+             self.model.outside.rope_cos_sliding.offset_bytes,
+             self.model.outside.rope_sin_sliding.offset_bytes,
+             &self.attn_backend_sliding)
+        };
+        let n_q = layer.q_proj.shape[0] as i32;
+        let n_kv = layer.k_proj.shape[0] as i32;
+        let v_proj_weight: Option<&rvllm_loader::weights::F16Weight>;
+        let n_v: i32;
+        if is_global {
+            if layer.v_proj.is_some() {
+                return Err(corrupt_runtime_err(format!(
+                    "batched: layer {layer_idx} Global but v_proj present")));
+            }
+            v_proj_weight = None;
+            n_v = n_kv;
+        } else {
+            let vw = layer.v_proj.as_ref().ok_or_else(|| corrupt_runtime_err(
+                format!("batched: layer {layer_idx} sliding but v_proj absent")))?;
+            n_v = vw.shape[0] as i32;
+            v_proj_weight = Some(vw);
+        }
+        let num_q_heads = (n_q as usize) / head_dim;
+        let num_kv_heads = (n_kv as usize) / head_dim;
+        let stream_u64 = self.stream.raw();
+        let n = num_tokens as usize;
+
+        // h_normed scratch [N * hidden] bf16. DtoD copy of
+        // residual then in-place input_layernorm with num_tokens=N.
+        let h_normed_region = self.arena.region(
+            "g4n_batch_h_normed", n * (hidden as usize) * 2, 256)?;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                h_normed_region.device_ptr(), residual_dev,
+                n * (hidden as usize) * 2, stream_u64 as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "batched: residual DtoD",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens, hidden, eps: self.arch.rms_norm_eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                h_normed_region.device_ptr(),
+                layer.input_layernorm.offset_bytes,
+                stream_u64,
+            )?;
+        }
+
+        // Q/K/V GEMM with M=N. f32 scratch sized N×dim.
+        let q_f32_region = self.arena.region(
+            "g4n_batch_q_f32", n * (n_q as usize) * 4, 256)?;
+        let k_f32_region = self.arena.region(
+            "g4n_batch_k_f32", n * (n_kv as usize) * 4, 256)?;
+        let v_f32_region = self.arena.region(
+            "g4n_batch_v_f32", n * (n_v as usize) * 4, 256)?;
+        unsafe {
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt, h_normed_region.device_ptr(),
+                layer.q_proj.offset_bytes, q_f32_region.device_ptr(),
+                num_tokens as i32, n_q, hidden as i32, stream_u64)?;
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt, h_normed_region.device_ptr(),
+                layer.k_proj.offset_bytes, k_f32_region.device_ptr(),
+                num_tokens as i32, n_kv, hidden as i32, stream_u64)?;
+            match v_proj_weight {
+                Some(vw) => {
+                    gemma4_nvfp4_attn_proj(
+                        &self.cublaslt, h_normed_region.device_ptr(),
+                        vw.offset_bytes, v_f32_region.device_ptr(),
+                        num_tokens as i32, n_v, hidden as i32, stream_u64)?;
+                }
+                None => {
+                    use cudarc::driver::sys::*;
+                    let rc = cuMemcpyDtoDAsync_v2(
+                        v_f32_region.device_ptr(),
+                        k_f32_region.device_ptr(),
+                        n * (n_v as usize) * 4,
+                        stream_u64 as CUstream);
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(RvllmError::cuda(
+                            "batched: k_eq_v DtoD",
+                            CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    }
+                }
+            }
+        }
+
+        // f32 → bf16 narrow on device.
+        let q_region = self.arena.region(
+            "g4n_batch_q_bf16", n * (n_q as usize) * 2, 256)?;
+        let k_region = self.arena.region(
+            "g4n_batch_k_bf16", n * (n_kv as usize) * 2, 256)?;
+        let v_region = self.arena.region(
+            "g4n_batch_v_bf16", n * (n_v as usize) * 2, 256)?;
+        let q_fp8_region = self.arena.region(
+            "g4n_batch_q_fp8", n * (n_q as usize), 256)?;
+        self.launch_f32_to_bf16(
+            q_region.device_ptr(), q_f32_region.device_ptr(),
+            (n * n_q as usize) as u32)?;
+        self.launch_f32_to_bf16(
+            k_region.device_ptr(), k_f32_region.device_ptr(),
+            (n * n_kv as usize) as u32)?;
+        self.launch_f32_to_bf16(
+            v_region.device_ptr(), v_f32_region.device_ptr(),
+            (n * n_v as usize) as u32)?;
+
+        // Q/K/V-norm operate per-(token, head). Flat-row count:
+        //   Q-norm:  N * num_q_heads  rows of head_dim
+        //   K-norm:  N * num_kv_heads rows of head_dim
+        //   V-norm:  N * num_kv_heads rows of head_dim
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: (n as u32) * (num_q_heads as u32),
+                hidden: head_dim as u32,
+                eps: self.arch.rms_norm_eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                q_region.device_ptr(), layer.q_norm.offset_bytes, stream_u64)?;
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: (n as u32) * (num_kv_heads as u32),
+                hidden: head_dim as u32,
+                eps: self.arch.rms_norm_eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                k_region.device_ptr(), layer.k_norm.offset_bytes, stream_u64)?;
+        }
+        self.launch_vnorm_bf16(
+            v_region.device_ptr(),
+            (n as u32) * (num_kv_heads as u32),
+            head_dim as u32)?;
+
+        // Metadata fill: positions[t] = position_start + t (mode B
+        // = absolute slot for full f16 RoPE tables); slot_mapping
+        // = same; context_lens[t] = position_start + t + 1.
+        self.fill_pos_slots(kv,
+            position_start as i32, position_start as i32,
+            num_tokens as i32)?;
+
+        // cu_seqlens_q for one sequence of length N: [0, N].
+        let cu_seqlens_region = self.arena.region(
+            "g4n_batch_cu_seqlens", 2 * 4, 16)?;
+        unsafe {
+            let cu: [i32; 2] = [0, num_tokens as i32];
+            let bytes: &[u8] = std::slice::from_raw_parts(
+                cu.as_ptr() as *const u8, 8);
+            cu_seqlens_region.copy_from_host(bytes)?;
+        }
+
+        let k_packed = kv.k_packed_layer_ptrs[layer_idx];
+        let v_packed = kv.v_packed_layer_ptrs[layer_idx];
+        let k_scale  = kv.k_scale_layer_ptrs[layer_idx];
+        let v_scale  = kv.v_scale_layer_ptrs[layer_idx];
+
+        // RoPE + KV write — kernel already takes num_tokens.
+        unsafe {
+            let mut q_in: u64 = q_region.device_ptr();
+            let mut k_in: u64 = k_region.device_ptr();
+            let mut v_in: u64 = v_region.device_ptr();
+            let mut q_out: u64 = q_fp8_region.device_ptr();
+            let mut kp: u64 = k_packed; let mut vp: u64 = v_packed;
+            let mut ks: u64 = k_scale; let mut vs: u64 = v_scale;
+            let mut cos_p: u64 = cos_table_dev;
+            let mut sin_p: u64 = sin_table_dev;
+            let mut positions_ptr: u64 = kv.positions_ptr;
+            let mut slot_ptr: u64 = kv.slot_mapping_ptr;
+            let mut q_scale_ptr: u64 = kv.q_scale_ptr;
+            let mut q_scale_cache_ptr: u64 = 0;
+            let mut hadamard_q: u64 = 0; let mut hadamard_k: u64 = 0;
+            let mut debug_k_prequant: u64 = 0;
+            let mut debug_v_prequant: u64 = 0;
+            let mut nt: i32 = num_tokens as i32;
+            let mut nh: i32 = num_q_heads as i32;
+            let mut nkvh: i32 = num_kv_heads as i32;
+            let mut hd: i32 = head_dim as i32;
+            let mut rd: i32 = rotary_dim as i32;
+            let (mut scale_policy, mut v_scale_policy) =
+                read_nvfp4_kv_policies();
+            let mut rotate_v: i32 = 0;
+            let mut stoch_round_v: i32 = 0;
+            let args = [
+                (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut kp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut ks) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vs) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut positions_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut slot_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_scale_cache_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut scale_policy) as *mut i32 as *mut core::ffi::c_void,
+                (&mut v_scale_policy) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hadamard_q) as *mut u64 as *mut core::ffi::c_void,
+                (&mut hadamard_k) as *mut u64 as *mut core::ffi::c_void,
+                (&mut rotate_v) as *mut i32 as *mut core::ffi::c_void,
+                (&mut debug_k_prequant) as *mut u64 as *mut core::ffi::c_void,
+                (&mut debug_v_prequant) as *mut u64 as *mut core::ffi::c_void,
+                (&mut stoch_round_v) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let max_heads = num_q_heads.max(num_kv_heads) as u32;
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_rope_kv_write_bf16in,
+                (num_tokens, max_heads, 1u32),
+                (head_dim as u32, 1u32, 1u32),
+                0, stream_u64, &args)?;
+        }
+
+        // Unified NVFP4 prefill kernel — ONE launch covers all N
+        // q-rows with causal softmax inside.
+        let tile_size: u32 = if head_dim <= 256 { 32 } else { 16 };
+        let num_queries_per_kv = (num_q_heads as u32) / (num_kv_heads as u32);
+        let block_q = (rvllm_attention::UNIFIED_PREFILL_BLOCK_M
+            / num_queries_per_kv.max(1)).max(1);
+        let params = rvllm_attention::PagedPrefillParams {
+            num_seqs: 1,
+            num_tokens,
+            num_heads: num_q_heads as u32,
+            num_kv_heads: num_kv_heads as u32,
+            head_dim: head_dim as u32,
+            block_size: kv.block_size,
+            max_blocks_per_seq: kv.max_pos,
+            num_blocks_total: kv.max_pos,
+            scale: 1.0,           // Gemma 4 QK-norm absorbs 1/sqrt(d_k)
+            window_size_left,
+        };
+        let unified = rvllm_attention::UnifiedPrefillParams {
+            num_queries_per_kv,
+            tile_size,
+            block_q,
+            use_mma: true,
+        };
+        let prefill = rvllm_attention::PagedPrefillNvfp4Launcher::new(backend);
+        unsafe {
+            prefill.launch_nvfp4kv_unified_sm121(
+                params,
+                unified,
+                attn_out_dev,                   // o (bf16)
+                q_fp8_region.device_ptr(),      // q (fp8)
+                k_packed, v_packed,
+                k_scale,  v_scale,
+                0,                              // q_scale_cache (none)
+                kv.block_tables_ptr,
+                cu_seqlens_region.device_ptr(),
+                kv.context_lens_ptr,
+                kv.q_scale_ptr,                 // q_descale fallback
+                true,                           // output_bf16
+                stream_u64,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Stream 5a-step2: device-mode post-attention close-out
     /// (o_proj + post_attention_layernorm + residual add).
     /// Takes attn_out_dev (bf16) + residual_dev (bf16, updated
@@ -3486,6 +3835,144 @@ impl Gemma4Nvfp4Bringup {
             hidden,
         )?;
         let _ = stream_u64;
+        Ok(())
+    }
+
+    /// Stream-#5f-PRIME: batched post-attention close-out.
+    /// Same as `forward_layer_post_attn_dev` but processes N
+    /// tokens — o_proj at M=N, RMSNorm over N rows,
+    /// scaled-add over N*hidden elements.
+    fn forward_layer_post_attn_batched_dev(
+        &self,
+        layer_idx: usize,
+        num_tokens: u32,
+        attn_out_dev: u64,
+        residual_dev: u64,
+    ) -> Result<()> {
+        if layer_idx >= self.arch.num_hidden_layers {
+            return Err(corrupt_runtime_err(format!(
+                "post_attn_batched_dev: layer_idx={} >= {}",
+                layer_idx, self.arch.num_hidden_layers)));
+        }
+        let layer = &self.model.layers[layer_idx];
+        let n_q = layer.o_proj.shape[1] as i32;
+        let hidden = self.arch.hidden_size as u32;
+        let n = num_tokens as usize;
+        let stream_u64 = self.stream.raw();
+        let o_f32_region = self.arena.region(
+            "g4n_batch_o_f32", n * (hidden as usize) * 4, 256)?;
+        let o_bf16_region = self.arena.region(
+            "g4n_batch_o_bf16", n * (hidden as usize) * 2, 256)?;
+        unsafe {
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt, attn_out_dev,
+                layer.o_proj.offset_bytes,
+                o_f32_region.device_ptr(),
+                num_tokens as i32, hidden as i32, n_q, stream_u64)?;
+        }
+        self.launch_f32_to_bf16(
+            o_bf16_region.device_ptr(),
+            o_f32_region.device_ptr(),
+            (n * (hidden as usize)) as u32)?;
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens, hidden, eps: self.arch.rms_norm_eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                o_bf16_region.device_ptr(),
+                layer.post_attention_layernorm.offset_bytes,
+                stream_u64)?;
+            // vector_add on flat N*hidden elements.
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch {
+                n: (n as u32) * hidden,
+            }.launch(
+                self.forward_kernels.fn_vector_add_bf16,
+                residual_dev,
+                o_bf16_region.device_ptr(),
+                stream_u64)?;
+        }
+        Ok(())
+    }
+
+    /// Stream-#5f-PRIME: batched post-MLP close-out. Processes
+    /// N tokens through the MLP layer; MLP itself stays per-
+    /// token (M=1 GEMV kernels) but pre/post norms + scaled_add
+    /// run on the full N*hidden flat. Per-token MLP loop is
+    /// the next perf step (would need M>1 W4A16 kernel).
+    fn forward_layer_post_attn_mlp_batched_dev(
+        &self,
+        layer_idx: usize,
+        num_tokens: u32,
+        residual_dev: u64,
+    ) -> Result<()> {
+        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        if layer_idx >= self.arch.num_hidden_layers {
+            return Err(corrupt_runtime_err(format!(
+                "post_attn_mlp_batched_dev: layer_idx={} >= {}",
+                layer_idx, self.arch.num_hidden_layers)));
+        }
+        let layer = &self.model.layers[layer_idx];
+        let hidden = self.arch.hidden_size as u32;
+        let intermediate = self.arch.intermediate_size as u32;
+        let n = num_tokens as usize;
+        let stream_u64 = self.stream.raw();
+        let h_normed_region = self.arena.region(
+            "g4n_batch_pamlp_normed", n * (hidden as usize) * 2, 256)?;
+        let scratch_region = self.arena.region(
+            "g4n_batch_pamlp_scratch", (2 * intermediate as usize) * 2, 256)?;
+        let mlp_out_region = self.arena.region(
+            "g4n_batch_pamlp_out", n * (hidden as usize) * 2, 256)?;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                h_normed_region.device_ptr(), residual_dev,
+                n * (hidden as usize) * 2, stream_u64 as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "post_attn_mlp_batched_dev: residual DtoD",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens, hidden, eps: self.arch.rms_norm_eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                h_normed_region.device_ptr(),
+                layer.pre_feedforward_layernorm.offset_bytes,
+                stream_u64)?;
+            // Per-token MLP loop. M=1 W4A16 kernels — batching the
+            // MLP needs a new kernel (~300 LOC follow-up). At N=3
+            // this is 3 MLP launches; at N=100 it's 100. For
+            // typical prompts the win from batched attention
+            // already dominates.
+            let hidden_bytes = (hidden as usize) * 2;
+            for t in 0..n {
+                let h_t = h_normed_region.device_ptr()
+                    + (t * hidden_bytes) as u64;
+                let mlp_t = mlp_out_region.device_ptr()
+                    + (t * hidden_bytes) as u64;
+                crate::gemma4_nvfp4_ops::gemma4_nvfp4_mlp_forward(
+                    &self.mlp_kernels,
+                    h_t, mlp_t,
+                    &layer.gate_proj, &layer.up_proj, &layer.down_proj,
+                    scratch_region.device_ptr(), stream_u64)?;
+            }
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens, hidden, eps: self.arch.rms_norm_eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                mlp_out_region.device_ptr(),
+                layer.post_feedforward_layernorm.offset_bytes,
+                stream_u64)?;
+        }
+        // scaled_add on N*hidden flat (alpha broadcast across all
+        // elements of all tokens — layer_scalar is per-layer not
+        // per-token).
+        self.launch_scaled_add_bf16(
+            residual_dev,
+            mlp_out_region.device_ptr(),
+            layer.layer_scalar.offset_bytes,
+            (n as u32) * hidden,
+        )?;
         Ok(())
     }
 
@@ -3720,61 +4207,65 @@ impl Gemma4Nvfp4Bringup {
                 position_start, n_tokens, kv.max_pos)));
         }
 
-        let f32_to_bf16_vec = |xs: &[f32]| -> Vec<u16> {
-            xs.iter().map(|&x| {
-                let bits = x.to_bits();
-                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-                (rounded >> 16) as u16
-            }).collect()
-        };
+        // Stream-#5f-PRIME: device-resident batched-prefill
+        // path. Residual lives as [N * hidden] bf16 on device
+        // across all 60 layers; attention runs as ONE unified-
+        // prefill kernel launch per layer instead of N decode
+        // launches.
+        if n_tokens > kv.max_query_tokens {
+            return Err(corrupt_runtime_err(format!(
+                "forward_prompt_to_token: prompt length {n_tokens} > \
+                 kv.max_query_tokens={}. Re-allocate KV via \
+                 `allocate_kv_state_with_chunk(max_pos, >= {n_tokens})`.",
+                kv.max_query_tokens)));
+        }
+        let _scratch_guard = self.forward_scratch_guard();
+        let hidden = self.arch.hidden_size as u32;
+        let n = prompt.len();
+        // attn_out_dev sized for the LARGEST per-layer n_q
+        // (global = 32*512 = 16384; sliding = 32*256 = 8192).
+        let max_n_q: usize = self.model.layers.iter()
+            .map(|l| l.q_proj.shape[0]).max().unwrap_or(0);
+        let residual_dev = self.arena.region(
+            "g4n_prompt_residual_bf16", n * (hidden as usize) * 2, 256)?;
+        let attn_out_dev = self.arena.region(
+            "g4n_prompt_attn_out_bf16", n * max_n_q * 2, 256)?;
 
-        // Per-token residuals on host as bf16. The KV cache on
-        // device accumulates K/V for every prompt slot as each
-        // token's layer chain runs. Layer ordering: outer loop
-        // over LAYERS, inner over tokens — this matches the
-        // production batched-prefill ordering (one layer's KV
-        // for all tokens, then the next layer) and lets each
-        // layer's K/V be reused by subsequent prompt tokens at
-        // the same layer.
-        let mut residuals: Vec<Vec<u16>> = Vec::with_capacity(prompt.len());
-        for &tok in prompt {
-            residuals.push(self.embed_one_token_bf16(tok)?);
+        // Embed N tokens into residual_dev rows 0..N-1.
+        let hidden_bytes = (hidden as usize) * 2;
+        for (t, &tok) in prompt.iter().enumerate() {
+            let dst = residual_dev.device_ptr()
+                + (t * hidden_bytes) as u64;
+            self.embed_one_token_to_device(tok, dst)?;
         }
 
         for li in 0..self.arch.num_hidden_layers {
-            // Pass 1: attention for every prompt token at this layer.
-            // Writes slot `position_start + t` of layer `li`'s KV cache;
-            // the next token's decode sees prior slots via context_lens.
-            let mut attn_outs_bf16: Vec<Vec<u16>> =
-                Vec::with_capacity(prompt.len());
-            for t in 0..prompt.len() {
-                let pos = position_start + (t as u32);
-                let attn_f32 = self.forward_layer_attn_from_residual(
-                    li, &residuals[t], pos, kv)?;
-                attn_outs_bf16.push(f32_to_bf16_vec(&attn_f32));
-            }
-            // Pass 2: post-attn close-out per token (no cross-token
-            // dependency, so order doesn't matter here).
-            let mut post_attn_bf16: Vec<Vec<u16>> =
-                Vec::with_capacity(prompt.len());
-            for t in 0..prompt.len() {
-                let h_f32 = self.forward_layer_post_attn(
-                    li, &attn_outs_bf16[t], &residuals[t])?;
-                post_attn_bf16.push(f32_to_bf16_vec(&h_f32));
-            }
-            // Pass 3: post-MLP close-out per token; output becomes
-            // input residual for next layer.
-            for t in 0..prompt.len() {
-                let h_f32 = self.forward_layer_post_attn_mlp(
-                    li, &post_attn_bf16[t])?;
-                residuals[t] = f32_to_bf16_vec(&h_f32);
-            }
+            self.forward_layer_attn_batched_prefill_dev(
+                li, n_tokens, residual_dev.device_ptr(),
+                position_start, kv, attn_out_dev.device_ptr())?;
+            self.forward_layer_post_attn_batched_dev(
+                li, n_tokens, attn_out_dev.device_ptr(),
+                residual_dev.device_ptr())?;
+            self.forward_layer_post_attn_mlp_batched_dev(
+                li, n_tokens, residual_dev.device_ptr())?;
         }
 
-        // Argmax on the LAST prompt position's final residual —
-        // the predicted next token.
-        let last = residuals.last().expect("non-empty");
-        self.forward_final_to_token(last)
+        // DtoH last token's residual for the final LM head.
+        self.stream.fence()?;
+        let mut last_residual = vec![0u16; hidden as usize];
+        let last_off = ((n - 1) * hidden_bytes) as u64;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                last_residual.as_mut_ptr() as *mut _,
+                residual_dev.device_ptr() + last_off,
+                hidden_bytes);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(corrupt_runtime_err(
+                    "forward_prompt_to_token: last residual DtoH".into()));
+            }
+        }
+        self.forward_final_to_token(&last_residual)
     }
 
     /// Commit #5e: dump-mode variant of `forward_final_to_token`
@@ -5093,8 +5584,11 @@ mod tests {
         let mut bringup = Gemma4Nvfp4Bringup::load(
             &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
         ).expect("Gemma4Nvfp4Bringup::load");
-        let kv = bringup.allocate_kv_state(64)
-            .expect("allocate_kv_state(64)");
+        // Stream-#5f-PRIME: prompt path needs max_query_tokens >=
+        // prompt length. Default chunk=1 only fits N=1 (decode);
+        // bump to N=64 for prompts.
+        let kv = bringup.allocate_kv_state_with_chunk(64, 64)
+            .expect("allocate_kv_state_with_chunk");
 
         let prompt: Vec<u32> = vec![2, 1000, 5000];
         let t0 = std::time::Instant::now();
