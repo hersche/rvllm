@@ -39,6 +39,43 @@ use rvllm_loader::gemma4_drafter::{
 #[cfg(feature = "cuda")]
 use rvllm_mem::HbmArena;
 
+/// Stream-#6a: abstraction over a base model's K/V cache for the
+/// drafter's cross-attention. Lets the same drafter code consume
+/// either:
+///   * Production `Gemma4Bringup` / `KvCache` (fp8-block weights,
+///     NVFP4-KV-optional).
+///   * Option B `Gemma4Nvfp4Bringup` / `Gemma4Nvfp4KvState`
+///     (NVFP4 weights + NVFP4 KV, this branch).
+///
+/// The trait is dyn-compatible (no associated types or generic
+/// methods) so the drafter can hold a `&dyn BaseKvSource` and the
+/// caller picks the concrete backend at session start.
+///
+/// Implementations:
+///   * `crate::gemma4_nvfp4_bring_up::Gemma4Nvfp4BaseKvSource` —
+///     wrapper around `(&Gemma4Nvfp4Bringup, &Gemma4Nvfp4KvState)`.
+///   * Production `Gemma4Bringup` impl — wired by the production
+///     drafter refactor follow-up (not in this commit; the
+///     drafter currently fetches directly from
+///     `Gemma4Bringup` fields, so parameterizing
+///     `populate_shadow_kv*_from_base`
+///     (gemma4_bring_up.rs:4583, 5742) over `&dyn BaseKvSource`
+///     is what enables Option B spec-decode end-to-end).
+pub trait BaseKvSource {
+    /// Build a drafter-consumable view of the K/V cache at the
+    /// given base-model layer index. The source layer's
+    /// kv_dtype + scale-cache pointers are filled in by the
+    /// implementation.
+    fn drafter_base_kv_view(
+        &self, layer_idx: usize,
+    ) -> Result<DrafterBaseKvView>;
+
+    /// Source layer pair for the drafter to cross-attend to.
+    /// 31B returns `Some((58, 59))`; E4B has a different pair.
+    /// `None` when the checkpoint doesn't support spec-decode.
+    fn assistant_shared_kv_sources(&self) -> Option<(usize, usize)>;
+}
+
 /// Base-model K/V cache view exposed to the assistant cross-attention
 /// layer. The assistant has Q-only attention weights, so its K/V comes
 /// from Gemma 4 E4B's shared-KV source layers.

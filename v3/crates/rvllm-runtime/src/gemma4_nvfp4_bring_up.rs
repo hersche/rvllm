@@ -4425,6 +4425,31 @@ impl Gemma4Nvfp4Bringup {
     }
 }
 
+/// Stream-#6a: borrow-pair wrapper that lets Option B's KV state
+/// implement `crate::gemma4_drafter::BaseKvSource`. Bound by the
+/// lifetime of the underlying bringup + kv state.
+pub struct Gemma4Nvfp4BaseKvSource<'a> {
+    pub bringup: &'a Gemma4Nvfp4Bringup,
+    pub kv: &'a Gemma4Nvfp4KvState,
+}
+
+impl<'a> crate::gemma4_drafter::BaseKvSource
+    for Gemma4Nvfp4BaseKvSource<'a>
+{
+    fn drafter_base_kv_view(
+        &self, layer_idx: usize,
+    ) -> Result<crate::gemma4_drafter::DrafterBaseKvView> {
+        self.bringup.drafter_base_kv_view(self.kv, layer_idx)
+    }
+
+    fn assistant_shared_kv_sources(&self) -> Option<(usize, usize)> {
+        // Re-route through the arch helper. 31B returns
+        // Some((58, 59)); other variants return None or their
+        // own pair.
+        self.bringup.arch.assistant_shared_kv_sources()
+    }
+}
+
 /// f32 → f16 IEEE-754 round-to-nearest-even, returning the raw u16
 /// bit pattern. Used for the per-position cos/sin mini-tables in
 /// `forward_layer0_attn`. Handles subnormals, overflow→inf, NaN.
@@ -5153,6 +5178,26 @@ mod tests {
         let n_layers = bringup.arch.num_hidden_layers;
         let err = bringup.drafter_base_kv_view(&kv, n_layers);
         assert!(err.is_err());
+
+        // Stream-#6a: BaseKvSource trait impl. The wrapper
+        // exposes Option B's KV as a `&dyn BaseKvSource` for
+        // the future drafter parameterization.
+        use crate::gemma4_drafter::BaseKvSource;
+        let src = crate::gemma4_nvfp4_bring_up::Gemma4Nvfp4BaseKvSource {
+            bringup: &bringup, kv: &kv,
+        };
+        let dyn_src: &dyn BaseKvSource = &src;
+        let pair = dyn_src.assistant_shared_kv_sources()
+            .expect("31B has an assistant source pair");
+        eprintln!("[stream-6a] assistant_shared_kv_sources = {pair:?}");
+        assert_eq!(pair, (58, 59),
+            "31B expected source pair (58, 59), got {pair:?}");
+        let v58 = dyn_src.drafter_base_kv_view(pair.0)
+            .expect("dyn-trait view at layer 58");
+        let v59 = dyn_src.drafter_base_kv_view(pair.1)
+            .expect("dyn-trait view at layer 59");
+        assert_ne!(v58.k_cache, v59.k_cache);
+        eprintln!("[stream-6a] trait impl ✓ — views at 58, 59 distinct");
     }
 
     /// Commit #5b2 smoke: layer-0 attention end-to-end at two
