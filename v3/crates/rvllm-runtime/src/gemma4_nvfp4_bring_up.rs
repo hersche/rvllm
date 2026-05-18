@@ -327,6 +327,21 @@ struct ForwardKernels {
     /// variants); we pick the f32→f16 entry.
     _cast_fp_mod: LoadedModule,
     fn_cast_f32_to_f16: KernelFn,
+    /// Stream-6a drafter forward primitive bundle (q_side +
+    /// attn_finisher + mlp_finisher). All f16 because the
+    /// drafter runs in f16 (its weights are bf16-narrowed
+    /// to f16 at load time per
+    /// `Gemma4DrafterRuntime::load`).
+    _rmsnorm_inplace_f16_mod: LoadedModule,
+    fn_rmsnorm_inplace_f16: KernelFn,
+    _fused_gelu_mul_f16_mod: LoadedModule,
+    fn_fused_gelu_mul_f16: KernelFn,
+    _vector_add_f16_mod: LoadedModule,
+    fn_vector_add_f16: KernelFn,
+    _scale_inplace_f16_mod: LoadedModule,
+    fn_scale_inplace_f16: KernelFn,
+    _rope_partial_f16kv_mod: LoadedModule,
+    fn_rope_partial_f16kv: KernelFn,
 }
 
 /// Restores the arena to the post-load high-water mark when a forward
@@ -505,6 +520,25 @@ impl Gemma4Nvfp4Bringup {
         let cast_fp_mod = loader.load_ptx("cast_fp")?;
         let fn_cast_f32_to_f16 =
             cast_fp_mod.get_function("cast_f32_to_f16_kernel")?;
+        // Stream-6a drafter forward bundle (f16 throughout).
+        let rmsnorm_inplace_f16_mod =
+            loader.load_ptx("rmsnorm_inplace_f16")?;
+        let fn_rmsnorm_inplace_f16 = rmsnorm_inplace_f16_mod
+            .get_function("rmsnorm_inplace_f16_kernel")?;
+        let fused_gelu_mul_f16_mod =
+            loader.load_ptx("fused_gelu_mul_f16")?;
+        let fn_fused_gelu_mul_f16 = fused_gelu_mul_f16_mod
+            .get_function("fused_gelu_mul_f16_kernel")?;
+        let vector_add_f16_mod = loader.load_ptx("vector_add_f16")?;
+        let fn_vector_add_f16 = vector_add_f16_mod
+            .get_function("vector_add_f16_kernel")?;
+        let scale_inplace_f16_mod = loader.load_ptx("scale_inplace_f16")?;
+        let fn_scale_inplace_f16 = scale_inplace_f16_mod
+            .get_function("scale_inplace_f16_kernel")?;
+        let rope_partial_f16kv_mod =
+            loader.load_ptx("fused_rope_partial_f16kv")?;
+        let fn_rope_partial_f16kv = rope_partial_f16kv_mod
+            .get_function("fused_rope_partial_f16kv_kernel")?;
 
         // Stream #5f-PRIME: still load this handle ourselves
         // for the per-launcher path (deprecated by the
@@ -581,6 +615,16 @@ impl Gemma4Nvfp4Bringup {
             fn_prefill_nvfp4kv_unified_bf16out,
             _cast_fp_mod: cast_fp_mod,
             fn_cast_f32_to_f16,
+            _rmsnorm_inplace_f16_mod: rmsnorm_inplace_f16_mod,
+            fn_rmsnorm_inplace_f16,
+            _fused_gelu_mul_f16_mod: fused_gelu_mul_f16_mod,
+            fn_fused_gelu_mul_f16,
+            _vector_add_f16_mod: vector_add_f16_mod,
+            fn_vector_add_f16,
+            _scale_inplace_f16_mod: scale_inplace_f16_mod,
+            fn_scale_inplace_f16,
+            _rope_partial_f16kv_mod: rope_partial_f16kv_mod,
+            fn_rope_partial_f16kv,
         };
         let forward_checkpoint = arena.checkpoint();
 
@@ -837,6 +881,465 @@ impl Gemma4Nvfp4Bringup {
         self.launch_cast_f32_to_f16(
             workspace.hidden, workspace.gemm_f32, hidden as u32,
         )?;
+        Ok(())
+    }
+
+    /// Stream-6a (drafter forward primitive #2): Q-side of one
+    /// drafter layer. Mirrors production's
+    /// `Gemma4Bringup::run_drafter_layer_q_side`
+    /// (gemma4_bring_up.rs:8823). Hadamard rotation is SKIPPED
+    /// (Option B ships spec with Hadamard OFF per codex
+    /// Stream-6b recommendation). Diagnostic probes
+    /// (Q_BISECT, LAYER_TRACE) skipped — readd in a follow-up.
+    ///
+    /// Steps:
+    ///   1. Snapshot workspace.hidden → workspace.residual1
+    ///      (attn_finisher reads this for residual_1 add).
+    ///   2. input_layernorm in place on workspace.hidden.
+    ///   3. q_proj GEMM → f32 scratch → cast_f32_to_f16 →
+    ///      workspace.q.
+    ///   4. Per-head q_norm (num_tokens=num_heads,
+    ///      hidden=effective_head_dim).
+    ///   5. Partial NeoX RoPE on Q (num_kv_heads=0 disables
+    ///      K/V branch so null kv pointers are safe). Sliding
+    ///      uses full rotation + sliding cos/sin tables;
+    ///      global uses partial_rotary_factor=0.25 + global
+    ///      tables.
+    pub fn forward_drafter_layer_q_side(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        layer_idx: usize,
+        position: u32,
+    ) -> Result<()> {
+        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        let hidden = drafter.arch.hidden_size;
+        let num_heads = drafter.arch.num_attention_heads;
+        let layer = drafter.layers.get(layer_idx).ok_or_else(||
+            corrupt_runtime_err(format!(
+                "forward_drafter_layer_q_side: layer_idx {} \
+                 out of range (drafter has {})",
+                layer_idx, drafter.layers.len())))?;
+        let eff_hd = layer.effective_head_dim;
+        let q_rows = num_heads * eff_hd;
+        let stream = self.stream.raw();
+        let eps = drafter.arch.rms_norm_eps;
+
+        // 1. Snapshot pre-norm residual.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyDtoDAsync_v2(
+                workspace.residual1, workspace.hidden,
+                hidden * 2, stream as CUstream);
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "drafter_q_side residual1 snapshot",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+        }
+        // 2. input_layernorm in place.
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden: hidden as u32, eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_f16,
+                workspace.hidden, layer.input_layernorm, stream)?;
+        }
+        // 3. q_proj GEMM + f32 → f16 cast.
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                workspace.hidden, layer.self_attn_q_proj,
+                workspace.gemm_f32,
+                1, q_rows as i32, hidden as i32, stream)?;
+        }
+        self.launch_cast_f32_to_f16(
+            workspace.q, workspace.gemm_f32, q_rows as u32)?;
+        // 4. per-head q_norm.
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: num_heads as u32,
+                hidden: eff_hd as u32, eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_f16,
+                workspace.q, layer.self_attn_q_norm, stream)?;
+        }
+        // 5. Partial NeoX RoPE. is_global per drafter layer type;
+        // partial_rotary_factor=0.25 for global (E4B convention,
+        // same on 31B drafter).
+        let is_global = matches!(layer.layer_type,
+            rvllm_loader::gemma4_drafter::DrafterLayerType::Full);
+        const PARTIAL_ROTARY_FACTOR_GLOBAL: f32 = 0.25;
+        let rotary_dim: i32 = if is_global {
+            ((eff_hd as f32) * PARTIAL_ROTARY_FACTOR_GLOBAL) as i32
+        } else {
+            eff_hd as i32
+        };
+        let (cos_table_off, sin_table_off) = if is_global {
+            (self.model.outside.rope_cos_global.offset_bytes,
+             self.model.outside.rope_sin_global.offset_bytes)
+        } else {
+            (self.model.outside.rope_cos_sliding.offset_bytes,
+             self.model.outside.rope_sin_sliding.offset_bytes)
+        };
+        let pos_region = self.arena.region(
+            "g4n_drafter_q_rope_pos", 4, 16)?;
+        unsafe {
+            let p = position as i32;
+            pos_region.copy_from_host(&p.to_le_bytes())?;
+        }
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut q_in: u64 = workspace.q;
+            let mut k_in: u64 = 0;
+            let mut v_in: u64 = 0;
+            let mut q_out: u64 = workspace.q;
+            let mut key_cache: u64 = 0;
+            let mut value_cache: u64 = 0;
+            let mut cos_table: u64 = cos_table_off;
+            let mut sin_table: u64 = sin_table_off;
+            let mut positions_ptr: u64 = pos_region.device_ptr();
+            let mut slot_mapping_ptr: u64 = 0;
+            let mut num_tokens_arg: i32 = 1;
+            let mut num_heads_arg: i32 = num_heads as i32;
+            let mut num_kv_heads_arg: i32 = 0;
+            let mut head_dim_arg: i32 = eff_hd as i32;
+            let mut rotary_dim_arg: i32 = rotary_dim;
+            let args: [*mut core::ffi::c_void; 15] = [
+                &mut q_in as *mut _ as *mut _,
+                &mut k_in as *mut _ as *mut _,
+                &mut v_in as *mut _ as *mut _,
+                &mut q_out as *mut _ as *mut _,
+                &mut key_cache as *mut _ as *mut _,
+                &mut value_cache as *mut _ as *mut _,
+                &mut cos_table as *mut _ as *mut _,
+                &mut sin_table as *mut _ as *mut _,
+                &mut positions_ptr as *mut _ as *mut _,
+                &mut slot_mapping_ptr as *mut _ as *mut _,
+                &mut num_tokens_arg as *mut _ as *mut _,
+                &mut num_heads_arg as *mut _ as *mut _,
+                &mut num_kv_heads_arg as *mut _ as *mut _,
+                &mut head_dim_arg as *mut _ as *mut _,
+                &mut rotary_dim_arg as *mut _ as *mut _,
+            ];
+            let rc = cuLaunchKernel(
+                self.forward_kernels.fn_rope_partial_f16kv.raw() as CUfunction,
+                1, num_heads as u32, 1,
+                (eff_hd as u32) / 2, 1, 1,
+                0, stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut());
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "drafter_q_side rope launch",
+                    CudaErrorKind::LaunchFailed, CudaCtx::setup()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream-6a (drafter forward primitive #3): attention
+    /// finisher. Mirrors production's
+    /// `run_drafter_layer_attn_finisher` (line 9271).
+    /// Steps: o_proj GEMM → f32→f16 cast → post_attention
+    /// _layernorm → residual_1 (workspace.hidden =
+    /// workspace.residual1 + workspace.proj_f16).
+    ///
+    /// Assumes the caller already populated workspace.attn_out
+    /// via the drafter cross-attention launcher (which lives
+    /// in gemma4_drafter.rs and is shared with production).
+    pub fn forward_drafter_layer_attn_finisher(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        layer_idx: usize,
+    ) -> Result<()> {
+        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        let hidden = drafter.arch.hidden_size;
+        let num_heads = drafter.arch.num_attention_heads;
+        let layer = drafter.layers.get(layer_idx).ok_or_else(||
+            corrupt_runtime_err(format!(
+                "forward_drafter_layer_attn_finisher: layer_idx \
+                 {} out of range", layer_idx)))?;
+        let eff_hd = layer.effective_head_dim;
+        let q_rows = num_heads * eff_hd;
+        let stream = self.stream.raw();
+        let eps = drafter.arch.rms_norm_eps;
+        // 1. o_proj GEMM.
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                workspace.attn_out, layer.self_attn_o_proj,
+                workspace.gemm_f32,
+                1, hidden as i32, q_rows as i32, stream)?;
+        }
+        // 2. cast f32 → f16.
+        self.launch_cast_f32_to_f16(
+            workspace.proj_f16, workspace.gemm_f32,
+            hidden as u32)?;
+        // 3. post_attention_layernorm.
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden: hidden as u32, eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_f16,
+                workspace.proj_f16,
+                layer.post_attention_layernorm, stream)?;
+        }
+        // 4. residual_1: hidden = residual1 + proj_f16.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyDtoDAsync_v2(
+                workspace.hidden, workspace.residual1,
+                hidden * 2, stream as CUstream);
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "attn_finisher residual1 reload",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+            let mut dst = workspace.hidden;
+            let mut src = workspace.proj_f16;
+            let mut n: i32 = hidden as i32;
+            let args = [
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                (&mut n)   as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((n as u32 + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                self.forward_kernels.fn_vector_add_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1,
+                0, stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut());
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "attn_finisher residual_1 vector_add",
+                    CudaErrorKind::LaunchFailed, CudaCtx::setup()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream-6a (drafter forward primitive #4): MLP
+    /// finisher. Mirrors production's
+    /// `run_drafter_layer_mlp_finisher` (line 9469).
+    /// Steps: residual_2 snapshot → pre_ff_norm → gate_proj +
+    /// up_proj → fused_gelu_mul_f16 → down_proj → post_ff_norm
+    /// → residual_2 add → layer_scalar scale in place.
+    pub fn forward_drafter_layer_mlp_finisher(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        layer_idx: usize,
+    ) -> Result<()> {
+        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        let hidden = drafter.arch.hidden_size;
+        let intermediate = drafter.arch.intermediate_size;
+        let layer = drafter.layers.get(layer_idx).ok_or_else(||
+            corrupt_runtime_err(format!(
+                "forward_drafter_layer_mlp_finisher: layer_idx \
+                 {} out of range", layer_idx)))?;
+        let stream = self.stream.raw();
+        let eps = drafter.arch.rms_norm_eps;
+
+        let residual2_region = self.arena.region(
+            "g4n_drafter_residual2", hidden * 2, 16)?;
+        let gate_up_region = self.arena.region(
+            "g4n_drafter_gate_up", 2 * intermediate * 2, 16)?;
+        let gate_ptr = gate_up_region.device_ptr();
+        let up_ptr = gate_ptr + (intermediate as u64) * 2;
+
+        // 1. residual_2 snapshot.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyDtoDAsync_v2(
+                residual2_region.device_ptr(), workspace.hidden,
+                hidden * 2, stream as CUstream);
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "mlp_finisher residual_2 snapshot",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+        }
+        // 2. pre_ff_norm.
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden: hidden as u32, eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_f16,
+                workspace.hidden,
+                layer.pre_feedforward_layernorm, stream)?;
+            // 3. gate_proj.
+            self.cublaslt.f16_gemm_f32(
+                workspace.hidden, layer.mlp_gate_proj,
+                workspace.gemm_f32,
+                1, intermediate as i32, hidden as i32, stream)?;
+        }
+        self.launch_cast_f32_to_f16(
+            gate_ptr, workspace.gemm_f32, intermediate as u32)?;
+        // 4. up_proj.
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                workspace.hidden, layer.mlp_up_proj,
+                workspace.gemm_f32,
+                1, intermediate as i32, hidden as i32, stream)?;
+        }
+        self.launch_cast_f32_to_f16(
+            up_ptr, workspace.gemm_f32, intermediate as u32)?;
+        // 5. fused_gelu_mul_f16: gate = gelu(gate) * up.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut out_p = gate_ptr;
+            let mut gate_up = gate_up_region.device_ptr();
+            let mut inter_i = intermediate as i32;
+            let args = [
+                (&mut out_p)   as *mut u64 as *mut core::ffi::c_void,
+                (&mut gate_up) as *mut u64 as *mut core::ffi::c_void,
+                (&mut inter_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 1024u32.min(intermediate as u32).max(1);
+            let rc = cuLaunchKernel(
+                self.forward_kernels.fn_fused_gelu_mul_f16.raw() as CUfunction,
+                1, 1, 1, block, 1, 1,
+                0, stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut());
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "mlp_finisher fused_gelu_mul_f16",
+                    CudaErrorKind::LaunchFailed, CudaCtx::setup()));
+            }
+            // 6. down_proj.
+            self.cublaslt.f16_gemm_f32(
+                gate_ptr, layer.mlp_down_proj,
+                workspace.gemm_f32,
+                1, hidden as i32, intermediate as i32, stream)?;
+        }
+        self.launch_cast_f32_to_f16(
+            workspace.hidden, workspace.gemm_f32, hidden as u32)?;
+        // 7. post_ff_norm.
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden: hidden as u32, eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_f16,
+                workspace.hidden,
+                layer.post_feedforward_layernorm, stream)?;
+            // 8. residual_2 vector_add: hidden = residual2 + hidden.
+            use cudarc::driver::sys::*;
+            let mut dst = workspace.hidden;
+            let mut src = residual2_region.device_ptr();
+            let mut n: i32 = hidden as i32;
+            let args = [
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                (&mut n)   as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((n as u32 + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                self.forward_kernels.fn_vector_add_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1,
+                0, stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut());
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "mlp_finisher residual_2 vector_add",
+                    CudaErrorKind::LaunchFailed, CudaCtx::setup()));
+            }
+            // 9. layer_scalar scale in place: hidden *= scalar.
+            // scale_inplace_f16 kernel ABI is (x, scalar_f32, n).
+            let mut x = workspace.hidden;
+            let mut s: f32 = layer.layer_scalar_f32;
+            let mut n: i32 = hidden as i32;
+            let args = [
+                (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                (&mut s) as *mut f32 as *mut core::ffi::c_void,
+                (&mut n) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((n as u32 + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                self.forward_kernels.fn_scale_inplace_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1,
+                0, stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut());
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "mlp_finisher layer_scalar scale_inplace",
+                    CudaErrorKind::LaunchFailed, CudaCtx::setup()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream-6a (drafter forward primitive #5): final-norm +
+    /// LM head + argmax + post_projection. Mirrors the inline
+    /// chain at gemma4_bring_up.rs:4976-5121 specialized for
+    /// the 31B drafter's `use_ordered_embeddings=false`
+    /// full-vocab tied LM-head path. Writes:
+    ///   workspace.out_token_id (i32[1]) — argmax token id.
+    ///   workspace.out_hidden (f16[backbone_hidden_size]) —
+    ///     post_projection output for chaining the next step.
+    pub fn forward_drafter_final_to_token(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+    ) -> Result<()> {
+        let hidden = drafter.arch.hidden_size;
+        let backbone_hidden = drafter.arch.backbone_hidden_size;
+        let vocab = drafter.arch.vocab_size as i32;
+        let stream = self.stream.raw();
+        let eps = drafter.arch.rms_norm_eps;
+
+        // 1. final_norm on workspace.hidden in place.
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden: hidden as u32, eps,
+            }.launch(
+                self.forward_kernels.fn_rmsnorm_inplace_f16,
+                workspace.hidden,
+                drafter.top.final_norm, stream)?;
+        }
+        // 2. Full-vocab tied LM head (31B path). f16_gemm to
+        // f32 logits in workspace.gemm_f32.
+        if drafter.arch.use_ordered_embeddings {
+            return Err(corrupt_runtime_err(
+                "forward_drafter_final_to_token: drafter has \
+                 use_ordered_embeddings=true (E4B masked-embedder \
+                 path); not wired for Option B yet".into()));
+        }
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                workspace.hidden, drafter.top.embed_tokens,
+                workspace.gemm_f32,
+                1, vocab, hidden as i32, stream)?;
+            // 3. Argmax over f32 vocab logits → out_token_id.
+            // ABI: argmax_kernel(logits, out, vocab) with grid
+            // (1,1,1), block (1024,1,1).
+            let mut logits = workspace.gemm_f32;
+            let mut out = workspace.out_token_id;
+            let mut v = vocab;
+            let args: [*mut core::ffi::c_void; 3] = [
+                (&mut logits) as *mut u64 as *mut _,
+                (&mut out)    as *mut u64 as *mut _,
+                (&mut v)      as *mut i32 as *mut _,
+            ];
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_argmax_f32,
+                (1, 1, 1), (1024, 1, 1), 0, stream, &args)?;
+            // 4. post_projection: hidden → out_hidden for
+            // chaining the next drafter step.
+            self.cublaslt.f16_gemm_f32(
+                workspace.hidden, drafter.top.post_projection,
+                workspace.gemm_f32,
+                1, backbone_hidden as i32, hidden as i32, stream)?;
+        }
+        self.launch_cast_f32_to_f16(
+            workspace.out_hidden, workspace.gemm_f32,
+            backbone_hidden as u32)?;
         Ok(())
     }
 
