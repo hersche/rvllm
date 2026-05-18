@@ -759,6 +759,69 @@ impl Gemma4Nvfp4Bringup {
         Ok(kv)
     }
 
+    /// Codex Stream-6a: build a `DrafterBaseKvView` over
+    /// Option B's NVFP4 KV layout for the given `layer_idx`.
+    /// The production drafter (`gemma4_drafter.rs`) cross-
+    /// attends from a small Q-only model into the BASE
+    /// model's K/V at the source-layer pair `(58, 59)` on
+    /// 31B (`gemma4_arch::Gemma4Arch::assistant_shared_kv
+    /// _sources()`).
+    ///
+    /// The view exposes the per-layer K + V packed nibble
+    /// arrays and their E4M3 microscale arrays, plus the
+    /// already-allocated identity block_tables and the live
+    /// context_lens (which `g4n_fill_pos_slots_i32` updates
+    /// per request). Drafter cross-attn currently reads NVFP4
+    /// only via the existing shadow-dequant kernel
+    /// (`kernels/gemma4_drafter_dequant.cu:72`); pointers from
+    /// this view feed straight into that path.
+    ///
+    /// Wiring into production spec-decode is the next step
+    /// (codex Stream-6a real work): the drafter needs to
+    /// consume this view through a `BaseKvSource` trait so the
+    /// same drafter code can read from either the production
+    /// fp8-block KV cache or Option B's NVFP4 cache. The
+    /// drafter side of that refactor is in
+    /// `gemma4_drafter.rs::DrafterRuntime` + `populate_shadow
+    /// _kv*_from_base` (gemma4_bring_up.rs:4583+, 5742+).
+    /// Today this method just hands back the view — the
+    /// production-side glue is unwired until spec-decode is
+    /// enabled on Option B.
+    pub fn drafter_base_kv_view(
+        &self,
+        kv: &Gemma4Nvfp4KvState,
+        layer_idx: usize,
+    ) -> Result<crate::gemma4_drafter::DrafterBaseKvView> {
+        if layer_idx >= self.arch.num_hidden_layers {
+            return Err(corrupt_runtime_err(format!(
+                "drafter_base_kv_view: layer_idx={} >= num_hidden_layers={}",
+                layer_idx, self.arch.num_hidden_layers)));
+        }
+        // block_tables: Option B uses the kv-state's
+        // identity table for the active sequence; the drafter
+        // reads block_tables[seq_idx * max_blocks_per_seq +
+        // page_idx] with seq_idx=0 in single-request mode.
+        // max_blocks_per_seq = max_pos because block_size=1.
+        Ok(crate::gemma4_drafter::DrafterBaseKvView {
+            k_cache:        kv.k_packed_layer_ptrs[layer_idx],
+            v_cache:        kv.v_packed_layer_ptrs[layer_idx],
+            k_scale_cache:  kv.k_scale_layer_ptrs[layer_idx],
+            v_scale_cache:  kv.v_scale_layer_ptrs[layer_idx],
+            // q_scale_cache: per-token Q scale cache. Option
+            // B doesn't allocate one today (per-token Q scale
+            // is OFF in the floor commits); the drafter cross-
+            // attn falls back to the scalar q_scale_ptr via
+            // DrafterBaseKvView.q_scale_cache=0.
+            q_scale_cache:  0,
+            block_tables:   kv.block_tables_ptr,
+            context_lens:   kv.context_lens_ptr,
+            block_size:     kv.block_size,
+            max_blocks_per_seq: kv.max_pos,
+            num_blocks_total: kv.max_pos,
+            kv_dtype:       crate::gemma4_layer_exec::KvDtype::Nvfp4,
+        })
+    }
+
     /// Layer-0 QKV + Q/K-norm on a single token. Extends
     /// `forward_layer0_qkv_only` with per-head RMSNorm on Q and
     /// K (V is not normed in Gemma 4). Returns the bf16 host
@@ -4576,6 +4639,29 @@ mod tests {
         // Gemma4Nvfp4KvState struct). Bound generously.
         assert!(mib > 500.0 && mib < 1500.0,
             "total_bytes={mib:.1} MiB outside expected 500..1500 range");
+
+        // Codex Stream-6a scaffold: verify the DrafterBaseKvView
+        // surfaces non-null per-layer pointers for the 31B
+        // source pair (58, 59) which is what the production
+        // drafter cross-attends to.
+        for src in [58usize, 59] {
+            let view = bringup.drafter_base_kv_view(&kv, src)
+                .expect("drafter_base_kv_view");
+            assert_ne!(view.k_cache, 0,        "{src}: k_cache null");
+            assert_ne!(view.v_cache, 0,        "{src}: v_cache null");
+            assert_ne!(view.k_scale_cache, 0,  "{src}: k_scale null");
+            assert_ne!(view.v_scale_cache, 0,  "{src}: v_scale null");
+            assert_ne!(view.block_tables, 0,   "{src}: block_tables null");
+            assert_ne!(view.context_lens, 0,   "{src}: context_lens null");
+            assert!(matches!(view.kv_dtype,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4));
+        }
+        eprintln!("[stream-6a-scaffold] drafter view at layers 58, 59 ✓");
+
+        // Rejection guard: out-of-range layer_idx must error.
+        let n_layers = bringup.arch.num_hidden_layers;
+        let err = bringup.drafter_base_kv_view(&kv, n_layers);
+        assert!(err.is_err());
     }
 
     /// Commit #5b2 smoke: layer-0 attention end-to-end at two
