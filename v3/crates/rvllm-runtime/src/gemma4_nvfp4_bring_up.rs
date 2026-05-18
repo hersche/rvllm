@@ -1420,6 +1420,53 @@ impl Gemma4Nvfp4Bringup {
         Ok(())
     }
 
+    /// Stream-6b orchestration primitive: chain the full drafter
+    /// forward for one speculation step.
+    ///
+    /// Caller contract: `workspace.pre_projection_in` is already
+    /// populated with `cat[last_token_embed, base_hidden_last]`
+    /// for this step (or zeros for the dispatch smoke). On
+    /// return:
+    ///   * `workspace.out_token_id` (u32, device) holds the
+    ///     speculated token id;
+    ///   * `workspace.out_hidden` (f16, device, `backbone_hidden`
+    ///     elems) holds the drafter's post-projection hidden,
+    ///     ready to splice into the next step's pre_projection_in
+    ///     embed half.
+    ///
+    /// `position` is the absolute position the drafter cross-
+    /// attends at (= number of base tokens currently in the
+    /// shared KV). The drafter has no autoregressive K/V of its
+    /// own — every step's Q is cross-attended into the shared
+    /// shadow K/V populated from the base's source-layer pair.
+    /// `kv` is therefore only used by the cross-attn launcher to
+    /// reach context_lens / block_tables; `populate_drafter_shadow
+    /// _kv` must have run for the current shared range BEFORE the
+    /// first step of a session (and after each base verify that
+    /// extends the shared range).
+    pub fn run_drafter_forward_one_token(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        position: u32,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<()> {
+        self.forward_drafter_pre_projection(drafter, workspace)?;
+        let num_layers = drafter.arch.num_hidden_layers;
+        for li in 0..num_layers {
+            self.forward_drafter_layer_q_side(
+                drafter, workspace, li, position)?;
+            self.forward_drafter_layer_cross_attn(
+                drafter, workspace, li, kv)?;
+            self.forward_drafter_layer_attn_finisher(
+                drafter, workspace, li)?;
+            self.forward_drafter_layer_mlp_finisher(
+                drafter, workspace, li)?;
+        }
+        self.forward_drafter_final_to_token(drafter, workspace)?;
+        Ok(())
+    }
+
     fn forward_scratch_guard(&self) -> ForwardScratchGuard<'_> {
         ForwardScratchGuard {
             arena: &self.arena,
@@ -1680,6 +1727,22 @@ impl Gemma4Nvfp4Bringup {
             corrupt_runtime_err(
                 "populate_drafter_shadow_kv: drafter not loaded; \
                  call ensure_drafter_nvfp4 first".into()))?;
+        self.populate_drafter_shadow_kv_with_rt(
+            drafter, kv, slot_start, slot_count)
+    }
+
+    /// Lock-free variant: caller already has a `&Gemma4Drafter
+    /// Runtime` borrow (e.g. it's holding the `self.drafter`
+    /// MutexGuard alive for other reads in the same critical
+    /// section). Re-locking here would deadlock; use this entry
+    /// point instead.
+    pub fn populate_drafter_shadow_kv_with_rt(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        kv: &Gemma4Nvfp4KvState,
+        slot_start: u32,
+        slot_count: u32,
+    ) -> Result<()> {
         let shadow = drafter.shadow_kv.as_ref().ok_or_else(||
             corrupt_runtime_err(
                 "populate_drafter_shadow_kv: shadow KV not attached \
@@ -6810,24 +6873,54 @@ mod tests {
         assert_eq!(nan, 0, "drafter layer0 produced NaN");
         assert_eq!(inf, 0, "drafter layer0 produced Inf");
 
-        // Drop the drafter MutexGuard before calling
-        // `populate_drafter_shadow_kv` — it re-locks
-        // `self.drafter` internally and would deadlock against
-        // the `guard` held since line 6681. Nothing below this
-        // line uses `rt` or `workspace`.
-        drop(guard);
-
         // Stream-6a populate call: smoke-test that
-        // `populate_drafter_shadow_kv` runs without panicking
-        // against the (zero-content) NVFP4 KV. Numerical
+        // `populate_drafter_shadow_kv_with_rt` runs without
+        // panicking against the (zero-content) NVFP4 KV.
+        // (`_with_rt` is the lock-free variant — the smoke
+        // already holds `bringup.drafter.lock()` via `guard`,
+        // so the locking entry point would deadlock.) Numerical
         // validation of cross-attn × real-K/V is deferred to the
         // spec-session smoke (which drives a real prompt prefill
         // first) — that path hung in the unified-NVFP4-prefill
         // kernel during 2026-05-18 bring-up and is being
         // debugged separately. Compilation + dispatch coverage
         // for the populate path lands here.
-        bringup.populate_drafter_shadow_kv(&kv, 0, 1)
-            .expect("populate_drafter_shadow_kv on empty KV");
-        eprintln!("[#6a-smoke] populate_drafter_shadow_kv dispatch OK");
+        bringup.populate_drafter_shadow_kv_with_rt(rt, &kv, 0, 1)
+            .expect("populate_drafter_shadow_kv_with_rt on empty KV");
+        eprintln!("[#6a-smoke] populate_drafter_shadow_kv_with_rt dispatch OK");
+
+        // Stream-6b orchestration primitive: chain the full
+        // drafter forward (pre_projection → 4 layers ×
+        // (q_side + cross_attn + attn_finisher + mlp_finisher)
+        // → final_to_token) on zero input. Shadow KV is still
+        // zero, so the speculated token is deterministic from
+        // the LM-head argmax over a near-zero residual; the
+        // smoke just verifies the launch chain completes and
+        // `out_token_id` ends up in a valid vocab range.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let zero_bytes = drafter_pre_in * 2;
+            let rc = cuMemsetD8_v2(
+                workspace.pre_projection_in, 0, zero_bytes);
+            assert_eq!(rc, CUresult::CUDA_SUCCESS);
+        }
+        bringup.run_drafter_forward_one_token(rt, &workspace, 0, &kv)
+            .expect("run_drafter_forward_one_token");
+        bringup.stream.fence().expect("stream fence");
+        let mut out_tok_host: u32 = u32::MAX;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                &mut out_tok_host as *mut u32 as *mut _,
+                workspace.out_token_id, 4);
+            assert_eq!(rc, CUresult::CUDA_SUCCESS,
+                "DtoH out_token_id");
+        }
+        eprintln!(
+            "[#6a-smoke] run_drafter_forward_one_token \
+             (zero input, shadow ZERO) → token={out_tok_host}");
+        assert!(out_tok_host < rt.arch.vocab_size as u32,
+            "run_drafter_forward_one_token produced out-of-vocab \
+             token {out_tok_host} (vocab={})", rt.arch.vocab_size);
     }
 }
