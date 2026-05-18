@@ -317,6 +317,16 @@ struct ForwardKernels {
     _unified_prefill_nvfp4kv_mod: Option<LoadedModule>,
     #[allow(dead_code)]
     fn_prefill_nvfp4kv_unified_bf16out: Option<KernelFn>,
+    /// Stream-6a (drafter forward primitive #1): cast_fp PTX
+    /// module + `cast_f32_to_f16_kernel`. Used by the drafter
+    /// forward to narrow `cublaslt.f16_gemm_f32` outputs
+    /// (which return f32) into the drafter's f16 hidden
+    /// stream. Same kernel production loads in its fused
+    /// modules; loaded here for the Option B drafter-forward
+    /// path. Module is `cast_fp.ptx` (contains multiple cast
+    /// variants); we pick the f32→f16 entry.
+    _cast_fp_mod: LoadedModule,
+    fn_cast_f32_to_f16: KernelFn,
 }
 
 /// Restores the arena to the post-load high-water mark when a forward
@@ -489,6 +499,13 @@ impl Gemma4Nvfp4Bringup {
         let fn_scaled_add_bf16 =
             scaled_add_bf16_mod.get_function("g4n_scaled_add_bf16_kernel")?;
 
+        // Stream-6a (drafter forward primitive #1): cast
+        // module — required by the drafter pre_projection
+        // step (f32 GEMM output → f16 hidden).
+        let cast_fp_mod = loader.load_ptx("cast_fp")?;
+        let fn_cast_f32_to_f16 =
+            cast_fp_mod.get_function("cast_f32_to_f16_kernel")?;
+
         // Stream #5f-PRIME: still load this handle ourselves
         // for the per-launcher path (deprecated by the
         // AttentionBackend below but kept until callers move).
@@ -562,6 +579,8 @@ impl Gemma4Nvfp4Bringup {
             fn_scaled_add_bf16,
             _unified_prefill_nvfp4kv_mod: unified_prefill_nvfp4kv_mod,
             fn_prefill_nvfp4kv_unified_bf16out,
+            _cast_fp_mod: cast_fp_mod,
+            fn_cast_f32_to_f16,
         };
         let forward_checkpoint = arena.checkpoint();
 
@@ -732,6 +751,93 @@ impl Gemma4Nvfp4Bringup {
                 0, self.stream.raw(), &args,
             )
         }
+    }
+
+    /// Stream-6a (drafter forward primitive #1): cast f32 →
+    /// f16 in place. Mirrors production's `launch_cast_f32_to
+    /// _f16` (gemma4_bring_up.rs:16723) — same kernel ABI,
+    /// same grid math, just on Option B's stream.
+    fn launch_cast_f32_to_f16(
+        &self, dst_f16: u64, src_f32: u64, n: u32,
+    ) -> Result<()> {
+        if n == 0 { return Ok(()); }
+        let mut dst = dst_f16;
+        let mut src = src_f32;
+        let mut n_i: i32 = n as i32;
+        let args: [*mut core::ffi::c_void; 3] = [
+            (&mut dst) as *mut u64 as *mut _,
+            (&mut src) as *mut u64 as *mut _,
+            (&mut n_i) as *mut i32 as *mut _,
+        ];
+        const BLOCK: u32 = 256;
+        let grid_x = (n + BLOCK - 1) / BLOCK;
+        unsafe {
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_cast_f32_to_f16,
+                (grid_x, 1, 1),
+                (BLOCK, 1, 1),
+                0, self.stream.raw(), &args,
+            )
+        }
+    }
+
+    /// Stream-6a (drafter forward primitive #1):
+    /// pre_projection step of one assistant draft iteration.
+    /// Mirrors production's `Gemma4Bringup::run_drafter_pre
+    /// _projection` (gemma4_bring_up.rs:8732) — same kernel
+    /// chain, just on Option B's state.
+    ///
+    /// Math:
+    ///   workspace.hidden[hidden_size] f16 =
+    ///     f32_to_f16(cublaslt.f16_gemm_f32(
+    ///       workspace.pre_projection_in[2*backbone_hidden] f16,
+    ///       drafter.top.pre_projection[hidden_size, 2*backbone_hidden] f16
+    ///     ))
+    ///
+    /// Caller responsibility: workspace + drafter populated;
+    /// pre_projection_in already contains
+    /// `[last_token_embed; base_hidden_last_step]`. The caller
+    /// runs subsequent drafter forward primitives (q_side +
+    /// cross-attn + finisher + mlp) — not in this commit.
+    ///
+    /// NO scratch_guard. NO fence. Caller orchestrates the
+    /// full step + the final DtoH.
+    pub fn forward_drafter_pre_projection(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+    ) -> Result<()> {
+        let hidden = drafter.arch.hidden_size;
+        let pre_in = drafter.arch.pre_projection_in_dim;
+        let stream = self.stream.raw();
+
+        if workspace.pre_projection_in == 0
+            || workspace.gemm_f32 == 0
+            || workspace.hidden == 0
+        {
+            return Err(corrupt_runtime_err(
+                "forward_drafter_pre_projection: workspace has \
+                 null device pointers — caller must call \
+                 drafter.alloc_step_workspace(arena) first".into()));
+        }
+        if drafter.top.pre_projection == 0 {
+            return Err(corrupt_runtime_err(
+                "forward_drafter_pre_projection: drafter \
+                 pre_projection weight is null".into()));
+        }
+
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                workspace.pre_projection_in,
+                drafter.top.pre_projection,
+                workspace.gemm_f32,
+                1, hidden as i32, pre_in as i32, stream,
+            )?;
+        }
+        self.launch_cast_f32_to_f16(
+            workspace.hidden, workspace.gemm_f32, hidden as u32,
+        )?;
+        Ok(())
     }
 
     fn forward_scratch_guard(&self) -> ForwardScratchGuard<'_> {
@@ -5947,5 +6053,67 @@ mod tests {
             shadow.sliding_layer_bytes / (1024 * 1024),
             shadow.full_layer_bytes / (1024 * 1024),
         );
+        let workspace = rt.alloc_step_workspace(&bringup.arena)
+            .expect("alloc_step_workspace");
+        eprintln!(
+            "[#6a-smoke] drafter workspace allocated ({} bytes)",
+            workspace.bytes,
+        );
+        // Stream-6a primitive #1: zero the pre_projection_in
+        // buffer (so f16_gemm sees a defined zero input — real
+        // step would populate this with [last_token_embed;
+        // base_hidden_last]) then run forward_drafter_pre
+        // _projection. Asserts the gemm + cast chain completes
+        // without NaN/Inf.
+        let drafter_hidden = rt.arch.hidden_size;
+        let drafter_pre_in = rt.arch.pre_projection_in_dim;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let zero_bytes = drafter_pre_in * 2; // pre_in f16
+            let rc = cuMemsetD8_v2(
+                workspace.pre_projection_in, 0, zero_bytes);
+            assert_eq!(rc, CUresult::CUDA_SUCCESS,
+                "zero pre_projection_in");
+        }
+        bringup.forward_drafter_pre_projection(rt, &workspace)
+            .expect("forward_drafter_pre_projection");
+        bringup.stream.fence().expect("stream fence");
+        // DtoH workspace.hidden (drafter f16 hidden, NOT base
+        // hidden — production drafter has its own hidden_size,
+        // 1024 on the 31B assistant).
+        let h_words = drafter_hidden;
+        let mut hidden_f16 = vec![0u16; h_words];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                hidden_f16.as_mut_ptr() as *mut _,
+                workspace.hidden, h_words * 2);
+            assert_eq!(rc, CUresult::CUDA_SUCCESS,
+                "drafter hidden DtoH");
+        }
+        let mut nan = 0usize;
+        let mut inf = 0usize;
+        let mut mean_abs: f32 = 0.0;
+        let mut max_abs: f32 = 0.0;
+        for &b in &hidden_f16 {
+            let v = half::f16::from_bits(b).to_f32();
+            if v.is_nan() { nan += 1; continue; }
+            if v.is_infinite() { inf += 1; continue; }
+            mean_abs += v.abs();
+            if v.abs() > max_abs { max_abs = v.abs(); }
+        }
+        mean_abs /= h_words as f32;
+        eprintln!(
+            "[#6a-smoke] pre_projection on zero input: \
+             N={h_words} nan={nan} inf={inf} mean_abs={mean_abs:.6} \
+             max_abs={max_abs:.6}"
+        );
+        assert_eq!(nan, 0, "pre_projection produced NaN");
+        assert_eq!(inf, 0, "pre_projection produced Inf");
+        // Zero input through bf16-narrow GEMM should land near
+        // zero. Bound generously to absorb FMA round-off.
+        assert!(max_abs < 1.0,
+            "pre_projection on zero input has implausible \
+             max_abs={max_abs}");
     }
 }
