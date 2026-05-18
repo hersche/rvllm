@@ -492,6 +492,17 @@ impl Gemma4Nvfp4Bringup {
         let model = load_gemma4_nvfp4_text(&arena, model_dir, &arch)?;
 
         // Load forward-path kernels.
+        // Resolve the per-arch kernel subdirectory (e.g.
+        // sm_121/) the same way production gemma4 / mistral35 /
+        // qwen35 bring-ups do. Without this, an operator profile
+        // that points `RVLLM_KERNELS_DIR` at the kernel-tree root
+        // (the natural choice — the path is family-agnostic and
+        // matches what every other rvllm profile uses) loads the
+        // empty top-level `kernels/manifest.json` placeholder and
+        // every PTX lookup errors out with
+        // `MissingField { name: "manifest.entries" }`.
+        let kernels_dir = crate::bring_up::resolve_kernels_dir(
+            &ctx, kernels_dir)?;
         let manifest_path = kernels_dir.join("manifest.json");
         let manifest = rvllm_kernels::KernelManifest::load_and_verify(&manifest_path)?;
         let loader = Arc::new(KernelLoader::new(manifest));
