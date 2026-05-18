@@ -3586,10 +3586,40 @@ impl Gemma4Nvfp4Bringup {
 
         // Metadata fill: positions[t] = position_start + t (mode B
         // = absolute slot for full f16 RoPE tables); slot_mapping
-        // = same; context_lens[t] = position_start + t + 1.
+        // = same. The fill kernel also writes context_lens[t] =
+        // position_start + t + 1, which is the PER-DECODE-TOKEN
+        // semantic. The unified prefill kernel, however, expects
+        // context_lens to be PER-SEQUENCE: `seq_len =
+        // context_lens[seq_idx]` (kernels/flash_attention_unified
+        // _prefill_nvfp4kv.cu:207). For num_seqs=1 with N prompt
+        // tokens it reads context_lens[0] only, treating it as
+        // the SEQUENCE total context length (= N + position_start).
+        // The fill leaves context_lens[0] = position_start + 1
+        // which would silently constrain the kernel to attend
+        // only to slot 0 (codex review caught this).
+        // Fix: after fill, overwrite context_lens[0] with the
+        // sequence-total via a stream-ordered HtoD memcpy.
         self.fill_pos_slots(kv,
             position_start as i32, position_start as i32,
             num_tokens as i32)?;
+        // Sequence total context length for this prompt batch.
+        let seq_total_ctx: i32 = (position_start + num_tokens) as i32;
+        let seq_total_region = self.arena.region(
+            "g4n_batch_ctx_override", 4, 16)?;
+        unsafe {
+            seq_total_region.copy_from_host(&seq_total_ctx.to_le_bytes())?;
+            // Stream-ordered DtoD copy into context_lens[0].
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                kv.context_lens_ptr,
+                seq_total_region.device_ptr(),
+                4, stream_u64 as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "batched: context_lens[0] override DtoD",
+                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+            }
+        }
 
         // cu_seqlens_q for one sequence of length N: [0, N].
         let cu_seqlens_region = self.arena.region(
