@@ -38,17 +38,15 @@ use std::path::{Path, PathBuf};
 
 use rvllm_core::Result;
 use rvllm_cutlass::cublaslt::CublasLt;
-use std::sync::Arc;
 use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
 use rvllm_loader::gemma4_arch::Gemma4Arch;
 use rvllm_loader::gemma4_nvfp4_weights::Gemma4Nvfp4LoadedModel;
-use rvllm_mem::{HbmArena, Stream};
 use rvllm_mem::context::CudaContextHandle;
+use rvllm_mem::{HbmArena, Stream};
+use std::sync::Arc;
 
 use crate::gemma4_nvfp4_load::load_gemma4_nvfp4_text;
-use crate::gemma4_nvfp4_ops::{
-    gemma4_nvfp4_attn_proj, Gemma4Nvfp4MlpKernels,
-};
+use crate::gemma4_nvfp4_ops::{gemma4_nvfp4_attn_proj, Gemma4Nvfp4MlpKernels};
 
 /// Kernel handles the forward path needs beyond the MLP set.
 /// Loaded once at bring-up time from the existing sm_121 PTX
@@ -140,22 +138,17 @@ impl Gemma4Nvfp4KvState {
         let block_size: u32 = 1;
         if max_query_tokens == 0 {
             return Err(corrupt_runtime_err(
-                "Gemma4Nvfp4KvState::allocate: max_query_tokens must be >= 1"
-                    .into()));
+                "Gemma4Nvfp4KvState::allocate: max_query_tokens must be >= 1".into(),
+            ));
         }
 
-        let block_tables_region = arena.region(
-            "gemma4_nvfp4_kv_block_tables",
-            (max_pos as usize) * 4, 256)?;
+        let block_tables_region =
+            arena.region("gemma4_nvfp4_kv_block_tables", (max_pos as usize) * 4, 256)?;
         let meta_bytes = (max_query_tokens as usize) * 4;
-        let context_lens_region = arena.region(
-            "gemma4_nvfp4_kv_context_lens", meta_bytes, 16)?;
-        let positions_region = arena.region(
-            "gemma4_nvfp4_kv_positions", meta_bytes, 16)?;
-        let slot_mapping_region = arena.region(
-            "gemma4_nvfp4_kv_slot_mapping", meta_bytes, 16)?;
-        let q_scale_region = arena.region(
-            "gemma4_nvfp4_kv_q_scale", 4, 16)?;
+        let context_lens_region = arena.region("gemma4_nvfp4_kv_context_lens", meta_bytes, 16)?;
+        let positions_region = arena.region("gemma4_nvfp4_kv_positions", meta_bytes, 16)?;
+        let slot_mapping_region = arena.region("gemma4_nvfp4_kv_slot_mapping", meta_bytes, 16)?;
+        let q_scale_region = arena.region("gemma4_nvfp4_kv_q_scale", 4, 16)?;
 
         // Initialize block_tables with identity mapping
         // (i32 0..max_pos). Single HtoD copy at allocate
@@ -169,10 +162,11 @@ impl Gemma4Nvfp4KvState {
         // q_scale default = 2.0f (matches production
         // RVLLM_Q_SCALE on the fp8-block spec profile).
         let q_scale_default: f32 = std::env::var("RVLLM_Q_SCALE")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(2.0_f32);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2.0_f32);
         unsafe {
-            q_scale_region.copy_from_host(
-                &q_scale_default.to_le_bytes())?;
+            q_scale_region.copy_from_host(&q_scale_default.to_le_bytes())?;
         }
 
         let mut k_packed_layer_ptrs = Vec::with_capacity(arch.num_hidden_layers);
@@ -180,8 +174,7 @@ impl Gemma4Nvfp4KvState {
         let mut k_scale_layer_ptrs = Vec::with_capacity(arch.num_hidden_layers);
         let mut v_scale_layer_ptrs = Vec::with_capacity(arch.num_hidden_layers);
         // block_tables[max_pos] + (positions+slot+context_lens)[max_query_tokens] + q_scale[1]
-        let mut total_bytes: u64 =
-            (max_pos as u64) * 4 + 3 * (max_query_tokens as u64) * 4 + 4;
+        let mut total_bytes: u64 = (max_pos as u64) * 4 + 3 * (max_query_tokens as u64) * 4 + 4;
 
         for layer_idx in 0..arch.num_hidden_layers {
             let lt = &arch.layer_types[layer_idx];
@@ -196,21 +189,15 @@ impl Gemma4Nvfp4KvState {
             // Packed K + V bytes per slot per head: head_dim/2
             // nibbles. Total per layer = max_pos * n_kv_heads *
             // head_dim/2.
-            let packed_bytes_per_layer =
-                (max_pos as usize) * n_kv_heads * (head_dim / 2);
+            let packed_bytes_per_layer = (max_pos as usize) * n_kv_heads * (head_dim / 2);
             // Per-(slot, head) E4M3 microscales: 1 byte per
             // group_of_16. groups per head = head_dim / 16.
-            let scale_bytes_per_layer =
-                (max_pos as usize) * n_kv_heads * (head_dim / 16);
+            let scale_bytes_per_layer = (max_pos as usize) * n_kv_heads * (head_dim / 16);
 
-            let k_packed = arena.region(
-                "gemma4_nvfp4_kv_k_packed", packed_bytes_per_layer, 256)?;
-            let v_packed = arena.region(
-                "gemma4_nvfp4_kv_v_packed", packed_bytes_per_layer, 256)?;
-            let k_scale = arena.region(
-                "gemma4_nvfp4_kv_k_scale", scale_bytes_per_layer, 256)?;
-            let v_scale = arena.region(
-                "gemma4_nvfp4_kv_v_scale", scale_bytes_per_layer, 256)?;
+            let k_packed = arena.region("gemma4_nvfp4_kv_k_packed", packed_bytes_per_layer, 256)?;
+            let v_packed = arena.region("gemma4_nvfp4_kv_v_packed", packed_bytes_per_layer, 256)?;
+            let k_scale = arena.region("gemma4_nvfp4_kv_k_scale", scale_bytes_per_layer, 256)?;
+            let v_scale = arena.region("gemma4_nvfp4_kv_v_scale", scale_bytes_per_layer, 256)?;
 
             k_packed_layer_ptrs.push(k_packed.device_ptr());
             v_packed_layer_ptrs.push(v_packed.device_ptr());
@@ -363,7 +350,9 @@ impl Drop for ForwardScratchGuard<'_> {
     fn drop(&mut self) {
         // SAFETY: these bring-up forwards return host-owned Vec/u32 values.
         // Any Region locals allocated after the guard are dropped first.
-        unsafe { self.arena.restore(self.checkpoint); }
+        unsafe {
+            self.arena.restore(self.checkpoint);
+        }
     }
 }
 
@@ -465,11 +454,7 @@ impl Gemma4Nvfp4Bringup {
     /// profile (`mobile-31b-nvfp4w-rvllm-spec.env`) targets
     /// 96 GiB to cover spec + vision scratch + KV in later
     /// commits.
-    pub fn load(
-        model_dir: &Path,
-        arena_bytes: usize,
-        kernels_dir: &Path,
-    ) -> Result<Self> {
+    pub fn load(model_dir: &Path, arena_bytes: usize, kernels_dir: &Path) -> Result<Self> {
         validate_no_stale_g4n_debug_envs()?;
         let ctx = CudaContextHandle::init(0)?;
         // SAFETY: HbmArena borrows the context for its lifetime.
@@ -484,10 +469,8 @@ impl Gemma4Nvfp4Bringup {
 
         // cuBLASLt: 64 MiB workspace, 256-byte aligned (cuBLASLt
         // requirement — see commit #2 bisect note).
-        let cublaslt_ws = arena.region("gemma4_nvfp4_cublaslt_ws",
-                                       64 * 1024 * 1024, 256)?;
-        let cublaslt = CublasLt::new(cublaslt_ws.device_ptr(),
-                                     64 * 1024 * 1024)?;
+        let cublaslt_ws = arena.region("gemma4_nvfp4_cublaslt_ws", 64 * 1024 * 1024, 256)?;
+        let cublaslt = CublasLt::new(cublaslt_ws.device_ptr(), 64 * 1024 * 1024)?;
 
         // Parse arch + run the text loader (Phase 3b).
         let arch = Gemma4Arch::from_dir(model_dir)?;
@@ -503,44 +486,38 @@ impl Gemma4Nvfp4Bringup {
         // empty top-level `kernels/manifest.json` placeholder and
         // every PTX lookup errors out with
         // `MissingField { name: "manifest.entries" }`.
-        let kernels_dir = crate::bring_up::resolve_kernels_dir(
-            &ctx, kernels_dir)?;
+        let kernels_dir = crate::bring_up::resolve_kernels_dir(&ctx, kernels_dir)?;
         let manifest_path = kernels_dir.join("manifest.json");
         let manifest = rvllm_kernels::KernelManifest::load_and_verify(&manifest_path)?;
         let loader = Arc::new(KernelLoader::new(manifest));
 
         let embed_mod = loader.load_ptx("embedding_gather_bf16")?;
-        let fn_embedding_gather_bf16 =
-            embed_mod.get_function("embedding_gather_bf16_kernel")?;
+        let fn_embedding_gather_bf16 = embed_mod.get_function("embedding_gather_bf16_kernel")?;
 
         let rmsnorm_mod = loader.load_ptx("rmsnorm_inplace_bf16_gbf16")?;
         let fn_rmsnorm_inplace_bf16 =
             rmsnorm_mod.get_function("rmsnorm_inplace_bf16_gbf16_kernel")?;
 
         let vector_add_mod = loader.load_ptx("vector_add_bf16")?;
-        let fn_vector_add_bf16 =
-            vector_add_mod.get_function("vector_add_bf16_kernel")?;
+        let fn_vector_add_bf16 = vector_add_mod.get_function("vector_add_bf16_kernel")?;
 
         let rope_mod = loader.load_ptx("rope_split_half_bf16")?;
-        let fn_rope_split_half_bf16 =
-            rope_mod.get_function("rope_split_half_bf16_kernel")?;
+        let fn_rope_split_half_bf16 = rope_mod.get_function("rope_split_half_bf16_kernel")?;
 
         let argmax_mod = loader.load_ptx("argmax")?;
         let fn_argmax_f32 = argmax_mod.get_function("argmax_kernel")?;
 
         // Commit #5b1: attention kernel handles loaded but not
         // yet wired into a forward (that's #5b2).
-        let rope_kv_write_mod =
-            loader.load_ptx("fused_rope_partial_nvfp4kv_bf16in")?;
-        let fn_rope_kv_write_bf16in = rope_kv_write_mod
-            .get_function("fused_rope_partial_nvfp4kv_bf16in_kernel")?;
+        let rope_kv_write_mod = loader.load_ptx("fused_rope_partial_nvfp4kv_bf16in")?;
+        let fn_rope_kv_write_bf16in =
+            rope_kv_write_mod.get_function("fused_rope_partial_nvfp4kv_bf16in_kernel")?;
 
-        let attn_decode_mod =
-            loader.load_ptx("flash_attention_nvfp4kv_bf16out")?;
-        let fn_attn_decode_bf16out = attn_decode_mod
-            .get_function("flash_attention_2_decode_nvfp4kv_bf16out_kernel")?;
-        let fn_attn_decode_gqa_bf16out = attn_decode_mod
-            .get_function("flash_attention_2_decode_nvfp4kv_gqa_bf16out_kernel")?;
+        let attn_decode_mod = loader.load_ptx("flash_attention_nvfp4kv_bf16out")?;
+        let fn_attn_decode_bf16out =
+            attn_decode_mod.get_function("flash_attention_2_decode_nvfp4kv_bf16out_kernel")?;
+        let fn_attn_decode_gqa_bf16out =
+            attn_decode_mod.get_function("flash_attention_2_decode_nvfp4kv_gqa_bf16out_kernel")?;
 
         // Floor commit 2 (stream-safe metadata).
         let fill_pos_slots_mod = loader.load_ptx("g4n_fill_pos_slots_i32")?;
@@ -554,14 +531,11 @@ impl Gemma4Nvfp4Bringup {
         // manifest (kernels/f32_to_bf16.cu, kernels/vnorm_bf16.cu);
         // Option B was just not loading them.
         let f32_to_bf16_mod = loader.load_ptx("f32_to_bf16")?;
-        let fn_f32_to_bf16 =
-            f32_to_bf16_mod.get_function("f32_to_bf16_kernel")?;
+        let fn_f32_to_bf16 = f32_to_bf16_mod.get_function("f32_to_bf16_kernel")?;
         let vnorm_bf16_mod = loader.load_ptx("vnorm_bf16")?;
-        let fn_vnorm_bf16 =
-            vnorm_bf16_mod.get_function("vnorm_bf16_kernel")?;
+        let fn_vnorm_bf16 = vnorm_bf16_mod.get_function("vnorm_bf16_kernel")?;
         let scaled_add_bf16_mod = loader.load_ptx("g4n_scaled_add_bf16")?;
-        let fn_scaled_add_bf16 =
-            scaled_add_bf16_mod.get_function("g4n_scaled_add_bf16_kernel")?;
+        let fn_scaled_add_bf16 = scaled_add_bf16_mod.get_function("g4n_scaled_add_bf16_kernel")?;
         // HF Gemma 4 layer epilogue: `hidden = residual + post_ff_norm(mlp);
         // hidden *= layer_scalar`. Production folds this into its
         // fused_norm_add_residual kernel; Option B uses a separate
@@ -570,36 +544,30 @@ impl Gemma4Nvfp4Bringup {
         // the mode-collapse smoking gun to Option B's prior
         // `residual += layer_scalar * mlp_contrib` semantics (vs
         // HF's `residual = (residual + mlp_contrib) * layer_scalar`).
-        let add_then_scale_bf16_mod =
-            loader.load_ptx("g4n_add_then_scale_bf16")?;
-        let fn_add_then_scale_bf16 = add_then_scale_bf16_mod
-            .get_function("g4n_add_then_scale_bf16_kernel")?;
+        let add_then_scale_bf16_mod = loader.load_ptx("g4n_add_then_scale_bf16")?;
+        let fn_add_then_scale_bf16 =
+            add_then_scale_bf16_mod.get_function("g4n_add_then_scale_bf16_kernel")?;
 
         // Stream-6a (drafter forward primitive #1): cast
         // module — required by the drafter pre_projection
         // step (f32 GEMM output → f16 hidden).
         let cast_fp_mod = loader.load_ptx("cast_fp")?;
-        let fn_cast_f32_to_f16 =
-            cast_fp_mod.get_function("cast_f32_to_f16_kernel")?;
+        let fn_cast_f32_to_f16 = cast_fp_mod.get_function("cast_f32_to_f16_kernel")?;
         // Stream-6a drafter forward bundle (f16 throughout).
-        let rmsnorm_inplace_f16_mod =
-            loader.load_ptx("rmsnorm_inplace_f16")?;
-        let fn_rmsnorm_inplace_f16 = rmsnorm_inplace_f16_mod
-            .get_function("rmsnorm_inplace_f16_kernel")?;
-        let fused_gelu_mul_f16_mod =
-            loader.load_ptx("fused_gelu_mul_f16")?;
-        let fn_fused_gelu_mul_f16 = fused_gelu_mul_f16_mod
-            .get_function("fused_gelu_mul_f16_kernel")?;
+        let rmsnorm_inplace_f16_mod = loader.load_ptx("rmsnorm_inplace_f16")?;
+        let fn_rmsnorm_inplace_f16 =
+            rmsnorm_inplace_f16_mod.get_function("rmsnorm_inplace_f16_kernel")?;
+        let fused_gelu_mul_f16_mod = loader.load_ptx("fused_gelu_mul_f16")?;
+        let fn_fused_gelu_mul_f16 =
+            fused_gelu_mul_f16_mod.get_function("fused_gelu_mul_f16_kernel")?;
         let vector_add_f16_mod = loader.load_ptx("vector_add_f16")?;
-        let fn_vector_add_f16 = vector_add_f16_mod
-            .get_function("vector_add_f16_kernel")?;
+        let fn_vector_add_f16 = vector_add_f16_mod.get_function("vector_add_f16_kernel")?;
         let scale_inplace_f16_mod = loader.load_ptx("scale_inplace_f16")?;
-        let fn_scale_inplace_f16 = scale_inplace_f16_mod
-            .get_function("scale_inplace_f16_kernel")?;
-        let rope_partial_f16kv_mod =
-            loader.load_ptx("fused_rope_partial_f16kv")?;
-        let fn_rope_partial_f16kv = rope_partial_f16kv_mod
-            .get_function("fused_rope_partial_f16kv_kernel")?;
+        let fn_scale_inplace_f16 =
+            scale_inplace_f16_mod.get_function("scale_inplace_f16_kernel")?;
+        let rope_partial_f16kv_mod = loader.load_ptx("fused_rope_partial_f16kv")?;
+        let fn_rope_partial_f16kv =
+            rope_partial_f16kv_mod.get_function("fused_rope_partial_f16kv_kernel")?;
 
         // Stream-6b spec primitive #1: bf16→f16 saturating cast.
         // Used to snapshot the base's post-final-norm hidden
@@ -607,20 +575,16 @@ impl Gemma4Nvfp4Bringup {
         // buffer the drafter consumes as `base_hidden_last`
         // (mirrors production's `base_last_hidden_ptr`).
         let bf16_to_f16_sat_mod = loader.load_ptx("bf16_to_f16_sat")?;
-        let fn_bf16_to_f16_sat = bf16_to_f16_sat_mod
-            .get_function("bf16_to_f16_sat_kernel")?;
+        let fn_bf16_to_f16_sat = bf16_to_f16_sat_mod.get_function("bf16_to_f16_sat_kernel")?;
 
         // Stream #5f-PRIME: still load this handle ourselves
         // for the per-launcher path (deprecated by the
         // AttentionBackend below but kept until callers move).
-        let (unified_prefill_nvfp4kv_mod,
-             fn_prefill_nvfp4kv_unified_bf16out) =
+        let (unified_prefill_nvfp4kv_mod, fn_prefill_nvfp4kv_unified_bf16out) =
             match loader.load_ptx("flash_attention_unified_prefill_nvfp4kv") {
                 Ok(m) => {
                     let f = m
-                        .get_function(
-                            "flash_attention_2_prefill_nvfp4kv_unified_bf16out_kernel"
-                        )
+                        .get_function("flash_attention_2_prefill_nvfp4kv_unified_bf16out_kernel")
                         .ok();
                     (Some(m), f)
                 }
@@ -634,22 +598,20 @@ impl Gemma4Nvfp4Bringup {
         // `PagedPrefillNvfp4Launcher` consumes for the
         // batched-N attention path.
         let attn_backend_sliding = rvllm_attention::AttentionBackend::Fa2Ptx(
-            rvllm_attention::Fa2PtxKernels::load(
-                &*loader, arch.head_dim_sliding as u32)?);
+            rvllm_attention::Fa2PtxKernels::load(&*loader, arch.head_dim_sliding as u32)?,
+        );
         let attn_backend_global = rvllm_attention::AttentionBackend::Fa2Ptx(
-            rvllm_attention::Fa2PtxKernels::load(
-                &*loader, arch.head_dim_global as u32)?);
+            rvllm_attention::Fa2PtxKernels::load(&*loader, arch.head_dim_global as u32)?,
+        );
 
         // MLP kernels (commit #3).
         let mlp_gemv_mod = loader.load_ptx("mistral35_w4a16_gemv_bf16")?;
-        let fn_w4a16_gemv =
-            mlp_gemv_mod.get_function("mistral35_w4a16_gemv_bf16_kernel")?;
+        let fn_w4a16_gemv = mlp_gemv_mod.get_function("mistral35_w4a16_gemv_bf16_kernel")?;
         let mlp_gate_up_mod = loader.load_ptx("mistral35_w4a16_gate_up_gemv_bf16")?;
         let fn_w4a16_gate_up_gemv =
             mlp_gate_up_mod.get_function("mistral35_w4a16_gate_up_gemv_bf16_kernel")?;
         let mlp_gelu_mod = loader.load_ptx("gelu_tanh_mul_bf16")?;
-        let fn_gelu_tanh_mul =
-            mlp_gelu_mod.get_function("gelu_tanh_mul_bf16_kernel")?;
+        let fn_gelu_tanh_mul = mlp_gelu_mod.get_function("gelu_tanh_mul_bf16_kernel")?;
 
         let mlp_kernels = Gemma4Nvfp4MlpKernels {
             fn_w4a16_gemv,
@@ -736,23 +698,23 @@ impl Gemma4Nvfp4Bringup {
             return Ok(());
         }
         let h = self.arch.hidden_size;
-        let region = self.arena.region(
-            "g4n_base_last_hidden_f16", h * 2, 16)?;
+        let region = self.arena.region("g4n_base_last_hidden_f16", h * 2, 16)?;
         // Zero-init so a drafter step that runs before the first
         // base forward sees a defined (all-zero) hidden half.
         unsafe {
             use cudarc::driver::sys::*;
-            let rc = cuMemsetD8_v2(
-                region.device_ptr(), 0, h * 2);
+            let rc = cuMemsetD8_v2(region.device_ptr(), 0, h * 2);
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(corrupt_runtime_err(
-                    "ensure_base_last_hidden_buffer: zero-init".into()));
+                    "ensure_base_last_hidden_buffer: zero-init".into(),
+                ));
             }
         }
         // Re-checkpoint above this allocation so subsequent
         // forward calls' arena.restore() leaves the buffer intact.
         self.forward_checkpoint = self.arena.checkpoint();
-        self.base_last_hidden_ptr.store(region.device_ptr(), Release);
+        self.base_last_hidden_ptr
+            .store(region.device_ptr(), Release);
         Ok(())
     }
 
@@ -800,10 +762,7 @@ impl Gemma4Nvfp4Bringup {
     ///
     /// Pure: no GPU work, no arena ops. Lives on the bringup
     /// only for namespacing alongside the other spec primitives.
-    pub fn spec_greedy_accept_count(
-        drafts: &[u32],
-        verifies: &[u32],
-    ) -> usize {
+    pub fn spec_greedy_accept_count(drafts: &[u32], verifies: &[u32]) -> usize {
         let k = drafts.len().min(verifies.len());
         let mut n = 0usize;
         while n < k && drafts[n] == verifies[n] {
@@ -863,23 +822,30 @@ impl Gemma4Nvfp4Bringup {
         if max_new == 0 {
             return Err(corrupt_runtime_err(
                 "run_spec_session_nvfp4_greedy_k1: max_new must be \
-                 >= 1".into()));
+                 >= 1"
+                    .into(),
+            ));
         }
         if prompt_ids.is_empty() {
             return Err(corrupt_runtime_err(
-                "run_spec_session_nvfp4_greedy_k1: prompt_ids empty".into()));
+                "run_spec_session_nvfp4_greedy_k1: prompt_ids empty".into(),
+            ));
         }
         if self.base_last_hidden_device_ptr() == 0 {
             return Err(corrupt_runtime_err(
                 "run_spec_session_nvfp4_greedy_k1: \
-                 ensure_base_last_hidden_buffer not called".into()));
+                 ensure_base_last_hidden_buffer not called"
+                    .into(),
+            ));
         }
         {
             let guard = self.drafter.lock().unwrap();
             if guard.is_none() {
                 return Err(corrupt_runtime_err(
                     "run_spec_session_nvfp4_greedy_k1: drafter not \
-                     loaded; call ensure_drafter_nvfp4 first".into()));
+                     loaded; call ensure_drafter_nvfp4 first"
+                        .into(),
+                ));
             }
         }
 
@@ -888,14 +854,15 @@ impl Gemma4Nvfp4Bringup {
         //    #6b-base-hidden hook in `forward_final_to_token`)
         //    snapshots base's post-final-norm hidden for the
         //    last prompt token into `base_last_hidden_ptr`.
-        let mut t_committed = self.forward_prompt_to_token(
-            prompt_ids, 0, kv)?;
+        let mut t_committed = self.forward_prompt_to_token(prompt_ids, 0, kv)?;
         let mut emitted: Vec<u32> = vec![t_committed];
         let mut ctx_len: u32 = prompt_ids.len() as u32;
 
         if emitted.len() >= max_new {
             return Ok(SpecSessionStats {
-                emitted, n_iters: 0, n_accepted: 0,
+                emitted,
+                n_iters: 0,
+                n_accepted: 0,
             });
         }
 
@@ -904,7 +871,8 @@ impl Gemma4Nvfp4Bringup {
         //    `verify_base_one_token` scratch_guards stop here.
         let workspace = {
             let guard = self.drafter.lock().unwrap();
-            let rt = guard.as_ref()
+            let rt = guard
+                .as_ref()
                 .expect("drafter slot populated (guarded above)");
             rt.alloc_step_workspace(&self.arena)?
         };
@@ -919,23 +887,21 @@ impl Gemma4Nvfp4Bringup {
             let t_draft: u32 = {
                 let guard = self.drafter.lock().unwrap();
                 let rt = guard.as_ref().unwrap();
-                self.populate_drafter_shadow_kv_with_rt(
-                    rt, kv, 0, ctx_len)?;
-                self.populate_drafter_pre_projection_input(
-                    rt, &workspace, t_committed)?;
-                self.run_drafter_forward_one_token(
-                    rt, &workspace, ctx_len, kv)?;
+                self.populate_drafter_shadow_kv_with_rt(rt, kv, 0, ctx_len)?;
+                self.populate_drafter_pre_projection_input(rt, &workspace, t_committed)?;
+                self.run_drafter_forward_one_token(rt, &workspace, ctx_len, kv)?;
                 self.stream.fence()?;
                 let mut t: u32 = 0;
                 unsafe {
                     use cudarc::driver::sys::*;
-                    let rc = cuMemcpyDtoH_v2(
-                        &mut t as *mut u32 as *mut _,
-                        workspace.out_token_id, 4);
+                    let rc =
+                        cuMemcpyDtoH_v2(&mut t as *mut u32 as *mut _, workspace.out_token_id, 4);
                     if rc != CUresult::CUDA_SUCCESS {
                         return Err(corrupt_runtime_err(
                             "run_spec_session_nvfp4_greedy_k1: \
-                             drafter token DtoH".into()));
+                             drafter token DtoH"
+                                .into(),
+                        ));
                     }
                 }
                 t
@@ -943,12 +909,10 @@ impl Gemma4Nvfp4Bringup {
 
             // (b) Base verify — writes slot `ctx_len`, snapshots
             //     fresh base_hidden_last for the next iter.
-            let t_verify = self.verify_base_one_token(
-                t_committed, ctx_len, kv)?;
+            let t_verify = self.verify_base_one_token(t_committed, ctx_len, kv)?;
 
             // (c) Accept count.
-            let n_acc = Self::spec_greedy_accept_count(
-                &[t_draft], &[t_verify]);
+            let n_acc = Self::spec_greedy_accept_count(&[t_draft], &[t_verify]);
 
             // (d) Commit verify, advance.
             emitted.push(t_verify);
@@ -959,7 +923,221 @@ impl Gemma4Nvfp4Bringup {
         }
 
         Ok(SpecSessionStats {
-            emitted, n_iters, n_accepted: n_accepted_total,
+            emitted,
+            n_iters,
+            n_accepted: n_accepted_total,
+        })
+    }
+
+    /// K>=1 greedy spec-session orchestration using one batched base
+    /// verify per iteration. K=1 is supported for bring-up parity, but
+    /// the intended use is K>=2 where the single unified-prefill verify
+    /// amortizes the extra drafter forwards.
+    ///
+    /// Per iteration:
+    ///   1. Drafter produces `K` drafts from the current committed base
+    ///      state, chaining each step through `workspace.out_hidden`.
+    ///   2. Base verifies `[t_committed, drafts...]` at positions
+    ///      `ctx_len..ctx_len+K`, producing `K+1` argmaxes.
+    ///   3. Accept longest `drafts[i] == verifies[i]` prefix.
+    ///   4. Commit accepted drafts plus `verifies[n_acc]` as the
+    ///      correction/bonus token, then snapshot residual row
+    ///      `n_acc` for the next drafter step.
+    ///
+    /// Base KV slots past the committed prefix are not scrubbed. The
+    /// next verify call starts at the new `ctx_len` and overwrites those
+    /// slots via `slot_mapping[t] = position_start + t`.
+    ///
+    /// If the drafter repeatedly accepts nothing, the loop bails out to
+    /// plain base decode for the rest of the request. That keeps an
+    /// accept-rate-zero drafter from making the HTTP spec path slower
+    /// than non-spec decode.
+    pub fn run_spec_session_nvfp4_greedy_k(
+        &mut self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        spec_k: usize,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<SpecSessionStats> {
+        if spec_k == 0 {
+            return Err(corrupt_runtime_err(
+                "run_spec_session_nvfp4_greedy_k: spec_k must be >= 1".into(),
+            ));
+        }
+        if max_new == 0 {
+            return Err(corrupt_runtime_err(
+                "run_spec_session_nvfp4_greedy_k: max_new must be >= 1".into(),
+            ));
+        }
+        if prompt_ids.is_empty() {
+            return Err(corrupt_runtime_err(
+                "run_spec_session_nvfp4_greedy_k: prompt_ids empty".into(),
+            ));
+        }
+        if self.base_last_hidden_device_ptr() == 0 {
+            return Err(corrupt_runtime_err(
+                "run_spec_session_nvfp4_greedy_k: \
+                 ensure_base_last_hidden_buffer not called"
+                    .into(),
+            ));
+        }
+        {
+            let guard = self.drafter.lock().unwrap();
+            if guard.is_none() {
+                return Err(corrupt_runtime_err(
+                    "run_spec_session_nvfp4_greedy_k: drafter not loaded; \
+                     call ensure_drafter_nvfp4 first"
+                        .into(),
+                ));
+            }
+        }
+
+        // Prefill prompt and snapshot the prompt-final base hidden for
+        // drafter step 0.
+        let mut t_committed = self.forward_prompt_to_token(prompt_ids, 0, kv)?;
+        let mut emitted: Vec<u32> = vec![t_committed];
+        let mut ctx_len: u32 = prompt_ids.len() as u32;
+
+        if emitted.len() >= max_new {
+            return Ok(SpecSessionStats {
+                emitted,
+                n_iters: 0,
+                n_accepted: 0,
+            });
+        }
+
+        let workspace = {
+            let guard = self.drafter.lock().unwrap();
+            let rt = guard
+                .as_ref()
+                .expect("drafter slot populated (guarded above)");
+            rt.alloc_step_workspace(&self.arena)?
+        };
+        self.pin_current_arena_top();
+
+        let mut shadow_valid_len = ctx_len;
+        {
+            let guard = self.drafter.lock().unwrap();
+            let rt = guard.as_ref().unwrap();
+            self.populate_drafter_shadow_kv_with_rt(
+                rt, kv, 0, shadow_valid_len)?;
+        }
+
+        let mut n_iters = 0usize;
+        let mut n_accepted_total = 0usize;
+        let mut zero_accept_iters = 0usize;
+        let zero_accept_bailout_iters = std::env::var("G4N_SPEC_ZERO_ACCEPT_BAILOUT_ITERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4);
+
+        while emitted.len() < max_new {
+            let remaining = max_new - emitted.len();
+            let k_eff = if remaining > 1 {
+                spec_k.min(remaining - 1)
+            } else {
+                1
+            };
+            let iter_ctx_start = ctx_len;
+
+            let drafts = {
+                let guard = self.drafter.lock().unwrap();
+                let rt = guard.as_ref().unwrap();
+                self.run_drafter_greedy_k_from_state(
+                    rt,
+                    &workspace,
+                    t_committed,
+                    ctx_len,
+                    k_eff,
+                    kv,
+                )?
+            };
+
+            let mut verify_inputs = Vec::with_capacity(drafts.len() + 1);
+            verify_inputs.push(t_committed);
+            verify_inputs.extend_from_slice(&drafts);
+
+            let (verifies, n_acc) =
+                self.verify_base_tokens_batched_with_accept(&verify_inputs, ctx_len, kv, &drafts)?;
+            if verifies.len() != drafts.len() + 1 {
+                return Err(corrupt_runtime_err(format!(
+                    "run_spec_session_nvfp4_greedy_k: verify returned {} \
+                     tokens for {} drafts",
+                    verifies.len(),
+                    drafts.len()
+                )));
+            }
+
+            if n_acc > drafts.len() || n_acc >= verifies.len() {
+                return Err(corrupt_runtime_err(format!(
+                    "run_spec_session_nvfp4_greedy_k: invalid n_acc={} \
+                     drafts={} verifies={}",
+                    n_acc,
+                    drafts.len(),
+                    verifies.len()
+                )));
+            }
+
+            let correction_or_bonus = verifies[n_acc];
+            let before_len = emitted.len();
+            for &tok in &drafts[..n_acc] {
+                if emitted.len() >= max_new {
+                    break;
+                }
+                emitted.push(tok);
+            }
+            if emitted.len() < max_new {
+                emitted.push(correction_or_bonus);
+            }
+            let committed_now = emitted.len() - before_len;
+            if committed_now == 0 {
+                return Err(corrupt_runtime_err(
+                    "run_spec_session_nvfp4_greedy_k: no token committed \
+                     in iteration"
+                        .into(),
+                ));
+            }
+
+            n_accepted_total += n_acc.min(committed_now);
+            n_iters += 1;
+            t_committed = *emitted.last().unwrap();
+            let committed_now_u32 = committed_now as u32;
+            if committed_now_u32 > 0 {
+                if shadow_valid_len != iter_ctx_start {
+                    return Err(corrupt_runtime_err(format!(
+                        "run_spec_session_nvfp4_greedy_k: shadow_valid_len={} \
+                         != iter_ctx_start={}",
+                        shadow_valid_len, iter_ctx_start)));
+                }
+                let guard = self.drafter.lock().unwrap();
+                let rt = guard.as_ref().unwrap();
+                self.populate_drafter_shadow_kv_with_rt(
+                    rt, kv, iter_ctx_start, committed_now_u32)?;
+                shadow_valid_len = iter_ctx_start + committed_now_u32;
+            }
+            ctx_len += committed_now as u32;
+
+            if n_acc == 0 {
+                zero_accept_iters += 1;
+            } else {
+                zero_accept_iters = 0;
+            }
+
+            if zero_accept_bailout_iters > 0 && zero_accept_iters >= zero_accept_bailout_iters {
+                while emitted.len() < max_new {
+                    let next = self.forward_full_to_token(t_committed, ctx_len, kv)?;
+                    emitted.push(next);
+                    t_committed = next;
+                    ctx_len += 1;
+                }
+                break;
+            }
+        }
+
+        Ok(SpecSessionStats {
+            emitted,
+            n_iters,
+            n_accepted: n_accepted_total,
         })
     }
 
@@ -993,9 +1171,100 @@ impl Gemma4Nvfp4Bringup {
                 "verify_base_one_token: base_last_hidden_ptr is 0 — \
                  call ensure_base_last_hidden_buffer before invoking \
                  this so the post-final-norm snapshot is captured \
-                 for the next drafter step".into()));
+                 for the next drafter step"
+                    .into(),
+            ));
         }
         self.forward_full_to_token(token_id, position, kv)
+    }
+
+    /// K>=2 batched-verify fast path: run base over consecutive
+    /// `input_tokens`, compute all verify argmaxes with one batched
+    /// final close-out, then snapshot the selected post-final-norm row
+    /// for the next drafter step while it is still device-resident.
+    pub fn verify_base_tokens_batched_with_accept(
+        &self,
+        input_tokens: &[u32],
+        position_start: u32,
+        kv: &Gemma4Nvfp4KvState,
+        drafts: &[u32],
+    ) -> Result<(Vec<u32>, usize)> {
+        if self.base_last_hidden_device_ptr() == 0 {
+            return Err(corrupt_runtime_err(
+                "verify_base_tokens_batched_with_accept: base_last_hidden_ptr is 0 — \
+                 call ensure_base_last_hidden_buffer before invoking \
+                 K>=2 verify"
+                    .into(),
+            ));
+        }
+        if input_tokens.len() != drafts.len() + 1 {
+            return Err(corrupt_runtime_err(format!(
+                "verify_base_tokens_batched_with_accept: input_tokens={} \
+                 drafts={} (expected drafts + 1)",
+                input_tokens.len(),
+                drafts.len()
+            )));
+        }
+        self.forward_prompt_to_all_tokens_batched_final_and_snapshot(
+            input_tokens,
+            position_start,
+            kv,
+            drafts,
+        )
+    }
+
+    /// K>=2 batched-verify primitive: run base over consecutive
+    /// `input_tokens` at `position_start`, return one base argmax per
+    /// row plus the raw residual rows `[input_tokens.len(), hidden]`.
+    ///
+    /// The method intentionally does NOT update `base_last_hidden_ptr`.
+    /// The caller must compute the greedy accept count first, then call
+    /// `snapshot_base_last_hidden_from_batched_residuals` for the
+    /// correction/bonus row that becomes the next committed token.
+    pub fn verify_base_tokens_batched(
+        &self,
+        input_tokens: &[u32],
+        position_start: u32,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<(Vec<u32>, Vec<u16>)> {
+        if self.base_last_hidden_device_ptr() == 0 {
+            return Err(corrupt_runtime_err(
+                "verify_base_tokens_batched: base_last_hidden_ptr is 0 — \
+                 call ensure_base_last_hidden_buffer before invoking \
+                 K>=2 verify"
+                    .into(),
+            ));
+        }
+        self.forward_prompt_to_all_tokens_with_residuals(input_tokens, position_start, kv)
+    }
+
+    /// Snapshot one selected row from the residual matrix returned by
+    /// `verify_base_tokens_batched`.
+    pub fn snapshot_base_last_hidden_from_batched_residuals(
+        &self,
+        residuals_bf16_host: &[u16],
+        row: usize,
+    ) -> Result<()> {
+        let hidden = self.arch.hidden_size;
+        if hidden == 0 || residuals_bf16_host.len() % hidden != 0 {
+            return Err(corrupt_runtime_err(format!(
+                "snapshot_base_last_hidden_from_batched_residuals: \
+                 residual len {} is not a multiple of hidden {}",
+                residuals_bf16_host.len(),
+                hidden
+            )));
+        }
+        let rows = residuals_bf16_host.len() / hidden;
+        if row >= rows {
+            return Err(corrupt_runtime_err(format!(
+                "snapshot_base_last_hidden_from_batched_residuals: \
+                 row {} >= rows {}",
+                row, rows
+            )));
+        }
+        let lo = row * hidden;
+        let hi = lo + hidden;
+        self.snapshot_base_last_hidden_from_residual(&residuals_bf16_host[lo..hi])
     }
 
     /// Stream-6b spec primitive #2: populate the drafter's
@@ -1042,8 +1311,9 @@ impl Gemma4Nvfp4Bringup {
 
         // (1) Gather base.embed_tokens[token_id] (bf16) into a
         //     scratch buffer.
-        let embed_bf16 = self.arena.region(
-            "g4n_drafter_last_token_embed_bf16", half_bytes, 16)?;
+        let embed_bf16 = self
+            .arena
+            .region("g4n_drafter_last_token_embed_bf16", half_bytes, 16)?;
         self.embed_one_token_to_device(token_id, embed_bf16.device_ptr())?;
 
         // (2) Cast bf16 → f16 directly into the embed half of
@@ -1056,7 +1326,8 @@ impl Gemma4Nvfp4Bringup {
             .launch(
                 self.forward_kernels.fn_bf16_to_f16_sat,
                 workspace.pre_projection_in,
-                embed_bf16.device_ptr(), stream,
+                embed_bf16.device_ptr(),
+                stream,
             )?;
         }
 
@@ -1070,17 +1341,24 @@ impl Gemma4Nvfp4Bringup {
                 "populate_drafter_pre_projection_input: \
                  base_last_hidden_ptr is 0 — call \
                  ensure_base_last_hidden_buffer (and run a base \
-                 forward to populate it) before invoking this".into()));
+                 forward to populate it) before invoking this"
+                    .into(),
+            ));
         }
         unsafe {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoDAsync_v2(
                 workspace.pre_projection_in + half_bytes as u64,
-                base_hidden, half_bytes, stream as CUstream);
+                base_hidden,
+                half_bytes,
+                stream as CUstream,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(corrupt_runtime_err(
                     "populate_drafter_pre_projection_input: \
-                     hidden half DtoDAsync".into()));
+                     hidden half DtoDAsync"
+                        .into(),
+                ));
             }
         }
         // Drop the scratch region BEFORE rewinding the bump
@@ -1090,8 +1368,165 @@ impl Gemma4Nvfp4Bringup {
         // anything else queues work that allocates over this
         // address, the GPU has consumed the source bytes.
         drop(embed_bf16);
-        unsafe { self.arena.restore(local_cp); }
+        unsafe {
+            self.arena.restore(local_cp);
+        }
         Ok(())
+    }
+
+    /// K>=2 drafter cascade helper: populate
+    /// `workspace.pre_projection_in` from a device-resident token id
+    /// and an explicit f16 base-hidden pointer. Used after draft step
+    /// 0, where both the previous draft token and the previous
+    /// post_projection hidden are already on device.
+    fn populate_drafter_pre_projection_input_from_device_token(
+        &self,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        token_id_dev: u64,
+        base_hidden_dev: u64,
+    ) -> Result<()> {
+        let backbone_hidden = self.arch.hidden_size;
+        let half_bytes = backbone_hidden * 2;
+        let stream = self.stream.raw();
+        if token_id_dev == 0 || base_hidden_dev == 0 {
+            return Err(corrupt_runtime_err(
+                "populate_drafter_pre_projection_input_from_device_token: \
+                 null token or hidden pointer"
+                    .into(),
+            ));
+        }
+
+        let local_cp = self.arena.checkpoint();
+        let embed_bf16 = self
+            .arena
+            .region("g4n_drafter_chain_embed_bf16", half_bytes, 16)?;
+        unsafe {
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens: 1,
+                hidden: backbone_hidden as u32,
+                vocab: self.arch.vocab_size as u32,
+            }
+            .launch(
+                self.forward_kernels.fn_embedding_gather_bf16,
+                embed_bf16.device_ptr(),
+                self.model.outside.embed_tokens.offset_bytes,
+                token_id_dev,
+                stream,
+            )?;
+            rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch {
+                n: backbone_hidden as u32,
+            }
+            .launch(
+                self.forward_kernels.fn_bf16_to_f16_sat,
+                workspace.pre_projection_in,
+                embed_bf16.device_ptr(),
+                stream,
+            )?;
+
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                workspace.pre_projection_in + half_bytes as u64,
+                base_hidden_dev,
+                half_bytes,
+                stream as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(corrupt_runtime_err(
+                    "populate_drafter_pre_projection_input_from_device_token: \
+                     hidden half DtoDAsync"
+                        .into(),
+                ));
+            }
+        }
+        drop(embed_bf16);
+        unsafe {
+            self.arena.restore(local_cp);
+        }
+        Ok(())
+    }
+
+    /// K>=2 drafter cascade: produce up to `spec_k` greedy draft
+    /// tokens from the current committed base state. Caller must have
+    /// populated the drafter shadow KV for `[0, ctx_len)`.
+    ///
+    /// Step 0 consumes `t_committed` plus `base_last_hidden_ptr`.
+    /// Steps 1..K-1 consume the previous draft token from a device
+    /// ring and `workspace.out_hidden` from the previous drafter
+    /// post_projection. The drafter position is intentionally
+    /// constant across the K-loop, matching the production batched
+    /// session path's HF-parity behavior.
+    pub fn run_drafter_greedy_k_from_state(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        t_committed: u32,
+        ctx_len: u32,
+        spec_k: usize,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<Vec<u32>> {
+        if spec_k == 0 {
+            return Err(corrupt_runtime_err(
+                "run_drafter_greedy_k_from_state: spec_k must be >= 1".into(),
+            ));
+        }
+        if self.base_last_hidden_device_ptr() == 0 {
+            return Err(corrupt_runtime_err(
+                "run_drafter_greedy_k_from_state: base_last_hidden_ptr is 0 — \
+                 call ensure_base_last_hidden_buffer first"
+                    .into(),
+            ));
+        }
+
+        let local_cp = self.arena.checkpoint();
+        let draft_ids_dev = self.arena.region("g4n_spec_draft_ids", spec_k * 4, 16)?;
+        let stream = self.stream.raw();
+
+        for k_step in 0..spec_k {
+            if k_step == 0 {
+                self.populate_drafter_pre_projection_input(drafter, workspace, t_committed)?;
+            } else {
+                let prev_id_dev = draft_ids_dev.device_ptr() + ((k_step - 1) * 4) as u64;
+                self.populate_drafter_pre_projection_input_from_device_token(
+                    workspace,
+                    prev_id_dev,
+                    workspace.out_hidden,
+                )?;
+            }
+
+            self.run_drafter_forward_one_token(drafter, workspace, ctx_len, kv)?;
+
+            unsafe {
+                use cudarc::driver::sys::*;
+                let dst = draft_ids_dev.device_ptr() + (k_step * 4) as u64;
+                let rc = cuMemcpyDtoDAsync_v2(dst, workspace.out_token_id, 4, stream as CUstream);
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(corrupt_runtime_err(
+                        "run_drafter_greedy_k_from_state: draft id DtoDAsync".into(),
+                    ));
+                }
+            }
+        }
+
+        self.stream.fence()?;
+        let mut drafts = vec![0u32; spec_k];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                drafts.as_mut_ptr() as *mut _,
+                draft_ids_dev.device_ptr(),
+                spec_k * 4,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(corrupt_runtime_err(
+                    "run_drafter_greedy_k_from_state: drafts DtoH".into(),
+                ));
+            }
+        }
+        drop(draft_ids_dev);
+        unsafe {
+            self.arena.restore(local_cp);
+        }
+        Ok(drafts)
     }
 
     /// Stream-ordered fill of the per-token metadata buffers
@@ -1116,11 +1551,13 @@ impl Gemma4Nvfp4Bringup {
             return Err(corrupt_runtime_err(format!(
                 "fill_pos_slots: num_tokens={num_tokens} > \
                  kv.max_query_tokens={}",
-                kv.max_query_tokens)));
+                kv.max_query_tokens
+            )));
         }
         if num_tokens <= 0 {
             return Err(corrupt_runtime_err(format!(
-                "fill_pos_slots: num_tokens={num_tokens} must be > 0")));
+                "fill_pos_slots: num_tokens={num_tokens} must be > 0"
+            )));
         }
         let mut positions: u64 = kv.positions_ptr;
         let mut slot_mapping: u64 = kv.slot_mapping_ptr;
@@ -1129,12 +1566,12 @@ impl Gemma4Nvfp4Bringup {
         let mut sslot: i32 = start_slot;
         let mut n: i32 = num_tokens;
         let args: [*mut core::ffi::c_void; 6] = [
-            (&mut positions)    as *mut u64 as *mut _,
+            (&mut positions) as *mut u64 as *mut _,
             (&mut slot_mapping) as *mut u64 as *mut _,
             (&mut context_lens) as *mut u64 as *mut _,
-            (&mut pos_off)      as *mut i32 as *mut _,
-            (&mut sslot)        as *mut i32 as *mut _,
-            (&mut n)            as *mut i32 as *mut _,
+            (&mut pos_off) as *mut i32 as *mut _,
+            (&mut sslot) as *mut i32 as *mut _,
+            (&mut n) as *mut i32 as *mut _,
         ];
         const BLOCK: u32 = 256;
         let grid_x: u32 = ((num_tokens as u32) + BLOCK - 1) / BLOCK;
@@ -1156,10 +1593,10 @@ impl Gemma4Nvfp4Bringup {
     /// host-RTNE-narrow + HtoD trio that was costing one
     /// stream.fence() per call. Launch: grid (ceil(n/256),
     /// 1, 1), block (256, 1, 1).
-    fn launch_f32_to_bf16(
-        &self, dst_bf16: u64, src_f32: u64, n: u32,
-    ) -> Result<()> {
-        if n == 0 { return Ok(()); }
+    fn launch_f32_to_bf16(&self, dst_bf16: u64, src_f32: u64, n: u32) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let mut dst = dst_bf16;
         let mut src = src_f32;
         let mut n_i: i32 = n as i32;
@@ -1175,7 +1612,9 @@ impl Gemma4Nvfp4Bringup {
                 self.forward_kernels.fn_f32_to_bf16,
                 (grid_x, 1, 1),
                 (BLOCK, 1, 1),
-                0, self.stream.raw(), &args,
+                0,
+                self.stream.raw(),
+                &args,
             )
         }
     }
@@ -1186,9 +1625,7 @@ impl Gemma4Nvfp4Bringup {
     /// with_scale=False)`. Grid (num_kv_heads, 1, 1), block
     /// (head_dim or 1024 capped, 1, 1) with shared warp
     /// reduction.
-    fn launch_vnorm_bf16(
-        &self, v_bf16: u64, num_kv_heads: u32, head_dim: u32,
-    ) -> Result<()> {
+    fn launch_vnorm_bf16(&self, v_bf16: u64, num_kv_heads: u32, head_dim: u32) -> Result<()> {
         let mut v = v_bf16;
         let mut eps: f32 = self.arch.rms_norm_eps;
         let mut hd: i32 = head_dim as i32;
@@ -1207,7 +1644,9 @@ impl Gemma4Nvfp4Bringup {
                 self.forward_kernels.fn_vnorm_bf16,
                 (num_kv_heads, 1, 1),
                 (block_x, 1, 1),
-                0, self.stream.raw(), &args,
+                0,
+                self.stream.raw(),
+                &args,
             )
         }
     }
@@ -1216,10 +1655,10 @@ impl Gemma4Nvfp4Bringup {
     /// bf16 vectors with bf16 alpha on device. Replaces the
     /// post-MLP host scale loop (the last per-layer fence on
     /// the Option B device-resident chain).
-    fn launch_scaled_add_bf16(
-        &self, dst: u64, src: u64, alpha_dev: u64, n: u32,
-    ) -> Result<()> {
-        if n == 0 { return Ok(()); }
+    fn launch_scaled_add_bf16(&self, dst: u64, src: u64, alpha_dev: u64, n: u32) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let mut d = dst;
         let mut s = src;
         let mut a = alpha_dev;
@@ -1237,7 +1676,9 @@ impl Gemma4Nvfp4Bringup {
                 self.forward_kernels.fn_scaled_add_bf16,
                 (grid_x, 1, 1),
                 (BLOCK, 1, 1),
-                0, self.stream.raw(), &args,
+                0,
+                self.stream.raw(),
+                &args,
             )
         }
     }
@@ -1246,10 +1687,10 @@ impl Gemma4Nvfp4Bringup {
     /// for bf16 vectors with bf16 alpha on device. Matches HF
     /// Gemma 4 layer epilogue (`hidden = residual + post_ff_norm
     /// (mlp); hidden *= layer_scalar`).
-    fn launch_add_then_scale_bf16(
-        &self, dst: u64, src: u64, alpha_dev: u64, n: u32,
-    ) -> Result<()> {
-        if n == 0 { return Ok(()); }
+    fn launch_add_then_scale_bf16(&self, dst: u64, src: u64, alpha_dev: u64, n: u32) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let mut d = dst;
         let mut s = src;
         let mut a = alpha_dev;
@@ -1267,7 +1708,9 @@ impl Gemma4Nvfp4Bringup {
                 self.forward_kernels.fn_add_then_scale_bf16,
                 (grid_x, 1, 1),
                 (BLOCK, 1, 1),
-                0, self.stream.raw(), &args,
+                0,
+                self.stream.raw(),
+                &args,
             )
         }
     }
@@ -1276,10 +1719,10 @@ impl Gemma4Nvfp4Bringup {
     /// f16 in place. Mirrors production's `launch_cast_f32_to
     /// _f16` (gemma4_bring_up.rs:16723) — same kernel ABI,
     /// same grid math, just on Option B's stream.
-    fn launch_cast_f32_to_f16(
-        &self, dst_f16: u64, src_f32: u64, n: u32,
-    ) -> Result<()> {
-        if n == 0 { return Ok(()); }
+    fn launch_cast_f32_to_f16(&self, dst_f16: u64, src_f32: u64, n: u32) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let mut dst = dst_f16;
         let mut src = src_f32;
         let mut n_i: i32 = n as i32;
@@ -1295,7 +1738,9 @@ impl Gemma4Nvfp4Bringup {
                 self.forward_kernels.fn_cast_f32_to_f16,
                 (grid_x, 1, 1),
                 (BLOCK, 1, 1),
-                0, self.stream.raw(), &args,
+                0,
+                self.stream.raw(),
+                &args,
             )
         }
     }
@@ -1330,19 +1775,20 @@ impl Gemma4Nvfp4Bringup {
         let pre_in = drafter.arch.pre_projection_in_dim;
         let stream = self.stream.raw();
 
-        if workspace.pre_projection_in == 0
-            || workspace.gemm_f32 == 0
-            || workspace.hidden == 0
-        {
+        if workspace.pre_projection_in == 0 || workspace.gemm_f32 == 0 || workspace.hidden == 0 {
             return Err(corrupt_runtime_err(
                 "forward_drafter_pre_projection: workspace has \
                  null device pointers — caller must call \
-                 drafter.alloc_step_workspace(arena) first".into()));
+                 drafter.alloc_step_workspace(arena) first"
+                    .into(),
+            ));
         }
         if drafter.top.pre_projection == 0 {
             return Err(corrupt_runtime_err(
                 "forward_drafter_pre_projection: drafter \
-                 pre_projection weight is null".into()));
+                 pre_projection weight is null"
+                    .into(),
+            ));
         }
 
         unsafe {
@@ -1350,12 +1796,13 @@ impl Gemma4Nvfp4Bringup {
                 workspace.pre_projection_in,
                 drafter.top.pre_projection,
                 workspace.gemm_f32,
-                1, hidden as i32, pre_in as i32, stream,
+                1,
+                hidden as i32,
+                pre_in as i32,
+                stream,
             )?;
         }
-        self.launch_cast_f32_to_f16(
-            workspace.hidden, workspace.gemm_f32, hidden as u32,
-        )?;
+        self.launch_cast_f32_to_f16(workspace.hidden, workspace.gemm_f32, hidden as u32)?;
         Ok(())
     }
 
@@ -1387,14 +1834,17 @@ impl Gemma4Nvfp4Bringup {
         layer_idx: usize,
         position: u32,
     ) -> Result<()> {
-        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_core::{CudaCtx, CudaErrorKind, RvllmError};
         let hidden = drafter.arch.hidden_size;
         let num_heads = drafter.arch.num_attention_heads;
-        let layer = drafter.layers.get(layer_idx).ok_or_else(||
+        let layer = drafter.layers.get(layer_idx).ok_or_else(|| {
             corrupt_runtime_err(format!(
                 "forward_drafter_layer_q_side: layer_idx {} \
                  out of range (drafter has {})",
-                layer_idx, drafter.layers.len())))?;
+                layer_idx,
+                drafter.layers.len()
+            ))
+        })?;
         let eff_hd = layer.effective_head_dim;
         let q_rows = num_heads * eff_hd;
         let stream = self.stream.raw();
@@ -1404,45 +1854,67 @@ impl Gemma4Nvfp4Bringup {
         unsafe {
             use cudarc::driver::sys::*;
             let r = cuMemcpyDtoDAsync_v2(
-                workspace.residual1, workspace.hidden,
-                hidden * 2, stream as CUstream);
+                workspace.residual1,
+                workspace.hidden,
+                hidden * 2,
+                stream as CUstream,
+            );
             if r != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "drafter_q_side residual1 snapshot",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
         }
         // 2. input_layernorm in place.
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden: hidden as u32, eps,
-            }.launch(
+                num_tokens: 1,
+                hidden: hidden as u32,
+                eps,
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_f16,
-                workspace.hidden, layer.input_layernorm, stream)?;
+                workspace.hidden,
+                layer.input_layernorm,
+                stream,
+            )?;
         }
         // 3. q_proj GEMM + f32 → f16 cast.
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                workspace.hidden, layer.self_attn_q_proj,
+                workspace.hidden,
+                layer.self_attn_q_proj,
                 workspace.gemm_f32,
-                1, q_rows as i32, hidden as i32, stream)?;
+                1,
+                q_rows as i32,
+                hidden as i32,
+                stream,
+            )?;
         }
-        self.launch_cast_f32_to_f16(
-            workspace.q, workspace.gemm_f32, q_rows as u32)?;
+        self.launch_cast_f32_to_f16(workspace.q, workspace.gemm_f32, q_rows as u32)?;
         // 4. per-head q_norm.
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
                 num_tokens: num_heads as u32,
-                hidden: eff_hd as u32, eps,
-            }.launch(
+                hidden: eff_hd as u32,
+                eps,
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_f16,
-                workspace.q, layer.self_attn_q_norm, stream)?;
+                workspace.q,
+                layer.self_attn_q_norm,
+                stream,
+            )?;
         }
         // 5. Partial NeoX RoPE. is_global per drafter layer type;
         // partial_rotary_factor=0.25 for global (E4B convention,
         // same on 31B drafter).
-        let is_global = matches!(layer.layer_type,
-            rvllm_loader::gemma4_drafter::DrafterLayerType::Full);
+        let is_global = matches!(
+            layer.layer_type,
+            rvllm_loader::gemma4_drafter::DrafterLayerType::Full
+        );
         const PARTIAL_ROTARY_FACTOR_GLOBAL: f32 = 0.25;
         let rotary_dim: i32 = if is_global {
             ((eff_hd as f32) * PARTIAL_ROTARY_FACTOR_GLOBAL) as i32
@@ -1450,14 +1922,17 @@ impl Gemma4Nvfp4Bringup {
             eff_hd as i32
         };
         let (cos_table_off, sin_table_off) = if is_global {
-            (self.model.outside.rope_cos_global.offset_bytes,
-             self.model.outside.rope_sin_global.offset_bytes)
+            (
+                self.model.outside.rope_cos_global.offset_bytes,
+                self.model.outside.rope_sin_global.offset_bytes,
+            )
         } else {
-            (self.model.outside.rope_cos_sliding.offset_bytes,
-             self.model.outside.rope_sin_sliding.offset_bytes)
+            (
+                self.model.outside.rope_cos_sliding.offset_bytes,
+                self.model.outside.rope_sin_sliding.offset_bytes,
+            )
         };
-        let pos_region = self.arena.region(
-            "g4n_drafter_q_rope_pos", 4, 16)?;
+        let pos_region = self.arena.region("g4n_drafter_q_rope_pos", 4, 16)?;
         unsafe {
             let p = position as i32;
             pos_region.copy_from_host(&p.to_le_bytes())?;
@@ -1498,15 +1973,23 @@ impl Gemma4Nvfp4Bringup {
             ];
             let rc = cuLaunchKernel(
                 self.forward_kernels.fn_rope_partial_f16kv.raw() as CUfunction,
-                1, num_heads as u32, 1,
-                (eff_hd as u32) / 2, 1, 1,
-                0, stream as CUstream,
+                1,
+                num_heads as u32,
+                1,
+                (eff_hd as u32) / 2,
+                1,
+                1,
+                0,
+                stream as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut());
+                core::ptr::null_mut(),
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "drafter_q_side rope launch",
-                    CudaErrorKind::LaunchFailed, CudaCtx::setup()));
+                    CudaErrorKind::LaunchFailed,
+                    CudaCtx::setup(),
+                ));
             }
         }
         Ok(())
@@ -1547,12 +2030,17 @@ impl Gemma4Nvfp4Bringup {
         layer_idx: usize,
         kv: &Gemma4Nvfp4KvState,
     ) -> Result<()> {
-        let layer = drafter.layers.get(layer_idx).ok_or_else(||
+        let layer = drafter.layers.get(layer_idx).ok_or_else(|| {
             corrupt_runtime_err(format!(
                 "forward_drafter_layer_cross_attn: layer_idx {} \
-                 out of range", layer_idx)))?;
-        let is_global = matches!(layer.layer_type,
-            rvllm_loader::gemma4_drafter::DrafterLayerType::Full);
+                 out of range",
+                layer_idx
+            ))
+        })?;
+        let is_global = matches!(
+            layer.layer_type,
+            rvllm_loader::gemma4_drafter::DrafterLayerType::Full
+        );
         // Gemma 4 QK-norm absorbs 1/sqrt(d_k); attention runs
         // with scale = 1.0 (production confirms in
         // gemma4_bring_up.rs:2939 / 3522 / 10615 / 11292).
@@ -1574,8 +2062,7 @@ impl Gemma4Nvfp4Bringup {
                 // sliding_window_size. window_size_left =
                 // sliding_window - 1 per the existing decode
                 // kernels.
-                let window_size_left =
-                    (self.arch.sliding_window_size as i32) - 1;
+                let window_size_left = (self.arch.sliding_window_size as i32) - 1;
                 drafter.launch_cross_attn_sliding(
                     workspace.attn_out,
                     workspace.q,
@@ -1605,13 +2092,16 @@ impl Gemma4Nvfp4Bringup {
         workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
         layer_idx: usize,
     ) -> Result<()> {
-        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_core::{CudaCtx, CudaErrorKind, RvllmError};
         let hidden = drafter.arch.hidden_size;
         let num_heads = drafter.arch.num_attention_heads;
-        let layer = drafter.layers.get(layer_idx).ok_or_else(||
+        let layer = drafter.layers.get(layer_idx).ok_or_else(|| {
             corrupt_runtime_err(format!(
                 "forward_drafter_layer_attn_finisher: layer_idx \
-                 {} out of range", layer_idx)))?;
+                 {} out of range",
+                layer_idx
+            ))
+        })?;
         let eff_hd = layer.effective_head_dim;
         let q_rows = num_heads * eff_hd;
         let stream = self.stream.raw();
@@ -1619,33 +2109,46 @@ impl Gemma4Nvfp4Bringup {
         // 1. o_proj GEMM.
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                workspace.attn_out, layer.self_attn_o_proj,
+                workspace.attn_out,
+                layer.self_attn_o_proj,
                 workspace.gemm_f32,
-                1, hidden as i32, q_rows as i32, stream)?;
+                1,
+                hidden as i32,
+                q_rows as i32,
+                stream,
+            )?;
         }
         // 2. cast f32 → f16.
-        self.launch_cast_f32_to_f16(
-            workspace.proj_f16, workspace.gemm_f32,
-            hidden as u32)?;
+        self.launch_cast_f32_to_f16(workspace.proj_f16, workspace.gemm_f32, hidden as u32)?;
         // 3. post_attention_layernorm.
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden: hidden as u32, eps,
-            }.launch(
+                num_tokens: 1,
+                hidden: hidden as u32,
+                eps,
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_f16,
                 workspace.proj_f16,
-                layer.post_attention_layernorm, stream)?;
+                layer.post_attention_layernorm,
+                stream,
+            )?;
         }
         // 4. residual_1: hidden = residual1 + proj_f16.
         unsafe {
             use cudarc::driver::sys::*;
             let r = cuMemcpyDtoDAsync_v2(
-                workspace.hidden, workspace.residual1,
-                hidden * 2, stream as CUstream);
+                workspace.hidden,
+                workspace.residual1,
+                hidden * 2,
+                stream as CUstream,
+            );
             if r != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "attn_finisher residual1 reload",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
             let mut dst = workspace.hidden;
             let mut src = workspace.proj_f16;
@@ -1653,20 +2156,29 @@ impl Gemma4Nvfp4Bringup {
             let args = [
                 (&mut dst) as *mut u64 as *mut core::ffi::c_void,
                 (&mut src) as *mut u64 as *mut core::ffi::c_void,
-                (&mut n)   as *mut i32 as *mut core::ffi::c_void,
+                (&mut n) as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = 256;
             let grid: u32 = ((n as u32 + block - 1) / block).max(1);
             let rc = cuLaunchKernel(
                 self.forward_kernels.fn_vector_add_f16.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1,
-                0, stream as CUstream,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut());
+                core::ptr::null_mut(),
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "attn_finisher residual_1 vector_add",
-                    CudaErrorKind::LaunchFailed, CudaCtx::setup()));
+                    CudaErrorKind::LaunchFailed,
+                    CudaCtx::setup(),
+                ));
             }
         }
         Ok(())
@@ -1684,20 +2196,23 @@ impl Gemma4Nvfp4Bringup {
         workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
         layer_idx: usize,
     ) -> Result<()> {
-        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_core::{CudaCtx, CudaErrorKind, RvllmError};
         let hidden = drafter.arch.hidden_size;
         let intermediate = drafter.arch.intermediate_size;
-        let layer = drafter.layers.get(layer_idx).ok_or_else(||
+        let layer = drafter.layers.get(layer_idx).ok_or_else(|| {
             corrupt_runtime_err(format!(
                 "forward_drafter_layer_mlp_finisher: layer_idx \
-                 {} out of range", layer_idx)))?;
+                 {} out of range",
+                layer_idx
+            ))
+        })?;
         let stream = self.stream.raw();
         let eps = drafter.arch.rms_norm_eps;
 
-        let residual2_region = self.arena.region(
-            "g4n_drafter_residual2", hidden * 2, 16)?;
-        let gate_up_region = self.arena.region(
-            "g4n_drafter_gate_up", 2 * intermediate * 2, 16)?;
+        let residual2_region = self.arena.region("g4n_drafter_residual2", hidden * 2, 16)?;
+        let gate_up_region = self
+            .arena
+            .region("g4n_drafter_gate_up", 2 * intermediate * 2, 16)?;
         let gate_ptr = gate_up_region.device_ptr();
         let up_ptr = gate_ptr + (intermediate as u64) * 2;
 
@@ -1705,39 +2220,57 @@ impl Gemma4Nvfp4Bringup {
         unsafe {
             use cudarc::driver::sys::*;
             let r = cuMemcpyDtoDAsync_v2(
-                residual2_region.device_ptr(), workspace.hidden,
-                hidden * 2, stream as CUstream);
+                residual2_region.device_ptr(),
+                workspace.hidden,
+                hidden * 2,
+                stream as CUstream,
+            );
             if r != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "mlp_finisher residual_2 snapshot",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
         }
         // 2. pre_ff_norm.
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden: hidden as u32, eps,
-            }.launch(
+                num_tokens: 1,
+                hidden: hidden as u32,
+                eps,
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_f16,
                 workspace.hidden,
-                layer.pre_feedforward_layernorm, stream)?;
+                layer.pre_feedforward_layernorm,
+                stream,
+            )?;
             // 3. gate_proj.
             self.cublaslt.f16_gemm_f32(
-                workspace.hidden, layer.mlp_gate_proj,
+                workspace.hidden,
+                layer.mlp_gate_proj,
                 workspace.gemm_f32,
-                1, intermediate as i32, hidden as i32, stream)?;
+                1,
+                intermediate as i32,
+                hidden as i32,
+                stream,
+            )?;
         }
-        self.launch_cast_f32_to_f16(
-            gate_ptr, workspace.gemm_f32, intermediate as u32)?;
+        self.launch_cast_f32_to_f16(gate_ptr, workspace.gemm_f32, intermediate as u32)?;
         // 4. up_proj.
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                workspace.hidden, layer.mlp_up_proj,
+                workspace.hidden,
+                layer.mlp_up_proj,
                 workspace.gemm_f32,
-                1, intermediate as i32, hidden as i32, stream)?;
+                1,
+                intermediate as i32,
+                hidden as i32,
+                stream,
+            )?;
         }
-        self.launch_cast_f32_to_f16(
-            up_ptr, workspace.gemm_f32, intermediate as u32)?;
+        self.launch_cast_f32_to_f16(up_ptr, workspace.gemm_f32, intermediate as u32)?;
         // 5. fused_gelu_mul_f16: gate = gelu(gate) * up.
         unsafe {
             use cudarc::driver::sys::*;
@@ -1745,38 +2278,56 @@ impl Gemma4Nvfp4Bringup {
             let mut gate_up = gate_up_region.device_ptr();
             let mut inter_i = intermediate as i32;
             let args = [
-                (&mut out_p)   as *mut u64 as *mut core::ffi::c_void,
+                (&mut out_p) as *mut u64 as *mut core::ffi::c_void,
                 (&mut gate_up) as *mut u64 as *mut core::ffi::c_void,
                 (&mut inter_i) as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = 1024u32.min(intermediate as u32).max(1);
             let rc = cuLaunchKernel(
                 self.forward_kernels.fn_fused_gelu_mul_f16.raw() as CUfunction,
-                1, 1, 1, block, 1, 1,
-                0, stream as CUstream,
+                1,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut());
+                core::ptr::null_mut(),
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "mlp_finisher fused_gelu_mul_f16",
-                    CudaErrorKind::LaunchFailed, CudaCtx::setup()));
+                    CudaErrorKind::LaunchFailed,
+                    CudaCtx::setup(),
+                ));
             }
             // 6. down_proj.
             self.cublaslt.f16_gemm_f32(
-                gate_ptr, layer.mlp_down_proj,
+                gate_ptr,
+                layer.mlp_down_proj,
                 workspace.gemm_f32,
-                1, hidden as i32, intermediate as i32, stream)?;
+                1,
+                hidden as i32,
+                intermediate as i32,
+                stream,
+            )?;
         }
-        self.launch_cast_f32_to_f16(
-            workspace.hidden, workspace.gemm_f32, hidden as u32)?;
+        self.launch_cast_f32_to_f16(workspace.hidden, workspace.gemm_f32, hidden as u32)?;
         // 7. post_ff_norm.
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden: hidden as u32, eps,
-            }.launch(
+                num_tokens: 1,
+                hidden: hidden as u32,
+                eps,
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_f16,
                 workspace.hidden,
-                layer.post_feedforward_layernorm, stream)?;
+                layer.post_feedforward_layernorm,
+                stream,
+            )?;
             // 8. residual_2 vector_add: hidden = residual2 + hidden.
             use cudarc::driver::sys::*;
             let mut dst = workspace.hidden;
@@ -1785,20 +2336,29 @@ impl Gemma4Nvfp4Bringup {
             let args = [
                 (&mut dst) as *mut u64 as *mut core::ffi::c_void,
                 (&mut src) as *mut u64 as *mut core::ffi::c_void,
-                (&mut n)   as *mut i32 as *mut core::ffi::c_void,
+                (&mut n) as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = 256;
             let grid: u32 = ((n as u32 + block - 1) / block).max(1);
             let rc = cuLaunchKernel(
                 self.forward_kernels.fn_vector_add_f16.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1,
-                0, stream as CUstream,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut());
+                core::ptr::null_mut(),
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "mlp_finisher residual_2 vector_add",
-                    CudaErrorKind::LaunchFailed, CudaCtx::setup()));
+                    CudaErrorKind::LaunchFailed,
+                    CudaCtx::setup(),
+                ));
             }
             // 9. layer_scalar scale in place: hidden *= scalar.
             // scale_inplace_f16 kernel ABI is (x, scalar_f32, n).
@@ -1814,14 +2374,23 @@ impl Gemma4Nvfp4Bringup {
             let grid: u32 = ((n as u32 + block - 1) / block).max(1);
             let rc = cuLaunchKernel(
                 self.forward_kernels.fn_scale_inplace_f16.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1,
-                0, stream as CUstream,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut());
+                core::ptr::null_mut(),
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "mlp_finisher layer_scalar scale_inplace",
-                    CudaErrorKind::LaunchFailed, CudaCtx::setup()));
+                    CudaErrorKind::LaunchFailed,
+                    CudaCtx::setup(),
+                ));
             }
         }
         Ok(())
@@ -1849,11 +2418,16 @@ impl Gemma4Nvfp4Bringup {
         // 1. final_norm on workspace.hidden in place.
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden: hidden as u32, eps,
-            }.launch(
+                num_tokens: 1,
+                hidden: hidden as u32,
+                eps,
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_f16,
                 workspace.hidden,
-                drafter.top.final_norm, stream)?;
+                drafter.top.final_norm,
+                stream,
+            )?;
         }
         // 2. Full-vocab tied LM head (31B path). f16_gemm to
         // f32 logits in workspace.gemm_f32.
@@ -1861,13 +2435,20 @@ impl Gemma4Nvfp4Bringup {
             return Err(corrupt_runtime_err(
                 "forward_drafter_final_to_token: drafter has \
                  use_ordered_embeddings=true (E4B masked-embedder \
-                 path); not wired for Option B yet".into()));
+                 path); not wired for Option B yet"
+                    .into(),
+            ));
         }
         unsafe {
             self.cublaslt.f16_gemm_f32(
-                workspace.hidden, drafter.top.embed_tokens,
+                workspace.hidden,
+                drafter.top.embed_tokens,
                 workspace.gemm_f32,
-                1, vocab, hidden as i32, stream)?;
+                1,
+                vocab,
+                hidden as i32,
+                stream,
+            )?;
             // 3. Argmax over f32 vocab logits → out_token_id.
             // ABI: argmax_kernel(logits, out, vocab) with grid
             // (1,1,1), block (1024,1,1).
@@ -1876,22 +2457,34 @@ impl Gemma4Nvfp4Bringup {
             let mut v = vocab;
             let args: [*mut core::ffi::c_void; 3] = [
                 (&mut logits) as *mut u64 as *mut _,
-                (&mut out)    as *mut u64 as *mut _,
-                (&mut v)      as *mut i32 as *mut _,
+                (&mut out) as *mut u64 as *mut _,
+                (&mut v) as *mut i32 as *mut _,
             ];
             rvllm_fused::launch_raw(
                 self.forward_kernels.fn_argmax_f32,
-                (1, 1, 1), (1024, 1, 1), 0, stream, &args)?;
+                (1, 1, 1),
+                (1024, 1, 1),
+                0,
+                stream,
+                &args,
+            )?;
             // 4. post_projection: hidden → out_hidden for
             // chaining the next drafter step.
             self.cublaslt.f16_gemm_f32(
-                workspace.hidden, drafter.top.post_projection,
+                workspace.hidden,
+                drafter.top.post_projection,
                 workspace.gemm_f32,
-                1, backbone_hidden as i32, hidden as i32, stream)?;
+                1,
+                backbone_hidden as i32,
+                hidden as i32,
+                stream,
+            )?;
         }
         self.launch_cast_f32_to_f16(
-            workspace.out_hidden, workspace.gemm_f32,
-            backbone_hidden as u32)?;
+            workspace.out_hidden,
+            workspace.gemm_f32,
+            backbone_hidden as u32,
+        )?;
         Ok(())
     }
 
@@ -1929,14 +2522,10 @@ impl Gemma4Nvfp4Bringup {
         self.forward_drafter_pre_projection(drafter, workspace)?;
         let num_layers = drafter.arch.num_hidden_layers;
         for li in 0..num_layers {
-            self.forward_drafter_layer_q_side(
-                drafter, workspace, li, position)?;
-            self.forward_drafter_layer_cross_attn(
-                drafter, workspace, li, kv)?;
-            self.forward_drafter_layer_attn_finisher(
-                drafter, workspace, li)?;
-            self.forward_drafter_layer_mlp_finisher(
-                drafter, workspace, li)?;
+            self.forward_drafter_layer_q_side(drafter, workspace, li, position)?;
+            self.forward_drafter_layer_cross_attn(drafter, workspace, li, kv)?;
+            self.forward_drafter_layer_attn_finisher(drafter, workspace, li)?;
+            self.forward_drafter_layer_mlp_finisher(drafter, workspace, li)?;
         }
         self.forward_drafter_final_to_token(drafter, workspace)?;
         Ok(())
@@ -1977,7 +2566,9 @@ impl Gemma4Nvfp4Bringup {
     /// via `allocate_kv_state`; #5f prefill bumps it to the
     /// configured chunk size.
     pub fn allocate_kv_state_with_chunk(
-        &mut self, max_pos: u32, max_query_tokens: u32,
+        &mut self,
+        max_pos: u32,
+        max_query_tokens: u32,
     ) -> Result<Gemma4Nvfp4KvState> {
         if self.kv_state_allocated {
             return Err(corrupt_runtime_err(
@@ -1989,8 +2580,7 @@ impl Gemma4Nvfp4Bringup {
                     .to_string(),
             ));
         }
-        let kv = Gemma4Nvfp4KvState::allocate(
-            &self.arena, &self.arch, max_pos, max_query_tokens)?;
+        let kv = Gemma4Nvfp4KvState::allocate(&self.arena, &self.arch, max_pos, max_query_tokens)?;
         // Re-anchor scratch rewinds above the KV state.
         self.forward_checkpoint = self.arena.checkpoint();
         self.kv_state_allocated = true;
@@ -2038,59 +2628,58 @@ impl Gemma4Nvfp4Bringup {
         if self.drafter.lock().unwrap().is_some() {
             return Ok(());
         }
-        let sources = self.arch.assistant_shared_kv_sources()
-            .ok_or_else(|| corrupt_runtime_err(
+        let sources = self.arch.assistant_shared_kv_sources().ok_or_else(|| {
+            corrupt_runtime_err(
                 "ensure_drafter_nvfp4: base arch has no \
                  assistant_shared_kv_sources — Gemma 4 assistant \
                  cross-attends to (sliding, full) layer pair; 31B \
-                 returns (58, 59). Unsupported checkpoint.".into()))?;
-        let layout = rvllm_loader::gemma4_drafter::Gemma4DrafterWeightLayout
-            ::from_dir(drafter_dir)?;
+                 returns (58, 59). Unsupported checkpoint."
+                    .into(),
+            )
+        })?;
+        let layout =
+            rvllm_loader::gemma4_drafter::Gemma4DrafterWeightLayout::from_dir(drafter_dir)?;
         if layout.arch.backbone_hidden_size != self.arch.hidden_size {
             return Err(corrupt_runtime_err(format!(
                 "ensure_drafter_nvfp4: drafter backbone_hidden_size={} \
                  != base hidden_size={}",
-                layout.arch.backbone_hidden_size, self.arch.hidden_size)));
+                layout.arch.backbone_hidden_size, self.arch.hidden_size
+            )));
         }
         if layout.arch.vocab_size != self.arch.vocab_size {
             return Err(corrupt_runtime_err(format!(
                 "ensure_drafter_nvfp4: drafter vocab_size={} != base \
-                 vocab_size={}", layout.arch.vocab_size,
-                self.arch.vocab_size)));
+                 vocab_size={}",
+                layout.arch.vocab_size, self.arch.vocab_size
+            )));
         }
         if layout.arch.pre_projection_in_dim != 2 * self.arch.hidden_size {
             return Err(corrupt_runtime_err(format!(
                 "ensure_drafter_nvfp4: drafter pre_projection_in_dim={} \
                  != 2 * base hidden_size={}",
-                layout.arch.pre_projection_in_dim, self.arch.hidden_size)));
+                layout.arch.pre_projection_in_dim, self.arch.hidden_size
+            )));
         }
 
-        let mut rt = crate::gemma4_drafter::Gemma4DrafterRuntime
-            ::load(&layout, &self.arena)?;
+        let mut rt = crate::gemma4_drafter::Gemma4DrafterRuntime::load(&layout, &self.arena)?;
 
         // Attach the 4 PTX bundles. Same kernel symbol set as
         // production's ensure_drafter.
         let me_mod = self.kernels.load_ptx("gemma4_masked_embedder")?;
-        let me_fn = me_mod.get_function(
-            "gemma4_masked_embedder_argmax_f16_kernel")?;
+        let me_fn = me_mod.get_function("gemma4_masked_embedder_argmax_f16_kernel")?;
         rt.attach_masked_embedder_kernel(me_mod, me_fn);
 
         let fa_mod = self.kernels.load_ptx("flash_attention")?;
-        let fa_fn = fa_mod.get_function(
-            "flash_attention_2_decode_f16io_kernel")?;
+        let fa_fn = fa_mod.get_function("flash_attention_2_decode_f16io_kernel")?;
         rt.attach_flash_attention_kernel(fa_mod, fa_fn);
 
-        let fa_bc16_mod = self.kernels.load_ptx(
-            "flash_attention_decode_f16io_bc16")?;
-        let fa_bc16_fn = fa_bc16_mod.get_function(
-            "flash_attention_2_decode_f16io_kernel")?;
+        let fa_bc16_mod = self.kernels.load_ptx("flash_attention_decode_f16io_bc16")?;
+        let fa_bc16_fn = fa_bc16_mod.get_function("flash_attention_2_decode_f16io_kernel")?;
         rt.attach_flash_attention_bc16_kernel(fa_bc16_mod, fa_bc16_fn);
 
         let dq_mod = self.kernels.load_ptx("gemma4_drafter_dequant")?;
-        let dq_fp8 = dq_mod.get_function(
-            "gemma4_drafter_dequant_fp8_to_f16_kernel")?;
-        let dq_nvfp4 = dq_mod.get_function(
-            "gemma4_drafter_dequant_nvfp4_to_f16_kernel")?;
+        let dq_fp8 = dq_mod.get_function("gemma4_drafter_dequant_fp8_to_f16_kernel")?;
+        let dq_nvfp4 = dq_mod.get_function("gemma4_drafter_dequant_nvfp4_to_f16_kernel")?;
         rt.attach_drafter_dequant_kernels(dq_mod, dq_fp8, dq_nvfp4);
 
         // Allocate f16 shadow KV. Codex Stream-6a fix:
@@ -2101,23 +2690,22 @@ impl Gemma4Nvfp4Bringup {
         let full_li = sources.1;
         let block_size = kv.block_size;
         let num_blocks_total = kv.max_pos;
-        let sliding_nkvh =
-            self.arch.num_kv_heads_for_layer(sliding_li) as u32;
-        let sliding_hd =
-            self.arch.head_dim_for_layer(sliding_li) as u32;
-        let full_nkvh =
-            self.arch.num_kv_heads_for_layer(full_li) as u32;
-        let full_hd =
-            self.arch.head_dim_for_layer(full_li) as u32;
+        let sliding_nkvh = self.arch.num_kv_heads_for_layer(sliding_li) as u32;
+        let sliding_hd = self.arch.head_dim_for_layer(sliding_li) as u32;
+        let full_nkvh = self.arch.num_kv_heads_for_layer(full_li) as u32;
+        let full_hd = self.arch.head_dim_for_layer(full_li) as u32;
         let sliding_layer_bytes = (num_blocks_total as usize)
-            * (block_size as usize) * (sliding_nkvh as usize)
-            * (sliding_hd as usize) * 2;
+            * (block_size as usize)
+            * (sliding_nkvh as usize)
+            * (sliding_hd as usize)
+            * 2;
         let full_layer_bytes = (num_blocks_total as usize)
-            * (block_size as usize) * (full_nkvh as usize)
-            * (full_hd as usize) * 2;
+            * (block_size as usize)
+            * (full_nkvh as usize)
+            * (full_hd as usize)
+            * 2;
 
-        let alloc_zeroed = |name: &'static str, bytes: usize|
-            -> Result<u64> {
+        let alloc_zeroed = |name: &'static str, bytes: usize| -> Result<u64> {
             let region = self.arena.region(name, bytes.max(16), 256)?;
             unsafe {
                 use cudarc::driver::sys::*;
@@ -2126,24 +2714,26 @@ impl Gemma4Nvfp4Bringup {
                     return Err(rvllm_core::RvllmError::cuda(
                         "drafter shadow KV zero-init",
                         rvllm_core::CudaErrorKind::MemcpyFailed,
-                        rvllm_core::CudaCtx::setup()));
+                        rvllm_core::CudaCtx::setup(),
+                    ));
                 }
             }
             Ok(region.device_ptr())
         };
-        let sliding_k_ptr = alloc_zeroed(
-            "g4n_drafter_shadow_k_sliding", sliding_layer_bytes)?;
-        let sliding_v_ptr = alloc_zeroed(
-            "g4n_drafter_shadow_v_sliding", sliding_layer_bytes)?;
-        let full_k_ptr = alloc_zeroed(
-            "g4n_drafter_shadow_k_full", full_layer_bytes)?;
-        let full_v_ptr = alloc_zeroed(
-            "g4n_drafter_shadow_v_full", full_layer_bytes)?;
+        let sliding_k_ptr = alloc_zeroed("g4n_drafter_shadow_k_sliding", sliding_layer_bytes)?;
+        let sliding_v_ptr = alloc_zeroed("g4n_drafter_shadow_v_sliding", sliding_layer_bytes)?;
+        let full_k_ptr = alloc_zeroed("g4n_drafter_shadow_k_full", full_layer_bytes)?;
+        let full_v_ptr = alloc_zeroed("g4n_drafter_shadow_v_full", full_layer_bytes)?;
 
         rt.attach_shadow_kv(crate::gemma4_drafter::DrafterShadowKv {
-            sliding_k_ptr, sliding_v_ptr, full_k_ptr, full_v_ptr,
-            sliding_layer_bytes, full_layer_bytes,
-            block_size, num_blocks_total,
+            sliding_k_ptr,
+            sliding_v_ptr,
+            full_k_ptr,
+            full_v_ptr,
+            sliding_layer_bytes,
+            full_layer_bytes,
+            block_size,
+            num_blocks_total,
             max_blocks_per_seq: num_blocks_total,
             sliding_num_kv_heads: sliding_nkvh,
             sliding_head_dim: sliding_hd,
@@ -2161,10 +2751,12 @@ impl Gemma4Nvfp4Bringup {
              vocab={}, shadow KV (sliding={} MiB, full={} MiB, \
              block_size={}, num_blocks={}) on Option B arena",
             layout.arch.num_hidden_layers,
-            layout.arch.hidden_size, layout.arch.vocab_size,
+            layout.arch.hidden_size,
+            layout.arch.vocab_size,
             sliding_layer_bytes / (1024 * 1024),
             full_layer_bytes / (1024 * 1024),
-            block_size, num_blocks_total,
+            block_size,
+            num_blocks_total,
         );
         Ok(())
     }
@@ -2198,12 +2790,14 @@ impl Gemma4Nvfp4Bringup {
         slot_count: u32,
     ) -> Result<()> {
         let drafter_guard = self.drafter.lock().unwrap();
-        let drafter = drafter_guard.as_ref().ok_or_else(||
+        let drafter = drafter_guard.as_ref().ok_or_else(|| {
             corrupt_runtime_err(
                 "populate_drafter_shadow_kv: drafter not loaded; \
-                 call ensure_drafter_nvfp4 first".into()))?;
-        self.populate_drafter_shadow_kv_with_rt(
-            drafter, kv, slot_start, slot_count)
+                 call ensure_drafter_nvfp4 first"
+                    .into(),
+            )
+        })?;
+        self.populate_drafter_shadow_kv_with_rt(drafter, kv, slot_start, slot_count)
     }
 
     /// Lock-free variant: caller already has a `&Gemma4Drafter
@@ -2218,38 +2812,46 @@ impl Gemma4Nvfp4Bringup {
         slot_start: u32,
         slot_count: u32,
     ) -> Result<()> {
-        let shadow = drafter.shadow_kv.as_ref().ok_or_else(||
+        let shadow = drafter.shadow_kv.as_ref().ok_or_else(|| {
             corrupt_runtime_err(
                 "populate_drafter_shadow_kv: shadow KV not attached \
-                 (ensure_drafter_nvfp4 should have done this)".into()))?;
-        let (sliding_li, full_li) = self.arch.assistant_shared_kv_sources()
-            .ok_or_else(|| corrupt_runtime_err(
-                "populate_drafter_shadow_kv: arch has no source pair".into()))?;
+                 (ensure_drafter_nvfp4 should have done this)"
+                    .into(),
+            )
+        })?;
+        let (sliding_li, full_li) = self.arch.assistant_shared_kv_sources().ok_or_else(|| {
+            corrupt_runtime_err("populate_drafter_shadow_kv: arch has no source pair".into())
+        })?;
 
         // Option B's K/V cache pointers for each source layer.
         let base_sliding_k = kv.k_packed_layer_ptrs[sliding_li];
         let base_sliding_v = kv.v_packed_layer_ptrs[sliding_li];
-        let base_full_k    = kv.k_packed_layer_ptrs[full_li];
-        let base_full_v    = kv.v_packed_layer_ptrs[full_li];
+        let base_full_k = kv.k_packed_layer_ptrs[full_li];
+        let base_full_v = kv.v_packed_layer_ptrs[full_li];
         let base_sliding_k_scale = kv.k_scale_layer_ptrs[sliding_li];
         let base_sliding_v_scale = kv.v_scale_layer_ptrs[sliding_li];
-        let base_full_k_scale    = kv.k_scale_layer_ptrs[full_li];
-        let base_full_v_scale    = kv.v_scale_layer_ptrs[full_li];
+        let base_full_k_scale = kv.k_scale_layer_ptrs[full_li];
+        let base_full_v_scale = kv.v_scale_layer_ptrs[full_li];
 
         let stream = self.stream.raw();
         unsafe {
             drafter.populate_shadow_kv_range_from_base(
-                base_sliding_k, base_sliding_v,
-                base_full_k, base_full_v,
-                base_sliding_k_scale, base_sliding_v_scale,
-                base_full_k_scale, base_full_v_scale,
+                base_sliding_k,
+                base_sliding_v,
+                base_full_k,
+                base_full_v,
+                base_sliding_k_scale,
+                base_sliding_v_scale,
+                base_full_k_scale,
+                base_full_v_scale,
                 // Both source layers in Option B are NVFP4 (the
                 // active KV dtype across the whole forward).
                 crate::gemma4_layer_exec::KvDtype::Nvfp4,
                 crate::gemma4_layer_exec::KvDtype::Nvfp4,
                 shadow.sliding_layer_bytes,
                 shadow.full_layer_bytes,
-                slot_start, slot_count,
+                slot_start,
+                slot_count,
                 stream,
             )?;
         }
@@ -2292,7 +2894,8 @@ impl Gemma4Nvfp4Bringup {
         if layer_idx >= self.arch.num_hidden_layers {
             return Err(corrupt_runtime_err(format!(
                 "drafter_base_kv_view: layer_idx={} >= num_hidden_layers={}",
-                layer_idx, self.arch.num_hidden_layers)));
+                layer_idx, self.arch.num_hidden_layers
+            )));
         }
         // block_tables: Option B uses the kv-state's
         // identity table for the active sequence; the drafter
@@ -2300,22 +2903,22 @@ impl Gemma4Nvfp4Bringup {
         // page_idx] with seq_idx=0 in single-request mode.
         // max_blocks_per_seq = max_pos because block_size=1.
         Ok(crate::gemma4_drafter::DrafterBaseKvView {
-            k_cache:        kv.k_packed_layer_ptrs[layer_idx],
-            v_cache:        kv.v_packed_layer_ptrs[layer_idx],
-            k_scale_cache:  kv.k_scale_layer_ptrs[layer_idx],
-            v_scale_cache:  kv.v_scale_layer_ptrs[layer_idx],
+            k_cache: kv.k_packed_layer_ptrs[layer_idx],
+            v_cache: kv.v_packed_layer_ptrs[layer_idx],
+            k_scale_cache: kv.k_scale_layer_ptrs[layer_idx],
+            v_scale_cache: kv.v_scale_layer_ptrs[layer_idx],
             // q_scale_cache: per-token Q scale cache. Option
             // B doesn't allocate one today (per-token Q scale
             // is OFF in the floor commits); the drafter cross-
             // attn falls back to the scalar q_scale_ptr via
             // DrafterBaseKvView.q_scale_cache=0.
-            q_scale_cache:  0,
-            block_tables:   kv.block_tables_ptr,
-            context_lens:   kv.context_lens_ptr,
-            block_size:     kv.block_size,
+            q_scale_cache: 0,
+            block_tables: kv.block_tables_ptr,
+            context_lens: kv.context_lens_ptr,
+            block_size: kv.block_size,
             max_blocks_per_seq: kv.max_pos,
             num_blocks_total: kv.max_pos,
-            kv_dtype:       crate::gemma4_layer_exec::KvDtype::Nvfp4,
+            kv_dtype: crate::gemma4_layer_exec::KvDtype::Nvfp4,
         })
     }
 
@@ -2339,10 +2942,7 @@ impl Gemma4Nvfp4Bringup {
     /// narrow via a tiny scratch CPU path because the cast
     /// kernel handle isn't yet on ForwardKernels; a follow-up
     /// micro-commit adds the GPU cast).
-    pub fn forward_layer0_qk_norm(
-        &self,
-        token_id: u32,
-    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    pub fn forward_layer0_qk_norm(&self, token_id: u32) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let _scratch_guard = self.forward_scratch_guard();
         let (q_f32, k_f32, v_f32) = self.forward_layer0_qkv_only(token_id)?;
         let layer0 = &self.model.layers[0];
@@ -2355,28 +2955,40 @@ impl Gemma4Nvfp4Bringup {
         // f32 → bf16 narrow on host (one-time small buffer for
         // the smoke; a GPU `f32_to_bf16_kernel` cast is the
         // production path).
-        let q_bf16_host: Vec<u16> = q_f32.iter().map(|&x| {
-            let bits = x.to_bits();
-            // Round-to-nearest-even bf16 narrow.
-            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-            (rounded >> 16) as u16
-        }).collect();
-        let k_bf16_host: Vec<u16> = k_f32.iter().map(|&x| {
-            let bits = x.to_bits();
-            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-            (rounded >> 16) as u16
-        }).collect();
+        let q_bf16_host: Vec<u16> = q_f32
+            .iter()
+            .map(|&x| {
+                let bits = x.to_bits();
+                // Round-to-nearest-even bf16 narrow.
+                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+                (rounded >> 16) as u16
+            })
+            .collect();
+        let k_bf16_host: Vec<u16> = k_f32
+            .iter()
+            .map(|&x| {
+                let bits = x.to_bits();
+                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+                (rounded >> 16) as u16
+            })
+            .collect();
 
         // Upload to device, run per-head RMSNorm in place.
-        let q_region = self.arena.region(
-            "gemma4_nvfp4_qk_q", q_bf16_host.len() * 2, 256)?;
-        let k_region = self.arena.region(
-            "gemma4_nvfp4_qk_k", k_bf16_host.len() * 2, 256)?;
+        let q_region = self
+            .arena
+            .region("gemma4_nvfp4_qk_q", q_bf16_host.len() * 2, 256)?;
+        let k_region = self
+            .arena
+            .region("gemma4_nvfp4_qk_k", k_bf16_host.len() * 2, 256)?;
         unsafe {
             let q_bytes: &[u8] = std::slice::from_raw_parts(
-                q_bf16_host.as_ptr() as *const u8, q_bf16_host.len() * 2);
+                q_bf16_host.as_ptr() as *const u8,
+                q_bf16_host.len() * 2,
+            );
             let k_bytes: &[u8] = std::slice::from_raw_parts(
-                k_bf16_host.as_ptr() as *const u8, k_bf16_host.len() * 2);
+                k_bf16_host.as_ptr() as *const u8,
+                k_bf16_host.len() * 2,
+            );
             q_region.copy_from_host(q_bytes)?;
             k_region.copy_from_host(k_bytes)?;
         }
@@ -2386,7 +2998,8 @@ impl Gemma4Nvfp4Bringup {
             // gamma=q_norm[head_dim]. Per-row RMSNorm matches the
             // per-head semantics.
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: num_q_heads, hidden: head_dim,
+                num_tokens: num_q_heads,
+                hidden: head_dim,
                 eps: self.arch.rms_norm_eps,
             }
             .launch(
@@ -2397,7 +3010,8 @@ impl Gemma4Nvfp4Bringup {
             )?;
             // K-norm: same idea on K.
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: num_kv_heads, hidden: head_dim,
+                num_tokens: num_kv_heads,
+                hidden: head_dim,
                 eps: self.arch.rms_norm_eps,
             }
             .launch(
@@ -2439,12 +3053,14 @@ impl Gemma4Nvfp4Bringup {
                 ));
             }
         }
-        let q_normed: Vec<f32> = q_bf16_out.iter().map(|&b| {
-            f32::from_bits((b as u32) << 16)
-        }).collect();
-        let k_normed: Vec<f32> = k_bf16_out.iter().map(|&b| {
-            f32::from_bits((b as u32) << 16)
-        }).collect();
+        let q_normed: Vec<f32> = q_bf16_out
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect();
+        let k_normed: Vec<f32> = k_bf16_out
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect();
 
         Ok((q_normed, k_normed, v_f32))
     }
@@ -2473,10 +3089,7 @@ impl Gemma4Nvfp4Bringup {
     ///
     /// Returns the predicted next token id from feeding layer 0's
     /// output through the final close-out (#4g).
-    pub fn forward_layer0_position_zero_to_token(
-        &self,
-        token_id: u32,
-    ) -> Result<u32> {
+    pub fn forward_layer0_position_zero_to_token(&self, token_id: u32) -> Result<u32> {
         let _scratch_guard = self.forward_scratch_guard();
         let (q_post_rope_f32, _k_post_rope_f32, v_f32) =
             self.forward_layer0_qk_rope(token_id, 0)?;
@@ -2504,8 +3117,7 @@ impl Gemma4Nvfp4Bringup {
         // each KV-head's V row gqa_ratio times. For 31B sliding
         // (gqa_ratio=2): Q-heads 0,1 read V[0]; Q-heads 2,3 read
         // V[1]; ...; Q-heads 30,31 read V[15].
-        let mut attn_out_f32: Vec<f32> =
-            Vec::with_capacity(num_q_heads * head_dim);
+        let mut attn_out_f32: Vec<f32> = Vec::with_capacity(num_q_heads * head_dim);
         for qh in 0..num_q_heads {
             let kvh = qh / gqa_ratio;
             let src = &v_f32[kvh * head_dim..(kvh + 1) * head_dim];
@@ -2514,11 +3126,14 @@ impl Gemma4Nvfp4Bringup {
         debug_assert_eq!(attn_out_f32.len(), num_q_heads * head_dim);
 
         // Narrow attn_out to bf16 for the post-attn flow.
-        let attn_out_bf16: Vec<u16> = attn_out_f32.iter().map(|&x| {
-            let bits = x.to_bits();
-            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-            (rounded >> 16) as u16
-        }).collect();
+        let attn_out_bf16: Vec<u16> = attn_out_f32
+            .iter()
+            .map(|&x| {
+                let bits = x.to_bits();
+                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+                (rounded >> 16) as u16
+            })
+            .collect();
 
         // Compute the input residual (embed → input_layernorm
         // output → no, actually the residual ENTERING the
@@ -2531,16 +3146,17 @@ impl Gemma4Nvfp4Bringup {
         // Cheaper than threading a residual handle through the
         // intermediate methods.
         let hidden = self.arch.hidden_size as u32;
-        let tok_region = self.arena.region(
-            "gemma4_nvfp4_pz_tok", 4, 16)?;
+        let tok_region = self.arena.region("gemma4_nvfp4_pz_tok", 4, 16)?;
         unsafe {
             tok_region.copy_from_host(&(token_id as i32).to_le_bytes())?;
         }
-        let h_residual_region = self.arena.region(
-            "gemma4_nvfp4_pz_residual", (hidden as usize) * 2, 256)?;
+        let h_residual_region =
+            self.arena
+                .region("gemma4_nvfp4_pz_residual", (hidden as usize) * 2, 256)?;
         unsafe {
             rvllm_fused::EmbeddingGatherLaunch {
-                num_tokens: 1, hidden,
+                num_tokens: 1,
+                hidden,
                 vocab: self.arch.vocab_size as u32,
             }
             .launch(
@@ -2571,22 +3187,21 @@ impl Gemma4Nvfp4Bringup {
 
         // Post-attention close-out (#4e): o_proj + post_attn_norm
         // + residual add → updated residual.
-        let h_after_attn_f32 = self.forward_layer0_post_attn(
-            &attn_out_bf16, &h_residual_bf16,
-        )?;
+        let h_after_attn_f32 = self.forward_layer0_post_attn(&attn_out_bf16, &h_residual_bf16)?;
 
         // Narrow back to bf16 for the MLP block (#4f).
-        let h_after_attn_bf16: Vec<u16> = h_after_attn_f32.iter().map(|&x| {
-            let bits = x.to_bits();
-            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-            (rounded >> 16) as u16
-        }).collect();
+        let h_after_attn_bf16: Vec<u16> = h_after_attn_f32
+            .iter()
+            .map(|&x| {
+                let bits = x.to_bits();
+                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+                (rounded >> 16) as u16
+            })
+            .collect();
 
         // MLP block (#4f): pre_ff_norm → MLP → post_ff_norm
         // → residual += mlp_normed * layer_scalar.
-        let h_after_mlp_f32 = self.forward_layer0_post_attn_mlp(
-            &h_after_attn_bf16,
-        )?;
+        let h_after_mlp_f32 = self.forward_layer0_post_attn_mlp(&h_after_attn_bf16)?;
 
         // For end-to-end position=0 we only have ONE layer. The
         // remaining 59 layers are stubbed by passing the layer-0
@@ -2594,11 +3209,14 @@ impl Gemma4Nvfp4Bringup {
         // composition lands with #5b once real attention works
         // for layers 1..59 (each layer's attention reads the KV
         // cache populated by earlier layers).
-        let h_after_mlp_bf16: Vec<u16> = h_after_mlp_f32.iter().map(|&x| {
-            let bits = x.to_bits();
-            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-            (rounded >> 16) as u16
-        }).collect();
+        let h_after_mlp_bf16: Vec<u16> = h_after_mlp_f32
+            .iter()
+            .map(|&x| {
+                let bits = x.to_bits();
+                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+                (rounded >> 16) as u16
+            })
+            .collect();
 
         // Final close-out (#4g): final_norm → tied lm_head → argmax.
         self.forward_final_to_token(&h_after_mlp_bf16)
@@ -2621,6 +3239,37 @@ impl Gemma4Nvfp4Bringup {
         &self,
         h_residual_bf16_host: &[u16], // [hidden]
     ) -> Result<u32> {
+        self.forward_final_to_token_impl(h_residual_bf16_host, /*snapshot_base_hidden=*/ true)
+    }
+
+    /// Variant used by K>=2 batched verify: score a residual row
+    /// without updating `base_last_hidden_ptr`. The orchestration
+    /// chooses which verified row becomes the next drafter input
+    /// only after accept-count is known.
+    fn forward_final_to_token_no_snapshot(&self, h_residual_bf16_host: &[u16]) -> Result<u32> {
+        self.forward_final_to_token_impl(h_residual_bf16_host, /*snapshot_base_hidden=*/ false)
+    }
+
+    /// Explicitly snapshot one selected base residual row as the
+    /// post-final-norm f16 hidden consumed by the next drafter step.
+    /// This intentionally reuses the final close-out path; the extra
+    /// LM-head work is acceptable for the first minimal K>=2 port.
+    pub fn snapshot_base_last_hidden_from_residual(
+        &self,
+        h_residual_bf16_host: &[u16],
+    ) -> Result<()> {
+        let _ = self.forward_final_to_token_impl(
+            h_residual_bf16_host,
+            /*snapshot_base_hidden=*/ true,
+        )?;
+        Ok(())
+    }
+
+    fn forward_final_to_token_impl(
+        &self,
+        h_residual_bf16_host: &[u16],
+        snapshot_base_hidden: bool,
+    ) -> Result<u32> {
         let _scratch_guard = self.forward_scratch_guard();
         let hidden = self.arch.hidden_size as u32;
         let vocab = self.arch.vocab_size as u32;
@@ -2631,16 +3280,18 @@ impl Gemma4Nvfp4Bringup {
                 rvllm_core::CudaCtx::setup(),
             ));
         }
-        let h_region = self.arena.region(
-            "gemma4_nvfp4_final_h", (hidden as usize) * 2, 256)?;
-        let logits_region = self.arena.region(
-            "gemma4_nvfp4_final_logits", (vocab as usize) * 4, 256)?;
-        let token_region = self.arena.region(
-            "gemma4_nvfp4_final_token", 4, 16)?;
+        let h_region = self
+            .arena
+            .region("gemma4_nvfp4_final_h", (hidden as usize) * 2, 256)?;
+        let logits_region =
+            self.arena
+                .region("gemma4_nvfp4_final_logits", (vocab as usize) * 4, 256)?;
+        let token_region = self.arena.region("gemma4_nvfp4_final_token", 4, 16)?;
         unsafe {
             let r: &[u8] = std::slice::from_raw_parts(
                 h_residual_bf16_host.as_ptr() as *const u8,
-                h_residual_bf16_host.len() * 2);
+                h_residual_bf16_host.len() * 2,
+            );
             h_region.copy_from_host(r)?;
         }
         let stream_u64 = self.stream.raw();
@@ -2648,7 +3299,9 @@ impl Gemma4Nvfp4Bringup {
         // (1) final_norm in-place on h_region.
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
             }
             .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
@@ -2665,12 +3318,9 @@ impl Gemma4Nvfp4Bringup {
         // ordered so the drafter forward enqueued after this
         // sees the updated bytes.
         let base_last_hidden = self.base_last_hidden_device_ptr();
-        if base_last_hidden != 0 {
+        if snapshot_base_hidden && base_last_hidden != 0 {
             unsafe {
-                rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch {
-                    n: hidden,
-                }
-                .launch(
+                rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: hidden }.launch(
                     self.forward_kernels.fn_bf16_to_f16_sat,
                     base_last_hidden,
                     h_region.device_ptr(),
@@ -2686,7 +3336,10 @@ impl Gemma4Nvfp4Bringup {
                 h_region.device_ptr(),
                 self.model.outside.lm_head_tokens.offset_bytes,
                 logits_region.device_ptr(),
-                1, vocab as i32, hidden as i32, stream_u64,
+                1,
+                vocab as i32,
+                hidden as i32,
+                stream_u64,
             )?;
         }
 
@@ -2703,7 +3356,11 @@ impl Gemma4Nvfp4Bringup {
             ];
             rvllm_fused::launch_raw(
                 self.forward_kernels.fn_argmax_f32,
-                (1, 1, 1), (1024, 1, 1), 0, stream_u64, &args,
+                (1, 1, 1),
+                (1024, 1, 1),
+                0,
+                stream_u64,
+                &args,
             )?;
         }
         self.stream.fence()?;
@@ -2711,11 +3368,7 @@ impl Gemma4Nvfp4Bringup {
         let mut tok = [0i32; 1];
         unsafe {
             use cudarc::driver::sys::*;
-            let rc = cuMemcpyDtoH_v2(
-                tok.as_mut_ptr() as *mut _,
-                token_region.device_ptr(),
-                4,
-            );
+            let rc = cuMemcpyDtoH_v2(tok.as_mut_ptr() as *mut _, token_region.device_ptr(), 4);
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
                     "forward_final_to_token: token DtoH",
@@ -2773,16 +3426,22 @@ impl Gemma4Nvfp4Bringup {
         // is [hidden] bf16.
         let h_residual_region = self.arena.region(
             "gemma4_nvfp4_post_attn_mlp_resid",
-            (hidden as usize) * 2, 256)?;
+            (hidden as usize) * 2,
+            256,
+        )?;
         let h_normed_region = self.arena.region(
             "gemma4_nvfp4_post_attn_mlp_normed",
-            (hidden as usize) * 2, 256)?;
+            (hidden as usize) * 2,
+            256,
+        )?;
         let scratch_region = self.arena.region(
             "gemma4_nvfp4_post_attn_mlp_scratch",
-            (2 * intermediate as usize) * 2, 256)?;
-        let mlp_out_region = self.arena.region(
-            "gemma4_nvfp4_post_attn_mlp_out",
-            (hidden as usize) * 2, 256)?;
+            (2 * intermediate as usize) * 2,
+            256,
+        )?;
+        let mlp_out_region =
+            self.arena
+                .region("gemma4_nvfp4_post_attn_mlp_out", (hidden as usize) * 2, 256)?;
 
         unsafe {
             // Upload h_residual; copy to h_normed so the
@@ -2790,7 +3449,8 @@ impl Gemma4Nvfp4Bringup {
             // h_residual intact for the final add.
             let r: &[u8] = std::slice::from_raw_parts(
                 h_residual_bf16_host.as_ptr() as *const u8,
-                h_residual_bf16_host.len() * 2);
+                h_residual_bf16_host.len() * 2,
+            );
             h_residual_region.copy_from_host(r)?;
             h_normed_region.copy_from_host(r)?;
         }
@@ -2799,7 +3459,9 @@ impl Gemma4Nvfp4Bringup {
         // (1) pre_feedforward_layernorm in-place on h_normed.
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
             }
             .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
@@ -2830,7 +3492,9 @@ impl Gemma4Nvfp4Bringup {
         // (3) post_feedforward_layernorm in-place on mlp_out.
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
             }
             .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
@@ -2881,28 +3545,32 @@ impl Gemma4Nvfp4Bringup {
         let layer_scalar_f32 = f32::from_bits((scalar_bf16[0] as u32) << 16);
 
         // Scale + narrow back to bf16. RTNE narrow.
-        let scaled_bf16: Vec<u16> = mlp_normed_bf16.iter().map(|&b| {
-            let v = f32::from_bits((b as u32) << 16) * layer_scalar_f32;
-            let bits = v.to_bits();
-            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-            (rounded >> 16) as u16
-        }).collect();
+        let scaled_bf16: Vec<u16> = mlp_normed_bf16
+            .iter()
+            .map(|&b| {
+                let v = f32::from_bits((b as u32) << 16) * layer_scalar_f32;
+                let bits = v.to_bits();
+                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+                (rounded >> 16) as u16
+            })
+            .collect();
         unsafe {
             let s: &[u8] = std::slice::from_raw_parts(
-                scaled_bf16.as_ptr() as *const u8, scaled_bf16.len() * 2);
+                scaled_bf16.as_ptr() as *const u8,
+                scaled_bf16.len() * 2,
+            );
             mlp_out_region.copy_from_host(s)?;
         }
 
         // (5) Residual add: h_residual += mlp_normed * layer_scalar.
         //     mlp_out_region NOW holds the scaled mlp_normed.
         unsafe {
-            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }
-                .launch(
-                    self.forward_kernels.fn_vector_add_bf16,
-                    h_residual_region.device_ptr(),
-                    mlp_out_region.device_ptr(),
-                    stream_u64,
-                )?;
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
+                self.forward_kernels.fn_vector_add_bf16,
+                h_residual_region.device_ptr(),
+                mlp_out_region.device_ptr(),
+                stream_u64,
+            )?;
         }
         self.stream.fence()?;
 
@@ -2922,9 +3590,10 @@ impl Gemma4Nvfp4Bringup {
                 ));
             }
         }
-        Ok(h_out_bf16.iter().map(|&b| {
-            f32::from_bits((b as u32) << 16)
-        }).collect())
+        Ok(h_out_bf16
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect())
     }
 
     /// Layer-0 post-attention close-out: o_proj +
@@ -2946,7 +3615,7 @@ impl Gemma4Nvfp4Bringup {
     /// in the residual add but a no-op at value 1.0.
     pub fn forward_layer0_post_attn(
         &self,
-        attn_out_bf16_host: &[u16], // [N_q]
+        attn_out_bf16_host: &[u16],   // [N_q]
         h_residual_bf16_host: &[u16], // [hidden]
     ) -> Result<Vec<f32>> {
         let _scratch_guard = self.forward_scratch_guard();
@@ -2971,23 +3640,29 @@ impl Gemma4Nvfp4Bringup {
         // Upload synthetic inputs.
         let attn_in_region = self.arena.region(
             "gemma4_nvfp4_post_attn_in",
-            attn_out_bf16_host.len() * 2, 256)?;
+            attn_out_bf16_host.len() * 2,
+            256,
+        )?;
         let residual_region = self.arena.region(
             "gemma4_nvfp4_post_attn_resid",
-            h_residual_bf16_host.len() * 2, 256)?;
-        let o_f32_region = self.arena.region(
-            "gemma4_nvfp4_post_attn_o_f32",
-            (hidden as usize) * 4, 256)?;
-        let o_bf16_region = self.arena.region(
-            "gemma4_nvfp4_post_attn_o_bf16",
-            (hidden as usize) * 2, 256)?;
+            h_residual_bf16_host.len() * 2,
+            256,
+        )?;
+        let o_f32_region =
+            self.arena
+                .region("gemma4_nvfp4_post_attn_o_f32", (hidden as usize) * 4, 256)?;
+        let o_bf16_region =
+            self.arena
+                .region("gemma4_nvfp4_post_attn_o_bf16", (hidden as usize) * 2, 256)?;
         unsafe {
             let a: &[u8] = std::slice::from_raw_parts(
                 attn_out_bf16_host.as_ptr() as *const u8,
-                attn_out_bf16_host.len() * 2);
+                attn_out_bf16_host.len() * 2,
+            );
             let r: &[u8] = std::slice::from_raw_parts(
                 h_residual_bf16_host.as_ptr() as *const u8,
-                h_residual_bf16_host.len() * 2);
+                h_residual_bf16_host.len() * 2,
+            );
             attn_in_region.copy_from_host(a)?;
             residual_region.copy_from_host(r)?;
         }
@@ -3001,7 +3676,10 @@ impl Gemma4Nvfp4Bringup {
                 attn_in_region.device_ptr(),
                 layer0.o_proj.offset_bytes,
                 o_f32_region.device_ptr(),
-                1, hidden as i32, n_q, stream_u64,
+                1,
+                hidden as i32,
+                n_q,
+                stream_u64,
             )?;
         }
         self.stream.fence()?;
@@ -3026,22 +3704,28 @@ impl Gemma4Nvfp4Bringup {
                 ));
             }
         }
-        let o_bf16_host: Vec<u16> = o_f32_host.iter().map(|&x| {
-            let bits = x.to_bits();
-            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-            (rounded >> 16) as u16
-        }).collect();
+        let o_bf16_host: Vec<u16> = o_f32_host
+            .iter()
+            .map(|&x| {
+                let bits = x.to_bits();
+                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+                (rounded >> 16) as u16
+            })
+            .collect();
         unsafe {
             let b: &[u8] = std::slice::from_raw_parts(
                 o_bf16_host.as_ptr() as *const u8,
-                o_bf16_host.len() * 2);
+                o_bf16_host.len() * 2,
+            );
             o_bf16_region.copy_from_host(b)?;
         }
 
         // (3) post_attention_layernorm in-place on o_bf16_region.
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
             }
             .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
@@ -3057,13 +3741,12 @@ impl Gemma4Nvfp4Bringup {
         //     which is what we want for weight=1.0. A future
         //     scaled-residual kernel handles weight!=1.0.
         unsafe {
-            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }
-                .launch(
-                    self.forward_kernels.fn_vector_add_bf16,
-                    residual_region.device_ptr(),
-                    o_bf16_region.device_ptr(),
-                    stream_u64,
-                )?;
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
+                self.forward_kernels.fn_vector_add_bf16,
+                residual_region.device_ptr(),
+                o_bf16_region.device_ptr(),
+                stream_u64,
+            )?;
         }
         self.stream.fence()?;
 
@@ -3084,9 +3767,10 @@ impl Gemma4Nvfp4Bringup {
                 ));
             }
         }
-        Ok(h_out_bf16.iter().map(|&b| {
-            f32::from_bits((b as u32) << 16)
-        }).collect())
+        Ok(h_out_bf16
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect())
     }
 
     /// Layer-0 RoPE on post-norm Q/K. Extends qk_norm by
@@ -3101,8 +3785,7 @@ impl Gemma4Nvfp4Bringup {
         position: u32,
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let _scratch_guard = self.forward_scratch_guard();
-        let (q_normed_f32, k_normed_f32, v_f32) =
-            self.forward_layer0_qk_norm(token_id)?;
+        let (q_normed_f32, k_normed_f32, v_f32) = self.forward_layer0_qk_norm(token_id)?;
         let head_dim = self.arch.head_dim_sliding as u32;
         let num_q_heads = (q_normed_f32.len() / head_dim as usize) as u32;
         let num_kv_heads = (k_normed_f32.len() / head_dim as usize) as u32;
@@ -3110,24 +3793,28 @@ impl Gemma4Nvfp4Bringup {
         // f32 → bf16 host narrow (commit #4c convention; GPU
         // f32_to_bf16 wiring is a separate follow-up commit).
         let narrow_to_bf16 = |xs: &[f32]| -> Vec<u16> {
-            xs.iter().map(|&x| {
-                let bits = x.to_bits();
-                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-                (rounded >> 16) as u16
-            }).collect()
+            xs.iter()
+                .map(|&x| {
+                    let bits = x.to_bits();
+                    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+                    (rounded >> 16) as u16
+                })
+                .collect()
         };
         let q_bf16: Vec<u16> = narrow_to_bf16(&q_normed_f32);
         let k_bf16: Vec<u16> = narrow_to_bf16(&k_normed_f32);
 
-        let q_region = self.arena.region(
-            "gemma4_nvfp4_rope_q", q_bf16.len() * 2, 256)?;
-        let k_region = self.arena.region(
-            "gemma4_nvfp4_rope_k", k_bf16.len() * 2, 256)?;
+        let q_region = self
+            .arena
+            .region("gemma4_nvfp4_rope_q", q_bf16.len() * 2, 256)?;
+        let k_region = self
+            .arena
+            .region("gemma4_nvfp4_rope_k", k_bf16.len() * 2, 256)?;
         unsafe {
-            let q_bytes: &[u8] = std::slice::from_raw_parts(
-                q_bf16.as_ptr() as *const u8, q_bf16.len() * 2);
-            let k_bytes: &[u8] = std::slice::from_raw_parts(
-                k_bf16.as_ptr() as *const u8, k_bf16.len() * 2);
+            let q_bytes: &[u8] =
+                std::slice::from_raw_parts(q_bf16.as_ptr() as *const u8, q_bf16.len() * 2);
+            let k_bytes: &[u8] =
+                std::slice::from_raw_parts(k_bf16.as_ptr() as *const u8, k_bf16.len() * 2);
             q_region.copy_from_host(q_bytes)?;
             k_region.copy_from_host(k_bytes)?;
         }
@@ -3150,40 +3837,42 @@ impl Gemma4Nvfp4Bringup {
             let row_off = (position as usize) * row_bytes;
             let rc = cuMemcpyDtoH_v2(
                 cos_row_f16.as_mut_ptr() as *mut _,
-                self.model.outside.rope_cos_sliding.offset_bytes
-                    + row_off as u64,
-                row_bytes);
+                self.model.outside.rope_cos_sliding.offset_bytes + row_off as u64,
+                row_bytes,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
                     "forward_layer0_qk_rope: cos row DtoH",
                     rvllm_core::CudaErrorKind::MemcpyFailed,
-                    rvllm_core::CudaCtx::setup()));
+                    rvllm_core::CudaCtx::setup(),
+                ));
             }
             let rc = cuMemcpyDtoH_v2(
                 sin_row_f16.as_mut_ptr() as *mut _,
-                self.model.outside.rope_sin_sliding.offset_bytes
-                    + row_off as u64,
-                row_bytes);
+                self.model.outside.rope_sin_sliding.offset_bytes + row_off as u64,
+                row_bytes,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
                     "forward_layer0_qk_rope: sin row DtoH",
                     rvllm_core::CudaErrorKind::MemcpyFailed,
-                    rvllm_core::CudaCtx::setup()));
+                    rvllm_core::CudaCtx::setup(),
+                ));
             }
         }
-        let cos_row_f32: Vec<f32> = cos_row_f16.iter()
-            .map(|&b| half::f16::from_bits(b).to_f32()).collect();
-        let sin_row_f32: Vec<f32> = sin_row_f16.iter()
-            .map(|&b| half::f16::from_bits(b).to_f32()).collect();
-        let cos_scratch = self.arena.region(
-            "g4n_probe_cos_f32", half * 4, 16)?;
-        let sin_scratch = self.arena.region(
-            "g4n_probe_sin_f32", half * 4, 16)?;
+        let cos_row_f32: Vec<f32> = cos_row_f16
+            .iter()
+            .map(|&b| half::f16::from_bits(b).to_f32())
+            .collect();
+        let sin_row_f32: Vec<f32> = sin_row_f16
+            .iter()
+            .map(|&b| half::f16::from_bits(b).to_f32())
+            .collect();
+        let cos_scratch = self.arena.region("g4n_probe_cos_f32", half * 4, 16)?;
+        let sin_scratch = self.arena.region("g4n_probe_sin_f32", half * 4, 16)?;
         unsafe {
-            let cb: &[u8] = std::slice::from_raw_parts(
-                cos_row_f32.as_ptr() as *const u8, half * 4);
-            let sb: &[u8] = std::slice::from_raw_parts(
-                sin_row_f32.as_ptr() as *const u8, half * 4);
+            let cb: &[u8] = std::slice::from_raw_parts(cos_row_f32.as_ptr() as *const u8, half * 4);
+            let sb: &[u8] = std::slice::from_raw_parts(sin_row_f32.as_ptr() as *const u8, half * 4);
             cos_scratch.copy_from_host(cb)?;
             sin_scratch.copy_from_host(sb)?;
         }
@@ -3211,7 +3900,9 @@ impl Gemma4Nvfp4Bringup {
                     self.forward_kernels.fn_rope_split_half_bf16,
                     (n_heads, 1, 1),
                     (head_dim / 2, 1, 1),
-                    0, stream_u64, &args,
+                    0,
+                    stream_u64,
+                    &args,
                 )
             }
         };
@@ -3225,8 +3916,16 @@ impl Gemma4Nvfp4Bringup {
         unsafe {
             use cudarc::driver::sys::*;
             for (host, dev, n) in [
-                (q_out_bf16.as_mut_ptr() as *mut _, q_region.device_ptr(), q_out_bf16.len() * 2),
-                (k_out_bf16.as_mut_ptr() as *mut _, k_region.device_ptr(), k_out_bf16.len() * 2),
+                (
+                    q_out_bf16.as_mut_ptr() as *mut _,
+                    q_region.device_ptr(),
+                    q_out_bf16.len() * 2,
+                ),
+                (
+                    k_out_bf16.as_mut_ptr() as *mut _,
+                    k_region.device_ptr(),
+                    k_out_bf16.len() * 2,
+                ),
             ] {
                 let rc = cuMemcpyDtoH_v2(host, dev, n);
                 if rc != CUresult::CUDA_SUCCESS {
@@ -3238,12 +3937,14 @@ impl Gemma4Nvfp4Bringup {
                 }
             }
         }
-        let q_out: Vec<f32> = q_out_bf16.iter().map(|&b| {
-            f32::from_bits((b as u32) << 16)
-        }).collect();
-        let k_out: Vec<f32> = k_out_bf16.iter().map(|&b| {
-            f32::from_bits((b as u32) << 16)
-        }).collect();
+        let q_out: Vec<f32> = q_out_bf16
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect();
+        let k_out: Vec<f32> = k_out_bf16
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect();
         Ok((q_out, k_out, v_f32))
     }
 
@@ -3268,10 +3969,7 @@ impl Gemma4Nvfp4Bringup {
     ///     rotary_dim=128 per arch.partial_rotary_factor_global).
     ///   * Attention launch + KV write.
     ///   * O-proj + residual.
-    pub fn forward_layer0_qkv_only(
-        &self,
-        token_id: u32,
-    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    pub fn forward_layer0_qkv_only(&self, token_id: u32) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let _scratch_guard = self.forward_scratch_guard();
         let layer0 = &self.model.layers[0];
         let n_q = layer0.q_proj.shape[0] as i32;
@@ -3307,30 +4005,38 @@ impl Gemma4Nvfp4Bringup {
         unsafe {
             tok_region.copy_from_host(&(token_id as i32).to_le_bytes())?;
         }
-        let residual_region = self.arena.region(
-            "gemma4_nvfp4_qkv_residual", (hidden as usize) * 2, 256)?;
-        let q_region = self.arena.region(
-            "gemma4_nvfp4_qkv_q", (n_q as usize) * 4, 256)?;
-        let k_region = self.arena.region(
-            "gemma4_nvfp4_qkv_k", (n_kv as usize) * 4, 256)?;
-        let v_region = self.arena.region(
-            "gemma4_nvfp4_qkv_v", (n_v as usize) * 4, 256)?;
+        let residual_region =
+            self.arena
+                .region("gemma4_nvfp4_qkv_residual", (hidden as usize) * 2, 256)?;
+        let q_region = self
+            .arena
+            .region("gemma4_nvfp4_qkv_q", (n_q as usize) * 4, 256)?;
+        let k_region = self
+            .arena
+            .region("gemma4_nvfp4_qkv_k", (n_kv as usize) * 4, 256)?;
+        let v_region = self
+            .arena
+            .region("gemma4_nvfp4_qkv_v", (n_v as usize) * 4, 256)?;
         let stream_u64 = self.stream.raw();
 
         // embed → residual → input_layernorm in-place.
         unsafe {
             rvllm_fused::EmbeddingGatherLaunch {
-                num_tokens: 1, hidden,
+                num_tokens: 1,
+                hidden,
                 vocab: self.arch.vocab_size as u32,
             }
             .launch(
                 self.forward_kernels.fn_embedding_gather_bf16,
                 residual_region.device_ptr(),
                 self.model.outside.embed_tokens.offset_bytes,
-                tok_region.device_ptr(), stream_u64,
+                tok_region.device_ptr(),
+                stream_u64,
             )?;
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
             }
             .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
@@ -3345,19 +4051,34 @@ impl Gemma4Nvfp4Bringup {
         // strided-batched if perf matters here.
         unsafe {
             gemma4_nvfp4_attn_proj(
-                &self.cublaslt, residual_region.device_ptr(),
-                layer0.q_proj.offset_bytes, q_region.device_ptr(),
-                1, n_q, hidden as i32, stream_u64,
+                &self.cublaslt,
+                residual_region.device_ptr(),
+                layer0.q_proj.offset_bytes,
+                q_region.device_ptr(),
+                1,
+                n_q,
+                hidden as i32,
+                stream_u64,
             )?;
             gemma4_nvfp4_attn_proj(
-                &self.cublaslt, residual_region.device_ptr(),
-                layer0.k_proj.offset_bytes, k_region.device_ptr(),
-                1, n_kv, hidden as i32, stream_u64,
+                &self.cublaslt,
+                residual_region.device_ptr(),
+                layer0.k_proj.offset_bytes,
+                k_region.device_ptr(),
+                1,
+                n_kv,
+                hidden as i32,
+                stream_u64,
             )?;
             gemma4_nvfp4_attn_proj(
-                &self.cublaslt, residual_region.device_ptr(),
-                v_weight.offset_bytes, v_region.device_ptr(),
-                1, n_v, hidden as i32, stream_u64,
+                &self.cublaslt,
+                residual_region.device_ptr(),
+                v_weight.offset_bytes,
+                v_region.device_ptr(),
+                1,
+                n_v,
+                hidden as i32,
+                stream_u64,
             )?;
         }
         self.stream.fence()?;
@@ -3368,9 +4089,21 @@ impl Gemma4Nvfp4Bringup {
         unsafe {
             use cudarc::driver::sys::*;
             let copies = [
-                (q.as_mut_ptr() as *mut _, q_region.device_ptr(), (n_q as usize) * 4),
-                (k.as_mut_ptr() as *mut _, k_region.device_ptr(), (n_kv as usize) * 4),
-                (v.as_mut_ptr() as *mut _, v_region.device_ptr(), (n_v as usize) * 4),
+                (
+                    q.as_mut_ptr() as *mut _,
+                    q_region.device_ptr(),
+                    (n_q as usize) * 4,
+                ),
+                (
+                    k.as_mut_ptr() as *mut _,
+                    k_region.device_ptr(),
+                    (n_kv as usize) * 4,
+                ),
+                (
+                    v.as_mut_ptr() as *mut _,
+                    v_region.device_ptr(),
+                    (n_v as usize) * 4,
+                ),
             ];
             for (host, dev, sz) in copies {
                 let rc = cuMemcpyDtoH_v2(host, dev, sz);
@@ -3405,14 +4138,12 @@ impl Gemma4Nvfp4Bringup {
         unsafe {
             tok_region.copy_from_host(&(token_id as i32).to_le_bytes())?;
         }
-        let residual_region = self.arena.region(
-            "gemma4_nvfp4_pre_attn_residual",
-            (hidden as usize) * 2, 256,
-        )?;
-        let q_region = self.arena.region(
-            "gemma4_nvfp4_pre_attn_q",
-            (n_q as usize) * 4, 256,
-        )?;
+        let residual_region =
+            self.arena
+                .region("gemma4_nvfp4_pre_attn_residual", (hidden as usize) * 2, 256)?;
+        let q_region = self
+            .arena
+            .region("gemma4_nvfp4_pre_attn_q", (n_q as usize) * 4, 256)?;
         let stream_u64 = self.stream.raw();
 
         // (1) embed lookup → residual_region [1, hidden] bf16.
@@ -3453,7 +4184,10 @@ impl Gemma4Nvfp4Bringup {
                 residual_region.device_ptr(),
                 layer0.q_proj.offset_bytes,
                 q_region.device_ptr(),
-                1, n_q, hidden as i32, stream_u64,
+                1,
+                n_q,
+                hidden as i32,
+                stream_u64,
             )?;
         }
 
@@ -3525,32 +4259,32 @@ impl Gemma4Nvfp4Bringup {
         position: u32,
         kv: &Gemma4Nvfp4KvState,
     ) -> Result<Vec<f32>> {
-        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_core::{CudaCtx, CudaErrorKind, RvllmError};
 
         if position >= kv.max_pos {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer0_attn: position={} >= kv.max_pos={}",
-                position, kv.max_pos)));
+                position, kv.max_pos
+            )));
         }
 
         let _scratch_guard = self.forward_scratch_guard();
 
         // ---- 1. Q-norm + K-norm via existing helper -----------------------
-        let (q_normed_f32, k_normed_f32, v_raw_f32) =
-            self.forward_layer0_qk_norm(token_id)?;
+        let (q_normed_f32, k_normed_f32, v_raw_f32) = self.forward_layer0_qk_norm(token_id)?;
 
         let head_dim = self.arch.head_dim_sliding;
         let num_q_heads = q_normed_f32.len() / head_dim;
         let num_kv_heads = k_normed_f32.len() / head_dim;
         debug_assert_eq!(v_raw_f32.len(), num_kv_heads * head_dim);
-        debug_assert!(num_q_heads >= num_kv_heads
-            && num_q_heads % num_kv_heads == 0);
+        debug_assert!(num_q_heads >= num_kv_heads && num_q_heads % num_kv_heads == 0);
         let gqa = num_q_heads / num_kv_heads;
         if gqa > 4 {
             // MAX_GQA_DECODE = 4 in the GQA kernel.
             return Err(corrupt_runtime_err(format!(
                 "forward_layer0_attn: gqa_ratio={} > MAX_GQA_DECODE=4",
-                gqa)));
+                gqa
+            )));
         }
         // Sliding layer 0: full RoPE on head_dim. The rotary_dim
         // arg is still threaded to the kernel.
@@ -3561,40 +4295,49 @@ impl Gemma4Nvfp4Bringup {
         let eps = self.arch.rms_norm_eps;
         let mut v_normed_f32: Vec<f32> = Vec::with_capacity(v_raw_f32.len());
         for h in 0..num_kv_heads {
-            let row = &v_raw_f32[h * head_dim .. (h + 1) * head_dim];
-            let mean_sq: f32 = row.iter().map(|x| x * x).sum::<f32>()
-                / (head_dim as f32);
+            let row = &v_raw_f32[h * head_dim..(h + 1) * head_dim];
+            let mean_sq: f32 = row.iter().map(|x| x * x).sum::<f32>() / (head_dim as f32);
             let scale = 1.0 / (mean_sq + eps).sqrt();
-            for &x in row { v_normed_f32.push(x * scale); }
+            for &x in row {
+                v_normed_f32.push(x * scale);
+            }
         }
 
         // ---- 3. Upload Q/K/V as bf16 + allocate scratch -------------------
         let f32_to_bf16 = |xs: &[f32]| -> Vec<u16> {
-            xs.iter().map(|&x| {
-                let bits = x.to_bits();
-                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-                (rounded >> 16) as u16
-            }).collect()
+            xs.iter()
+                .map(|&x| {
+                    let bits = x.to_bits();
+                    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+                    (rounded >> 16) as u16
+                })
+                .collect()
         };
         let q_bf16 = f32_to_bf16(&q_normed_f32);
         let k_bf16 = f32_to_bf16(&k_normed_f32);
         let v_bf16 = f32_to_bf16(&v_normed_f32);
 
-        let q_region  = self.arena.region("g4n_attn_q_bf16",   q_bf16.len() * 2, 256)?;
-        let k_region  = self.arena.region("g4n_attn_k_bf16",   k_bf16.len() * 2, 256)?;
-        let v_region  = self.arena.region("g4n_attn_v_bf16",   v_bf16.len() * 2, 256)?;
-        let q_fp8_region = self.arena.region(
-            "g4n_attn_q_fp8", q_bf16.len(), 256)?;  // 1 byte/elem
-        let attn_out_region = self.arena.region(
-            "g4n_attn_out_bf16", num_q_heads * head_dim * 2, 256)?;
+        let q_region = self
+            .arena
+            .region("g4n_attn_q_bf16", q_bf16.len() * 2, 256)?;
+        let k_region = self
+            .arena
+            .region("g4n_attn_k_bf16", k_bf16.len() * 2, 256)?;
+        let v_region = self
+            .arena
+            .region("g4n_attn_v_bf16", v_bf16.len() * 2, 256)?;
+        let q_fp8_region = self.arena.region("g4n_attn_q_fp8", q_bf16.len(), 256)?; // 1 byte/elem
+        let attn_out_region =
+            self.arena
+                .region("g4n_attn_out_bf16", num_q_heads * head_dim * 2, 256)?;
 
         unsafe {
-            let qb: &[u8] = std::slice::from_raw_parts(
-                q_bf16.as_ptr() as *const u8, q_bf16.len() * 2);
-            let kb: &[u8] = std::slice::from_raw_parts(
-                k_bf16.as_ptr() as *const u8, k_bf16.len() * 2);
-            let vb: &[u8] = std::slice::from_raw_parts(
-                v_bf16.as_ptr() as *const u8, v_bf16.len() * 2);
+            let qb: &[u8] =
+                std::slice::from_raw_parts(q_bf16.as_ptr() as *const u8, q_bf16.len() * 2);
+            let kb: &[u8] =
+                std::slice::from_raw_parts(k_bf16.as_ptr() as *const u8, k_bf16.len() * 2);
+            let vb: &[u8] =
+                std::slice::from_raw_parts(v_bf16.as_ptr() as *const u8, v_bf16.len() * 2);
             q_region.copy_from_host(qb)?;
             k_region.copy_from_host(kb)?;
             v_region.copy_from_host(vb)?;
@@ -3614,18 +4357,19 @@ impl Gemma4Nvfp4Bringup {
         // positions[0] = position (mode B: full f16 tables index by
         // absolute row), slot_mapping[0] = position, context_lens[0]
         // = position+1.
-        self.fill_pos_slots(kv,
-            /*position_offset=*/position as i32,
-            /*start_slot=*/position as i32,
-            /*num_tokens=*/1,
+        self.fill_pos_slots(
+            kv,
+            /*position_offset=*/ position as i32,
+            /*start_slot=*/ position as i32,
+            /*num_tokens=*/ 1,
         )?;
 
         // ---- 5. Launch RoPE + NVFP4 K/V write + FP8 Q ---------------------
         // Layer 0 is sliding; pick the layer-0 KV pointers.
         let k_packed = kv.k_packed_layer_ptrs[0];
         let v_packed = kv.v_packed_layer_ptrs[0];
-        let k_scale  = kv.k_scale_layer_ptrs[0];
-        let v_scale  = kv.v_scale_layer_ptrs[0];
+        let k_scale = kv.k_scale_layer_ptrs[0];
+        let v_scale = kv.v_scale_layer_ptrs[0];
         let stream_u64 = self.stream.raw();
 
         unsafe {
@@ -3653,8 +4397,7 @@ impl Gemma4Nvfp4Bringup {
             let mut nkvh: i32 = num_kv_heads as i32;
             let mut hd: i32 = head_dim as i32;
             let mut rd: i32 = rotary_dim as i32;
-            let (mut scale_policy, mut v_scale_policy) =
-                read_nvfp4_kv_policies();
+            let (mut scale_policy, mut v_scale_policy) = read_nvfp4_kv_policies();
             let mut rotate_v: i32 = 0;
             let mut stoch_round_v: i32 = 0;
 
@@ -3692,7 +4435,9 @@ impl Gemma4Nvfp4Bringup {
                 self.forward_kernels.fn_rope_kv_write_bf16in,
                 (1u32, max_heads, 1u32),
                 (head_dim as u32, 1u32, 1u32),
-                0, stream_u64, &args,
+                0,
+                stream_u64,
+                &args,
             )?;
         }
 
@@ -3722,8 +4467,7 @@ impl Gemma4Nvfp4Bringup {
             let mut block_size: i32 = kv.block_size as i32;
             let mut max_blocks_per_seq: i32 = kv.max_pos as i32;
             // Sliding layer 0: window_size_left = sliding_window - 1.
-            let mut window_size_left: i32 =
-                (self.arch.sliding_window_size as i32) - 1;
+            let mut window_size_left: i32 = (self.arch.sliding_window_size as i32) - 1;
 
             let args = [
                 (&mut output) as *mut u64 as *mut core::ffi::c_void,
@@ -3750,14 +4494,15 @@ impl Gemma4Nvfp4Bringup {
             let max_gqa: u32 = 4;
             let fa2_threads: u32 = 128;
             let smem_bytes: u32 =
-                2 * fa2_bc * (head_dim as u32) * 2
-                + (max_gqa * fa2_bc + fa2_threads / 32) * 4;
+                2 * fa2_bc * (head_dim as u32) * 2 + (max_gqa * fa2_bc + fa2_threads / 32) * 4;
 
             rvllm_fused::launch_raw(
                 self.forward_kernels.fn_attn_decode_gqa_bf16out,
                 (1u32, num_kv_heads as u32, 1u32),
                 (fa2_threads, 1u32, 1u32),
-                smem_bytes, stream_u64, &args,
+                smem_bytes,
+                stream_u64,
+                &args,
             )?;
         }
 
@@ -3770,16 +4515,20 @@ impl Gemma4Nvfp4Bringup {
             let rc = cuMemcpyDtoH_v2(
                 attn_out_bf16.as_mut_ptr() as *mut _,
                 attn_out_region.device_ptr(),
-                attn_out_bf16.len() * 2);
+                attn_out_bf16.len() * 2,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "forward_layer0_attn: attn_out DtoH",
                     CudaErrorKind::MemcpyFailed,
-                    CudaCtx::setup()));
+                    CudaCtx::setup(),
+                ));
             }
         }
-        let attn_out_f32: Vec<f32> = attn_out_bf16.iter()
-            .map(|&b| f32::from_bits((b as u32) << 16)).collect();
+        let attn_out_f32: Vec<f32> = attn_out_bf16
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect();
         Ok(attn_out_f32)
     }
 
@@ -3822,18 +4571,20 @@ impl Gemma4Nvfp4Bringup {
         position: u32,
         kv: &Gemma4Nvfp4KvState,
     ) -> Result<Vec<f32>> {
-        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_core::{CudaCtx, CudaErrorKind, RvllmError};
         use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
         if layer_idx >= self.arch.num_hidden_layers {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_attn_from_residual: layer_idx={} >= num_hidden_layers={}",
-                layer_idx, self.arch.num_hidden_layers)));
+                layer_idx, self.arch.num_hidden_layers
+            )));
         }
         if position >= kv.max_pos {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_attn_from_residual: position={} >= kv.max_pos={}",
-                position, kv.max_pos)));
+                position, kv.max_pos
+            )));
         }
 
         let _scratch_guard = self.forward_scratch_guard();
@@ -3841,33 +4592,35 @@ impl Gemma4Nvfp4Bringup {
         let layer = &self.model.layers[layer_idx];
         let hidden = self.arch.hidden_size as u32;
         let is_global = matches!(
-            self.arch.layer_types[layer_idx], Gemma4LayerType::GlobalAttention);
+            self.arch.layer_types[layer_idx],
+            Gemma4LayerType::GlobalAttention
+        );
 
         // Per-layer-type config + persistent f16 RoPE tables.
         // `theta` is kept for diagnostic dumps but no longer
         // drives a per-launch table build — the global tables
         // are computed once at load time.
         #[allow(unused_variables)]
-        let (head_dim, rotary_dim, theta, window_size_left,
-             cos_table_dev, sin_table_dev) = if is_global {
-            (
-                self.arch.head_dim_global,
-                self.arch.rotary_dim_global(),
-                self.arch.rope_theta_global as f64,
-                -1i32, // full attention — no sliding window
-                self.model.outside.rope_cos_global.offset_bytes,
-                self.model.outside.rope_sin_global.offset_bytes,
-            )
-        } else {
-            (
-                self.arch.head_dim_sliding,
-                self.arch.head_dim_sliding, // sliding = full RoPE
-                self.arch.rope_theta_sliding as f64,
-                (self.arch.sliding_window_size as i32) - 1,
-                self.model.outside.rope_cos_sliding.offset_bytes,
-                self.model.outside.rope_sin_sliding.offset_bytes,
-            )
-        };
+        let (head_dim, rotary_dim, theta, window_size_left, cos_table_dev, sin_table_dev) =
+            if is_global {
+                (
+                    self.arch.head_dim_global,
+                    self.arch.rotary_dim_global(),
+                    self.arch.rope_theta_global as f64,
+                    -1i32, // full attention — no sliding window
+                    self.model.outside.rope_cos_global.offset_bytes,
+                    self.model.outside.rope_sin_global.offset_bytes,
+                )
+            } else {
+                (
+                    self.arch.head_dim_sliding,
+                    self.arch.head_dim_sliding, // sliding = full RoPE
+                    self.arch.rope_theta_sliding as f64,
+                    (self.arch.sliding_window_size as i32) - 1,
+                    self.model.outside.rope_cos_sliding.offset_bytes,
+                    self.model.outside.rope_sin_sliding.offset_bytes,
+                )
+            };
 
         let n_q = layer.q_proj.shape[0] as i32;
         let n_kv = layer.k_proj.shape[0] as i32;
@@ -3885,20 +4638,25 @@ impl Gemma4Nvfp4Bringup {
                 return Err(corrupt_runtime_err(format!(
                     "forward_layer_attn_from_residual: layer {layer_idx} is \
                      Global but v_proj IS present — attention_k_eq_v expected \
-                     to drop v_proj from the modelopt checkpoint")));
+                     to drop v_proj from the modelopt checkpoint"
+                )));
             }
             v_proj_weight = None;
             n_v = n_kv;
         } else {
-            let vw = layer.v_proj.as_ref().ok_or_else(|| corrupt_runtime_err(
-                format!("forward_layer_attn_from_residual: layer {layer_idx} \
-                         is sliding but v_proj is absent")))?;
+            let vw = layer.v_proj.as_ref().ok_or_else(|| {
+                corrupt_runtime_err(format!(
+                    "forward_layer_attn_from_residual: layer {layer_idx} \
+                         is sliding but v_proj is absent"
+                ))
+            })?;
             n_v = vw.shape[0] as i32;
             v_proj_weight = Some(vw);
             if n_kv != n_v {
                 return Err(corrupt_runtime_err(format!(
                     "forward_layer_attn_from_residual: layer {layer_idx} K/V dim mismatch \
-                     ({n_kv} vs {n_v})")));
+                     ({n_kv} vs {n_v})"
+                )));
             }
         }
 
@@ -3914,22 +4672,28 @@ impl Gemma4Nvfp4Bringup {
         if h_residual_bf16_host.len() != hidden as usize {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_attn_from_residual: residual length {} != hidden {}",
-                h_residual_bf16_host.len(), hidden)));
+                h_residual_bf16_host.len(),
+                hidden
+            )));
         }
 
         // -- Upload residual to device, then in-place input_layernorm ----
-        let residual_region = self.arena.region(
-            "g4n_lN_resid_bf16", (hidden as usize) * 2, 256)?;
+        let residual_region = self
+            .arena
+            .region("g4n_lN_resid_bf16", (hidden as usize) * 2, 256)?;
         unsafe {
             let r: &[u8] = std::slice::from_raw_parts(
                 h_residual_bf16_host.as_ptr() as *const u8,
-                h_residual_bf16_host.len() * 2);
+                h_residual_bf16_host.len() * 2,
+            );
             residual_region.copy_from_host(r)?;
         }
         let stream_u64 = self.stream.raw();
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
             }
             .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
@@ -3940,22 +4704,31 @@ impl Gemma4Nvfp4Bringup {
         }
 
         // -- Q/K/V projections to f32 buffers via bf16 GEMV --------------
-        let q_f32_region = self.arena.region(
-            "g4n_lN_q_f32", (n_q as usize) * 4, 256)?;
-        let k_f32_region = self.arena.region(
-            "g4n_lN_k_f32", (n_kv as usize) * 4, 256)?;
-        let v_f32_region = self.arena.region(
-            "g4n_lN_v_f32", (n_v as usize) * 4, 256)?;
+        let q_f32_region = self.arena.region("g4n_lN_q_f32", (n_q as usize) * 4, 256)?;
+        let k_f32_region = self
+            .arena
+            .region("g4n_lN_k_f32", (n_kv as usize) * 4, 256)?;
+        let v_f32_region = self.arena.region("g4n_lN_v_f32", (n_v as usize) * 4, 256)?;
         unsafe {
             gemma4_nvfp4_attn_proj(
-                &self.cublaslt, residual_region.device_ptr(),
-                layer.q_proj.offset_bytes, q_f32_region.device_ptr(),
-                1, n_q, hidden as i32, stream_u64,
+                &self.cublaslt,
+                residual_region.device_ptr(),
+                layer.q_proj.offset_bytes,
+                q_f32_region.device_ptr(),
+                1,
+                n_q,
+                hidden as i32,
+                stream_u64,
             )?;
             gemma4_nvfp4_attn_proj(
-                &self.cublaslt, residual_region.device_ptr(),
-                layer.k_proj.offset_bytes, k_f32_region.device_ptr(),
-                1, n_kv, hidden as i32, stream_u64,
+                &self.cublaslt,
+                residual_region.device_ptr(),
+                layer.k_proj.offset_bytes,
+                k_f32_region.device_ptr(),
+                1,
+                n_kv,
+                hidden as i32,
+                stream_u64,
             )?;
             // V source: alias k_proj output for global
             // (attention_k_eq_v=true); explicit v_proj for
@@ -3965,9 +4738,14 @@ impl Gemma4Nvfp4Bringup {
             match v_proj_weight {
                 Some(vw) => {
                     gemma4_nvfp4_attn_proj(
-                        &self.cublaslt, residual_region.device_ptr(),
-                        vw.offset_bytes, v_f32_region.device_ptr(),
-                        1, n_v, hidden as i32, stream_u64,
+                        &self.cublaslt,
+                        residual_region.device_ptr(),
+                        vw.offset_bytes,
+                        v_f32_region.device_ptr(),
+                        1,
+                        n_v,
+                        hidden as i32,
+                        stream_u64,
                     )?;
                 }
                 None => {
@@ -3976,12 +4754,15 @@ impl Gemma4Nvfp4Bringup {
                         v_f32_region.device_ptr(),
                         k_f32_region.device_ptr(),
                         (n_v as usize) * 4,
-                        stream_u64 as CUstream);
+                        stream_u64 as CUstream,
+                    );
                     if rc != CUresult::CUDA_SUCCESS {
                         return Err(RvllmError::cuda(
                             "forward_layer_attn_from_residual: \
                              k_eq_v DtoD copy",
-                            CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                            CudaErrorKind::MemcpyFailed,
+                            CudaCtx::setup(),
+                        ));
                     }
                 }
             }
@@ -3998,32 +4779,34 @@ impl Gemma4Nvfp4Bringup {
 
         // bf16 Q/K/V scratch (per-call). q_fp8 + attn_out
         // scratch sized to N_q for the decode launch.
-        let q_region = self.arena.region(
-            "g4n_lN_q_bf16", (n_q as usize) * 2, 256)?;
-        let k_region = self.arena.region(
-            "g4n_lN_k_bf16", (n_kv as usize) * 2, 256)?;
-        let v_region = self.arena.region(
-            "g4n_lN_v_bf16", (n_v as usize) * 2, 256)?;
-        let q_fp8_region = self.arena.region(
-            "g4n_lN_q_fp8", n_q as usize, 256)?;
-        let attn_out_region = self.arena.region(
-            "g4n_lN_attn_out_bf16", num_q_heads * head_dim * 2, 256)?;
+        let q_region = self
+            .arena
+            .region("g4n_lN_q_bf16", (n_q as usize) * 2, 256)?;
+        let k_region = self
+            .arena
+            .region("g4n_lN_k_bf16", (n_kv as usize) * 2, 256)?;
+        let v_region = self
+            .arena
+            .region("g4n_lN_v_bf16", (n_v as usize) * 2, 256)?;
+        let q_fp8_region = self.arena.region("g4n_lN_q_fp8", n_q as usize, 256)?;
+        let attn_out_region =
+            self.arena
+                .region("g4n_lN_attn_out_bf16", num_q_heads * head_dim * 2, 256)?;
 
         // Device narrows: f32 GEMM outputs → bf16 scratch.
+        self.launch_f32_to_bf16(q_region.device_ptr(), q_f32_region.device_ptr(), n_q as u32)?;
         self.launch_f32_to_bf16(
-            q_region.device_ptr(), q_f32_region.device_ptr(),
-            n_q as u32)?;
-        self.launch_f32_to_bf16(
-            k_region.device_ptr(), k_f32_region.device_ptr(),
-            n_kv as u32)?;
-        self.launch_f32_to_bf16(
-            v_region.device_ptr(), v_f32_region.device_ptr(),
-            n_v as u32)?;
+            k_region.device_ptr(),
+            k_f32_region.device_ptr(),
+            n_kv as u32,
+        )?;
+        self.launch_f32_to_bf16(v_region.device_ptr(), v_f32_region.device_ptr(), n_v as u32)?;
 
         unsafe {
             // Q-norm + K-norm in place on the bf16 scratches.
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: num_q_heads as u32, hidden: head_dim as u32,
+                num_tokens: num_q_heads as u32,
+                hidden: head_dim as u32,
                 eps: self.arch.rms_norm_eps,
             }
             .launch(
@@ -4033,7 +4816,8 @@ impl Gemma4Nvfp4Bringup {
                 stream_u64,
             )?;
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: num_kv_heads as u32, hidden: head_dim as u32,
+                num_tokens: num_kv_heads as u32,
+                hidden: head_dim as u32,
                 eps: self.arch.rms_norm_eps,
             }
             .launch(
@@ -4046,9 +4830,7 @@ impl Gemma4Nvfp4Bringup {
 
         // Parameter-free V-RMSNorm on device, in place on the
         // bf16 V scratch.
-        self.launch_vnorm_bf16(
-            v_region.device_ptr(),
-            num_kv_heads as u32, head_dim as u32)?;
+        self.launch_vnorm_bf16(v_region.device_ptr(), num_kv_heads as u32, head_dim as u32)?;
 
         // Floor commit 3: use the global f16 RoPE table for this
         // layer's type (sliding or global). Mode B fill —
@@ -4059,20 +4841,22 @@ impl Gemma4Nvfp4Bringup {
         if (position as usize) >= self.arch.max_position_embeddings {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_attn_from_residual: position={} >= \
-                 max_position_embeddings={}", position,
-                self.arch.max_position_embeddings)));
+                 max_position_embeddings={}",
+                position, self.arch.max_position_embeddings
+            )));
         }
-        self.fill_pos_slots(kv,
-            /*position_offset=*/position as i32,
-            /*start_slot=*/position as i32,
-            /*num_tokens=*/1,
+        self.fill_pos_slots(
+            kv,
+            /*position_offset=*/ position as i32,
+            /*start_slot=*/ position as i32,
+            /*num_tokens=*/ 1,
         )?;
 
         // -- RoPE + NVFP4 K/V write + FP8 Q launch -----------------------
         let k_packed = kv.k_packed_layer_ptrs[layer_idx];
         let v_packed = kv.v_packed_layer_ptrs[layer_idx];
-        let k_scale  = kv.k_scale_layer_ptrs[layer_idx];
-        let v_scale  = kv.v_scale_layer_ptrs[layer_idx];
+        let k_scale = kv.k_scale_layer_ptrs[layer_idx];
+        let v_scale = kv.v_scale_layer_ptrs[layer_idx];
         unsafe {
             let mut q_in: u64 = q_region.device_ptr();
             let mut k_in: u64 = k_region.device_ptr();
@@ -4098,8 +4882,7 @@ impl Gemma4Nvfp4Bringup {
             let mut nkvh: i32 = num_kv_heads as i32;
             let mut hd: i32 = head_dim as i32;
             let mut rd: i32 = rotary_dim as i32;
-            let (mut scale_policy, mut v_scale_policy) =
-                read_nvfp4_kv_policies();
+            let (mut scale_policy, mut v_scale_policy) = read_nvfp4_kv_policies();
             let mut rotate_v: i32 = 0;
             let mut stoch_round_v: i32 = 0;
 
@@ -4137,7 +4920,9 @@ impl Gemma4Nvfp4Bringup {
                 self.forward_kernels.fn_rope_kv_write_bf16in,
                 (1u32, max_heads, 1u32),
                 (head_dim as u32, 1u32, 1u32),
-                0, stream_u64, &args,
+                0,
+                stream_u64,
+                &args,
             )?;
         }
 
@@ -4197,15 +4982,20 @@ impl Gemma4Nvfp4Bringup {
             // (head_idx → kv_head) mapping.
             let (kernel, grid_y, smem_bytes) = if use_gqa_kernel {
                 let max_gqa: u32 = 4;
-                let smem = 2 * fa2_bc * (head_dim as u32) * 2
-                    + (max_gqa * fa2_bc + fa2_threads / 32) * 4;
-                (self.forward_kernels.fn_attn_decode_gqa_bf16out,
-                 num_kv_heads as u32, smem)
+                let smem =
+                    2 * fa2_bc * (head_dim as u32) * 2 + (max_gqa * fa2_bc + fa2_threads / 32) * 4;
+                (
+                    self.forward_kernels.fn_attn_decode_gqa_bf16out,
+                    num_kv_heads as u32,
+                    smem,
+                )
             } else {
-                let smem = 2 * fa2_bc * (head_dim as u32) * 2
-                    + (fa2_bc + fa2_threads / 32) * 4;
-                (self.forward_kernels.fn_attn_decode_bf16out,
-                 num_q_heads as u32, smem)
+                let smem = 2 * fa2_bc * (head_dim as u32) * 2 + (fa2_bc + fa2_threads / 32) * 4;
+                (
+                    self.forward_kernels.fn_attn_decode_bf16out,
+                    num_q_heads as u32,
+                    smem,
+                )
             };
             // head_dim=512 pushes the decode kernel above the 48 KiB
             // default per-launch smem cap; opt in via cuFuncSetAttribute.
@@ -4220,14 +5010,18 @@ impl Gemma4Nvfp4Bringup {
                     return Err(RvllmError::cuda(
                         "forward_layer_attn_from_residual: \
                          cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE)",
-                        CudaErrorKind::LaunchFailed, CudaCtx::setup()));
+                        CudaErrorKind::LaunchFailed,
+                        CudaCtx::setup(),
+                    ));
                 }
             }
             rvllm_fused::launch_raw(
                 kernel,
                 (1u32, grid_y, 1u32),
                 (fa2_threads, 1u32, 1u32),
-                smem_bytes, stream_u64, &args,
+                smem_bytes,
+                stream_u64,
+                &args,
             )?;
         }
 
@@ -4240,15 +5034,20 @@ impl Gemma4Nvfp4Bringup {
             let rc = cuMemcpyDtoH_v2(
                 attn_out_bf16.as_mut_ptr() as *mut _,
                 attn_out_region.device_ptr(),
-                attn_out_bf16.len() * 2);
+                attn_out_bf16.len() * 2,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "forward_layer_attn_from_residual: attn_out DtoH",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
         }
-        Ok(attn_out_bf16.iter()
-            .map(|&b| f32::from_bits((b as u32) << 16)).collect())
+        Ok(attn_out_bf16
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect())
     }
 
     /// Helper for the per-layer smoke + future driver: do the
@@ -4257,23 +5056,28 @@ impl Gemma4Nvfp4Bringup {
     /// input to layer 0; layers ≥1 receive their predecessor's
     /// post-MLP residual instead.
     pub fn embed_one_token_bf16(&self, token_id: u32) -> Result<Vec<u16>> {
-        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_core::{CudaCtx, CudaErrorKind, RvllmError};
         let _scratch_guard = self.forward_scratch_guard();
         let hidden = self.arch.hidden_size as u32;
-        let h_region = self.arena.region(
-            "g4n_embed_residual_bf16", (hidden as usize) * 2, 256)?;
+        let h_region = self
+            .arena
+            .region("g4n_embed_residual_bf16", (hidden as usize) * 2, 256)?;
         self.embed_one_token_to_device(token_id, h_region.device_ptr())?;
         self.stream.fence()?;
         let mut out = vec![0u16; hidden as usize];
         unsafe {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoH_v2(
-                out.as_mut_ptr() as *mut _, h_region.device_ptr(),
-                (hidden as usize) * 2);
+                out.as_mut_ptr() as *mut _,
+                h_region.device_ptr(),
+                (hidden as usize) * 2,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "embed_one_token_bf16: residual DtoH",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
         }
         Ok(out)
@@ -4284,23 +5088,25 @@ impl Gemma4Nvfp4Bringup {
     /// `dst_dev` (caller-allocated, length `hidden_size * 2`
     /// bytes). No fence — caller decides when to sync. Used by
     /// the inter-layer-device-residual drivers.
-    fn embed_one_token_to_device(
-        &self, token_id: u32, dst_dev: u64,
-    ) -> Result<()> {
+    fn embed_one_token_to_device(&self, token_id: u32, dst_dev: u64) -> Result<()> {
         let hidden = self.arch.hidden_size as u32;
         let tok_region = self.arena.region("g4n_embed_tok", 4, 16)?;
-        unsafe { tok_region.copy_from_host(&(token_id as i32).to_le_bytes())?; }
+        unsafe {
+            tok_region.copy_from_host(&(token_id as i32).to_le_bytes())?;
+        }
         let stream_u64 = self.stream.raw();
         unsafe {
             rvllm_fused::EmbeddingGatherLaunch {
-                num_tokens: 1, hidden,
+                num_tokens: 1,
+                hidden,
                 vocab: self.arch.vocab_size as u32,
             }
             .launch(
                 self.forward_kernels.fn_embedding_gather_bf16,
                 dst_dev,
                 self.model.outside.embed_tokens.offset_bytes,
-                tok_region.device_ptr(), stream_u64,
+                tok_region.device_ptr(),
+                stream_u64,
             )?;
         }
         Ok(())
@@ -4317,11 +5123,12 @@ impl Gemma4Nvfp4Bringup {
         attn_out_bf16_host: &[u16],
         h_residual_bf16_host: &[u16],
     ) -> Result<Vec<f32>> {
-        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_core::{CudaCtx, CudaErrorKind, RvllmError};
         if layer_idx >= self.arch.num_hidden_layers {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_post_attn: layer_idx={} >= num_hidden_layers={}",
-                layer_idx, self.arch.num_hidden_layers)));
+                layer_idx, self.arch.num_hidden_layers
+            )));
         }
         let _scratch_guard = self.forward_scratch_guard();
         let layer = &self.model.layers[layer_idx];
@@ -4330,29 +5137,41 @@ impl Gemma4Nvfp4Bringup {
         if attn_out_bf16_host.len() != n_q as usize {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_post_attn: attn_out length {} != N_q {}",
-                attn_out_bf16_host.len(), n_q)));
+                attn_out_bf16_host.len(),
+                n_q
+            )));
         }
         if h_residual_bf16_host.len() != hidden as usize {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_post_attn: residual length {} != hidden {}",
-                h_residual_bf16_host.len(), hidden)));
+                h_residual_bf16_host.len(),
+                hidden
+            )));
         }
 
-        let attn_in_region = self.arena.region(
-            "g4n_lN_post_attn_in", attn_out_bf16_host.len() * 2, 256)?;
+        let attn_in_region =
+            self.arena
+                .region("g4n_lN_post_attn_in", attn_out_bf16_host.len() * 2, 256)?;
         let residual_region = self.arena.region(
-            "g4n_lN_post_attn_resid", h_residual_bf16_host.len() * 2, 256)?;
-        let o_f32_region = self.arena.region(
-            "g4n_lN_post_attn_o_f32", (hidden as usize) * 4, 256)?;
-        let o_bf16_region = self.arena.region(
-            "g4n_lN_post_attn_o_bf16", (hidden as usize) * 2, 256)?;
+            "g4n_lN_post_attn_resid",
+            h_residual_bf16_host.len() * 2,
+            256,
+        )?;
+        let o_f32_region =
+            self.arena
+                .region("g4n_lN_post_attn_o_f32", (hidden as usize) * 4, 256)?;
+        let o_bf16_region =
+            self.arena
+                .region("g4n_lN_post_attn_o_bf16", (hidden as usize) * 2, 256)?;
         unsafe {
             let a: &[u8] = std::slice::from_raw_parts(
                 attn_out_bf16_host.as_ptr() as *const u8,
-                attn_out_bf16_host.len() * 2);
+                attn_out_bf16_host.len() * 2,
+            );
             let r: &[u8] = std::slice::from_raw_parts(
                 h_residual_bf16_host.as_ptr() as *const u8,
-                h_residual_bf16_host.len() * 2);
+                h_residual_bf16_host.len() * 2,
+            );
             attn_in_region.copy_from_host(a)?;
             residual_region.copy_from_host(r)?;
         }
@@ -4368,7 +5187,10 @@ impl Gemma4Nvfp4Bringup {
                 attn_in_region.device_ptr(),
                 layer.o_proj.offset_bytes,
                 o_f32_region.device_ptr(),
-                1, hidden as i32, n_q, stream_u64,
+                1,
+                hidden as i32,
+                n_q,
+                stream_u64,
             )?;
         }
         self.launch_f32_to_bf16(
@@ -4380,7 +5202,9 @@ impl Gemma4Nvfp4Bringup {
         // post_attention_layernorm in-place on o_bf16.
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
             }
             .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
@@ -4389,13 +5213,12 @@ impl Gemma4Nvfp4Bringup {
                 stream_u64,
             )?;
             // Residual add: residual += normed_o.
-            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }
-                .launch(
-                    self.forward_kernels.fn_vector_add_bf16,
-                    residual_region.device_ptr(),
-                    o_bf16_region.device_ptr(),
-                    stream_u64,
-                )?;
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
+                self.forward_kernels.fn_vector_add_bf16,
+                residual_region.device_ptr(),
+                o_bf16_region.device_ptr(),
+                stream_u64,
+            )?;
         }
         self.stream.fence()?;
 
@@ -4405,15 +5228,20 @@ impl Gemma4Nvfp4Bringup {
             let rc = cuMemcpyDtoH_v2(
                 h_out_bf16.as_mut_ptr() as *mut _,
                 residual_region.device_ptr(),
-                (hidden as usize) * 2);
+                (hidden as usize) * 2,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "forward_layer_post_attn: residual DtoH",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
         }
-        Ok(h_out_bf16.iter()
-            .map(|&b| f32::from_bits((b as u32) << 16)).collect())
+        Ok(h_out_bf16
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect())
     }
 
     /// Commit #5c: per-layer post-MLP close-out
@@ -4427,11 +5255,12 @@ impl Gemma4Nvfp4Bringup {
         layer_idx: usize,
         h_residual_bf16_host: &[u16],
     ) -> Result<Vec<f32>> {
-        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_core::{CudaCtx, CudaErrorKind, RvllmError};
         if layer_idx >= self.arch.num_hidden_layers {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_post_attn_mlp: layer_idx={} >= num_hidden_layers={}",
-                layer_idx, self.arch.num_hidden_layers)));
+                layer_idx, self.arch.num_hidden_layers
+            )));
         }
         let _scratch_guard = self.forward_scratch_guard();
         let layer = &self.model.layers[layer_idx];
@@ -4440,21 +5269,28 @@ impl Gemma4Nvfp4Bringup {
         if h_residual_bf16_host.len() != hidden as usize {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_post_attn_mlp: residual length {} != hidden {}",
-                h_residual_bf16_host.len(), hidden)));
+                h_residual_bf16_host.len(),
+                hidden
+            )));
         }
 
-        let h_residual_region = self.arena.region(
-            "g4n_lN_pamlp_resid", (hidden as usize) * 2, 256)?;
-        let h_normed_region = self.arena.region(
-            "g4n_lN_pamlp_normed", (hidden as usize) * 2, 256)?;
-        let scratch_region = self.arena.region(
-            "g4n_lN_pamlp_scratch", (2 * intermediate as usize) * 2, 256)?;
-        let mlp_out_region = self.arena.region(
-            "g4n_lN_pamlp_out", (hidden as usize) * 2, 256)?;
+        let h_residual_region =
+            self.arena
+                .region("g4n_lN_pamlp_resid", (hidden as usize) * 2, 256)?;
+        let h_normed_region =
+            self.arena
+                .region("g4n_lN_pamlp_normed", (hidden as usize) * 2, 256)?;
+        let scratch_region =
+            self.arena
+                .region("g4n_lN_pamlp_scratch", (2 * intermediate as usize) * 2, 256)?;
+        let mlp_out_region = self
+            .arena
+            .region("g4n_lN_pamlp_out", (hidden as usize) * 2, 256)?;
         unsafe {
             let r: &[u8] = std::slice::from_raw_parts(
                 h_residual_bf16_host.as_ptr() as *const u8,
-                h_residual_bf16_host.len() * 2);
+                h_residual_bf16_host.len() * 2,
+            );
             h_residual_region.copy_from_host(r)?;
             h_normed_region.copy_from_host(r)?;
         }
@@ -4462,7 +5298,9 @@ impl Gemma4Nvfp4Bringup {
 
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
             }
             .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
@@ -4481,7 +5319,9 @@ impl Gemma4Nvfp4Bringup {
                 stream_u64,
             )?;
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
             }
             .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
@@ -4513,15 +5353,20 @@ impl Gemma4Nvfp4Bringup {
             let rc = cuMemcpyDtoH_v2(
                 h_out_bf16.as_mut_ptr() as *mut _,
                 h_residual_region.device_ptr(),
-                (hidden as usize) * 2);
+                (hidden as usize) * 2,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "forward_layer_post_attn_mlp: residual DtoH",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
         }
-        Ok(h_out_bf16.iter()
-            .map(|&b| f32::from_bits((b as u32) << 16)).collect())
+        Ok(h_out_bf16
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect())
     }
 
     /// Stream 5a-step2: device-mode attention forward. Takes a
@@ -4548,40 +5393,48 @@ impl Gemma4Nvfp4Bringup {
         kv: &Gemma4Nvfp4KvState,
         attn_out_dev: u64,
     ) -> Result<()> {
-        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_core::{CudaCtx, CudaErrorKind, RvllmError};
         use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
         if layer_idx >= self.arch.num_hidden_layers {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_attn_from_residual_dev: layer_idx={} >= {}",
-                layer_idx, self.arch.num_hidden_layers)));
+                layer_idx, self.arch.num_hidden_layers
+            )));
         }
         if position >= kv.max_pos {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_attn_from_residual_dev: position={} >= kv.max_pos={}",
-                position, kv.max_pos)));
+                position, kv.max_pos
+            )));
         }
         let layer = &self.model.layers[layer_idx];
         let hidden = self.arch.hidden_size as u32;
         let is_global = matches!(
-            self.arch.layer_types[layer_idx], Gemma4LayerType::GlobalAttention);
+            self.arch.layer_types[layer_idx],
+            Gemma4LayerType::GlobalAttention
+        );
         #[allow(unused_variables)]
-        let (head_dim, rotary_dim, _theta, window_size_left,
-             cos_table_dev, sin_table_dev) = if is_global {
-            (self.arch.head_dim_global,
-             self.arch.rotary_dim_global(),
-             self.arch.rope_theta_global as f64,
-             -1i32,
-             self.model.outside.rope_cos_global.offset_bytes,
-             self.model.outside.rope_sin_global.offset_bytes)
-        } else {
-            (self.arch.head_dim_sliding,
-             self.arch.head_dim_sliding,
-             self.arch.rope_theta_sliding as f64,
-             (self.arch.sliding_window_size as i32) - 1,
-             self.model.outside.rope_cos_sliding.offset_bytes,
-             self.model.outside.rope_sin_sliding.offset_bytes)
-        };
+        let (head_dim, rotary_dim, _theta, window_size_left, cos_table_dev, sin_table_dev) =
+            if is_global {
+                (
+                    self.arch.head_dim_global,
+                    self.arch.rotary_dim_global(),
+                    self.arch.rope_theta_global as f64,
+                    -1i32,
+                    self.model.outside.rope_cos_global.offset_bytes,
+                    self.model.outside.rope_sin_global.offset_bytes,
+                )
+            } else {
+                (
+                    self.arch.head_dim_sliding,
+                    self.arch.head_dim_sliding,
+                    self.arch.rope_theta_sliding as f64,
+                    (self.arch.sliding_window_size as i32) - 1,
+                    self.model.outside.rope_cos_sliding.offset_bytes,
+                    self.model.outside.rope_sin_sliding.offset_bytes,
+                )
+            };
         let n_q = layer.q_proj.shape[0] as i32;
         let n_kv = layer.k_proj.shape[0] as i32;
         let v_proj_weight: Option<&rvllm_loader::weights::F16Weight>;
@@ -4590,20 +5443,25 @@ impl Gemma4Nvfp4Bringup {
             if layer.v_proj.is_some() {
                 return Err(corrupt_runtime_err(format!(
                     "forward_layer_attn_from_residual_dev: layer {layer_idx} \
-                     is Global but v_proj IS present")));
+                     is Global but v_proj IS present"
+                )));
             }
             v_proj_weight = None;
             n_v = n_kv;
         } else {
-            let vw = layer.v_proj.as_ref().ok_or_else(|| corrupt_runtime_err(
-                format!("forward_layer_attn_from_residual_dev: layer {layer_idx} \
-                         is sliding but v_proj is absent")))?;
+            let vw = layer.v_proj.as_ref().ok_or_else(|| {
+                corrupt_runtime_err(format!(
+                    "forward_layer_attn_from_residual_dev: layer {layer_idx} \
+                         is sliding but v_proj is absent"
+                ))
+            })?;
             n_v = vw.shape[0] as i32;
             v_proj_weight = Some(vw);
             if n_kv != n_v {
                 return Err(corrupt_runtime_err(format!(
                     "forward_layer_attn_from_residual_dev: K/V dim mismatch \
-                     ({n_kv} vs {n_v})")));
+                     ({n_kv} vs {n_v})"
+                )));
             }
         }
         let num_q_heads = (n_q as usize) / head_dim;
@@ -4613,29 +5471,39 @@ impl Gemma4Nvfp4Bringup {
         if (position as usize) >= self.arch.max_position_embeddings {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_attn_from_residual_dev: position={} >= \
-                 max_position_embeddings={}", position,
-                self.arch.max_position_embeddings)));
+                 max_position_embeddings={}",
+                position, self.arch.max_position_embeddings
+            )));
         }
 
         let stream_u64 = self.stream.raw();
 
         // Local h_normed scratch (caller's residual preserved).
-        let h_normed_region = self.arena.region(
-            "g4n_dev_h_normed", (hidden as usize) * 2, 256)?;
+        let h_normed_region = self
+            .arena
+            .region("g4n_dev_h_normed", (hidden as usize) * 2, 256)?;
         unsafe {
             // DtoD copy of residual_dev → h_normed.
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoDAsync_v2(
-                h_normed_region.device_ptr(), residual_dev,
-                (hidden as usize) * 2, stream_u64 as CUstream);
+                h_normed_region.device_ptr(),
+                residual_dev,
+                (hidden as usize) * 2,
+                stream_u64 as CUstream,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "forward_layer_attn_from_residual_dev: residual DtoD copy",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
-            }.launch(
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
                 h_normed_region.device_ptr(),
                 layer.input_layernorm.offset_bytes,
@@ -4645,27 +5513,48 @@ impl Gemma4Nvfp4Bringup {
 
         // Q/K/V projections + device narrow + norms (same kernel
         // chain as the host-API method, just no boundary I/O).
-        let q_f32_region = self.arena.region(
-            "g4n_dev_q_f32", (n_q as usize) * 4, 256)?;
-        let k_f32_region = self.arena.region(
-            "g4n_dev_k_f32", (n_kv as usize) * 4, 256)?;
-        let v_f32_region = self.arena.region(
-            "g4n_dev_v_f32", (n_v as usize) * 4, 256)?;
+        let q_f32_region = self
+            .arena
+            .region("g4n_dev_q_f32", (n_q as usize) * 4, 256)?;
+        let k_f32_region = self
+            .arena
+            .region("g4n_dev_k_f32", (n_kv as usize) * 4, 256)?;
+        let v_f32_region = self
+            .arena
+            .region("g4n_dev_v_f32", (n_v as usize) * 4, 256)?;
         unsafe {
             gemma4_nvfp4_attn_proj(
-                &self.cublaslt, h_normed_region.device_ptr(),
-                layer.q_proj.offset_bytes, q_f32_region.device_ptr(),
-                1, n_q, hidden as i32, stream_u64)?;
+                &self.cublaslt,
+                h_normed_region.device_ptr(),
+                layer.q_proj.offset_bytes,
+                q_f32_region.device_ptr(),
+                1,
+                n_q,
+                hidden as i32,
+                stream_u64,
+            )?;
             gemma4_nvfp4_attn_proj(
-                &self.cublaslt, h_normed_region.device_ptr(),
-                layer.k_proj.offset_bytes, k_f32_region.device_ptr(),
-                1, n_kv, hidden as i32, stream_u64)?;
+                &self.cublaslt,
+                h_normed_region.device_ptr(),
+                layer.k_proj.offset_bytes,
+                k_f32_region.device_ptr(),
+                1,
+                n_kv,
+                hidden as i32,
+                stream_u64,
+            )?;
             match v_proj_weight {
                 Some(vw) => {
                     gemma4_nvfp4_attn_proj(
-                        &self.cublaslt, h_normed_region.device_ptr(),
-                        vw.offset_bytes, v_f32_region.device_ptr(),
-                        1, n_v, hidden as i32, stream_u64)?;
+                        &self.cublaslt,
+                        h_normed_region.device_ptr(),
+                        vw.offset_bytes,
+                        v_f32_region.device_ptr(),
+                        1,
+                        n_v,
+                        hidden as i32,
+                        stream_u64,
+                    )?;
                 }
                 None => {
                     use cudarc::driver::sys::*;
@@ -4673,69 +5562,89 @@ impl Gemma4Nvfp4Bringup {
                         v_f32_region.device_ptr(),
                         k_f32_region.device_ptr(),
                         (n_v as usize) * 4,
-                        stream_u64 as CUstream);
+                        stream_u64 as CUstream,
+                    );
                     if rc != CUresult::CUDA_SUCCESS {
                         return Err(RvllmError::cuda(
                             "forward_layer_attn_from_residual_dev: k_eq_v DtoD",
-                            CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                            CudaErrorKind::MemcpyFailed,
+                            CudaCtx::setup(),
+                        ));
                     }
                 }
             }
         }
 
-        let q_region = self.arena.region(
-            "g4n_dev_q_bf16", (n_q as usize) * 2, 256)?;
-        let k_region = self.arena.region(
-            "g4n_dev_k_bf16", (n_kv as usize) * 2, 256)?;
-        let v_region = self.arena.region(
-            "g4n_dev_v_bf16", (n_v as usize) * 2, 256)?;
-        let q_fp8_region = self.arena.region(
-            "g4n_dev_q_fp8", n_q as usize, 256)?;
+        let q_region = self
+            .arena
+            .region("g4n_dev_q_bf16", (n_q as usize) * 2, 256)?;
+        let k_region = self
+            .arena
+            .region("g4n_dev_k_bf16", (n_kv as usize) * 2, 256)?;
+        let v_region = self
+            .arena
+            .region("g4n_dev_v_bf16", (n_v as usize) * 2, 256)?;
+        let q_fp8_region = self.arena.region("g4n_dev_q_fp8", n_q as usize, 256)?;
+        self.launch_f32_to_bf16(q_region.device_ptr(), q_f32_region.device_ptr(), n_q as u32)?;
         self.launch_f32_to_bf16(
-            q_region.device_ptr(), q_f32_region.device_ptr(), n_q as u32)?;
-        self.launch_f32_to_bf16(
-            k_region.device_ptr(), k_f32_region.device_ptr(), n_kv as u32)?;
-        self.launch_f32_to_bf16(
-            v_region.device_ptr(), v_f32_region.device_ptr(), n_v as u32)?;
+            k_region.device_ptr(),
+            k_f32_region.device_ptr(),
+            n_kv as u32,
+        )?;
+        self.launch_f32_to_bf16(v_region.device_ptr(), v_f32_region.device_ptr(), n_v as u32)?;
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: num_q_heads as u32, hidden: head_dim as u32,
+                num_tokens: num_q_heads as u32,
+                hidden: head_dim as u32,
                 eps: self.arch.rms_norm_eps,
-            }.launch(
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
-                q_region.device_ptr(), layer.q_norm.offset_bytes, stream_u64)?;
+                q_region.device_ptr(),
+                layer.q_norm.offset_bytes,
+                stream_u64,
+            )?;
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: num_kv_heads as u32, hidden: head_dim as u32,
+                num_tokens: num_kv_heads as u32,
+                hidden: head_dim as u32,
                 eps: self.arch.rms_norm_eps,
-            }.launch(
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
-                k_region.device_ptr(), layer.k_norm.offset_bytes, stream_u64)?;
+                k_region.device_ptr(),
+                layer.k_norm.offset_bytes,
+                stream_u64,
+            )?;
         }
-        self.launch_vnorm_bf16(
-            v_region.device_ptr(), num_kv_heads as u32, head_dim as u32)?;
-        self.fill_pos_slots(kv,
-            /*position_offset=*/position as i32,
-            /*start_slot=*/position as i32,
-            /*num_tokens=*/1)?;
+        self.launch_vnorm_bf16(v_region.device_ptr(), num_kv_heads as u32, head_dim as u32)?;
+        self.fill_pos_slots(
+            kv,
+            /*position_offset=*/ position as i32,
+            /*start_slot=*/ position as i32,
+            /*num_tokens=*/ 1,
+        )?;
 
         let k_packed = kv.k_packed_layer_ptrs[layer_idx];
         let v_packed = kv.v_packed_layer_ptrs[layer_idx];
-        let k_scale  = kv.k_scale_layer_ptrs[layer_idx];
-        let v_scale  = kv.v_scale_layer_ptrs[layer_idx];
+        let k_scale = kv.k_scale_layer_ptrs[layer_idx];
+        let v_scale = kv.v_scale_layer_ptrs[layer_idx];
         unsafe {
             let mut q_in: u64 = q_region.device_ptr();
             let mut k_in: u64 = k_region.device_ptr();
             let mut v_in: u64 = v_region.device_ptr();
             let mut q_out: u64 = q_fp8_region.device_ptr();
-            let mut kp: u64 = k_packed; let mut vp: u64 = v_packed;
-            let mut ks: u64 = k_scale; let mut vs: u64 = v_scale;
+            let mut kp: u64 = k_packed;
+            let mut vp: u64 = v_packed;
+            let mut ks: u64 = k_scale;
+            let mut vs: u64 = v_scale;
             let mut cos_p: u64 = cos_table_dev;
             let mut sin_p: u64 = sin_table_dev;
             let mut positions_ptr: u64 = kv.positions_ptr;
             let mut slot_ptr: u64 = kv.slot_mapping_ptr;
             let mut q_scale_ptr: u64 = kv.q_scale_ptr;
             let mut q_scale_cache_ptr: u64 = 0;
-            let mut hadamard_q: u64 = 0; let mut hadamard_k: u64 = 0;
+            let mut hadamard_q: u64 = 0;
+            let mut hadamard_k: u64 = 0;
             let mut debug_k_prequant: u64 = 0;
             let mut debug_v_prequant: u64 = 0;
             let mut nt: i32 = 1;
@@ -4743,8 +5652,7 @@ impl Gemma4Nvfp4Bringup {
             let mut nkvh: i32 = num_kv_heads as i32;
             let mut hd: i32 = head_dim as i32;
             let mut rd: i32 = rotary_dim as i32;
-            let (mut scale_policy, mut v_scale_policy) =
-                read_nvfp4_kv_policies();
+            let (mut scale_policy, mut v_scale_policy) = read_nvfp4_kv_policies();
             let mut rotate_v: i32 = 0;
             let mut stoch_round_v: i32 = 0;
             let args = [
@@ -4781,14 +5689,19 @@ impl Gemma4Nvfp4Bringup {
                 self.forward_kernels.fn_rope_kv_write_bf16in,
                 (1u32, max_heads, 1u32),
                 (head_dim as u32, 1u32, 1u32),
-                0, stream_u64, &args)?;
+                0,
+                stream_u64,
+                &args,
+            )?;
         }
 
         unsafe {
             let mut output: u64 = attn_out_dev;
             let mut query: u64 = q_fp8_region.device_ptr();
-            let mut kp: u64 = k_packed; let mut vp: u64 = v_packed;
-            let mut ks: u64 = k_scale; let mut vs: u64 = v_scale;
+            let mut kp: u64 = k_packed;
+            let mut vp: u64 = v_packed;
+            let mut ks: u64 = k_scale;
+            let mut vs: u64 = v_scale;
             let mut q_scale_cache_ptr: u64 = 0;
             let mut block_tables: u64 = kv.block_tables_ptr;
             let mut context_lens: u64 = kv.context_lens_ptr;
@@ -4823,34 +5736,45 @@ impl Gemma4Nvfp4Bringup {
             let fa2_threads: u32 = 128;
             let (kernel, grid_y, smem_bytes) = if use_gqa_kernel {
                 let max_gqa: u32 = 4;
-                let smem = 2 * fa2_bc * (head_dim as u32) * 2
-                    + (max_gqa * fa2_bc + fa2_threads / 32) * 4;
-                (self.forward_kernels.fn_attn_decode_gqa_bf16out,
-                 num_kv_heads as u32, smem)
+                let smem =
+                    2 * fa2_bc * (head_dim as u32) * 2 + (max_gqa * fa2_bc + fa2_threads / 32) * 4;
+                (
+                    self.forward_kernels.fn_attn_decode_gqa_bf16out,
+                    num_kv_heads as u32,
+                    smem,
+                )
             } else {
-                let smem = 2 * fa2_bc * (head_dim as u32) * 2
-                    + (fa2_bc + fa2_threads / 32) * 4;
-                (self.forward_kernels.fn_attn_decode_bf16out,
-                 num_q_heads as u32, smem)
+                let smem = 2 * fa2_bc * (head_dim as u32) * 2 + (fa2_bc + fa2_threads / 32) * 4;
+                (
+                    self.forward_kernels.fn_attn_decode_bf16out,
+                    num_q_heads as u32,
+                    smem,
+                )
             };
             if smem_bytes >= 48 * 1024 {
                 use cudarc::driver::sys::*;
                 let rc = cuFuncSetAttribute(
                     kernel.raw() as CUfunction,
                     CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    smem_bytes as i32);
+                    smem_bytes as i32,
+                );
                 if rc != CUresult::CUDA_SUCCESS {
                     return Err(RvllmError::cuda(
                         "forward_layer_attn_from_residual_dev: \
                          cuFuncSetAttribute",
-                        CudaErrorKind::LaunchFailed, CudaCtx::setup()));
+                        CudaErrorKind::LaunchFailed,
+                        CudaCtx::setup(),
+                    ));
                 }
             }
             rvllm_fused::launch_raw(
                 kernel,
                 (1u32, grid_y, 1u32),
                 (fa2_threads, 1u32, 1u32),
-                smem_bytes, stream_u64, &args)?;
+                smem_bytes,
+                stream_u64,
+                &args,
+            )?;
         }
         Ok(())
     }
@@ -4882,54 +5806,64 @@ impl Gemma4Nvfp4Bringup {
         kv: &Gemma4Nvfp4KvState,
         attn_out_dev: u64,
     ) -> Result<()> {
-        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_core::{CudaCtx, CudaErrorKind, RvllmError};
         use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
         if num_tokens == 0 {
             return Err(corrupt_runtime_err(
-                "forward_layer_attn_batched_prefill_dev: num_tokens=0".into()));
+                "forward_layer_attn_batched_prefill_dev: num_tokens=0".into(),
+            ));
         }
         if layer_idx >= self.arch.num_hidden_layers {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_attn_batched_prefill_dev: layer_idx={} >= {}",
-                layer_idx, self.arch.num_hidden_layers)));
+                layer_idx, self.arch.num_hidden_layers
+            )));
         }
         if num_tokens > kv.max_query_tokens {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_attn_batched_prefill_dev: num_tokens={} > \
                  kv.max_query_tokens={} (rebuild KV state via \
                  allocate_kv_state_with_chunk)",
-                num_tokens, kv.max_query_tokens)));
+                num_tokens, kv.max_query_tokens
+            )));
         }
         if (position_start as u64) + (num_tokens as u64) > (kv.max_pos as u64) {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_attn_batched_prefill_dev: position_start={} + \
                  num_tokens={} > kv.max_pos={}",
-                position_start, num_tokens, kv.max_pos)));
+                position_start, num_tokens, kv.max_pos
+            )));
         }
         let layer = &self.model.layers[layer_idx];
         let hidden = self.arch.hidden_size as u32;
         let is_global = matches!(
-            self.arch.layer_types[layer_idx], Gemma4LayerType::GlobalAttention);
+            self.arch.layer_types[layer_idx],
+            Gemma4LayerType::GlobalAttention
+        );
         #[allow(unused_variables)]
-        let (head_dim, rotary_dim, _theta, window_size_left,
-             cos_table_dev, sin_table_dev, backend) = if is_global {
-            (self.arch.head_dim_global,
-             self.arch.rotary_dim_global(),
-             self.arch.rope_theta_global as f64,
-             -1i32,
-             self.model.outside.rope_cos_global.offset_bytes,
-             self.model.outside.rope_sin_global.offset_bytes,
-             &self.attn_backend_global)
-        } else {
-            (self.arch.head_dim_sliding,
-             self.arch.head_dim_sliding,
-             self.arch.rope_theta_sliding as f64,
-             (self.arch.sliding_window_size as i32) - 1,
-             self.model.outside.rope_cos_sliding.offset_bytes,
-             self.model.outside.rope_sin_sliding.offset_bytes,
-             &self.attn_backend_sliding)
-        };
+        let (head_dim, rotary_dim, _theta, window_size_left, cos_table_dev, sin_table_dev, backend) =
+            if is_global {
+                (
+                    self.arch.head_dim_global,
+                    self.arch.rotary_dim_global(),
+                    self.arch.rope_theta_global as f64,
+                    -1i32,
+                    self.model.outside.rope_cos_global.offset_bytes,
+                    self.model.outside.rope_sin_global.offset_bytes,
+                    &self.attn_backend_global,
+                )
+            } else {
+                (
+                    self.arch.head_dim_sliding,
+                    self.arch.head_dim_sliding,
+                    self.arch.rope_theta_sliding as f64,
+                    (self.arch.sliding_window_size as i32) - 1,
+                    self.model.outside.rope_cos_sliding.offset_bytes,
+                    self.model.outside.rope_sin_sliding.offset_bytes,
+                    &self.attn_backend_sliding,
+                )
+            };
         let n_q = layer.q_proj.shape[0] as i32;
         let n_kv = layer.k_proj.shape[0] as i32;
         let v_proj_weight: Option<&rvllm_loader::weights::F16Weight>;
@@ -4937,13 +5871,17 @@ impl Gemma4Nvfp4Bringup {
         if is_global {
             if layer.v_proj.is_some() {
                 return Err(corrupt_runtime_err(format!(
-                    "batched: layer {layer_idx} Global but v_proj present")));
+                    "batched: layer {layer_idx} Global but v_proj present"
+                )));
             }
             v_proj_weight = None;
             n_v = n_kv;
         } else {
-            let vw = layer.v_proj.as_ref().ok_or_else(|| corrupt_runtime_err(
-                format!("batched: layer {layer_idx} sliding but v_proj absent")))?;
+            let vw = layer.v_proj.as_ref().ok_or_else(|| {
+                corrupt_runtime_err(format!(
+                    "batched: layer {layer_idx} sliding but v_proj absent"
+                ))
+            })?;
             n_v = vw.shape[0] as i32;
             v_proj_weight = Some(vw);
         }
@@ -4954,21 +5892,30 @@ impl Gemma4Nvfp4Bringup {
 
         // h_normed scratch [N * hidden] bf16. DtoD copy of
         // residual then in-place input_layernorm with num_tokens=N.
-        let h_normed_region = self.arena.region(
-            "g4n_batch_h_normed", n * (hidden as usize) * 2, 256)?;
+        let h_normed_region =
+            self.arena
+                .region("g4n_batch_h_normed", n * (hidden as usize) * 2, 256)?;
         unsafe {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoDAsync_v2(
-                h_normed_region.device_ptr(), residual_dev,
-                n * (hidden as usize) * 2, stream_u64 as CUstream);
+                h_normed_region.device_ptr(),
+                residual_dev,
+                n * (hidden as usize) * 2,
+                stream_u64 as CUstream,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "batched: residual DtoD",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens, hidden, eps: self.arch.rms_norm_eps,
-            }.launch(
+                num_tokens,
+                hidden,
+                eps: self.arch.rms_norm_eps,
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
                 h_normed_region.device_ptr(),
                 layer.input_layernorm.offset_bytes,
@@ -4977,27 +5924,48 @@ impl Gemma4Nvfp4Bringup {
         }
 
         // Q/K/V GEMM with M=N. f32 scratch sized N×dim.
-        let q_f32_region = self.arena.region(
-            "g4n_batch_q_f32", n * (n_q as usize) * 4, 256)?;
-        let k_f32_region = self.arena.region(
-            "g4n_batch_k_f32", n * (n_kv as usize) * 4, 256)?;
-        let v_f32_region = self.arena.region(
-            "g4n_batch_v_f32", n * (n_v as usize) * 4, 256)?;
+        let q_f32_region = self
+            .arena
+            .region("g4n_batch_q_f32", n * (n_q as usize) * 4, 256)?;
+        let k_f32_region = self
+            .arena
+            .region("g4n_batch_k_f32", n * (n_kv as usize) * 4, 256)?;
+        let v_f32_region = self
+            .arena
+            .region("g4n_batch_v_f32", n * (n_v as usize) * 4, 256)?;
         unsafe {
             gemma4_nvfp4_attn_proj(
-                &self.cublaslt, h_normed_region.device_ptr(),
-                layer.q_proj.offset_bytes, q_f32_region.device_ptr(),
-                num_tokens as i32, n_q, hidden as i32, stream_u64)?;
+                &self.cublaslt,
+                h_normed_region.device_ptr(),
+                layer.q_proj.offset_bytes,
+                q_f32_region.device_ptr(),
+                num_tokens as i32,
+                n_q,
+                hidden as i32,
+                stream_u64,
+            )?;
             gemma4_nvfp4_attn_proj(
-                &self.cublaslt, h_normed_region.device_ptr(),
-                layer.k_proj.offset_bytes, k_f32_region.device_ptr(),
-                num_tokens as i32, n_kv, hidden as i32, stream_u64)?;
+                &self.cublaslt,
+                h_normed_region.device_ptr(),
+                layer.k_proj.offset_bytes,
+                k_f32_region.device_ptr(),
+                num_tokens as i32,
+                n_kv,
+                hidden as i32,
+                stream_u64,
+            )?;
             match v_proj_weight {
                 Some(vw) => {
                     gemma4_nvfp4_attn_proj(
-                        &self.cublaslt, h_normed_region.device_ptr(),
-                        vw.offset_bytes, v_f32_region.device_ptr(),
-                        num_tokens as i32, n_v, hidden as i32, stream_u64)?;
+                        &self.cublaslt,
+                        h_normed_region.device_ptr(),
+                        vw.offset_bytes,
+                        v_f32_region.device_ptr(),
+                        num_tokens as i32,
+                        n_v,
+                        hidden as i32,
+                        stream_u64,
+                    )?;
                 }
                 None => {
                     use cudarc::driver::sys::*;
@@ -5005,34 +5973,47 @@ impl Gemma4Nvfp4Bringup {
                         v_f32_region.device_ptr(),
                         k_f32_region.device_ptr(),
                         n * (n_v as usize) * 4,
-                        stream_u64 as CUstream);
+                        stream_u64 as CUstream,
+                    );
                     if rc != CUresult::CUDA_SUCCESS {
                         return Err(RvllmError::cuda(
                             "batched: k_eq_v DtoD",
-                            CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                            CudaErrorKind::MemcpyFailed,
+                            CudaCtx::setup(),
+                        ));
                     }
                 }
             }
         }
 
         // f32 → bf16 narrow on device.
-        let q_region = self.arena.region(
-            "g4n_batch_q_bf16", n * (n_q as usize) * 2, 256)?;
-        let k_region = self.arena.region(
-            "g4n_batch_k_bf16", n * (n_kv as usize) * 2, 256)?;
-        let v_region = self.arena.region(
-            "g4n_batch_v_bf16", n * (n_v as usize) * 2, 256)?;
-        let q_fp8_region = self.arena.region(
-            "g4n_batch_q_fp8", n * (n_q as usize), 256)?;
+        let q_region = self
+            .arena
+            .region("g4n_batch_q_bf16", n * (n_q as usize) * 2, 256)?;
+        let k_region = self
+            .arena
+            .region("g4n_batch_k_bf16", n * (n_kv as usize) * 2, 256)?;
+        let v_region = self
+            .arena
+            .region("g4n_batch_v_bf16", n * (n_v as usize) * 2, 256)?;
+        let q_fp8_region = self
+            .arena
+            .region("g4n_batch_q_fp8", n * (n_q as usize), 256)?;
         self.launch_f32_to_bf16(
-            q_region.device_ptr(), q_f32_region.device_ptr(),
-            (n * n_q as usize) as u32)?;
+            q_region.device_ptr(),
+            q_f32_region.device_ptr(),
+            (n * n_q as usize) as u32,
+        )?;
         self.launch_f32_to_bf16(
-            k_region.device_ptr(), k_f32_region.device_ptr(),
-            (n * n_kv as usize) as u32)?;
+            k_region.device_ptr(),
+            k_f32_region.device_ptr(),
+            (n * n_kv as usize) as u32,
+        )?;
         self.launch_f32_to_bf16(
-            v_region.device_ptr(), v_f32_region.device_ptr(),
-            (n * n_v as usize) as u32)?;
+            v_region.device_ptr(),
+            v_f32_region.device_ptr(),
+            (n * n_v as usize) as u32,
+        )?;
 
         // Q/K/V-norm operate per-(token, head). Flat-row count:
         //   Q-norm:  N * num_q_heads  rows of head_dim
@@ -5043,21 +6024,30 @@ impl Gemma4Nvfp4Bringup {
                 num_tokens: (n as u32) * (num_q_heads as u32),
                 hidden: head_dim as u32,
                 eps: self.arch.rms_norm_eps,
-            }.launch(
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
-                q_region.device_ptr(), layer.q_norm.offset_bytes, stream_u64)?;
+                q_region.device_ptr(),
+                layer.q_norm.offset_bytes,
+                stream_u64,
+            )?;
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
                 num_tokens: (n as u32) * (num_kv_heads as u32),
                 hidden: head_dim as u32,
                 eps: self.arch.rms_norm_eps,
-            }.launch(
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
-                k_region.device_ptr(), layer.k_norm.offset_bytes, stream_u64)?;
+                k_region.device_ptr(),
+                layer.k_norm.offset_bytes,
+                stream_u64,
+            )?;
         }
         self.launch_vnorm_bf16(
             v_region.device_ptr(),
             (n as u32) * (num_kv_heads as u32),
-            head_dim as u32)?;
+            head_dim as u32,
+        )?;
 
         // Metadata fill: positions[t] = position_start + t (mode B
         // = absolute slot for full f16 RoPE tables); slot_mapping
@@ -5074,13 +6064,15 @@ impl Gemma4Nvfp4Bringup {
         // only to slot 0 (codex review caught this).
         // Fix: after fill, overwrite context_lens[0] with the
         // sequence-total via a stream-ordered HtoD memcpy.
-        self.fill_pos_slots(kv,
-            position_start as i32, position_start as i32,
-            num_tokens as i32)?;
+        self.fill_pos_slots(
+            kv,
+            position_start as i32,
+            position_start as i32,
+            num_tokens as i32,
+        )?;
         // Sequence total context length for this prompt batch.
         let seq_total_ctx: i32 = (position_start + num_tokens) as i32;
-        let seq_total_region = self.arena.region(
-            "g4n_batch_ctx_override", 4, 16)?;
+        let seq_total_region = self.arena.region("g4n_batch_ctx_override", 4, 16)?;
         unsafe {
             seq_total_region.copy_from_host(&seq_total_ctx.to_le_bytes())?;
             // Stream-ordered DtoD copy into context_lens[0].
@@ -5088,28 +6080,30 @@ impl Gemma4Nvfp4Bringup {
             let rc = cuMemcpyDtoDAsync_v2(
                 kv.context_lens_ptr,
                 seq_total_region.device_ptr(),
-                4, stream_u64 as CUstream);
+                4,
+                stream_u64 as CUstream,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "batched: context_lens[0] override DtoD",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
         }
 
         // cu_seqlens_q for one sequence of length N: [0, N].
-        let cu_seqlens_region = self.arena.region(
-            "g4n_batch_cu_seqlens", 2 * 4, 16)?;
+        let cu_seqlens_region = self.arena.region("g4n_batch_cu_seqlens", 2 * 4, 16)?;
         unsafe {
             let cu: [i32; 2] = [0, num_tokens as i32];
-            let bytes: &[u8] = std::slice::from_raw_parts(
-                cu.as_ptr() as *const u8, 8);
+            let bytes: &[u8] = std::slice::from_raw_parts(cu.as_ptr() as *const u8, 8);
             cu_seqlens_region.copy_from_host(bytes)?;
         }
 
         let k_packed = kv.k_packed_layer_ptrs[layer_idx];
         let v_packed = kv.v_packed_layer_ptrs[layer_idx];
-        let k_scale  = kv.k_scale_layer_ptrs[layer_idx];
-        let v_scale  = kv.v_scale_layer_ptrs[layer_idx];
+        let k_scale = kv.k_scale_layer_ptrs[layer_idx];
+        let v_scale = kv.v_scale_layer_ptrs[layer_idx];
 
         // RoPE + KV write — kernel already takes num_tokens.
         unsafe {
@@ -5117,15 +6111,18 @@ impl Gemma4Nvfp4Bringup {
             let mut k_in: u64 = k_region.device_ptr();
             let mut v_in: u64 = v_region.device_ptr();
             let mut q_out: u64 = q_fp8_region.device_ptr();
-            let mut kp: u64 = k_packed; let mut vp: u64 = v_packed;
-            let mut ks: u64 = k_scale; let mut vs: u64 = v_scale;
+            let mut kp: u64 = k_packed;
+            let mut vp: u64 = v_packed;
+            let mut ks: u64 = k_scale;
+            let mut vs: u64 = v_scale;
             let mut cos_p: u64 = cos_table_dev;
             let mut sin_p: u64 = sin_table_dev;
             let mut positions_ptr: u64 = kv.positions_ptr;
             let mut slot_ptr: u64 = kv.slot_mapping_ptr;
             let mut q_scale_ptr: u64 = kv.q_scale_ptr;
             let mut q_scale_cache_ptr: u64 = 0;
-            let mut hadamard_q: u64 = 0; let mut hadamard_k: u64 = 0;
+            let mut hadamard_q: u64 = 0;
+            let mut hadamard_k: u64 = 0;
             let mut debug_k_prequant: u64 = 0;
             let mut debug_v_prequant: u64 = 0;
             let mut nt: i32 = num_tokens as i32;
@@ -5133,8 +6130,7 @@ impl Gemma4Nvfp4Bringup {
             let mut nkvh: i32 = num_kv_heads as i32;
             let mut hd: i32 = head_dim as i32;
             let mut rd: i32 = rotary_dim as i32;
-            let (mut scale_policy, mut v_scale_policy) =
-                read_nvfp4_kv_policies();
+            let (mut scale_policy, mut v_scale_policy) = read_nvfp4_kv_policies();
             let mut rotate_v: i32 = 0;
             let mut stoch_round_v: i32 = 0;
             let args = [
@@ -5171,15 +6167,17 @@ impl Gemma4Nvfp4Bringup {
                 self.forward_kernels.fn_rope_kv_write_bf16in,
                 (num_tokens, max_heads, 1u32),
                 (head_dim as u32, 1u32, 1u32),
-                0, stream_u64, &args)?;
+                0,
+                stream_u64,
+                &args,
+            )?;
         }
 
         // Unified NVFP4 prefill kernel — ONE launch covers all N
         // q-rows with causal softmax inside.
         let tile_size: u32 = if head_dim <= 256 { 32 } else { 16 };
         let num_queries_per_kv = (num_q_heads as u32) / (num_kv_heads as u32);
-        let block_q = (rvllm_attention::UNIFIED_PREFILL_BLOCK_M
-            / num_queries_per_kv.max(1)).max(1);
+        let block_q = (rvllm_attention::UNIFIED_PREFILL_BLOCK_M / num_queries_per_kv.max(1)).max(1);
         let params = rvllm_attention::PagedPrefillParams {
             num_seqs: 1,
             num_tokens,
@@ -5189,7 +6187,7 @@ impl Gemma4Nvfp4Bringup {
             block_size: kv.block_size,
             max_blocks_per_seq: kv.max_pos,
             num_blocks_total: kv.max_pos,
-            scale: 1.0,           // Gemma 4 QK-norm absorbs 1/sqrt(d_k)
+            scale: 1.0, // Gemma 4 QK-norm absorbs 1/sqrt(d_k)
             window_size_left,
         };
         let unified = rvllm_attention::UnifiedPrefillParams {
@@ -5203,16 +6201,18 @@ impl Gemma4Nvfp4Bringup {
             prefill.launch_nvfp4kv_unified_sm121(
                 params,
                 unified,
-                attn_out_dev,                   // o (bf16)
-                q_fp8_region.device_ptr(),      // q (fp8)
-                k_packed, v_packed,
-                k_scale,  v_scale,
-                0,                              // q_scale_cache (none)
+                attn_out_dev,              // o (bf16)
+                q_fp8_region.device_ptr(), // q (fp8)
+                k_packed,
+                v_packed,
+                k_scale,
+                v_scale,
+                0, // q_scale_cache (none)
                 kv.block_tables_ptr,
                 cu_seqlens_region.device_ptr(),
                 kv.context_lens_ptr,
-                kv.q_scale_ptr,                 // q_descale fallback
-                true,                           // output_bf16
+                kv.q_scale_ptr, // q_descale fallback
+                true,           // output_bf16
                 stream_u64,
             )?;
         }
@@ -5232,41 +6232,54 @@ impl Gemma4Nvfp4Bringup {
         if layer_idx >= self.arch.num_hidden_layers {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_post_attn_dev: layer_idx={} >= {}",
-                layer_idx, self.arch.num_hidden_layers)));
+                layer_idx, self.arch.num_hidden_layers
+            )));
         }
         let layer = &self.model.layers[layer_idx];
         let n_q = layer.o_proj.shape[1] as i32;
         let hidden = self.arch.hidden_size as u32;
         let stream_u64 = self.stream.raw();
-        let o_f32_region = self.arena.region(
-            "g4n_dev_post_attn_o_f32", (hidden as usize) * 4, 256)?;
-        let o_bf16_region = self.arena.region(
-            "g4n_dev_post_attn_o_bf16", (hidden as usize) * 2, 256)?;
+        let o_f32_region =
+            self.arena
+                .region("g4n_dev_post_attn_o_f32", (hidden as usize) * 4, 256)?;
+        let o_bf16_region =
+            self.arena
+                .region("g4n_dev_post_attn_o_bf16", (hidden as usize) * 2, 256)?;
         unsafe {
             gemma4_nvfp4_attn_proj(
-                &self.cublaslt, attn_out_dev,
+                &self.cublaslt,
+                attn_out_dev,
                 layer.o_proj.offset_bytes,
                 o_f32_region.device_ptr(),
-                1, hidden as i32, n_q, stream_u64)?;
+                1,
+                hidden as i32,
+                n_q,
+                stream_u64,
+            )?;
         }
         self.launch_f32_to_bf16(
             o_bf16_region.device_ptr(),
             o_f32_region.device_ptr(),
-            hidden)?;
+            hidden,
+        )?;
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
-            }.launch(
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
                 o_bf16_region.device_ptr(),
                 layer.post_attention_layernorm.offset_bytes,
-                stream_u64)?;
-            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }
-                .launch(
-                    self.forward_kernels.fn_vector_add_bf16,
-                    residual_dev,
-                    o_bf16_region.device_ptr(),
-                    stream_u64)?;
+                stream_u64,
+            )?;
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
+                self.forward_kernels.fn_vector_add_bf16,
+                residual_dev,
+                o_bf16_region.device_ptr(),
+                stream_u64,
+            )?;
         }
         Ok(())
     }
@@ -5275,58 +6288,77 @@ impl Gemma4Nvfp4Bringup {
     /// residual_dev (bf16) in place. The layer_scalar host scale
     /// loop still costs ONE fence + DtoH(hidden*2 + 2) + HtoD per
     /// layer — Stream 5b (bf16 scaled_add kernel) eliminates it.
-    fn forward_layer_post_attn_mlp_dev(
-        &self,
-        layer_idx: usize,
-        residual_dev: u64,
-    ) -> Result<()> {
-        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+    fn forward_layer_post_attn_mlp_dev(&self, layer_idx: usize, residual_dev: u64) -> Result<()> {
+        use rvllm_core::{CudaCtx, CudaErrorKind, RvllmError};
         if layer_idx >= self.arch.num_hidden_layers {
             return Err(corrupt_runtime_err(format!(
                 "forward_layer_post_attn_mlp_dev: layer_idx={} >= {}",
-                layer_idx, self.arch.num_hidden_layers)));
+                layer_idx, self.arch.num_hidden_layers
+            )));
         }
         let layer = &self.model.layers[layer_idx];
         let hidden = self.arch.hidden_size as u32;
         let intermediate = self.arch.intermediate_size as u32;
         let stream_u64 = self.stream.raw();
 
-        let h_normed_region = self.arena.region(
-            "g4n_dev_pamlp_normed", (hidden as usize) * 2, 256)?;
+        let h_normed_region =
+            self.arena
+                .region("g4n_dev_pamlp_normed", (hidden as usize) * 2, 256)?;
         let scratch_region = self.arena.region(
-            "g4n_dev_pamlp_scratch", (2 * intermediate as usize) * 2, 256)?;
-        let mlp_out_region = self.arena.region(
-            "g4n_dev_pamlp_out", (hidden as usize) * 2, 256)?;
+            "g4n_dev_pamlp_scratch",
+            (2 * intermediate as usize) * 2,
+            256,
+        )?;
+        let mlp_out_region = self
+            .arena
+            .region("g4n_dev_pamlp_out", (hidden as usize) * 2, 256)?;
         unsafe {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoDAsync_v2(
-                h_normed_region.device_ptr(), residual_dev,
-                (hidden as usize) * 2, stream_u64 as CUstream);
+                h_normed_region.device_ptr(),
+                residual_dev,
+                (hidden as usize) * 2,
+                stream_u64 as CUstream,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "forward_layer_post_attn_mlp_dev: residual DtoD",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
-            }.launch(
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
                 h_normed_region.device_ptr(),
                 layer.pre_feedforward_layernorm.offset_bytes,
-                stream_u64)?;
+                stream_u64,
+            )?;
             crate::gemma4_nvfp4_ops::gemma4_nvfp4_mlp_forward(
                 &self.mlp_kernels,
                 h_normed_region.device_ptr(),
                 mlp_out_region.device_ptr(),
-                &layer.gate_proj, &layer.up_proj, &layer.down_proj,
-                scratch_region.device_ptr(), stream_u64)?;
+                &layer.gate_proj,
+                &layer.up_proj,
+                &layer.down_proj,
+                scratch_region.device_ptr(),
+                stream_u64,
+            )?;
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
-            }.launch(
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
                 mlp_out_region.device_ptr(),
                 layer.post_feedforward_layernorm.offset_bytes,
-                stream_u64)?;
+                stream_u64,
+            )?;
         }
 
         // HF Gemma 4 layer epilogue: residual = (residual +
@@ -5362,44 +6394,59 @@ impl Gemma4Nvfp4Bringup {
         if layer_idx >= self.arch.num_hidden_layers {
             return Err(corrupt_runtime_err(format!(
                 "post_attn_batched_dev: layer_idx={} >= {}",
-                layer_idx, self.arch.num_hidden_layers)));
+                layer_idx, self.arch.num_hidden_layers
+            )));
         }
         let layer = &self.model.layers[layer_idx];
         let n_q = layer.o_proj.shape[1] as i32;
         let hidden = self.arch.hidden_size as u32;
         let n = num_tokens as usize;
         let stream_u64 = self.stream.raw();
-        let o_f32_region = self.arena.region(
-            "g4n_batch_o_f32", n * (hidden as usize) * 4, 256)?;
-        let o_bf16_region = self.arena.region(
-            "g4n_batch_o_bf16", n * (hidden as usize) * 2, 256)?;
+        let o_f32_region = self
+            .arena
+            .region("g4n_batch_o_f32", n * (hidden as usize) * 4, 256)?;
+        let o_bf16_region =
+            self.arena
+                .region("g4n_batch_o_bf16", n * (hidden as usize) * 2, 256)?;
         unsafe {
             gemma4_nvfp4_attn_proj(
-                &self.cublaslt, attn_out_dev,
+                &self.cublaslt,
+                attn_out_dev,
                 layer.o_proj.offset_bytes,
                 o_f32_region.device_ptr(),
-                num_tokens as i32, hidden as i32, n_q, stream_u64)?;
+                num_tokens as i32,
+                hidden as i32,
+                n_q,
+                stream_u64,
+            )?;
         }
         self.launch_f32_to_bf16(
             o_bf16_region.device_ptr(),
             o_f32_region.device_ptr(),
-            (n * (hidden as usize)) as u32)?;
+            (n * (hidden as usize)) as u32,
+        )?;
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens, hidden, eps: self.arch.rms_norm_eps,
-            }.launch(
+                num_tokens,
+                hidden,
+                eps: self.arch.rms_norm_eps,
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
                 o_bf16_region.device_ptr(),
                 layer.post_attention_layernorm.offset_bytes,
-                stream_u64)?;
+                stream_u64,
+            )?;
             // vector_add on flat N*hidden elements.
             rvllm_fused::gemma4_launcher::VectorAddF16Launch {
                 n: (n as u32) * hidden,
-            }.launch(
+            }
+            .launch(
                 self.forward_kernels.fn_vector_add_bf16,
                 residual_dev,
                 o_bf16_region.device_ptr(),
-                stream_u64)?;
+                stream_u64,
+            )?;
         }
         Ok(())
     }
@@ -5415,40 +6462,55 @@ impl Gemma4Nvfp4Bringup {
         num_tokens: u32,
         residual_dev: u64,
     ) -> Result<()> {
-        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_core::{CudaCtx, CudaErrorKind, RvllmError};
         if layer_idx >= self.arch.num_hidden_layers {
             return Err(corrupt_runtime_err(format!(
                 "post_attn_mlp_batched_dev: layer_idx={} >= {}",
-                layer_idx, self.arch.num_hidden_layers)));
+                layer_idx, self.arch.num_hidden_layers
+            )));
         }
         let layer = &self.model.layers[layer_idx];
         let hidden = self.arch.hidden_size as u32;
         let intermediate = self.arch.intermediate_size as u32;
         let n = num_tokens as usize;
         let stream_u64 = self.stream.raw();
-        let h_normed_region = self.arena.region(
-            "g4n_batch_pamlp_normed", n * (hidden as usize) * 2, 256)?;
+        let h_normed_region =
+            self.arena
+                .region("g4n_batch_pamlp_normed", n * (hidden as usize) * 2, 256)?;
         let scratch_region = self.arena.region(
-            "g4n_batch_pamlp_scratch", (2 * intermediate as usize) * 2, 256)?;
-        let mlp_out_region = self.arena.region(
-            "g4n_batch_pamlp_out", n * (hidden as usize) * 2, 256)?;
+            "g4n_batch_pamlp_scratch",
+            (2 * intermediate as usize) * 2,
+            256,
+        )?;
+        let mlp_out_region =
+            self.arena
+                .region("g4n_batch_pamlp_out", n * (hidden as usize) * 2, 256)?;
         unsafe {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoDAsync_v2(
-                h_normed_region.device_ptr(), residual_dev,
-                n * (hidden as usize) * 2, stream_u64 as CUstream);
+                h_normed_region.device_ptr(),
+                residual_dev,
+                n * (hidden as usize) * 2,
+                stream_u64 as CUstream,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "post_attn_mlp_batched_dev: residual DtoD",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens, hidden, eps: self.arch.rms_norm_eps,
-            }.launch(
+                num_tokens,
+                hidden,
+                eps: self.arch.rms_norm_eps,
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
                 h_normed_region.device_ptr(),
                 layer.pre_feedforward_layernorm.offset_bytes,
-                stream_u64)?;
+                stream_u64,
+            )?;
             // Per-token MLP loop. M=1 W4A16 kernels — batching the
             // MLP needs a new kernel (~300 LOC follow-up). At N=3
             // this is 3 MLP launches; at N=100 it's 100. For
@@ -5456,23 +6518,30 @@ impl Gemma4Nvfp4Bringup {
             // already dominates.
             let hidden_bytes = (hidden as usize) * 2;
             for t in 0..n {
-                let h_t = h_normed_region.device_ptr()
-                    + (t * hidden_bytes) as u64;
-                let mlp_t = mlp_out_region.device_ptr()
-                    + (t * hidden_bytes) as u64;
+                let h_t = h_normed_region.device_ptr() + (t * hidden_bytes) as u64;
+                let mlp_t = mlp_out_region.device_ptr() + (t * hidden_bytes) as u64;
                 crate::gemma4_nvfp4_ops::gemma4_nvfp4_mlp_forward(
                     &self.mlp_kernels,
-                    h_t, mlp_t,
-                    &layer.gate_proj, &layer.up_proj, &layer.down_proj,
-                    scratch_region.device_ptr(), stream_u64)?;
+                    h_t,
+                    mlp_t,
+                    &layer.gate_proj,
+                    &layer.up_proj,
+                    &layer.down_proj,
+                    scratch_region.device_ptr(),
+                    stream_u64,
+                )?;
             }
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens, hidden, eps: self.arch.rms_norm_eps,
-            }.launch(
+                num_tokens,
+                hidden,
+                eps: self.arch.rms_norm_eps,
+            }
+            .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
                 mlp_out_region.device_ptr(),
                 layer.post_feedforward_layernorm.offset_bytes,
-                stream_u64)?;
+                stream_u64,
+            )?;
         }
         // HF Gemma 4 epilogue: residual = (residual + post_ff_norm(mlp))
         // * layer_scalar. Alpha broadcasts across all elements of all
@@ -5522,16 +6591,19 @@ impl Gemma4Nvfp4Bringup {
         if position >= kv.max_pos {
             return Err(corrupt_runtime_err(format!(
                 "forward_full_to_token: position={} >= kv.max_pos={}",
-                position, kv.max_pos)));
+                position, kv.max_pos
+            )));
         }
         // bf16 narrow on host. Used to flip the f32 Vec returned
         // by attn/post-attn/post-mlp back to bf16 between layers.
         let f32_to_bf16_vec = |xs: &[f32]| -> Vec<u16> {
-            xs.iter().map(|&x| {
-                let bits = x.to_bits();
-                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-                (rounded >> 16) as u16
-            }).collect()
+            xs.iter()
+                .map(|&x| {
+                    let bits = x.to_bits();
+                    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+                    (rounded >> 16) as u16
+                })
+                .collect()
         };
 
         // Commit #5e: per-layer dump for numerical validation.
@@ -5541,37 +6613,47 @@ impl Gemma4Nvfp4Bringup {
         // dumps are consumable by `v3/tools/cmp_g4n_residuals.py`
         // for HF-vs-rvllm cosine comparisons. No-op when the
         // env is unset, so production paths pay nothing.
-        let dump_dir: Option<std::path::PathBuf> =
-            std::env::var("G4N_DUMP_DIR").ok().map(std::path::PathBuf::from);
+        let dump_dir: Option<std::path::PathBuf> = std::env::var("G4N_DUMP_DIR")
+            .ok()
+            .map(std::path::PathBuf::from);
         let dump_bf16 = |label: &str, data: &[u16]| -> Result<()> {
             if let Some(d) = dump_dir.as_ref() {
-                std::fs::create_dir_all(d).map_err(|e|
-                    corrupt_runtime_err(format!(
-                        "G4N_DUMP_DIR create {d:?}: {e}")))?;
+                std::fs::create_dir_all(d)
+                    .map_err(|e| corrupt_runtime_err(format!("G4N_DUMP_DIR create {d:?}: {e}")))?;
                 let path = d.join(format!("{label}.bf16.bin"));
-                let bytes: &[u8] = unsafe { std::slice::from_raw_parts(
-                    data.as_ptr() as *const u8, data.len() * 2) };
-                std::fs::write(&path, bytes).map_err(|e|
-                    corrupt_runtime_err(format!(
-                        "G4N_DUMP_DIR write {path:?}: {e}")))?;
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2)
+                };
+                std::fs::write(&path, bytes).map_err(|e| {
+                    corrupt_runtime_err(format!("G4N_DUMP_DIR write {path:?}: {e}"))
+                })?;
             }
             Ok(())
         };
 
-        let trace_on = std::env::var("G4N_FORWARD_TRACE")
-            .ok().as_deref() == Some("1");
+        let trace_on = std::env::var("G4N_FORWARD_TRACE").ok().as_deref() == Some("1");
         let log_stats = |li: usize, stage: &str, data: &[u16]| {
-            if !trace_on { return; }
+            if !trace_on {
+                return;
+            }
             let mut mean_abs: f32 = 0.0;
             let mut max_abs: f32 = 0.0;
             let mut nan = 0usize;
             let mut inf = 0usize;
             for &b in data {
                 let v = f32::from_bits((b as u32) << 16);
-                if v.is_nan() { nan += 1; continue; }
-                if v.is_infinite() { inf += 1; continue; }
+                if v.is_nan() {
+                    nan += 1;
+                    continue;
+                }
+                if v.is_infinite() {
+                    inf += 1;
+                    continue;
+                }
                 mean_abs += v.abs();
-                if v.abs() > max_abs { max_abs = v.abs(); }
+                if v.abs() > max_abs {
+                    max_abs = v.abs();
+                }
             }
             mean_abs /= data.len() as f32;
             eprintln!(
@@ -5589,26 +6671,24 @@ impl Gemma4Nvfp4Bringup {
             let mut residual_bf16 = self.embed_one_token_bf16(token_id)?;
             dump_bf16("step_00_embed", &residual_bf16)?;
             for li in 0..self.arch.num_hidden_layers {
-                let attn_out_f32 = self.forward_layer_attn_from_residual(
-                    li, &residual_bf16, position, kv)?;
+                let attn_out_f32 =
+                    self.forward_layer_attn_from_residual(li, &residual_bf16, position, kv)?;
                 let attn_out_bf16 = f32_to_bf16_vec(&attn_out_f32);
                 dump_bf16(&format!("step_{:02}_attn_out", li), &attn_out_bf16)?;
-                let resid_after_attn_f32 = self.forward_layer_post_attn(
-                    li, &attn_out_bf16, &residual_bf16)?;
+                let resid_after_attn_f32 =
+                    self.forward_layer_post_attn(li, &attn_out_bf16, &residual_bf16)?;
                 let resid_after_attn_bf16 = f32_to_bf16_vec(&resid_after_attn_f32);
-                dump_bf16(&format!("step_{:02}_post_attn", li),
-                          &resid_after_attn_bf16)?;
-                let resid_after_mlp_f32 = self.forward_layer_post_attn_mlp(
-                    li, &resid_after_attn_bf16)?;
+                dump_bf16(&format!("step_{:02}_post_attn", li), &resid_after_attn_bf16)?;
+                let resid_after_mlp_f32 =
+                    self.forward_layer_post_attn_mlp(li, &resid_after_attn_bf16)?;
                 residual_bf16 = f32_to_bf16_vec(&resid_after_mlp_f32);
                 dump_bf16(&format!("step_{:02}_post_mlp", li), &residual_bf16)?;
-                if trace_on && (li % 10 == 0
-                                || li == self.arch.num_hidden_layers - 1) {
+                if trace_on && (li % 10 == 0 || li == self.arch.num_hidden_layers - 1) {
                     log_stats(li, "post_mlp", &residual_bf16);
                 }
             }
-            return self.forward_final_to_token_with_dump(
-                &residual_bf16, dump_dir.as_ref().unwrap());
+            return self
+                .forward_final_to_token_with_dump(&residual_bf16, dump_dir.as_ref().unwrap());
         }
 
         // Production path (no dump): device-resident residual
@@ -5618,23 +6698,35 @@ impl Gemma4Nvfp4Bringup {
         // attn_out scratch sized for the LARGEST per-layer
         // n_q across layer types (global = 32*512 = 16384 bf16
         // elems; sliding = 32*256 = 8192).
-        let max_n_q: usize = self.model.layers.iter()
-            .map(|l| l.q_proj.shape[0]).max().unwrap_or(0);
-        let residual_dev = self.arena.region(
-            "g4n_drv_residual_bf16", (hidden as usize) * 2, 256)?;
-        let attn_out_dev = self.arena.region(
-            "g4n_drv_attn_out_bf16", max_n_q * 2, 256)?;
+        let max_n_q: usize = self
+            .model
+            .layers
+            .iter()
+            .map(|l| l.q_proj.shape[0])
+            .max()
+            .unwrap_or(0);
+        let residual_dev =
+            self.arena
+                .region("g4n_drv_residual_bf16", (hidden as usize) * 2, 256)?;
+        let attn_out_dev = self
+            .arena
+            .region("g4n_drv_attn_out_bf16", max_n_q * 2, 256)?;
         self.embed_one_token_to_device(token_id, residual_dev.device_ptr())?;
         for li in 0..self.arch.num_hidden_layers {
             self.forward_layer_attn_from_residual_dev(
-                li, residual_dev.device_ptr(), position, kv,
-                attn_out_dev.device_ptr())?;
+                li,
+                residual_dev.device_ptr(),
+                position,
+                kv,
+                attn_out_dev.device_ptr(),
+            )?;
             self.forward_layer_post_attn_dev(
-                li, attn_out_dev.device_ptr(), residual_dev.device_ptr())?;
-            self.forward_layer_post_attn_mlp_dev(
-                li, residual_dev.device_ptr())?;
-            if trace_on && (li % 10 == 0
-                            || li == self.arch.num_hidden_layers - 1) {
+                li,
+                attn_out_dev.device_ptr(),
+                residual_dev.device_ptr(),
+            )?;
+            self.forward_layer_post_attn_mlp_dev(li, residual_dev.device_ptr())?;
+            if trace_on && (li % 10 == 0 || li == self.arch.num_hidden_layers - 1) {
                 // Trace requires DtoH — opt-in only, so the
                 // per-decade-of-layers sync is acceptable.
                 self.stream.fence()?;
@@ -5644,7 +6736,8 @@ impl Gemma4Nvfp4Bringup {
                     let _ = cuMemcpyDtoH_v2(
                         h.as_mut_ptr() as *mut _,
                         residual_dev.device_ptr(),
-                        (hidden as usize) * 2);
+                        (hidden as usize) * 2,
+                    );
                 }
                 log_stats(li, "post_mlp", &h);
             }
@@ -5656,10 +6749,12 @@ impl Gemma4Nvfp4Bringup {
             let rc = cuMemcpyDtoH_v2(
                 residual_host.as_mut_ptr() as *mut _,
                 residual_dev.device_ptr(),
-                (hidden as usize) * 2);
+                (hidden as usize) * 2,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(corrupt_runtime_err(
-                    "forward_full_to_token: residual DtoH".into()));
+                    "forward_full_to_token: residual DtoH".into(),
+                ));
             }
         }
         self.forward_final_to_token(&residual_host)
@@ -5706,36 +6801,356 @@ impl Gemma4Nvfp4Bringup {
         position_start: u32,
         kv: &Gemma4Nvfp4KvState,
     ) -> Result<u32> {
+        if std::env::var("G4N_PROMPT_DECODE_FALLBACK").ok().as_deref() == Some("1") {
+            if prompt.is_empty() {
+                return Err(corrupt_runtime_err(
+                    "forward_prompt_to_token: prompt is empty".into(),
+                ));
+            }
+            let n_tokens = prompt.len() as u32;
+            if (position_start as u64) + (n_tokens as u64) > kv.max_pos as u64 {
+                return Err(corrupt_runtime_err(format!(
+                    "forward_prompt_to_token: position_start={} + n_tokens={} \
+                     exceeds kv.max_pos={}",
+                    position_start, n_tokens, kv.max_pos
+                )));
+            }
+            let mut out = 0u32;
+            for (i, &tok) in prompt.iter().enumerate() {
+                out = self.forward_full_to_token(tok, position_start + i as u32, kv)?;
+            }
+            return Ok(out);
+        }
+
+        let (all, _) = self.forward_prompt_to_all_tokens_impl(
+            prompt,
+            position_start,
+            kv,
+            Some(prompt.len().saturating_sub(1)),
+        )?;
+        Ok(*all.last().expect(
+            "forward_prompt_to_all_tokens_impl returned empty Vec \
+             despite non-empty prompt",
+        ))
+    }
+
+    /// Stream-6b spec primitive #6 (K>=2 batched verify): runs
+    /// the full N-token prompt through the unified-NVFP4-prefill
+    /// device chain (60 layers) AND returns the LM-head argmax
+    /// for EVERY prompt position, not just the last one. Same
+    /// device-resident chain as `forward_prompt_to_token` —
+    /// it's just that the final-norm + LM-head + argmax now
+    /// loops over all N residual rows instead of only the last.
+    ///
+    /// Spec-decode use: `verify_base_tokens_batched` calls this
+    /// with `prompt = [t_committed, t_draft[0], ..., t_draft[K-1]]`
+    /// at `position_start = L` to get K+1 base argmax outputs
+    /// in one prefill pass — the K+1 verify tokens the
+    /// accept-count helper compares against the drafter's K
+    /// speculations.
+    ///
+    /// This method does NOT update `base_last_hidden_ptr`: K>=2
+    /// verify must choose the accepted/correction row after
+    /// `spec_greedy_accept_count`. Use
+    /// `forward_prompt_to_all_tokens_with_residuals` when the
+    /// caller needs to snapshot a selected row.
+    ///
+    /// Cost vs `forward_prompt_to_token`: N final_norm + LM-head
+    /// GEMV + argmax launches instead of 1. Each is small
+    /// (5376-elem RMSNorm + cuBLASLt M=1 GEMV against vocab=
+    /// 262144 + 1024-thread argmax). At N=5 the extra cost is
+    /// negligible compared to 60 layers of NVFP4 forward.
+    /// Production batches LM-head over N rows; that's a later
+    /// optimization (codex Q2 option B).
+    pub fn forward_prompt_to_all_tokens(
+        &self,
+        prompt: &[u32],
+        position_start: u32,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<Vec<u32>> {
         if prompt.is_empty() {
             return Err(corrupt_runtime_err(
-                "forward_prompt_to_token: prompt is empty".into()));
+                "forward_prompt_to_all_tokens: prompt is empty".into(),
+            ));
+        }
+        if std::env::var("G4N_PROMPT_DECODE_FALLBACK").ok().as_deref() == Some("1") {
+            return Err(corrupt_runtime_err(
+                "forward_prompt_to_all_tokens: \
+                 G4N_PROMPT_DECODE_FALLBACK=1 would update \
+                 base_last_hidden_ptr as a side effect; use \
+                 forward_prompt_to_token for fallback decode"
+                    .into(),
+            ));
+        }
+
+        let (tokens, _) =
+            self.forward_prompt_to_all_tokens_impl(prompt, position_start, kv, None)?;
+        Ok(tokens)
+    }
+
+    /// Same as `forward_prompt_to_all_tokens`, plus the raw
+    /// post-layer residual rows `[N, hidden]` on host. The K>=2
+    /// spec loop uses these residuals to snapshot exactly the row
+    /// selected by greedy accept.
+    ///
+    /// Requires the unified prefill path. The decode fallback can
+    /// produce token ids, but it does not expose all residual rows
+    /// without a second refactor, and it would hide the perf path
+    /// this primitive is meant to validate.
+    pub fn forward_prompt_to_all_tokens_with_residuals(
+        &self,
+        prompt: &[u32],
+        position_start: u32,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<(Vec<u32>, Vec<u16>)> {
+        if std::env::var("G4N_PROMPT_DECODE_FALLBACK").ok().as_deref() == Some("1") {
+            return Err(corrupt_runtime_err(
+                "forward_prompt_to_all_tokens_with_residuals: \
+                 G4N_PROMPT_DECODE_FALLBACK=1 does not expose \
+                 batched residual rows; unset it for K>=2 verify"
+                    .into(),
+            ));
+        }
+        self.forward_prompt_to_all_tokens_impl(prompt, position_start, kv, None)
+    }
+
+    fn forward_prompt_to_all_tokens_batched_final_and_snapshot(
+        &self,
+        prompt: &[u32],
+        position_start: u32,
+        kv: &Gemma4Nvfp4KvState,
+        drafts: &[u32],
+    ) -> Result<(Vec<u32>, usize)> {
+        if std::env::var("G4N_PROMPT_DECODE_FALLBACK").ok().as_deref() == Some("1") {
+            return Err(corrupt_runtime_err(
+                "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
+                 G4N_PROMPT_DECODE_FALLBACK=1 would bypass unified prefill; \
+                 unset it for K>=2 verify"
+                    .into(),
+            ));
+        }
+        if prompt.is_empty() {
+            return Err(corrupt_runtime_err(
+                "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
+                 prompt is empty"
+                    .into(),
+            ));
+        }
+        if prompt.len() != drafts.len() + 1 {
+            return Err(corrupt_runtime_err(format!(
+                "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
+                 prompt={} drafts={} (expected drafts + 1)",
+                prompt.len(),
+                drafts.len()
+            )));
+        }
+
+        let n_tokens = prompt.len() as u32;
+        if (position_start as u64) + (n_tokens as u64) > kv.max_pos as u64 {
+            return Err(corrupt_runtime_err(format!(
+                "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
+                 position_start={} + n_tokens={} exceeds kv.max_pos={}",
+                position_start, n_tokens, kv.max_pos
+            )));
+        }
+        if n_tokens > kv.max_query_tokens {
+            return Err(corrupt_runtime_err(format!(
+                "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
+                 prompt length {n_tokens} > kv.max_query_tokens={}. \
+                 Re-allocate KV via `allocate_kv_state_with_chunk(max_pos, >= {n_tokens})`.",
+                kv.max_query_tokens
+            )));
+        }
+
+        let _scratch_guard = self.forward_scratch_guard();
+        let hidden = self.arch.hidden_size as u32;
+        let vocab = self.arch.vocab_size as u32;
+        let n = prompt.len();
+        let max_n_q: usize = self
+            .model
+            .layers
+            .iter()
+            .map(|l| l.q_proj.shape[0])
+            .max()
+            .unwrap_or(0);
+        let hidden_bytes = (hidden as usize) * 2;
+        let residual_dev =
+            self.arena
+                .region("g4n_prompt_residual_bf16", n * hidden_bytes, 256)?;
+        let attn_out_dev = self
+            .arena
+            .region("g4n_prompt_attn_out_bf16", n * max_n_q * 2, 256)?;
+
+        for (t, &tok) in prompt.iter().enumerate() {
+            let dst = residual_dev.device_ptr() + (t * hidden_bytes) as u64;
+            self.embed_one_token_to_device(tok, dst)?;
+        }
+
+        for li in 0..self.arch.num_hidden_layers {
+            self.forward_layer_attn_batched_prefill_dev(
+                li,
+                n_tokens,
+                residual_dev.device_ptr(),
+                position_start,
+                kv,
+                attn_out_dev.device_ptr(),
+            )?;
+            self.forward_layer_post_attn_batched_dev(
+                li,
+                n_tokens,
+                attn_out_dev.device_ptr(),
+                residual_dev.device_ptr(),
+            )?;
+            self.forward_layer_post_attn_mlp_batched_dev(li, n_tokens, residual_dev.device_ptr())?;
+        }
+
+        let logits_region =
+            self.arena
+                .region("g4n_prompt_final_logits", n * (vocab as usize) * 4, 256)?;
+        let token_region = self
+            .arena
+            .region("g4n_prompt_final_tokens", n * 4, 16)?;
+        let stream_u64 = self.stream.raw();
+
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: n_tokens,
+                hidden,
+                eps: self.arch.rms_norm_eps,
+            }
+            .launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                residual_dev.device_ptr(),
+                self.model.outside.final_norm.offset_bytes,
+                stream_u64,
+            )?;
+        }
+
+        unsafe {
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt,
+                residual_dev.device_ptr(),
+                self.model.outside.lm_head_tokens.offset_bytes,
+                logits_region.device_ptr(),
+                n_tokens as i32,
+                vocab as i32,
+                hidden as i32,
+                stream_u64,
+            )?;
+        }
+
+        unsafe {
+            let mut logits_ptr = logits_region.device_ptr();
+            let mut out_ptr = token_region.device_ptr();
+            let mut vs = vocab as i32;
+            let args: [*mut core::ffi::c_void; 3] = [
+                (&mut logits_ptr) as *mut u64 as *mut _,
+                (&mut out_ptr) as *mut u64 as *mut _,
+                (&mut vs) as *mut i32 as *mut _,
+            ];
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_argmax_f32,
+                (n_tokens, 1, 1),
+                (1024, 1, 1),
+                0,
+                stream_u64,
+                &args,
+            )?;
+        }
+
+        self.stream.fence()?;
+        let mut token_i32 = vec![0i32; n];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                token_i32.as_mut_ptr() as *mut _,
+                token_region.device_ptr(),
+                n * 4,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(corrupt_runtime_err(
+                    "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
+                     token DtoH"
+                        .into(),
+                ));
+            }
+        }
+
+        let mut tokens = Vec::with_capacity(n);
+        for id in token_i32 {
+            if id < 0 || (id as u32) >= vocab {
+                return Err(corrupt_runtime_err(format!(
+                    "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
+                     argmax produced out-of-range token id {}",
+                    id
+                )));
+            }
+            tokens.push(id as u32);
+        }
+
+        let n_acc = Self::spec_greedy_accept_count(drafts, &tokens[..drafts.len()]);
+        if n_acc > drafts.len() || n_acc >= tokens.len() {
+            return Err(corrupt_runtime_err(format!(
+                "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
+                 invalid n_acc={} drafts={} verifies={}",
+                n_acc,
+                drafts.len(),
+                tokens.len()
+            )));
+        }
+
+        let base_last_hidden = self.base_last_hidden_device_ptr();
+        if base_last_hidden == 0 {
+            return Err(corrupt_runtime_err(
+                "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
+                 base_last_hidden_ptr is 0"
+                    .into(),
+            ));
+        }
+        let selected_hidden =
+            residual_dev.device_ptr() + (n_acc * (hidden as usize) * 2) as u64;
+        unsafe {
+            rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: hidden }.launch(
+                self.forward_kernels.fn_bf16_to_f16_sat,
+                base_last_hidden,
+                selected_hidden,
+                stream_u64,
+            )?;
+        }
+
+        Ok((tokens, n_acc))
+    }
+
+    fn forward_prompt_to_all_tokens_impl(
+        &self,
+        prompt: &[u32],
+        position_start: u32,
+        kv: &Gemma4Nvfp4KvState,
+        snapshot_row: Option<usize>,
+    ) -> Result<(Vec<u32>, Vec<u16>)> {
+        if prompt.is_empty() {
+            return Err(corrupt_runtime_err(
+                "forward_prompt_to_all_tokens: prompt is empty".into(),
+            ));
         }
         let n_tokens = prompt.len() as u32;
         if (position_start as u64) + (n_tokens as u64) > kv.max_pos as u64 {
             return Err(corrupt_runtime_err(format!(
-                "forward_prompt_to_token: position_start={} + n_tokens={} \
+                "forward_prompt_to_all_tokens: position_start={} + n_tokens={} \
                  exceeds kv.max_pos={}",
-                position_start, n_tokens, kv.max_pos)));
+                position_start, n_tokens, kv.max_pos
+            )));
         }
 
-        // Codex Round 4 (2026-05-18) fallback: per-token decode
-        // loop. The unified-NVFP4-prefill path is independently
-        // broken on Option B (different broken output than the
-        // single-token decode path). Opt in via env var to
-        // force the path that re-uses forward_full_to_token at
-        // each prompt position. Production has equivalent
-        // RVLLM_BATCH_PREFILL / RVLLM_UNIFIED_PREFILL gates
-        // (gemma4_bring_up.rs:1143, gemma4_layer_exec.rs:2036);
-        // Option B's path was unconditional until now.
-        if std::env::var("G4N_PROMPT_DECODE_FALLBACK")
-            .ok().as_deref() == Some("1")
-        {
-            let mut out = 0u32;
-            for (i, &tok) in prompt.iter().enumerate() {
-                out = self.forward_full_to_token(
-                    tok, position_start + i as u32, kv)?;
+        if let Some(row) = snapshot_row {
+            if row >= prompt.len() {
+                return Err(corrupt_runtime_err(format!(
+                    "forward_prompt_to_all_tokens: snapshot_row={} \
+                     >= prompt.len()={}",
+                    row,
+                    prompt.len()
+                )));
             }
-            return Ok(out);
         }
 
         // Stream-#5f-PRIME: device-resident batched-prefill
@@ -5745,58 +7160,87 @@ impl Gemma4Nvfp4Bringup {
         // launches.
         if n_tokens > kv.max_query_tokens {
             return Err(corrupt_runtime_err(format!(
-                "forward_prompt_to_token: prompt length {n_tokens} > \
+                "forward_prompt_to_all_tokens: prompt length {n_tokens} > \
                  kv.max_query_tokens={}. Re-allocate KV via \
                  `allocate_kv_state_with_chunk(max_pos, >= {n_tokens})`.",
-                kv.max_query_tokens)));
+                kv.max_query_tokens
+            )));
         }
         let _scratch_guard = self.forward_scratch_guard();
         let hidden = self.arch.hidden_size as u32;
         let n = prompt.len();
         // attn_out_dev sized for the LARGEST per-layer n_q
         // (global = 32*512 = 16384; sliding = 32*256 = 8192).
-        let max_n_q: usize = self.model.layers.iter()
-            .map(|l| l.q_proj.shape[0]).max().unwrap_or(0);
-        let residual_dev = self.arena.region(
-            "g4n_prompt_residual_bf16", n * (hidden as usize) * 2, 256)?;
-        let attn_out_dev = self.arena.region(
-            "g4n_prompt_attn_out_bf16", n * max_n_q * 2, 256)?;
+        let max_n_q: usize = self
+            .model
+            .layers
+            .iter()
+            .map(|l| l.q_proj.shape[0])
+            .max()
+            .unwrap_or(0);
+        let residual_dev =
+            self.arena
+                .region("g4n_prompt_residual_bf16", n * (hidden as usize) * 2, 256)?;
+        let attn_out_dev = self
+            .arena
+            .region("g4n_prompt_attn_out_bf16", n * max_n_q * 2, 256)?;
 
         // Embed N tokens into residual_dev rows 0..N-1.
         let hidden_bytes = (hidden as usize) * 2;
         for (t, &tok) in prompt.iter().enumerate() {
-            let dst = residual_dev.device_ptr()
-                + (t * hidden_bytes) as u64;
+            let dst = residual_dev.device_ptr() + (t * hidden_bytes) as u64;
             self.embed_one_token_to_device(tok, dst)?;
         }
 
         for li in 0..self.arch.num_hidden_layers {
             self.forward_layer_attn_batched_prefill_dev(
-                li, n_tokens, residual_dev.device_ptr(),
-                position_start, kv, attn_out_dev.device_ptr())?;
+                li,
+                n_tokens,
+                residual_dev.device_ptr(),
+                position_start,
+                kv,
+                attn_out_dev.device_ptr(),
+            )?;
             self.forward_layer_post_attn_batched_dev(
-                li, n_tokens, attn_out_dev.device_ptr(),
-                residual_dev.device_ptr())?;
-            self.forward_layer_post_attn_mlp_batched_dev(
-                li, n_tokens, residual_dev.device_ptr())?;
+                li,
+                n_tokens,
+                attn_out_dev.device_ptr(),
+                residual_dev.device_ptr(),
+            )?;
+            self.forward_layer_post_attn_mlp_batched_dev(li, n_tokens, residual_dev.device_ptr())?;
         }
 
-        // DtoH last token's residual for the final LM head.
+        // DtoH ALL N residual rows, then call the final close-out
+        // per row to get N argmax tokens. The caller controls which
+        // row, if any, snapshots `base_last_hidden_ptr`.
         self.stream.fence()?;
-        let mut last_residual = vec![0u16; hidden as usize];
-        let last_off = ((n - 1) * hidden_bytes) as u64;
+        let mut all_residuals = vec![0u16; n * (hidden as usize)];
         unsafe {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoH_v2(
-                last_residual.as_mut_ptr() as *mut _,
-                residual_dev.device_ptr() + last_off,
-                hidden_bytes);
+                all_residuals.as_mut_ptr() as *mut _,
+                residual_dev.device_ptr(),
+                n * hidden_bytes,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(corrupt_runtime_err(
-                    "forward_prompt_to_token: last residual DtoH".into()));
+                    "forward_prompt_to_all_tokens: bulk residual DtoH".into(),
+                ));
             }
         }
-        self.forward_final_to_token(&last_residual)
+        let mut tokens = Vec::with_capacity(n);
+        for t in 0..n {
+            let lo = t * (hidden as usize);
+            let hi = lo + (hidden as usize);
+            let row = &all_residuals[lo..hi];
+            let tok = if snapshot_row == Some(t) {
+                self.forward_final_to_token(row)?
+            } else {
+                self.forward_final_to_token_no_snapshot(row)?
+            };
+            tokens.push(tok);
+        }
+        Ok((tokens, all_residuals))
     }
 
     /// Commit #5e: dump-mode variant of `forward_final_to_token`
@@ -5810,33 +7254,39 @@ impl Gemma4Nvfp4Bringup {
         h_residual_bf16_host: &[u16],
         dump_dir: &std::path::Path,
     ) -> Result<u32> {
-        use rvllm_core::{RvllmError, CudaErrorKind, CudaCtx};
+        use rvllm_core::{CudaCtx, CudaErrorKind, RvllmError};
         let _scratch_guard = self.forward_scratch_guard();
         let hidden = self.arch.hidden_size as u32;
         let vocab = self.arch.vocab_size as u32;
         if h_residual_bf16_host.len() != hidden as usize {
             return Err(corrupt_runtime_err(format!(
                 "forward_final_to_token_with_dump: residual length {} != hidden {}",
-                h_residual_bf16_host.len(), hidden)));
+                h_residual_bf16_host.len(),
+                hidden
+            )));
         }
 
-        let h_region = self.arena.region(
-            "g4n_final_dump_h", (hidden as usize) * 2, 256)?;
-        let logits_region = self.arena.region(
-            "g4n_final_dump_logits", (vocab as usize) * 4, 256)?;
-        let token_region = self.arena.region(
-            "g4n_final_dump_token", 4, 16)?;
+        let h_region = self
+            .arena
+            .region("g4n_final_dump_h", (hidden as usize) * 2, 256)?;
+        let logits_region =
+            self.arena
+                .region("g4n_final_dump_logits", (vocab as usize) * 4, 256)?;
+        let token_region = self.arena.region("g4n_final_dump_token", 4, 16)?;
         unsafe {
             let r: &[u8] = std::slice::from_raw_parts(
                 h_residual_bf16_host.as_ptr() as *const u8,
-                h_residual_bf16_host.len() * 2);
+                h_residual_bf16_host.len() * 2,
+            );
             h_region.copy_from_host(r)?;
         }
         let stream_u64 = self.stream.raw();
 
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps: self.arch.rms_norm_eps,
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
             }
             .launch(
                 self.forward_kernels.fn_rmsnorm_inplace_bf16,
@@ -5854,24 +7304,25 @@ impl Gemma4Nvfp4Bringup {
             let rc = cuMemcpyDtoH_v2(
                 h_normed_bf16.as_mut_ptr() as *mut _,
                 h_region.device_ptr(),
-                (hidden as usize) * 2);
+                (hidden as usize) * 2,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "forward_final_to_token_with_dump: h_normed DtoH",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
         }
-        std::fs::create_dir_all(dump_dir).map_err(|e|
-            corrupt_runtime_err(format!(
-                "dump_dir create {dump_dir:?}: {e}")))?;
+        std::fs::create_dir_all(dump_dir)
+            .map_err(|e| corrupt_runtime_err(format!("dump_dir create {dump_dir:?}: {e}")))?;
         unsafe {
             let bytes: &[u8] = std::slice::from_raw_parts(
                 h_normed_bf16.as_ptr() as *const u8,
-                h_normed_bf16.len() * 2);
-            std::fs::write(
-                dump_dir.join("step_final_norm.bf16.bin"), bytes
-            ).map_err(|e| corrupt_runtime_err(format!(
-                "dump final_norm: {e}")))?;
+                h_normed_bf16.len() * 2,
+            );
+            std::fs::write(dump_dir.join("step_final_norm.bf16.bin"), bytes)
+                .map_err(|e| corrupt_runtime_err(format!("dump final_norm: {e}")))?;
         }
 
         // Tied LM head GEMV.
@@ -5881,7 +7332,10 @@ impl Gemma4Nvfp4Bringup {
                 h_region.device_ptr(),
                 self.model.outside.lm_head_tokens.offset_bytes,
                 logits_region.device_ptr(),
-                1, vocab as i32, hidden as i32, stream_u64,
+                1,
+                vocab as i32,
+                hidden as i32,
+                stream_u64,
             )?;
         }
         self.stream.fence()?;
@@ -5893,21 +7347,21 @@ impl Gemma4Nvfp4Bringup {
             let rc = cuMemcpyDtoH_v2(
                 logits_f32.as_mut_ptr() as *mut _,
                 logits_region.device_ptr(),
-                (vocab as usize) * 4);
+                (vocab as usize) * 4,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "forward_final_to_token_with_dump: logits DtoH",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
         }
         unsafe {
-            let bytes: &[u8] = std::slice::from_raw_parts(
-                logits_f32.as_ptr() as *const u8,
-                logits_f32.len() * 4);
-            std::fs::write(
-                dump_dir.join("step_final_logits.f32.bin"), bytes
-            ).map_err(|e| corrupt_runtime_err(format!(
-                "dump final_logits: {e}")))?;
+            let bytes: &[u8] =
+                std::slice::from_raw_parts(logits_f32.as_ptr() as *const u8, logits_f32.len() * 4);
+            std::fs::write(dump_dir.join("step_final_logits.f32.bin"), bytes)
+                .map_err(|e| corrupt_runtime_err(format!("dump final_logits: {e}")))?;
         }
 
         // argmax.
@@ -5922,7 +7376,11 @@ impl Gemma4Nvfp4Bringup {
             ];
             rvllm_fused::launch_raw(
                 self.forward_kernels.fn_argmax_f32,
-                (1, 1, 1), (1024, 1, 1), 0, stream_u64, &args,
+                (1, 1, 1),
+                (1024, 1, 1),
+                0,
+                stream_u64,
+                &args,
             )?;
         }
         self.stream.fence()?;
@@ -5930,27 +7388,31 @@ impl Gemma4Nvfp4Bringup {
         let mut tok = [0i32; 1];
         unsafe {
             use cudarc::driver::sys::*;
-            let rc = cuMemcpyDtoH_v2(
-                tok.as_mut_ptr() as *mut _, token_region.device_ptr(), 4);
+            let rc = cuMemcpyDtoH_v2(tok.as_mut_ptr() as *mut _, token_region.device_ptr(), 4);
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "forward_final_to_token_with_dump: token DtoH",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
+                    CudaErrorKind::MemcpyFailed,
+                    CudaCtx::setup(),
+                ));
             }
         }
         let id = tok[0];
         if id < 0 || (id as u32) >= vocab {
             return Err(corrupt_runtime_err(format!(
                 "forward_final_to_token_with_dump: argmax out-of-range \
-                 token id={id} vocab={vocab}")));
+                 token id={id} vocab={vocab}"
+            )));
         }
 
         // Also dump the token id as an i32 so the Python diff
         // script can show "rvllm token vs reference token" at a
         // glance.
-        std::fs::write(dump_dir.join("step_final_token.i32.bin"),
-                       (id as i32).to_le_bytes()).map_err(|e|
-            corrupt_runtime_err(format!("dump token: {e}")))?;
+        std::fs::write(
+            dump_dir.join("step_final_token.i32.bin"),
+            (id as i32).to_le_bytes(),
+        )
+        .map_err(|e| corrupt_runtime_err(format!("dump token: {e}")))?;
 
         Ok(id as u32)
     }
@@ -5964,11 +7426,10 @@ pub struct Gemma4Nvfp4BaseKvSource<'a> {
     pub kv: &'a Gemma4Nvfp4KvState,
 }
 
-impl<'a> crate::gemma4_drafter::BaseKvSource
-    for Gemma4Nvfp4BaseKvSource<'a>
-{
+impl<'a> crate::gemma4_drafter::BaseKvSource for Gemma4Nvfp4BaseKvSource<'a> {
     fn drafter_base_kv_view(
-        &self, layer_idx: usize,
+        &self,
+        layer_idx: usize,
     ) -> Result<crate::gemma4_drafter::DrafterBaseKvView> {
         self.bringup.drafter_base_kv_view(self.kv, layer_idx)
     }
@@ -6002,21 +7463,29 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     if unbiased < -14 {
         // Subnormal f16 or zero.
         let shift = -unbiased - 1; // 0..24
-        if shift >= 24 { return sign; }
+        if shift >= 24 {
+            return sign;
+        }
         let mant_with_hidden = mant32 | 0x00800000;
         let mant16 = (mant_with_hidden >> (shift + 13)) as u16;
         let round_bit = (mant_with_hidden >> (shift + 12)) & 1;
         let sticky = (mant_with_hidden & ((1 << (shift + 12)) - 1)) != 0;
-        let bumped = if round_bit == 1 && (sticky || (mant16 & 1) == 1)
-            { mant16 + 1 } else { mant16 };
+        let bumped = if round_bit == 1 && (sticky || (mant16 & 1) == 1) {
+            mant16 + 1
+        } else {
+            mant16
+        };
         return sign | bumped;
     }
     let exp16 = ((unbiased + 15) as u16) << 10;
     let mant16 = (mant32 >> 13) as u16;
     let round_bit = (mant32 >> 12) & 1;
     let sticky = (mant32 & 0xfff) != 0;
-    let bumped = if round_bit == 1 && (sticky || (mant16 & 1) == 1)
-        { (sign | exp16 | mant16) + 1 } else { sign | exp16 | mant16 };
+    let bumped = if round_bit == 1 && (sticky || (mant16 & 1) == 1) {
+        (sign | exp16 | mant16) + 1
+    } else {
+        sign | exp16 | mant16
+    };
     bumped
 }
 
@@ -6024,7 +7493,8 @@ fn f32_to_f16_bits(x: f32) -> u16 {
 fn corrupt_runtime_err(msg: String) -> rvllm_core::RvllmError {
     rvllm_core::RvllmError::Config {
         err: rvllm_core::ConfigError::InvalidField {
-            name: "runtime", reason: msg.into(),
+            name: "runtime",
+            reason: msg.into(),
         },
         field: "runtime",
     }
@@ -6039,7 +7509,7 @@ fn corrupt_runtime_err(msg: String) -> rvllm_core::RvllmError {
 fn parse_nvfp4_policy(v: &str) -> Option<i32> {
     match v.trim() {
         "amax6" | "0" => Some(0),
-        "mse"   | "1" => Some(1),
+        "mse" | "1" => Some(1),
         _ => None,
     }
 }
@@ -6064,12 +7534,12 @@ fn read_nvfp4_kv_policies() -> (i32, i32) {
         .ok()
         .and_then(|s| parse_nvfp4_policy(&s))
         .or(global)
-        .unwrap_or(0);          // K default = amax6
+        .unwrap_or(0); // K default = amax6
     let v = std::env::var("RVLLM_NVFP4_V_SCALE_POLICY")
         .ok()
         .and_then(|s| parse_nvfp4_policy(&s))
         .or(global)
-        .unwrap_or(1);          // V default = mse
+        .unwrap_or(1); // V default = mse
     (k, v)
 }
 
@@ -6079,10 +7549,7 @@ fn read_nvfp4_kv_policies() -> (i32, i32) {
 /// these is set without `RVLLM_DEBUG_G4N=1`, refuse to start so
 /// a leaked diagnostic env from a prior session can't slowly
 /// fill disk on a production rvllm-serve.
-const G4N_STALE_DEBUG_KEYS: &[&str] = &[
-    "G4N_DUMP_DIR",
-    "G4N_FORWARD_TRACE",
-];
+const G4N_STALE_DEBUG_KEYS: &[&str] = &["G4N_DUMP_DIR", "G4N_FORWARD_TRACE"];
 
 #[inline]
 fn g4n_debug_active() -> bool {
@@ -6093,7 +7560,9 @@ fn g4n_debug_active() -> bool {
 }
 
 fn validate_no_stale_g4n_debug_envs() -> Result<()> {
-    if g4n_debug_active() { return Ok(()); }
+    if g4n_debug_active() {
+        return Ok(());
+    }
     for key in G4N_STALE_DEBUG_KEYS {
         if std::env::var_os(key).is_some() {
             return Err(corrupt_runtime_err(format!(
@@ -6134,18 +7603,16 @@ mod tests {
                 return;
             }
         };
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
 
         // 32 GiB arena — covers ~22 GiB of model weights + ~10
         // GiB of forward scratch headroom. Production profile
         // (mobile-31b-nvfp4w-rvllm-spec.env) uses 96 GiB to
         // include KV cache + spec scratch which we don't allocate here.
         let t0 = std::time::Instant::now();
-        let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
         let load_s = t0.elapsed().as_secs_f64();
         eprintln!(
             "[bringup-smoke] load complete in {load_s:.1}s — layers={} hidden={} \
@@ -6158,7 +7625,8 @@ mod tests {
 
         // BOS token (Gemma 4 tokenizer: <bos>=2).
         let token_id: u32 = 2;
-        let q = bringup.pre_attn_one_token(token_id)
+        let q = bringup
+            .pre_attn_one_token(token_id)
             .expect("pre_attn_one_token");
 
         let nan = q.iter().filter(|x| x.is_nan()).count();
@@ -6169,7 +7637,8 @@ mod tests {
             "[bringup-smoke] layer-0 pre-attn q_proj on token {token_id}: \
              N_q={} nan={nan} inf={inf} mean_abs={mean_abs:.4} max_abs={max_abs:.4} \
              first8={:?}",
-            q.len(), &q[..8],
+            q.len(),
+            &q[..8],
         );
 
         assert_eq!(nan, 0, "{nan} NaN(s) in q_proj");
@@ -6179,10 +7648,14 @@ mod tests {
         // q_proj weights are small Gaussian-ish → expect output
         // magnitudes in roughly the [0.01, 10.0] range. Reject
         // extreme outliers that would indicate a bug.
-        assert!(mean_abs < 100.0,
-                "q_proj mean_abs={mean_abs} implausibly large");
-        assert!(max_abs < 1000.0,
-                "q_proj max_abs={max_abs} implausibly large");
+        assert!(
+            mean_abs < 100.0,
+            "q_proj mean_abs={mean_abs} implausibly large"
+        );
+        assert!(
+            max_abs < 1000.0,
+            "q_proj max_abs={max_abs} implausibly large"
+        );
     }
 
     /// Commit #4b smoke: full Q/K/V projection on BOS token.
@@ -6206,15 +7679,14 @@ mod tests {
                 return;
             }
         };
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
-        let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
 
         let token_id: u32 = 2;
-        let (q, k, v) = bringup.forward_layer0_qkv_only(token_id)
+        let (q, k, v) = bringup
+            .forward_layer0_qkv_only(token_id)
             .expect("forward_layer0_qkv_only");
 
         for (name, vec) in [("q", &q), ("k", &k), ("v", &v)] {
@@ -6225,7 +7697,8 @@ mod tests {
             eprintln!(
                 "[qkv-smoke] {name}: N={} nan={nan} inf={inf} \
                  mean_abs={mean_abs:.4} max_abs={max_abs:.4} first4={:?}",
-                vec.len(), &vec[..4],
+                vec.len(),
+                &vec[..4],
             );
             assert_eq!(nan, 0, "{name} has {nan} NaN");
             assert_eq!(inf, 0, "{name} has {inf} Inf");
@@ -6260,21 +7733,17 @@ mod tests {
                 return;
             }
         };
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
-        let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
 
         let head_dim = bringup.arch.head_dim_sliding;
-        let (q, k, _v) = bringup.forward_layer0_qk_norm(2)
+        let (q, k, _v) = bringup
+            .forward_layer0_qk_norm(2)
             .expect("forward_layer0_qk_norm");
 
-        for (name, vec, n_heads) in [
-            ("q", &q, q.len() / head_dim),
-            ("k", &k, k.len() / head_dim),
-        ] {
+        for (name, vec, n_heads) in [("q", &q, q.len() / head_dim), ("k", &k, k.len() / head_dim)] {
             let nan = vec.iter().filter(|x| x.is_nan()).count();
             let inf = vec.iter().filter(|x| x.is_infinite()).count();
             assert_eq!(nan, 0, "{name} has {nan} NaN");
@@ -6297,8 +7766,10 @@ mod tests {
                 "[qk-norm-smoke] {name}: heads={n_heads} head_dim={head_dim} \
                  mean_rms={mean_rms:.4} min_rms={min_rms:.4} max_rms={max_rms:.4}"
             );
-            assert!(mean_rms > 0.01 && mean_rms < 100.0,
-                    "{name} mean_rms={mean_rms} outside plausible [0.01, 100]");
+            assert!(
+                mean_rms > 0.01 && mean_rms < 100.0,
+                "{name} mean_rms={mean_rms} outside plausible [0.01, 100]"
+            );
         }
     }
 
@@ -6324,18 +7795,18 @@ mod tests {
                 return;
             }
         };
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
-        let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
 
         let head_dim = bringup.arch.head_dim_sliding;
 
-        let (q_pre, k_pre, _v) = bringup.forward_layer0_qk_norm(2)
+        let (q_pre, k_pre, _v) = bringup
+            .forward_layer0_qk_norm(2)
             .expect("forward_layer0_qk_norm");
-        let (q_post, k_post, _v2) = bringup.forward_layer0_qk_rope(2, 0)
+        let (q_post, k_post, _v2) = bringup
+            .forward_layer0_qk_rope(2, 0)
             .expect("forward_layer0_qk_rope(pos=0)");
 
         for (name, pre, post, n_heads) in [
@@ -6354,10 +7825,9 @@ mod tests {
             for h in 0..n_heads {
                 let row_pre = &pre[h * head_dim..(h + 1) * head_dim];
                 let row_post = &post[h * head_dim..(h + 1) * head_dim];
-                let rms_pre = (row_pre.iter().map(|x| x * x).sum::<f32>()
-                               / head_dim as f32).sqrt();
-                let rms_post = (row_post.iter().map(|x| x * x).sum::<f32>()
-                                / head_dim as f32).sqrt();
+                let rms_pre = (row_pre.iter().map(|x| x * x).sum::<f32>() / head_dim as f32).sqrt();
+                let rms_post =
+                    (row_post.iter().map(|x| x * x).sum::<f32>() / head_dim as f32).sqrt();
                 max_rms_drift = max_rms_drift.max((rms_pre - rms_post).abs());
             }
 
@@ -6365,7 +7835,9 @@ mod tests {
             // The pre / post values should agree element-wise modulo
             // bf16 round-trip through the GPU buffer (one extra narrow
             // beyond the pre-RoPE narrow). Element-wise max diff:
-            let max_elem_diff = pre.iter().zip(post.iter())
+            let max_elem_diff = pre
+                .iter()
+                .zip(post.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
 
@@ -6377,10 +7849,14 @@ mod tests {
             // bf16 mantissa is 7 bits → relative precision ~0.8%.
             // For values up to ~10 the absolute error is ~0.08.
             // Allow generous headroom — anything > 0.5 indicates a bug.
-            assert!(max_rms_drift < 0.5,
-                    "{name} RoPE NOT norm-preserving: max_rms_drift={max_rms_drift}");
-            assert!(max_elem_diff < 0.5,
-                    "{name} RoPE@pos=0 NOT identity: max_elem_diff={max_elem_diff}");
+            assert!(
+                max_rms_drift < 0.5,
+                "{name} RoPE NOT norm-preserving: max_rms_drift={max_rms_drift}"
+            );
+            assert!(
+                max_elem_diff < 0.5,
+                "{name} RoPE@pos=0 NOT identity: max_elem_diff={max_elem_diff}"
+            );
         }
     }
 
@@ -6405,41 +7881,40 @@ mod tests {
                 return;
             }
         };
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
-        let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
 
         let hidden = bringup.arch.hidden_size;
-        let n_q = (bringup.arch.num_attention_heads
-                   * bringup.arch.head_dim_sliding) as usize;
+        let n_q = (bringup.arch.num_attention_heads * bringup.arch.head_dim_sliding) as usize;
         assert_eq!(n_q, 8192, "31B sliding N_q sanity");
 
         // Synthetic bf16 0.01 ≈ 0x3C23.
         let bf16_0_01: u16 = 0x3C23;
         let attn_out: Vec<u16> = vec![bf16_0_01; n_q];
         let h_in: Vec<u16> = vec![bf16_0_01; hidden];
-        let h_in_f32: Vec<f32> = h_in.iter().map(|&b| {
-            f32::from_bits((b as u32) << 16)
-        }).collect();
+        let h_in_f32: Vec<f32> = h_in
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect();
 
-        let h_out = bringup.forward_layer0_post_attn(&attn_out, &h_in)
+        let h_out = bringup
+            .forward_layer0_post_attn(&attn_out, &h_in)
             .expect("forward_layer0_post_attn");
 
         assert_eq!(h_out.len(), hidden);
         let nan = h_out.iter().filter(|x| x.is_nan()).count();
         let inf = h_out.iter().filter(|x| x.is_infinite()).count();
-        let mean_abs: f32 = h_out.iter().map(|x| x.abs()).sum::<f32>()
-                          / (hidden as f32);
+        let mean_abs: f32 = h_out.iter().map(|x| x.abs()).sum::<f32>() / (hidden as f32);
         let max_abs: f32 = h_out.iter().fold(0f32, |a, &x| a.max(x.abs()));
         // Delta = output - input (= the normed o_proj contribution)
-        let diff: Vec<f32> = h_out.iter().zip(h_in_f32.iter())
+        let diff: Vec<f32> = h_out
+            .iter()
+            .zip(h_in_f32.iter())
             .map(|(o, i)| o - i)
             .collect();
-        let diff_mean_abs: f32 = diff.iter().map(|x| x.abs()).sum::<f32>()
-                              / (hidden as f32);
+        let diff_mean_abs: f32 = diff.iter().map(|x| x.abs()).sum::<f32>() / (hidden as f32);
         let diff_max_abs: f32 = diff.iter().fold(0f32, |a, &x| a.max(x.abs()));
 
         eprintln!(
@@ -6452,12 +7927,18 @@ mod tests {
 
         assert_eq!(nan, 0, "post_attn produced NaN");
         assert_eq!(inf, 0, "post_attn produced Inf");
-        assert!(diff_mean_abs > 1e-6,
-            "post_attn delta=0 — residual add did nothing");
-        assert!(mean_abs < 100.0,
-            "post_attn h_out mean_abs={mean_abs} implausibly large");
-        assert!(diff_mean_abs < 100.0,
-            "post_attn delta mean_abs={diff_mean_abs} implausibly large");
+        assert!(
+            diff_mean_abs > 1e-6,
+            "post_attn delta=0 — residual add did nothing"
+        );
+        assert!(
+            mean_abs < 100.0,
+            "post_attn h_out mean_abs={mean_abs} implausibly large"
+        );
+        assert!(
+            diff_mean_abs < 100.0,
+            "post_attn delta mean_abs={diff_mean_abs} implausibly large"
+        );
     }
 
     /// Commit #4f smoke: MLP-block composition on layer 0.
@@ -6473,33 +7954,33 @@ mod tests {
                 return;
             }
         };
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
-        let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
 
         let hidden = bringup.arch.hidden_size;
         let bf16_0_01: u16 = 0x3C23;
         let h_in: Vec<u16> = vec![bf16_0_01; hidden];
-        let h_in_f32: Vec<f32> = h_in.iter().map(|&b| {
-            f32::from_bits((b as u32) << 16)
-        }).collect();
+        let h_in_f32: Vec<f32> = h_in
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect();
 
-        let h_out = bringup.forward_layer0_post_attn_mlp(&h_in)
+        let h_out = bringup
+            .forward_layer0_post_attn_mlp(&h_in)
             .expect("forward_layer0_post_attn_mlp");
 
         let nan = h_out.iter().filter(|x| x.is_nan()).count();
         let inf = h_out.iter().filter(|x| x.is_infinite()).count();
-        let mean_abs: f32 = h_out.iter().map(|x| x.abs()).sum::<f32>()
-                          / (hidden as f32);
+        let mean_abs: f32 = h_out.iter().map(|x| x.abs()).sum::<f32>() / (hidden as f32);
         let max_abs: f32 = h_out.iter().fold(0f32, |a, &x| a.max(x.abs()));
-        let diff: Vec<f32> = h_out.iter().zip(h_in_f32.iter())
+        let diff: Vec<f32> = h_out
+            .iter()
+            .zip(h_in_f32.iter())
             .map(|(o, i)| o - i)
             .collect();
-        let diff_mean_abs: f32 = diff.iter().map(|x| x.abs()).sum::<f32>()
-                              / (hidden as f32);
+        let diff_mean_abs: f32 = diff.iter().map(|x| x.abs()).sum::<f32>() / (hidden as f32);
         let diff_max_abs: f32 = diff.iter().fold(0f32, |a, &x| a.max(x.abs()));
 
         eprintln!(
@@ -6513,18 +7994,24 @@ mod tests {
 
         assert_eq!(nan, 0, "mlp_block produced NaN");
         assert_eq!(inf, 0, "mlp_block produced Inf");
-        assert!(diff_mean_abs > 1e-7,
-            "mlp_block delta=0 — residual add did nothing");
+        assert!(
+            diff_mean_abs > 1e-7,
+            "mlp_block delta=0 — residual add did nothing"
+        );
         // layer_scalar≈0.0894 means the MLP contribution is
         // small relative to whatever post_ff_norm would normally
         // produce (~mean_gamma=1.39). diff_mean_abs upper bound
         // is roughly layer_scalar * gamma ≈ 0.12. Allow wide
         // headroom — real MLP output for 0.01 input is much
         // smaller than the trained-on activation magnitudes.
-        assert!(diff_mean_abs < 100.0,
-            "mlp_block delta mean_abs={diff_mean_abs} implausibly large");
-        assert!(mean_abs < 100.0,
-            "mlp_block h_out mean_abs={mean_abs} implausibly large");
+        assert!(
+            diff_mean_abs < 100.0,
+            "mlp_block delta mean_abs={diff_mean_abs} implausibly large"
+        );
+        assert!(
+            mean_abs < 100.0,
+            "mlp_block h_out mean_abs={mean_abs} implausibly large"
+        );
     }
 
     /// Commit #4g smoke: final_norm + tied LM head + argmax.
@@ -6548,27 +8035,28 @@ mod tests {
                 return;
             }
         };
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
-        let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
 
         let hidden = bringup.arch.hidden_size;
         let vocab = bringup.arch.vocab_size;
         let bf16_0_01: u16 = 0x3C23;
         let h_in: Vec<u16> = vec![bf16_0_01; hidden];
 
-        let token_id = bringup.forward_final_to_token(&h_in)
+        let token_id = bringup
+            .forward_final_to_token(&h_in)
             .expect("forward_final_to_token");
 
         eprintln!(
             "[final-smoke] hidden={hidden} vocab={vocab} \
              predicted_token_id={token_id}"
         );
-        assert!((token_id as usize) < vocab,
-            "argmax produced token_id={token_id} >= vocab={vocab}");
+        assert!(
+            (token_id as usize) < vocab,
+            "argmax produced token_id={token_id} >= vocab={vocab}"
+        );
     }
 
     /// Commit #5a smoke: layer-0 END-TO-END at position=0.
@@ -6592,23 +8080,24 @@ mod tests {
                 return;
             }
         };
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
-        let bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
 
         // BOS token at position=0.
-        let token_id = bringup.forward_layer0_position_zero_to_token(2)
+        let token_id = bringup
+            .forward_layer0_position_zero_to_token(2)
             .expect("forward_layer0_position_zero_to_token");
 
         eprintln!(
             "[e2e-pos0-smoke] BOS(2) at position=0 → layer0 only → tied_lm_head → token_id={token_id}"
         );
         let vocab = bringup.arch.vocab_size;
-        assert!((token_id as usize) < vocab,
-            "e2e pos=0 produced token_id={token_id} >= vocab={vocab}");
+        assert!(
+            (token_id as usize) < vocab,
+            "e2e pos=0 produced token_id={token_id} >= vocab={vocab}"
+        );
     }
 
     /// Commit #5b1 smoke: allocate the NVFP4 KV state on a loaded
@@ -6634,22 +8123,23 @@ mod tests {
                 return;
             }
         };
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
-        let mut bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let mut bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
 
         let max_pos: u32 = 4096;
-        let kv = bringup.allocate_kv_state(max_pos)
+        let kv = bringup
+            .allocate_kv_state(max_pos)
             .expect("allocate_kv_state");
 
         // Commit floor: re-entrancy guard — a second call must
         // refuse rather than silently leak the first state.
         let second = bringup.allocate_kv_state(max_pos);
-        assert!(second.is_err(),
-            "allocate_kv_state must reject the second call");
+        assert!(
+            second.is_err(),
+            "allocate_kv_state must reject the second call"
+        );
         eprintln!("[#floor-smoke] double-allocate guard: rejected ✓");
 
         assert_eq!(kv.max_pos, max_pos);
@@ -6666,14 +8156,10 @@ mod tests {
         assert_eq!(kv.k_scale_layer_ptrs.len(), n_layers);
         assert_eq!(kv.v_scale_layer_ptrs.len(), n_layers);
         for li in 0..n_layers {
-            assert_ne!(kv.k_packed_layer_ptrs[li], 0,
-                "k_packed[{li}] null");
-            assert_ne!(kv.v_packed_layer_ptrs[li], 0,
-                "v_packed[{li}] null");
-            assert_ne!(kv.k_scale_layer_ptrs[li], 0,
-                "k_scale[{li}] null");
-            assert_ne!(kv.v_scale_layer_ptrs[li], 0,
-                "v_scale[{li}] null");
+            assert_ne!(kv.k_packed_layer_ptrs[li], 0, "k_packed[{li}] null");
+            assert_ne!(kv.v_packed_layer_ptrs[li], 0, "v_packed[{li}] null");
+            assert_ne!(kv.k_scale_layer_ptrs[li], 0, "k_scale[{li}] null");
+            assert_ne!(kv.v_scale_layer_ptrs[li], 0, "v_scale[{li}] null");
         }
 
         let mib = kv.total_bytes as f64 / (1024.0 * 1024.0);
@@ -6684,24 +8170,29 @@ mod tests {
         );
         // Expected ~990 MiB at max_pos=4096 (see docstring on the
         // Gemma4Nvfp4KvState struct). Bound generously.
-        assert!(mib > 500.0 && mib < 1500.0,
-            "total_bytes={mib:.1} MiB outside expected 500..1500 range");
+        assert!(
+            mib > 500.0 && mib < 1500.0,
+            "total_bytes={mib:.1} MiB outside expected 500..1500 range"
+        );
 
         // Codex Stream-6a scaffold: verify the DrafterBaseKvView
         // surfaces non-null per-layer pointers for the 31B
         // source pair (58, 59) which is what the production
         // drafter cross-attends to.
         for src in [58usize, 59] {
-            let view = bringup.drafter_base_kv_view(&kv, src)
+            let view = bringup
+                .drafter_base_kv_view(&kv, src)
                 .expect("drafter_base_kv_view");
-            assert_ne!(view.k_cache, 0,        "{src}: k_cache null");
-            assert_ne!(view.v_cache, 0,        "{src}: v_cache null");
-            assert_ne!(view.k_scale_cache, 0,  "{src}: k_scale null");
-            assert_ne!(view.v_scale_cache, 0,  "{src}: v_scale null");
-            assert_ne!(view.block_tables, 0,   "{src}: block_tables null");
-            assert_ne!(view.context_lens, 0,   "{src}: context_lens null");
-            assert!(matches!(view.kv_dtype,
-                crate::gemma4_layer_exec::KvDtype::Nvfp4));
+            assert_ne!(view.k_cache, 0, "{src}: k_cache null");
+            assert_ne!(view.v_cache, 0, "{src}: v_cache null");
+            assert_ne!(view.k_scale_cache, 0, "{src}: k_scale null");
+            assert_ne!(view.v_scale_cache, 0, "{src}: v_scale null");
+            assert_ne!(view.block_tables, 0, "{src}: block_tables null");
+            assert_ne!(view.context_lens, 0, "{src}: context_lens null");
+            assert!(matches!(
+                view.kv_dtype,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4
+            ));
         }
         eprintln!("[stream-6a-scaffold] drafter view at layers 58, 59 ✓");
 
@@ -6715,17 +8206,24 @@ mod tests {
         // the future drafter parameterization.
         use crate::gemma4_drafter::BaseKvSource;
         let src = crate::gemma4_nvfp4_bring_up::Gemma4Nvfp4BaseKvSource {
-            bringup: &bringup, kv: &kv,
+            bringup: &bringup,
+            kv: &kv,
         };
         let dyn_src: &dyn BaseKvSource = &src;
-        let pair = dyn_src.assistant_shared_kv_sources()
+        let pair = dyn_src
+            .assistant_shared_kv_sources()
             .expect("31B has an assistant source pair");
         eprintln!("[stream-6a] assistant_shared_kv_sources = {pair:?}");
-        assert_eq!(pair, (58, 59),
-            "31B expected source pair (58, 59), got {pair:?}");
-        let v58 = dyn_src.drafter_base_kv_view(pair.0)
+        assert_eq!(
+            pair,
+            (58, 59),
+            "31B expected source pair (58, 59), got {pair:?}"
+        );
+        let v58 = dyn_src
+            .drafter_base_kv_view(pair.0)
             .expect("dyn-trait view at layer 58");
-        let v59 = dyn_src.drafter_base_kv_view(pair.1)
+        let v59 = dyn_src
+            .drafter_base_kv_view(pair.1)
             .expect("dyn-trait view at layer 59");
         assert_ne!(v58.k_cache, v59.k_cache);
         eprintln!("[stream-6a] trait impl ✓ — views at 58, 59 distinct");
@@ -6756,34 +8254,35 @@ mod tests {
                 return;
             }
         };
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
-        let mut bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let mut bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
 
-        let kv = bringup.allocate_kv_state(64)
+        let kv = bringup
+            .allocate_kv_state(64)
             .expect("allocate_kv_state(64)");
 
         // Run attention at position=0 (BOS) and position=1
         // (some other token id) sharing the same KV state.
-        let attn0 = bringup.forward_layer0_attn(2, 0, &kv)
+        let attn0 = bringup
+            .forward_layer0_attn(2, 0, &kv)
             .expect("forward_layer0_attn(pos=0)");
-        let attn1 = bringup.forward_layer0_attn(64, 1, &kv)
+        let attn1 = bringup
+            .forward_layer0_attn(64, 1, &kv)
             .expect("forward_layer0_attn(pos=1)");
 
         let summarize = |label: &str, a: &[f32]| -> (f32, f32, usize, usize) {
             let nan = a.iter().filter(|x| x.is_nan()).count();
             let inf = a.iter().filter(|x| x.is_infinite()).count();
-            let mean_abs: f32 = a.iter().map(|x| x.abs()).sum::<f32>()
-                / (a.len() as f32);
+            let mean_abs: f32 = a.iter().map(|x| x.abs()).sum::<f32>() / (a.len() as f32);
             let max_abs: f32 = a.iter().fold(0f32, |a, &x| a.max(x.abs()));
             eprintln!(
                 "[#5b2-smoke] {label}: N={} nan={nan} inf={inf} \
                  mean_abs={mean_abs:.4} max_abs={max_abs:.4} \
                  first4={:?}",
-                a.len(), &a[..4],
+                a.len(),
+                &a[..4],
             );
             (mean_abs, max_abs, nan, inf)
         };
@@ -6810,13 +8309,18 @@ mod tests {
         // token's V), so the attn_out distribution is different
         // from pos=0 (which sees only slot 0).
         assert_eq!(attn0.len(), attn1.len());
-        let diff: f32 = attn0.iter().zip(attn1.iter())
-            .map(|(a, b)| (a - b).abs()).sum::<f32>()
+        let diff: f32 = attn0
+            .iter()
+            .zip(attn1.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
             / (attn0.len() as f32);
         eprintln!("[#5b2-smoke] mean_abs(attn_pos0 - attn_pos1) = {diff:.6}");
-        assert!(diff > 1e-4,
+        assert!(
+            diff > 1e-4,
             "pos=0 and pos=1 attn_out are identical — KV cache likely \
-             not being consumed (diff_mean_abs={diff})");
+             not being consumed (diff_mean_abs={diff})"
+        );
     }
 
     /// Commit #5b3 smoke: per-layer attention works on layer 1
@@ -6854,45 +8358,50 @@ mod tests {
                 return;
             }
         };
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
-        let mut bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let mut bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
 
         // Confirm test assumption: layers 0 and 1 are both sliding.
         for li in [0usize, 1] {
             let lt = &bringup.arch.layer_types[li];
             assert!(
-                matches!(lt, rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention),
+                matches!(
+                    lt,
+                    rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention
+                ),
                 "test precondition: layer {li} must be SlidingAttention, got {lt:?}"
             );
         }
 
-        let kv = bringup.allocate_kv_state(64)
+        let kv = bringup
+            .allocate_kv_state(64)
             .expect("allocate_kv_state(64)");
 
-        let residual = bringup.embed_one_token_bf16(2)
+        let residual = bringup
+            .embed_one_token_bf16(2)
             .expect("embed_one_token_bf16(BOS=2)");
         assert_eq!(residual.len(), bringup.arch.hidden_size);
 
-        let attn_l0 = bringup.forward_layer_attn_from_residual(0, &residual, 0, &kv)
+        let attn_l0 = bringup
+            .forward_layer_attn_from_residual(0, &residual, 0, &kv)
             .expect("forward_layer_attn_from_residual(layer=0)");
-        let attn_l1 = bringup.forward_layer_attn_from_residual(1, &residual, 0, &kv)
+        let attn_l1 = bringup
+            .forward_layer_attn_from_residual(1, &residual, 0, &kv)
             .expect("forward_layer_attn_from_residual(layer=1)");
 
         let summarize = |label: &str, a: &[f32]| -> (f32, f32, usize, usize) {
             let nan = a.iter().filter(|x| x.is_nan()).count();
             let inf = a.iter().filter(|x| x.is_infinite()).count();
-            let mean_abs: f32 = a.iter().map(|x| x.abs()).sum::<f32>()
-                / (a.len() as f32);
+            let mean_abs: f32 = a.iter().map(|x| x.abs()).sum::<f32>() / (a.len() as f32);
             let max_abs: f32 = a.iter().fold(0f32, |a, &x| a.max(x.abs()));
             eprintln!(
                 "[#5b3-smoke] {label}: N={} nan={nan} inf={inf} \
                  mean_abs={mean_abs:.4} max_abs={max_abs:.4} \
                  first4={:?}",
-                a.len(), &a[..4],
+                a.len(),
+                &a[..4],
             );
             (mean_abs, max_abs, nan, inf)
         };
@@ -6903,22 +8412,33 @@ mod tests {
         assert_eq!(i0, 0, "layer 0 has {i0} Inf");
         assert_eq!(n1, 0, "layer 1 has {n1} NaN");
         assert_eq!(i1, 0, "layer 1 has {i1} Inf");
-        assert!(m0 > 0.0 && m0 < 100.0,
-            "layer 0 mean_abs={m0} out of [0, 100)");
-        assert!(m1 > 0.0 && m1 < 100.0,
-            "layer 1 mean_abs={m1} out of [0, 100)");
-        assert!(x0 < 1000.0 && x1 < 1000.0,
-            "implausible max_abs (l0={x0}, l1={x1})");
+        assert!(
+            m0 > 0.0 && m0 < 100.0,
+            "layer 0 mean_abs={m0} out of [0, 100)"
+        );
+        assert!(
+            m1 > 0.0 && m1 < 100.0,
+            "layer 1 mean_abs={m1} out of [0, 100)"
+        );
+        assert!(
+            x0 < 1000.0 && x1 < 1000.0,
+            "implausible max_abs (l0={x0}, l1={x1})"
+        );
 
         // Per-layer weights differ → outputs should differ.
         assert_eq!(attn_l0.len(), attn_l1.len());
-        let diff: f32 = attn_l0.iter().zip(attn_l1.iter())
-            .map(|(a, b)| (a - b).abs()).sum::<f32>()
+        let diff: f32 = attn_l0
+            .iter()
+            .zip(attn_l1.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
             / (attn_l0.len() as f32);
         eprintln!("[#5b3-smoke] mean_abs(attn_l0 - attn_l1) = {diff:.6}");
-        assert!(diff > 1e-4,
+        assert!(
+            diff > 1e-4,
             "layer 0 and layer 1 attn_out are identical (diff={diff}) — \
-             per-layer weight indexing is likely broken");
+             per-layer weight indexing is likely broken"
+        );
 
         // #5b3 used to reject global layers; #5b4 wires them
         // through the same method via partial RoPE + k_eq_v V
@@ -6970,18 +8490,19 @@ mod tests {
                 return;
             }
         };
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
-        let mut bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let mut bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
 
         // Pick the first global layer.
         let global_idx = (0..bringup.arch.num_hidden_layers)
-            .find(|&i| matches!(
-                bringup.arch.layer_types[i],
-                rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention))
+            .find(|&i| {
+                matches!(
+                    bringup.arch.layer_types[i],
+                    rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention
+                )
+            })
             .expect("31B must have at least one global layer");
         eprintln!(
             "[#5b4-smoke] global layer index = {global_idx}, \
@@ -6993,7 +8514,8 @@ mod tests {
             bringup.arch.rope_theta_global,
         );
 
-        let kv = bringup.allocate_kv_state(64)
+        let kv = bringup
+            .allocate_kv_state(64)
             .expect("allocate_kv_state(64)");
 
         // Two DIFFERENT tokens so the per-position V differs.
@@ -7001,54 +8523,68 @@ mod tests {
         // attention output for pos=1 collapses back to
         // V_pos0 = V_pos1 = sm[0]·V + sm[1]·V = V, masking the
         // KV-cache read (matches #5b2's sliding-pos1 smoke).
-        let resid0 = bringup.embed_one_token_bf16(2)   // BOS
+        let resid0 = bringup
+            .embed_one_token_bf16(2) // BOS
             .expect("embed_one_token_bf16(BOS=2)");
-        let resid1 = bringup.embed_one_token_bf16(64)  // arbitrary
+        let resid1 = bringup
+            .embed_one_token_bf16(64) // arbitrary
             .expect("embed_one_token_bf16(64)");
 
-        let attn_g0 = bringup.forward_layer_attn_from_residual(
-            global_idx, &resid0, 0, &kv,
-        ).expect("forward_layer_attn_from_residual(global, pos=0)");
-        let attn_g1 = bringup.forward_layer_attn_from_residual(
-            global_idx, &resid1, 1, &kv,
-        ).expect("forward_layer_attn_from_residual(global, pos=1)");
+        let attn_g0 = bringup
+            .forward_layer_attn_from_residual(global_idx, &resid0, 0, &kv)
+            .expect("forward_layer_attn_from_residual(global, pos=0)");
+        let attn_g1 = bringup
+            .forward_layer_attn_from_residual(global_idx, &resid1, 1, &kv)
+            .expect("forward_layer_attn_from_residual(global, pos=1)");
 
         for (label, a) in [("attn_g0", &attn_g0), ("attn_g1", &attn_g1)] {
             let nan = a.iter().filter(|x| x.is_nan()).count();
             let inf = a.iter().filter(|x| x.is_infinite()).count();
-            let mean_abs: f32 = a.iter().map(|x| x.abs()).sum::<f32>()
-                / (a.len() as f32);
+            let mean_abs: f32 = a.iter().map(|x| x.abs()).sum::<f32>() / (a.len() as f32);
             let max_abs: f32 = a.iter().fold(0f32, |a, &x| a.max(x.abs()));
             eprintln!(
                 "[#5b4-smoke] {label}: N={} nan={nan} inf={inf} \
                  mean_abs={mean_abs:.4} max_abs={max_abs:.4} \
                  first4={:?}",
-                a.len(), &a[..4],
+                a.len(),
+                &a[..4],
             );
             assert_eq!(nan, 0, "{label} has {nan} NaN");
             assert_eq!(inf, 0, "{label} has {inf} Inf");
-            assert!(mean_abs > 0.0 && mean_abs < 100.0,
-                "{label} mean_abs={mean_abs} out of (0, 100)");
-            assert!(max_abs < 1000.0,
-                "{label} max_abs={max_abs} implausibly large");
+            assert!(
+                mean_abs > 0.0 && mean_abs < 100.0,
+                "{label} mean_abs={mean_abs} out of (0, 100)"
+            );
+            assert!(
+                max_abs < 1000.0,
+                "{label} max_abs={max_abs} implausibly large"
+            );
         }
 
         // Pos=0 cache state has only slot 0; pos=1 reads two slots.
         // Outputs MUST differ.
-        let diff: f32 = attn_g0.iter().zip(attn_g1.iter())
-            .map(|(a, b)| (a - b).abs()).sum::<f32>()
+        let diff: f32 = attn_g0
+            .iter()
+            .zip(attn_g1.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
             / (attn_g0.len() as f32);
         eprintln!("[#5b4-smoke] mean_abs(attn_g0 - attn_g1) = {diff:.6}");
-        assert!(diff > 1e-4,
+        assert!(
+            diff > 1e-4,
             "global pos=0 and pos=1 are identical (diff={diff}) — \
-             global decode kernel likely not consuming the KV cache");
+             global decode kernel likely not consuming the KV cache"
+        );
 
         // Confirm output dim = num_attention_heads * head_dim_global.
-        let expected_n =
-            bringup.arch.num_attention_heads * bringup.arch.head_dim_global;
-        assert_eq!(attn_g0.len(), expected_n,
+        let expected_n = bringup.arch.num_attention_heads * bringup.arch.head_dim_global;
+        assert_eq!(
+            attn_g0.len(),
+            expected_n,
             "global attn_out length {} != num_attention_heads*head_dim_global {}",
-            attn_g0.len(), expected_n);
+            attn_g0.len(),
+            expected_n
+        );
     }
 
     /// Commit #5c smoke: full 60-layer forward at position=0.
@@ -7078,20 +8614,22 @@ mod tests {
                 return;
             }
         };
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
-        let mut bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let mut bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
 
-        let kv = bringup.allocate_kv_state(64)
+        let kv = bringup
+            .allocate_kv_state(64)
             .expect("allocate_kv_state(64)");
 
         let tok: u32 = std::env::var("G4N_TOKEN")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
         let t0 = std::time::Instant::now();
-        let token = bringup.forward_full_to_token(tok, 0, &kv)
+        let token = bringup
+            .forward_full_to_token(tok, 0, &kv)
             .expect("forward_full_to_token");
         let elapsed = t0.elapsed().as_secs_f64();
         eprintln!("[#5c-smoke] G4N_TOKEN={tok}");
@@ -7102,8 +8640,10 @@ mod tests {
             "[#5c-smoke] BOS at pos=0 → {n_layers}-layer NVFP4 forward → \
              argmax token = {token} (vocab={vocab}) in {elapsed:.2}s"
         );
-        assert!((token as usize) < vocab,
-            "argmax returned out-of-range token {token} (vocab={vocab})");
+        assert!(
+            (token as usize) < vocab,
+            "argmax returned out-of-range token {token} (vocab={vocab})"
+        );
     }
 
     /// Commit #5f smoke: multi-token prompt processing.
@@ -7128,30 +8668,31 @@ mod tests {
                 return;
             }
         };
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
 
         // 1-token baseline: forward_prompt_to_token([BOS]) must
         // match forward_full_to_token(BOS) byte-identically.
         {
-            let mut bringup = Gemma4Nvfp4Bringup::load(
-                &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-            ).expect("Gemma4Nvfp4Bringup::load");
-            let kv = bringup.allocate_kv_state(64)
+            let mut bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+                .expect("Gemma4Nvfp4Bringup::load");
+            let kv = bringup
+                .allocate_kv_state(64)
                 .expect("allocate_kv_state(64)");
-            let token_a = bringup.forward_full_to_token(2, 0, &kv)
+            let token_a = bringup
+                .forward_full_to_token(2, 0, &kv)
                 .expect("forward_full_to_token");
             eprintln!("[#5f-smoke] forward_full_to_token(BOS)={token_a}");
             assert!((token_a as usize) < bringup.arch.vocab_size);
         }
         {
-            let mut bringup = Gemma4Nvfp4Bringup::load(
-                &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-            ).expect("Gemma4Nvfp4Bringup::load");
-            let kv = bringup.allocate_kv_state(64)
+            let mut bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+                .expect("Gemma4Nvfp4Bringup::load");
+            let kv = bringup
+                .allocate_kv_state(64)
                 .expect("allocate_kv_state(64)");
-            let token_b = bringup.forward_prompt_to_token(&[2], 0, &kv)
+            let token_b = bringup
+                .forward_prompt_to_token(&[2], 0, &kv)
                 .expect("forward_prompt_to_token([BOS])");
             eprintln!("[#5f-smoke] forward_prompt_to_token([BOS])={token_b}");
             assert!((token_b as usize) < bringup.arch.vocab_size);
@@ -7160,27 +8701,31 @@ mod tests {
         // 3-token prompt: BOS + two arbitrary tokens. Verifies
         // the prompt-loop scaffolding doesn't blow up on N>1 and
         // produces an in-range argmax.
-        let mut bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let mut bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
         // Stream-#5f-PRIME: prompt path needs max_query_tokens >=
         // prompt length. Default chunk=1 only fits N=1 (decode);
         // bump to N=64 for prompts.
-        let kv = bringup.allocate_kv_state_with_chunk(64, 64)
+        let kv = bringup
+            .allocate_kv_state_with_chunk(64, 64)
             .expect("allocate_kv_state_with_chunk");
 
         let prompt: Vec<u32> = vec![2, 1000, 5000];
         let t0 = std::time::Instant::now();
-        let next = bringup.forward_prompt_to_token(&prompt, 0, &kv)
+        let next = bringup
+            .forward_prompt_to_token(&prompt, 0, &kv)
             .expect("forward_prompt_to_token(3 tokens)");
         let elapsed = t0.elapsed().as_secs_f64();
         eprintln!(
             "[#5f-smoke] 3-token prompt={:?} at pos=0..3 → next token {next} \
              in {elapsed:.2}s ({} tok/s)",
-            prompt, prompt.len() as f64 / elapsed,
+            prompt,
+            prompt.len() as f64 / elapsed,
         );
-        assert!((next as usize) < bringup.arch.vocab_size,
-            "out-of-range prompt argmax {next}");
+        assert!(
+            (next as usize) < bringup.arch.vocab_size,
+            "out-of-range prompt argmax {next}"
+        );
     }
 
     /// Stream-6a smoke: `ensure_drafter_nvfp4` loads the
@@ -7220,49 +8765,62 @@ mod tests {
             eprintln!("drafter dir {drafter_dir:?} missing — skip");
             return;
         }
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
-        );
-        let mut bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
-        let kv = bringup.allocate_kv_state_with_chunk(64, 64)
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let mut bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
+        let kv = bringup
+            .allocate_kv_state_with_chunk(64, 64)
             .expect("allocate_kv_state_with_chunk");
 
         // Stream-6b primitive #1: ensure the base_last_hidden
         // snapshot buffer is allocated. Must happen BEFORE we
         // lock the drafter mutex (this method needs &mut self).
-        bringup.ensure_base_last_hidden_buffer()
+        bringup
+            .ensure_base_last_hidden_buffer()
             .expect("ensure_base_last_hidden_buffer");
         assert_ne!(bringup.base_last_hidden_device_ptr(), 0);
 
-        bringup.ensure_drafter_nvfp4(&drafter_dir, &kv)
+        bringup
+            .ensure_drafter_nvfp4(&drafter_dir, &kv)
             .expect("ensure_drafter_nvfp4");
 
         // Idempotency: second call is a no-op.
-        bringup.ensure_drafter_nvfp4(&drafter_dir, &kv)
+        bringup
+            .ensure_drafter_nvfp4(&drafter_dir, &kv)
             .expect("ensure_drafter_nvfp4 idempotent");
 
         // Verify the drafter slot is populated with all
         // attached handles.
         let guard = bringup.drafter.lock().unwrap();
         let rt = guard.as_ref().expect("drafter slot populated");
-        assert!(rt.fn_masked_embedder_argmax_f16.is_some(),
-            "masked_embedder kernel handle missing");
-        assert!(rt.fn_flash_attention_2_decode_f16io.is_some(),
-            "flash_attention f16io kernel handle missing");
-        assert!(rt.fn_flash_attention_2_decode_f16io_bc16.is_some(),
-            "flash_attention bc16 kernel handle missing");
-        assert!(rt.fn_drafter_dequant_fp8_to_f16.is_some(),
-            "dequant FP8 kernel handle missing");
-        assert!(rt.fn_drafter_dequant_nvfp4_to_f16.is_some(),
-            "dequant NVFP4 kernel handle missing");
-        let shadow = rt.shadow_kv.as_ref()
-            .expect("shadow KV not allocated");
+        assert!(
+            rt.fn_masked_embedder_argmax_f16.is_some(),
+            "masked_embedder kernel handle missing"
+        );
+        assert!(
+            rt.fn_flash_attention_2_decode_f16io.is_some(),
+            "flash_attention f16io kernel handle missing"
+        );
+        assert!(
+            rt.fn_flash_attention_2_decode_f16io_bc16.is_some(),
+            "flash_attention bc16 kernel handle missing"
+        );
+        assert!(
+            rt.fn_drafter_dequant_fp8_to_f16.is_some(),
+            "dequant FP8 kernel handle missing"
+        );
+        assert!(
+            rt.fn_drafter_dequant_nvfp4_to_f16.is_some(),
+            "dequant NVFP4 kernel handle missing"
+        );
+        let shadow = rt.shadow_kv.as_ref().expect("shadow KV not allocated");
         assert!(shadow.sliding_layer_bytes > 0);
         assert!(shadow.full_layer_bytes > 0);
-        assert_eq!(shadow.block_size, kv.block_size,
-            "shadow block_size must match Option B's kv.block_size");
+        assert_eq!(
+            shadow.block_size, kv.block_size,
+            "shadow block_size must match Option B's kv.block_size"
+        );
         assert_eq!(shadow.num_blocks_total, kv.max_pos);
         eprintln!(
             "[#6a-smoke] drafter loaded: {} bytes resident, \
@@ -7271,7 +8829,8 @@ mod tests {
             shadow.sliding_layer_bytes / (1024 * 1024),
             shadow.full_layer_bytes / (1024 * 1024),
         );
-        let workspace = rt.alloc_step_workspace(&bringup.arena)
+        let workspace = rt
+            .alloc_step_workspace(&bringup.arena)
             .expect("alloc_step_workspace");
         eprintln!(
             "[#6a-smoke] drafter workspace allocated ({} bytes)",
@@ -7300,12 +8859,11 @@ mod tests {
         unsafe {
             use cudarc::driver::sys::*;
             let zero_bytes = drafter_pre_in * 2; // pre_in f16
-            let rc = cuMemsetD8_v2(
-                workspace.pre_projection_in, 0, zero_bytes);
-            assert_eq!(rc, CUresult::CUDA_SUCCESS,
-                "zero pre_projection_in");
+            let rc = cuMemsetD8_v2(workspace.pre_projection_in, 0, zero_bytes);
+            assert_eq!(rc, CUresult::CUDA_SUCCESS, "zero pre_projection_in");
         }
-        bringup.forward_drafter_pre_projection(rt, &workspace)
+        bringup
+            .forward_drafter_pre_projection(rt, &workspace)
             .expect("forward_drafter_pre_projection");
         bringup.stream.fence().expect("stream fence");
         // DtoH workspace.hidden (drafter f16 hidden, NOT base
@@ -7317,9 +8875,10 @@ mod tests {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoH_v2(
                 hidden_f16.as_mut_ptr() as *mut _,
-                workspace.hidden, h_words * 2);
-            assert_eq!(rc, CUresult::CUDA_SUCCESS,
-                "drafter hidden DtoH");
+                workspace.hidden,
+                h_words * 2,
+            );
+            assert_eq!(rc, CUresult::CUDA_SUCCESS, "drafter hidden DtoH");
         }
         let mut nan = 0usize;
         let mut inf = 0usize;
@@ -7327,10 +8886,18 @@ mod tests {
         let mut max_abs: f32 = 0.0;
         for &b in &hidden_f16 {
             let v = half::f16::from_bits(b).to_f32();
-            if v.is_nan() { nan += 1; continue; }
-            if v.is_infinite() { inf += 1; continue; }
+            if v.is_nan() {
+                nan += 1;
+                continue;
+            }
+            if v.is_infinite() {
+                inf += 1;
+                continue;
+            }
             mean_abs += v.abs();
-            if v.abs() > max_abs { max_abs = v.abs(); }
+            if v.abs() > max_abs {
+                max_abs = v.abs();
+            }
         }
         mean_abs /= h_words as f32;
         eprintln!(
@@ -7342,9 +8909,11 @@ mod tests {
         assert_eq!(inf, 0, "pre_projection produced Inf");
         // Zero input through bf16-narrow GEMM should land near
         // zero. Bound generously to absorb FMA round-off.
-        assert!(max_abs < 1.0,
+        assert!(
+            max_abs < 1.0,
             "pre_projection on zero input has implausible \
-             max_abs={max_abs}");
+             max_abs={max_abs}"
+        );
 
         // Stream-6a primitives #2-3 chained: run layer 0 of
         // the drafter (q_side → cross_attn → attn_finisher).
@@ -7355,31 +8924,48 @@ mod tests {
         // (zero or near-zero) attn_out. The smoke just verifies
         // the launch chain completes without panic / NaN / Inf.
         let pos: u32 = 0;
-        bringup.forward_drafter_layer_q_side(rt, &workspace, 0, pos)
+        bringup
+            .forward_drafter_layer_q_side(rt, &workspace, 0, pos)
             .expect("forward_drafter_layer_q_side");
-        bringup.forward_drafter_layer_cross_attn(rt, &workspace, 0, &kv)
+        bringup
+            .forward_drafter_layer_cross_attn(rt, &workspace, 0, &kv)
             .expect("forward_drafter_layer_cross_attn");
-        bringup.forward_drafter_layer_attn_finisher(rt, &workspace, 0)
+        bringup
+            .forward_drafter_layer_attn_finisher(rt, &workspace, 0)
             .expect("forward_drafter_layer_attn_finisher");
-        bringup.forward_drafter_layer_mlp_finisher(rt, &workspace, 0)
+        bringup
+            .forward_drafter_layer_mlp_finisher(rt, &workspace, 0)
             .expect("forward_drafter_layer_mlp_finisher");
         bringup.stream.fence().expect("stream fence");
         unsafe {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoH_v2(
                 hidden_f16.as_mut_ptr() as *mut _,
-                workspace.hidden, h_words * 2);
-            assert_eq!(rc, CUresult::CUDA_SUCCESS,
-                "drafter hidden DtoH (post-layer0)");
+                workspace.hidden,
+                h_words * 2,
+            );
+            assert_eq!(
+                rc,
+                CUresult::CUDA_SUCCESS,
+                "drafter hidden DtoH (post-layer0)"
+            );
         }
         let mut nan = 0usize;
         let mut inf = 0usize;
         let mut max_abs: f32 = 0.0;
         for &b in &hidden_f16 {
             let v = half::f16::from_bits(b).to_f32();
-            if v.is_nan() { nan += 1; continue; }
-            if v.is_infinite() { inf += 1; continue; }
-            if v.abs() > max_abs { max_abs = v.abs(); }
+            if v.is_nan() {
+                nan += 1;
+                continue;
+            }
+            if v.is_infinite() {
+                inf += 1;
+                continue;
+            }
+            if v.abs() > max_abs {
+                max_abs = v.abs();
+            }
         }
         eprintln!(
             "[#6a-smoke] layer0 full chain (q_side + cross_attn + \
@@ -7401,7 +8987,8 @@ mod tests {
         // kernel during 2026-05-18 bring-up and is being
         // debugged separately. Compilation + dispatch coverage
         // for the populate path lands here.
-        bringup.populate_drafter_shadow_kv_with_rt(rt, &kv, 0, 1)
+        bringup
+            .populate_drafter_shadow_kv_with_rt(rt, &kv, 0, 1)
             .expect("populate_drafter_shadow_kv_with_rt on empty KV");
         eprintln!("[#6a-smoke] populate_drafter_shadow_kv_with_rt dispatch OK");
 
@@ -7416,11 +9003,11 @@ mod tests {
         unsafe {
             use cudarc::driver::sys::*;
             let zero_bytes = drafter_pre_in * 2;
-            let rc = cuMemsetD8_v2(
-                workspace.pre_projection_in, 0, zero_bytes);
+            let rc = cuMemsetD8_v2(workspace.pre_projection_in, 0, zero_bytes);
             assert_eq!(rc, CUresult::CUDA_SUCCESS);
         }
-        bringup.run_drafter_forward_one_token(rt, &workspace, 0, &kv)
+        bringup
+            .run_drafter_forward_one_token(rt, &workspace, 0, &kv)
             .expect("run_drafter_forward_one_token");
         bringup.stream.fence().expect("stream fence");
         let mut out_tok_host: u32 = u32::MAX;
@@ -7428,22 +9015,27 @@ mod tests {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoH_v2(
                 &mut out_tok_host as *mut u32 as *mut _,
-                workspace.out_token_id, 4);
-            assert_eq!(rc, CUresult::CUDA_SUCCESS,
-                "DtoH out_token_id");
+                workspace.out_token_id,
+                4,
+            );
+            assert_eq!(rc, CUresult::CUDA_SUCCESS, "DtoH out_token_id");
         }
         eprintln!(
             "[#6a-smoke] run_drafter_forward_one_token \
-             (zero input, shadow ZERO) → token={out_tok_host}");
-        assert!(out_tok_host < rt.arch.vocab_size as u32,
+             (zero input, shadow ZERO) → token={out_tok_host}"
+        );
+        assert!(
+            out_tok_host < rt.arch.vocab_size as u32,
             "run_drafter_forward_one_token produced out-of-vocab \
-             token {out_tok_host} (vocab={})", rt.arch.vocab_size);
+             token {out_tok_host} (vocab={})",
+            rt.arch.vocab_size
+        );
 
         // Stream-6b primitive #2: populate pre_projection_in
         // with a real base-embed lookup + the (zero-initialised)
         // base_last_hidden buffer.
-        bringup.populate_drafter_pre_projection_input(
-            rt, &workspace, /* token_id */ 2)
+        bringup
+            .populate_drafter_pre_projection_input(rt, &workspace, /* token_id */ 2)
             .expect("populate_drafter_pre_projection_input(BOS)");
         bringup.stream.fence().expect("stream fence");
 
@@ -7458,24 +9050,32 @@ mod tests {
             let rc = cuMemcpyDtoH_v2(
                 probe.as_mut_ptr() as *mut _,
                 workspace.pre_projection_in,
-                half_elems * 2);
+                half_elems * 2,
+            );
             assert_eq!(rc, CUresult::CUDA_SUCCESS);
         }
         let nonzero = probe.iter().filter(|&&b| b != 0).count();
         let mut max_abs: f32 = 0.0;
         for &b in &probe {
             let v = half::f16::from_bits(b).to_f32();
-            if v.is_nan() || v.is_infinite() { continue; }
-            if v.abs() > max_abs { max_abs = v.abs(); }
+            if v.is_nan() || v.is_infinite() {
+                continue;
+            }
+            if v.abs() > max_abs {
+                max_abs = v.abs();
+            }
         }
         eprintln!(
             "[#6a-smoke] populate_drafter_pre_projection_input(BOS): \
              embed-half nonzero={nonzero}/{half_elems} \
-             max_abs={max_abs:.4}");
-        assert!(nonzero > 0,
+             max_abs={max_abs:.4}"
+        );
+        assert!(
+            nonzero > 0,
             "populate_drafter_pre_projection_input(BOS) left the \
              embed half of pre_projection_in fully zero — the \
-             bf16→f16 cast must not be reaching the buffer");
+             bf16→f16 cast must not be reaching the buffer"
+        );
 
         // End-to-end: re-run the drafter forward on the populated
         // input. Just verifies the chain stays NaN/Inf-free; we
@@ -7485,7 +9085,8 @@ mod tests {
         // pre_projection output and the LM-head argmax can
         // collapse to the same token even with very different
         // inputs).
-        bringup.run_drafter_forward_one_token(rt, &workspace, 0, &kv)
+        bringup
+            .run_drafter_forward_one_token(rt, &workspace, 0, &kv)
             .expect("run_drafter_forward_one_token (post-populate)");
         bringup.stream.fence().expect("stream fence");
         let mut tok_after: u32 = u32::MAX;
@@ -7493,15 +9094,21 @@ mod tests {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoH_v2(
                 &mut tok_after as *mut u32 as *mut _,
-                workspace.out_token_id, 4);
+                workspace.out_token_id,
+                4,
+            );
             assert_eq!(rc, CUresult::CUDA_SUCCESS);
         }
         eprintln!(
             "[#6a-smoke] post-populate run_drafter_forward_one_token \
-             → token={tok_after}");
-        assert!(tok_after < rt.arch.vocab_size as u32,
+             → token={tok_after}"
+        );
+        assert!(
+            tok_after < rt.arch.vocab_size as u32,
             "drafter post-populate produced out-of-vocab token \
-             {tok_after} (vocab={})", rt.arch.vocab_size);
+             {tok_after} (vocab={})",
+            rt.arch.vocab_size
+        );
 
         // Drop the drafter guard so we can call verify_base_one
         // _token (it doesn't need the guard, and we don't need
@@ -7515,11 +9122,10 @@ mod tests {
         // drafter cross-attention reads NON-zero K/V, so its
         // output lifts off the zero-cross-attn fixed point that
         // collapsed the earlier checks to token=0.
-        let base_argmax = bringup.verify_base_one_token(
-            /* token_id */ 2 /*BOS*/, 0, &kv)
+        let base_argmax = bringup
+            .verify_base_one_token(/* token_id */ 2 /*BOS*/, 0, &kv)
             .expect("verify_base_one_token(BOS, pos=0)");
-        eprintln!(
-            "[#6a-smoke] verify_base_one_token(BOS, pos=0) → token={base_argmax}");
+        eprintln!("[#6a-smoke] verify_base_one_token(BOS, pos=0) → token={base_argmax}");
         assert!((base_argmax as usize) < bringup.arch.vocab_size);
 
         // Re-lock the drafter guard for the remaining drafter
@@ -7528,15 +9134,17 @@ mod tests {
         let rt = guard.as_ref().expect("drafter slot populated");
 
         // Populate shadow KV from the real base K/V at slot 0.
-        bringup.populate_drafter_shadow_kv_with_rt(rt, &kv, 0, 1)
+        bringup
+            .populate_drafter_shadow_kv_with_rt(rt, &kv, 0, 1)
             .expect("populate_drafter_shadow_kv_with_rt(real, 0, 1)");
         // Re-populate pre_projection_in: embed half from the base
         // argmax token, hidden half automatically picks up
         // base_last_hidden updated by verify_base_one_token.
-        bringup.populate_drafter_pre_projection_input(
-            rt, &workspace, base_argmax)
+        bringup
+            .populate_drafter_pre_projection_input(rt, &workspace, base_argmax)
             .expect("populate_drafter_pre_projection_input(base_argmax)");
-        bringup.run_drafter_forward_one_token(rt, &workspace, 1, &kv)
+        bringup
+            .run_drafter_forward_one_token(rt, &workspace, 1, &kv)
             .expect("run_drafter_forward_one_token (real KV + real embed)");
         bringup.stream.fence().expect("stream fence");
         let mut tok_real: u32 = u32::MAX;
@@ -7544,7 +9152,9 @@ mod tests {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoH_v2(
                 &mut tok_real as *mut u32 as *mut _,
-                workspace.out_token_id, 4);
+                workspace.out_token_id,
+                4,
+            );
             assert_eq!(rc, CUresult::CUDA_SUCCESS);
         }
         // Also probe the drafter hidden so we can see whether the
@@ -7556,34 +9166,48 @@ mod tests {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoH_v2(
                 hidden_real.as_mut_ptr() as *mut _,
-                workspace.hidden, drafter_hidden_elems * 2);
+                workspace.hidden,
+                drafter_hidden_elems * 2,
+            );
             assert_eq!(rc, CUresult::CUDA_SUCCESS);
         }
         let mut real_nonzero = 0usize;
         let mut real_max_abs: f32 = 0.0;
         for &b in &hidden_real {
             let v = half::f16::from_bits(b).to_f32();
-            if v.is_nan() || v.is_infinite() { continue; }
-            if v != 0.0 { real_nonzero += 1; }
-            if v.abs() > real_max_abs { real_max_abs = v.abs(); }
+            if v.is_nan() || v.is_infinite() {
+                continue;
+            }
+            if v != 0.0 {
+                real_nonzero += 1;
+            }
+            if v.abs() > real_max_abs {
+                real_max_abs = v.abs();
+            }
         }
         eprintln!(
             "[#6a-smoke] real-KV drafter step → token={tok_real} \
              hidden nonzero={real_nonzero}/{drafter_hidden_elems} \
-             max_abs={real_max_abs:.4}");
-        assert!(tok_real < rt.arch.vocab_size as u32,
+             max_abs={real_max_abs:.4}"
+        );
+        assert!(
+            tok_real < rt.arch.vocab_size as u32,
             "real-KV drafter produced out-of-vocab token \
-             {tok_real} (vocab={})", rt.arch.vocab_size);
+             {tok_real} (vocab={})",
+            rt.arch.vocab_size
+        );
         // With real shadow KV the drafter hidden should NOT be
         // identically zero — pre_projection produces non-zero
         // hidden + cross-attn now contributes real attn_out, so
         // the residual stream carries information through to the
         // LM head.
-        assert!(real_nonzero > 0,
+        assert!(
+            real_nonzero > 0,
             "real-KV drafter step produced an all-zero hidden — \
              either the shadow KV population didn't reach the \
              cross-attn read, or pre_projection_in's hidden half \
-             didn't get the snapshot from verify_base_one_token");
+             didn't get the snapshot from verify_base_one_token"
+        );
 
         // Stream-6b primitive #4 end-to-end: complete one spec
         // K=1 round and score it via `spec_greedy_accept_count`.
@@ -7611,32 +9235,35 @@ mod tests {
         drop(guard);
         let drafts = vec![tok_real];
         let verifies = vec![base_argmax];
-        let n_accepted = Gemma4Nvfp4Bringup::spec_greedy_accept_count(
-            &drafts, &verifies);
+        let n_accepted = Gemma4Nvfp4Bringup::spec_greedy_accept_count(&drafts, &verifies);
         eprintln!(
             "[#6a-smoke] spec_greedy_accept_count(\
              drafts={drafts:?}, verifies={verifies:?}) → \
-             n_accepted={n_accepted}");
-        assert!(n_accepted <= 1,
-            "n_accepted ({n_accepted}) > K=1");
+             n_accepted={n_accepted}"
+        );
+        assert!(n_accepted <= 1, "n_accepted ({n_accepted}) > K=1");
         // Also exercise the trivial branches so the helper isn't
         // only covered for the rejected-draft case.
         assert_eq!(
-            Gemma4Nvfp4Bringup::spec_greedy_accept_count(
-                &[10, 20, 30], &[10, 20, 30]),
-            3, "all-match K=3");
+            Gemma4Nvfp4Bringup::spec_greedy_accept_count(&[10, 20, 30], &[10, 20, 30]),
+            3,
+            "all-match K=3"
+        );
         assert_eq!(
-            Gemma4Nvfp4Bringup::spec_greedy_accept_count(
-                &[10, 20, 30], &[10, 20, 99]),
-            2, "longest matching prefix K=3");
+            Gemma4Nvfp4Bringup::spec_greedy_accept_count(&[10, 20, 30], &[10, 20, 99]),
+            2,
+            "longest matching prefix K=3"
+        );
         assert_eq!(
-            Gemma4Nvfp4Bringup::spec_greedy_accept_count(
-                &[10], &[99]),
-            0, "no match");
+            Gemma4Nvfp4Bringup::spec_greedy_accept_count(&[10], &[99]),
+            0,
+            "no match"
+        );
         assert_eq!(
-            Gemma4Nvfp4Bringup::spec_greedy_accept_count(
-                &[], &[]),
-            0, "empty");
+            Gemma4Nvfp4Bringup::spec_greedy_accept_count(&[], &[]),
+            0,
+            "empty"
+        );
     }
 
     /// Stream-6b primitive #5 end-to-end smoke: drive
@@ -7666,43 +9293,128 @@ mod tests {
             eprintln!("drafter dir {drafter_dir:?} missing — skip");
             return;
         }
-        let kernels_dir = std::path::PathBuf::from(
-            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
 
-        let mut bringup = Gemma4Nvfp4Bringup::load(
-            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
-        ).expect("Gemma4Nvfp4Bringup::load");
+        let mut bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
         // max_pos=64 gives plenty of room for 1-token prompt +
         // 3 spec iters; max_query_tokens=64 lets the prefill
         // batched-NVFP4 path run.
-        let kv = bringup.allocate_kv_state_with_chunk(64, 64)
+        let kv = bringup
+            .allocate_kv_state_with_chunk(64, 64)
             .expect("allocate_kv_state_with_chunk");
 
-        bringup.ensure_base_last_hidden_buffer()
+        bringup
+            .ensure_base_last_hidden_buffer()
             .expect("ensure_base_last_hidden_buffer");
-        bringup.ensure_drafter_nvfp4(&drafter_dir, &kv)
+        bringup
+            .ensure_drafter_nvfp4(&drafter_dir, &kv)
             .expect("ensure_drafter_nvfp4");
 
         let t0 = std::time::Instant::now();
-        let stats = bringup.run_spec_session_nvfp4_greedy_k1(
-            /*prompt_ids=*/ &[2 /*BOS*/], /*max_new=*/ 3, &kv,
-        ).expect("run_spec_session_nvfp4_greedy_k1");
+        let stats = bringup
+            .run_spec_session_nvfp4_greedy_k1(
+                /*prompt_ids=*/ &[2 /*BOS*/],
+                /*max_new=*/ 3,
+                &kv,
+            )
+            .expect("run_spec_session_nvfp4_greedy_k1");
         let elapsed = t0.elapsed().as_secs_f64();
         eprintln!(
             "[#6b-spec-session] emitted={:?} n_iters={} n_accepted={} \
              elapsed={:.2}s",
-            stats.emitted, stats.n_iters, stats.n_accepted, elapsed);
+            stats.emitted, stats.n_iters, stats.n_accepted, elapsed
+        );
 
-        assert_eq!(stats.emitted.len(), 3,
-            "expected 3 emitted tokens (1 prefill + 2 iters)");
-        assert_eq!(stats.n_iters, 2,
-            "expected 2 spec iters for max_new=3 with 1-token prefill");
-        assert!(stats.n_accepted <= stats.n_iters,
-            "n_accepted {} > n_iters {}", stats.n_accepted, stats.n_iters);
+        assert_eq!(
+            stats.emitted.len(),
+            3,
+            "expected 3 emitted tokens (1 prefill + 2 iters)"
+        );
+        assert_eq!(
+            stats.n_iters, 2,
+            "expected 2 spec iters for max_new=3 with 1-token prefill"
+        );
+        assert!(
+            stats.n_accepted <= stats.n_iters,
+            "n_accepted {} > n_iters {}",
+            stats.n_accepted,
+            stats.n_iters
+        );
         let vocab = bringup.arch.vocab_size as u32;
         for (i, &t) in stats.emitted.iter().enumerate() {
-            assert!(t < vocab,
-                "emitted[{i}]={t} out of vocab (vocab={vocab})");
+            assert!(t < vocab, "emitted[{i}]={t} out of vocab (vocab={vocab})");
+        }
+    }
+
+    /// K>=2 smoke for the Option B batched-verify spec loop. Uses the
+    /// BOS-only prompt for parity with the K=1 smoke; this is a wiring
+    /// smoke, not a drafter-quality measurement.
+    #[test]
+    #[ignore]
+    fn ondisk_bringup_spec_session_k4() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skip");
+                return;
+            }
+        };
+        let drafter_dir = match std::env::var("GEMMA4_DRAFTER_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => PathBuf::from("/home/r00t/gemma-4-31B-it-assistant"),
+        };
+        if !drafter_dir.is_dir() {
+            eprintln!("drafter dir {drafter_dir:?} missing — skip");
+            return;
+        }
+        let kernels_dir =
+            std::path::PathBuf::from("/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+
+        let mut bringup = Gemma4Nvfp4Bringup::load(&dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+            .expect("Gemma4Nvfp4Bringup::load");
+        let kv = bringup
+            .allocate_kv_state_with_chunk(64, 64)
+            .expect("allocate_kv_state_with_chunk");
+
+        bringup
+            .ensure_base_last_hidden_buffer()
+            .expect("ensure_base_last_hidden_buffer");
+        bringup
+            .ensure_drafter_nvfp4(&drafter_dir, &kv)
+            .expect("ensure_drafter_nvfp4");
+
+        let t0 = std::time::Instant::now();
+        let stats = bringup
+            .run_spec_session_nvfp4_greedy_k(
+                /*prompt_ids=*/ &[2 /*BOS*/],
+                /*max_new=*/ 6,
+                /*spec_k=*/ 4,
+                &kv,
+            )
+            .expect("run_spec_session_nvfp4_greedy_k(K=4)");
+        let elapsed = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "[#6b-spec-session-k4] emitted={:?} n_iters={} n_accepted={} \
+             elapsed={:.2}s",
+            stats.emitted, stats.n_iters, stats.n_accepted, elapsed
+        );
+
+        assert_eq!(stats.emitted.len(), 6, "expected max_new=6 emitted tokens");
+        assert!(
+            stats.n_iters >= 1,
+            "expected at least one K=4 spec iteration"
+        );
+        assert!(
+            stats.n_accepted <= stats.n_iters * 4,
+            "n_accepted {} > n_iters * 4 {}",
+            stats.n_accepted,
+            stats.n_iters * 4
+        );
+        let vocab = bringup.arch.vocab_size as u32;
+        for (i, &t) in stats.emitted.iter().enumerate() {
+            assert!(t < vocab, "emitted[{i}]={t} out of vocab (vocab={vocab})");
         }
     }
 }

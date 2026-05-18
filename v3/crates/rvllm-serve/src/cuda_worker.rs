@@ -779,12 +779,10 @@ pub async fn spawn_cuda_worker(
                 // front so a bad config fails at ready_tx time
                 // rather than mid-request.
                 if spec_decode {
-                    if spec_cfg.k != 1 {
+                    if spec_cfg.k == 0 {
                         let _ = ready_tx.send(Err(format!(
-                            "RVLLM_GEMMA4_SPEC_K={} is not yet wired \
-                             on the Option B Gemma4-NVFP4 path. Only \
-                             K=1 (greedy, primitive #5) lands this \
-                             commit; batched K>1 verify is a follow-up.",
+                            "RVLLM_GEMMA4_SPEC_K={} is invalid on the \
+                             Option B Gemma4-NVFP4 path; K must be >= 1.",
                             spec_cfg.k)));
                         return;
                     }
@@ -840,8 +838,8 @@ pub async fn spawn_cuda_worker(
                 // top so subsequent per-request scratch_guard
                 // rewinds don't reclaim the drafter workspace
                 // mid-forward. Done once at worker startup so
-                // each request just calls
-                // `run_spec_session_nvfp4_greedy_k1` directly.
+                // each request can call the Option B spec session
+                // directly.
                 if spec_decode {
                     if let Err(e) = bringup.ensure_base_last_hidden_buffer() {
                         let _ = ready_tx.send(Err(format!(
@@ -868,6 +866,19 @@ pub async fn spawn_cuda_worker(
                     bringup.arch.num_hidden_layers,
                     spec_cfg.k,
                 );
+
+                let spec_zero_accept_trip_reqs = std::env::var(
+                    "G4N_SPEC_ZERO_ACCEPT_TRIP_REQUESTS")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(2);
+                let spec_zero_accept_skip_reqs = std::env::var(
+                    "G4N_SPEC_ZERO_ACCEPT_SKIP_REQUESTS")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(16);
+                let mut spec_zero_accept_req_streak = 0usize;
+                let mut spec_circuit_skip_remaining = 0usize;
 
                 while let Some(req) = req_rx.blocking_recv() {
                     let prompt_len = req.prompt_ids.len() as u32;
@@ -933,28 +944,35 @@ pub async fn spawn_cuda_worker(
                     let stop_set: std::collections::HashSet<u32> =
                         req.stop_token_ids.iter().copied().chain([106u32]).collect();
 
-                    // Spec-decode branch: drive the full
-                    // request through
-                    // `run_spec_session_nvfp4_greedy_k1`, then
-                    // post-process the emitted tokens for stop
-                    // tokens. Cancellation isn't honored inside
-                    // the session (single big call); coarse-
-                    // grained cancel check + finer-grained
-                    // cancellation inside the session is a
-                    // follow-up.
-                    if spec_decode {
-                        let stats = match bringup
-                            .run_spec_session_nvfp4_greedy_k1(
-                                &req.prompt_ids,
-                                max_new as usize, &kv,
-                            )
-                        {
+                    let spec_probe_this_request = spec_decode
+                        && spec_circuit_skip_remaining == 0;
+                    if spec_decode && spec_circuit_skip_remaining > 0 {
+                        spec_circuit_skip_remaining -= 1;
+                    }
+
+                    // Spec-decode branch: drive the full request
+                    // through the Option B greedy spec loop, then
+                    // post-process the emitted tokens for stop tokens.
+                    // Cancellation isn't honored inside the session
+                    // (single big call); coarse-grained cancel check +
+                    // finer-grained cancellation inside the session is
+                    // a follow-up.
+                    if spec_probe_this_request {
+                        let stats = match if spec_cfg.k == 1 {
+                            bringup.run_spec_session_nvfp4_greedy_k1(
+                                &req.prompt_ids, max_new as usize, &kv)
+                        } else {
+                            bringup.run_spec_session_nvfp4_greedy_k(
+                                &req.prompt_ids, max_new as usize,
+                                spec_cfg.k as usize, &kv)
+                        } {
                             Ok(s) => s,
                             Err(e) => {
                                 let _ = req.events_tx.send(GenerateEvent::Error(
                                     format!(
-                                        "run_spec_session_nvfp4_greedy_k1: \
-                                         {e:?}")));
+                                        "gemma4-nvfp4 spec session K={}: \
+                                         {e:?}",
+                                        spec_cfg.k)));
                                 continue;
                             }
                         };
@@ -981,6 +999,28 @@ pub async fn spawn_cuda_worker(
                                     / stats.n_iters as f32
                             } else { 0.0 },
                         );
+                        if stats.n_iters > 0 && stats.n_accepted == 0 {
+                            spec_zero_accept_req_streak += 1;
+                        } else {
+                            spec_zero_accept_req_streak = 0;
+                        }
+                        if spec_zero_accept_trip_reqs > 0
+                            && spec_zero_accept_skip_reqs > 0
+                            && spec_zero_accept_req_streak
+                                >= spec_zero_accept_trip_reqs
+                        {
+                            tracing::warn!(
+                                "gemma4-nvfp4 spec circuit open: \
+                                 {} consecutive zero-accept requests; \
+                                 routing next {} requests through \
+                                 non-spec decode",
+                                spec_zero_accept_req_streak,
+                                spec_zero_accept_skip_reqs,
+                            );
+                            spec_zero_accept_req_streak = 0;
+                            spec_circuit_skip_remaining =
+                                spec_zero_accept_skip_reqs;
+                        }
                         let _ = req.events_tx.send(GenerateEvent::Done {
                             finish, prompt_tokens: prompt_len,
                             completion_tokens,
@@ -2274,5 +2314,128 @@ mod tests {
         assert!(after.is_empty(), "kernels_dir was written to despite env override");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Operator-only accept-rate probe for the Option B Gemma4-NVFP4
+    /// spec path on a real text prompt. This lives in rvllm-serve so it
+    /// can reuse the production tokenizer instead of adding tokenizers
+    /// as a runtime-crate dependency.
+    #[test]
+    #[ignore]
+    fn ondisk_gemma4_nvfp4_spec_real_prompt_accept_probe() {
+        let _g = env_lock().lock().expect("env lock");
+        let model_dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset - skip");
+                return;
+            }
+        };
+        let drafter_dir = std::env::var("GEMMA4_DRAFTER_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(
+                "/home/r00t/gemma-4-31B-it-assistant"));
+        if !drafter_dir.is_dir() {
+            eprintln!("drafter dir {drafter_dir:?} missing - skip");
+            return;
+        }
+        let kernels_dir = PathBuf::from(
+            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+        let prompt = std::env::var("G4N_SPEC_ACCEPT_PROMPT")
+            .unwrap_or_else(|_| {
+                "Tell me a short story about a careful engineer who \
+                 measures before optimizing."
+                    .to_string()
+            });
+        let max_new = std::env::var("G4N_SPEC_ACCEPT_MAX_NEW")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(64);
+        let spec_k = std::env::var("G4N_SPEC_ACCEPT_K")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4);
+
+        let tokenizer = crate::tokenize::TokenizerHandle::load(&model_dir)
+            .expect("TokenizerHandle::load");
+        let prompt_ids = tokenizer.encode(&prompt).expect("tokenize prompt");
+        assert!(!prompt_ids.is_empty(), "tokenized prompt is empty");
+
+        let mut bringup =
+            rvllm_runtime::gemma4_nvfp4_bring_up::Gemma4Nvfp4Bringup::load(
+                &model_dir, 40 * 1024 * 1024 * 1024, &kernels_dir)
+                .expect("Gemma4Nvfp4Bringup::load");
+        let max_pos = ((prompt_ids.len() + max_new + spec_k + 8)
+            .next_power_of_two())
+            .max(128)
+            .min(4096) as u32;
+        let kv = bringup
+            .allocate_kv_state_with_chunk(max_pos, max_pos)
+            .expect("allocate_kv_state_with_chunk");
+        bringup
+            .ensure_base_last_hidden_buffer()
+            .expect("ensure_base_last_hidden_buffer");
+        bringup
+            .ensure_drafter_nvfp4(&drafter_dir, &kv)
+            .expect("ensure_drafter_nvfp4");
+
+        let plain_t0 = std::time::Instant::now();
+        let mut plain_emitted = Vec::with_capacity(max_new);
+        let mut last = bringup
+            .forward_prompt_to_token(&prompt_ids, 0, &kv)
+            .expect("plain forward_prompt_to_token");
+        plain_emitted.push(last);
+        for step in 1..max_new {
+            let position = prompt_ids.len() as u32 + (step as u32) - 1;
+            last = bringup
+                .forward_full_to_token(last, position, &kv)
+                .expect("plain forward_full_to_token");
+            plain_emitted.push(last);
+        }
+        let plain_elapsed = plain_t0.elapsed().as_secs_f64();
+
+        let old_bailout = std::env::var(
+            "G4N_SPEC_ZERO_ACCEPT_BAILOUT_ITERS").ok();
+        std::env::set_var("G4N_SPEC_ZERO_ACCEPT_BAILOUT_ITERS", "0");
+
+        let spec_t0 = std::time::Instant::now();
+        let spec_stats = bringup
+            .run_spec_session_nvfp4_greedy_k(
+                &prompt_ids, max_new, spec_k, &kv)
+            .expect("run_spec_session_nvfp4_greedy_k");
+        let spec_elapsed = spec_t0.elapsed().as_secs_f64();
+
+        match old_bailout {
+            Some(v) => std::env::set_var(
+                "G4N_SPEC_ZERO_ACCEPT_BAILOUT_ITERS", v),
+            None => std::env::remove_var(
+                "G4N_SPEC_ZERO_ACCEPT_BAILOUT_ITERS"),
+        }
+
+        eprintln!(
+            "[g4n-spec-real-prompt-bench] prompt_tokens={} max_new={} \
+             K={} plain_elapsed={:.2}s plain_tok_s={:.3} \
+             spec_elapsed={:.2}s spec_tok_s={:.3} speedup={:.3}x \
+             spec_emitted={} n_iters={} n_accepted={} \
+             accept_per_iter={:.3} prompt={:?}",
+            prompt_ids.len(),
+            max_new,
+            spec_k,
+            plain_elapsed,
+            max_new as f64 / plain_elapsed,
+            spec_elapsed,
+            max_new as f64 / spec_elapsed,
+            plain_elapsed / spec_elapsed,
+            spec_stats.emitted.len(),
+            spec_stats.n_iters,
+            spec_stats.n_accepted,
+            if spec_stats.n_iters > 0 {
+                spec_stats.n_accepted as f32 / spec_stats.n_iters as f32
+            } else { 0.0 },
+            prompt,
+        );
+        assert_eq!(plain_emitted.len(), max_new);
+        assert_eq!(spec_stats.emitted.len(), max_new);
+        assert!(spec_stats.n_accepted <= spec_stats.n_iters * spec_k);
     }
 }
