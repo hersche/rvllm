@@ -5694,6 +5694,26 @@ impl Gemma4Nvfp4Bringup {
                 position_start, n_tokens, kv.max_pos)));
         }
 
+        // Codex Round 4 (2026-05-18) fallback: per-token decode
+        // loop. The unified-NVFP4-prefill path is independently
+        // broken on Option B (different broken output than the
+        // single-token decode path). Opt in via env var to
+        // force the path that re-uses forward_full_to_token at
+        // each prompt position. Production has equivalent
+        // RVLLM_BATCH_PREFILL / RVLLM_UNIFIED_PREFILL gates
+        // (gemma4_bring_up.rs:1143, gemma4_layer_exec.rs:2036);
+        // Option B's path was unconditional until now.
+        if std::env::var("G4N_PROMPT_DECODE_FALLBACK")
+            .ok().as_deref() == Some("1")
+        {
+            let mut out = 0u32;
+            for (i, &tok) in prompt.iter().enumerate() {
+                out = self.forward_full_to_token(
+                    tok, position_start + i as u32, kv)?;
+            }
+            return Ok(out);
+        }
+
         // Stream-#5f-PRIME: device-resident batched-prefill
         // path. Residual lives as [N * hidden] bf16 on device
         // across all 60 layers; attention runs as ONE unified-
@@ -7044,10 +7064,13 @@ mod tests {
         let kv = bringup.allocate_kv_state(64)
             .expect("allocate_kv_state(64)");
 
+        let tok: u32 = std::env::var("G4N_TOKEN")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
         let t0 = std::time::Instant::now();
-        let token = bringup.forward_full_to_token(2 /*BOS*/, 0, &kv)
+        let token = bringup.forward_full_to_token(tok, 0, &kv)
             .expect("forward_full_to_token");
         let elapsed = t0.elapsed().as_secs_f64();
+        eprintln!("[#5c-smoke] G4N_TOKEN={tok}");
 
         let vocab = bringup.arch.vocab_size;
         let n_layers = bringup.arch.num_hidden_layers;
