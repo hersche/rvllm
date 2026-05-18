@@ -1037,6 +1037,83 @@ impl Gemma4Nvfp4Bringup {
         Ok(())
     }
 
+    /// Stream-6a (drafter forward primitive #2.5): bridge
+    /// between `q_side` and `attn_finisher`. Dispatches to the
+    /// drafter's existing `launch_cross_attn_sliding` /
+    /// `launch_cross_attn_global` (gemma4_drafter.rs:1227 /
+    /// :1387) — those wrap the production f16io decode
+    /// kernel against the drafter's f16 shadow KV. No new
+    /// kernels; just the per-layer dispatch from Option B's
+    /// state.
+    ///
+    /// Pre-conditions:
+    ///   1. `forward_drafter_layer_q_side` has populated
+    ///      `workspace.q` (RoPE'd Q).
+    ///   2. Caller has populated the drafter's shadow KV via
+    ///      `Gemma4DrafterRuntime::populate_shadow_kv*` so
+    ///      shadow_kv.{sliding,full}_{k,v}_ptr point at
+    ///      correct f16 K/V for the active spec session.
+    ///
+    /// Post-condition: `workspace.attn_out` holds the
+    /// cross-attention output for this layer. `attn_finisher`
+    /// then folds it through o_proj + post_attn norm +
+    /// residual_1.
+    ///
+    /// `block_tables_ptr` / `context_lens_ptr`: Option B
+    /// passes its own `kv.block_tables_ptr` /
+    /// `kv.context_lens_ptr` — same identity-table /
+    /// per-sequence length the BASE attention reads from, so
+    /// the drafter sees the exact committed context length
+    /// the base has written.
+    pub fn forward_drafter_layer_cross_attn(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        layer_idx: usize,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<()> {
+        let layer = drafter.layers.get(layer_idx).ok_or_else(||
+            corrupt_runtime_err(format!(
+                "forward_drafter_layer_cross_attn: layer_idx {} \
+                 out of range", layer_idx)))?;
+        let is_global = matches!(layer.layer_type,
+            rvllm_loader::gemma4_drafter::DrafterLayerType::Full);
+        // Gemma 4 QK-norm absorbs 1/sqrt(d_k); attention runs
+        // with scale = 1.0 (production confirms in
+        // gemma4_bring_up.rs:2939 / 3522 / 10615 / 11292).
+        let scale: f32 = 1.0;
+        let stream = self.stream.raw();
+        unsafe {
+            if is_global {
+                drafter.launch_cross_attn_global(
+                    workspace.attn_out,
+                    workspace.q,
+                    kv.block_tables_ptr,
+                    kv.context_lens_ptr,
+                    scale,
+                    stream,
+                )
+            } else {
+                // Sliding window from the BASE arch — drafter's
+                // sliding source layer mirrors the base's
+                // sliding_window_size. window_size_left =
+                // sliding_window - 1 per the existing decode
+                // kernels.
+                let window_size_left =
+                    (self.arch.sliding_window_size as i32) - 1;
+                drafter.launch_cross_attn_sliding(
+                    workspace.attn_out,
+                    workspace.q,
+                    kv.block_tables_ptr,
+                    kv.context_lens_ptr,
+                    scale,
+                    window_size_left,
+                    stream,
+                )
+            }
+        }
+    }
+
     /// Stream-6a (drafter forward primitive #3): attention
     /// finisher. Mirrors production's
     /// `run_drafter_layer_attn_finisher` (line 9271).
@@ -6618,5 +6695,47 @@ mod tests {
         assert!(max_abs < 1.0,
             "pre_projection on zero input has implausible \
              max_abs={max_abs}");
+
+        // Stream-6a primitives #2-3 chained: run layer 0 of
+        // the drafter (q_side → cross_attn → attn_finisher).
+        // Shadow KV is zero-initialised (we haven't called
+        // populate_shadow_kv*_from_base yet — that's the next
+        // step in the spec session loop), so the cross-attn
+        // sees an all-zero K/V and produces a deterministic
+        // (zero or near-zero) attn_out. The smoke just verifies
+        // the launch chain completes without panic / NaN / Inf.
+        let pos: u32 = 0;
+        bringup.forward_drafter_layer_q_side(rt, &workspace, 0, pos)
+            .expect("forward_drafter_layer_q_side");
+        bringup.forward_drafter_layer_cross_attn(rt, &workspace, 0, &kv)
+            .expect("forward_drafter_layer_cross_attn");
+        bringup.forward_drafter_layer_attn_finisher(rt, &workspace, 0)
+            .expect("forward_drafter_layer_attn_finisher");
+        bringup.forward_drafter_layer_mlp_finisher(rt, &workspace, 0)
+            .expect("forward_drafter_layer_mlp_finisher");
+        bringup.stream.fence().expect("stream fence");
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                hidden_f16.as_mut_ptr() as *mut _,
+                workspace.hidden, h_words * 2);
+            assert_eq!(rc, CUresult::CUDA_SUCCESS,
+                "drafter hidden DtoH (post-layer0)");
+        }
+        let mut nan = 0usize;
+        let mut inf = 0usize;
+        let mut max_abs: f32 = 0.0;
+        for &b in &hidden_f16 {
+            let v = half::f16::from_bits(b).to_f32();
+            if v.is_nan() { nan += 1; continue; }
+            if v.is_infinite() { inf += 1; continue; }
+            if v.abs() > max_abs { max_abs = v.abs(); }
+        }
+        eprintln!(
+            "[#6a-smoke] layer0 full chain (q_side + cross_attn + \
+             attn_fin + mlp_fin): nan={nan} inf={inf} max_abs={max_abs:.6}"
+        );
+        assert_eq!(nan, 0, "drafter layer0 produced NaN");
+        assert_eq!(inf, 0, "drafter layer0 produced Inf");
     }
 }
