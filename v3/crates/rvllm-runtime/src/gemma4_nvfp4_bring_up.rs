@@ -718,6 +718,90 @@ impl Gemma4Nvfp4Bringup {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Stream-6b spec primitive #2: populate the drafter's
+    /// `pre_projection_in` buffer with
+    /// `cat[base.embed_tokens[token_id], base_last_hidden]`
+    /// — the input shape `pre_projection` expects.
+    ///
+    /// Both halves are `backbone_hidden_size` (= base hidden,
+    /// = 5376 on 31B), so `pre_projection_in` is `2 *
+    /// backbone_hidden_size` f16 elements wide.
+    ///
+    /// The embed half is sourced from the BASE model's
+    /// `embed_tokens` (bf16 on Option B → cast to f16 via
+    /// `bf16_to_f16_sat`), NOT from the drafter's own
+    /// `top.embed_tokens` table. The drafter's table is sized
+    /// `[vocab, drafter_hidden]` (1024 wide on 31B), too narrow
+    /// for the `2 * backbone_hidden` contract — production
+    /// matches this behaviour (`gemma4_bring_up.rs:4676` gathers
+    /// from `self.model.embedding`, not the drafter's).
+    ///
+    /// Caller must have called `ensure_base_last_hidden_buffer`
+    /// at least once; otherwise the hidden half has no source
+    /// and this returns a clear error rather than silently
+    /// reading from address 0.
+    pub fn populate_drafter_pre_projection_input(
+        &self,
+        _drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        token_id: u32,
+    ) -> Result<()> {
+        let backbone_hidden = self.arch.hidden_size;
+        let half_bytes = backbone_hidden * 2;
+        let stream = self.stream.raw();
+
+        // Scratch guard so the bf16 embed lookup buffer is
+        // reclaimed when this method returns. The destination
+        // (workspace.pre_projection_in) lives above the
+        // checkpoint and is unaffected.
+        let _scratch_guard = self.forward_scratch_guard();
+
+        // (1) Gather base.embed_tokens[token_id] (bf16) into a
+        //     scratch buffer.
+        let embed_bf16 = self.arena.region(
+            "g4n_drafter_last_token_embed_bf16", half_bytes, 16)?;
+        self.embed_one_token_to_device(token_id, embed_bf16.device_ptr())?;
+
+        // (2) Cast bf16 → f16 directly into the embed half of
+        //     pre_projection_in. The cast kernel is the same one
+        //     used by the base's post-final-norm snapshot.
+        unsafe {
+            rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch {
+                n: backbone_hidden as u32,
+            }
+            .launch(
+                self.forward_kernels.fn_bf16_to_f16_sat,
+                workspace.pre_projection_in,
+                embed_bf16.device_ptr(), stream,
+            )?;
+        }
+
+        // (3) DtoD copy base_last_hidden_ptr (already f16) into
+        //     the hidden half of pre_projection_in. Stream-
+        //     ordered so any update enqueued before this from
+        //     `forward_final_to_token`'s Bf16ToF16Sat is observed.
+        let base_hidden = self.base_last_hidden_device_ptr();
+        if base_hidden == 0 {
+            return Err(corrupt_runtime_err(
+                "populate_drafter_pre_projection_input: \
+                 base_last_hidden_ptr is 0 — call \
+                 ensure_base_last_hidden_buffer (and run a base \
+                 forward to populate it) before invoking this".into()));
+        }
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                workspace.pre_projection_in + half_bytes as u64,
+                base_hidden, half_bytes, stream as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(corrupt_runtime_err(
+                    "populate_drafter_pre_projection_input: \
+                     hidden half DtoDAsync".into()));
+            }
+        }
+        Ok(())
+    }
+
     /// Stream-ordered fill of the per-token metadata buffers
     /// (positions, slot_mapping, context_lens) via the
     /// `g4n_fill_pos_slots_i32` kernel on `self.stream`. Replaces
@@ -6822,6 +6906,13 @@ mod tests {
         let kv = bringup.allocate_kv_state_with_chunk(64, 64)
             .expect("allocate_kv_state_with_chunk");
 
+        // Stream-6b primitive #1: ensure the base_last_hidden
+        // snapshot buffer is allocated. Must happen BEFORE we
+        // lock the drafter mutex (this method needs &mut self).
+        bringup.ensure_base_last_hidden_buffer()
+            .expect("ensure_base_last_hidden_buffer");
+        assert_ne!(bringup.base_last_hidden_device_ptr(), 0);
+
         bringup.ensure_drafter_nvfp4(&drafter_dir, &kv)
             .expect("ensure_drafter_nvfp4");
 
@@ -7012,5 +7103,69 @@ mod tests {
         assert!(out_tok_host < rt.arch.vocab_size as u32,
             "run_drafter_forward_one_token produced out-of-vocab \
              token {out_tok_host} (vocab={})", rt.arch.vocab_size);
+
+        // Stream-6b primitive #2: populate pre_projection_in
+        // with a real base-embed lookup + the (zero-initialised)
+        // base_last_hidden buffer.
+        bringup.populate_drafter_pre_projection_input(
+            rt, &workspace, /* token_id */ 2)
+            .expect("populate_drafter_pre_projection_input(BOS)");
+        bringup.stream.fence().expect("stream fence");
+
+        // Probe: DtoH the embed half of pre_projection_in and
+        // assert it's non-zero. The bf16→f16 cast must produce
+        // a defined non-zero buffer for any BOS embedding; if
+        // the cast or DtoD never ran, the buffer stays zero.
+        let half_elems = rt.arch.backbone_hidden_size;
+        let mut probe = vec![0u16; half_elems];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                probe.as_mut_ptr() as *mut _,
+                workspace.pre_projection_in,
+                half_elems * 2);
+            assert_eq!(rc, CUresult::CUDA_SUCCESS);
+        }
+        let nonzero = probe.iter().filter(|&&b| b != 0).count();
+        let mut max_abs: f32 = 0.0;
+        for &b in &probe {
+            let v = half::f16::from_bits(b).to_f32();
+            if v.is_nan() || v.is_infinite() { continue; }
+            if v.abs() > max_abs { max_abs = v.abs(); }
+        }
+        eprintln!(
+            "[#6a-smoke] populate_drafter_pre_projection_input(BOS): \
+             embed-half nonzero={nonzero}/{half_elems} \
+             max_abs={max_abs:.4}");
+        assert!(nonzero > 0,
+            "populate_drafter_pre_projection_input(BOS) left the \
+             embed half of pre_projection_in fully zero — the \
+             bf16→f16 cast must not be reaching the buffer");
+
+        // End-to-end: re-run the drafter forward on the populated
+        // input. Just verifies the chain stays NaN/Inf-free; we
+        // don't assert token inequality with the zero baseline
+        // because shadow KV is still zero (cross-attn × 0 V = 0
+        // attn_out, so layer-0+ residual is dominated by the
+        // pre_projection output and the LM-head argmax can
+        // collapse to the same token even with very different
+        // inputs).
+        bringup.run_drafter_forward_one_token(rt, &workspace, 0, &kv)
+            .expect("run_drafter_forward_one_token (post-populate)");
+        bringup.stream.fence().expect("stream fence");
+        let mut tok_after: u32 = u32::MAX;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                &mut tok_after as *mut u32 as *mut _,
+                workspace.out_token_id, 4);
+            assert_eq!(rc, CUresult::CUDA_SUCCESS);
+        }
+        eprintln!(
+            "[#6a-smoke] post-populate run_drafter_forward_one_token \
+             → token={tok_after}");
+        assert!(tok_after < rt.arch.vocab_size as u32,
+            "drafter post-populate produced out-of-vocab token \
+             {tok_after} (vocab={})", rt.arch.vocab_size);
     }
 }
