@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 
 use rvllm_core::Result;
 use rvllm_cutlass::cublaslt::CublasLt;
+use std::sync::Arc;
 use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
 use rvllm_loader::gemma4_arch::Gemma4Arch;
 use rvllm_loader::gemma4_nvfp4_weights::Gemma4Nvfp4LoadedModel;
@@ -374,6 +375,18 @@ pub struct Gemma4Nvfp4Bringup {
     /// (arena bump points past it) and silently shadow the caller's
     /// pointer to the prior state. We reject the second call instead.
     kv_state_allocated: bool,
+    /// Stream-6a (Option B-side spec-decode): kernel loader kept
+    /// around for lazy PTX module loads after construction. The
+    /// drafter PTX bundle (masked_embedder, flash_attention_decode
+    /// _f16io, flash_attention_decode_f16io_bc16, gemma4_drafter
+    /// _dequant) only loads when `ensure_drafter_nvfp4` is called.
+    pub kernels: Arc<KernelLoader>,
+    /// Stream-6a: lazy-uploaded drafter runtime (parallel to
+    /// production's `Gemma4Bringup::drafter`). Populated by
+    /// `ensure_drafter_nvfp4` on first spec request. Behind a
+    /// `Mutex<Option<_>>` so construction is at-most-once and
+    /// thread-safe under the cuda_worker's single thread.
+    pub drafter: std::sync::Mutex<Option<crate::gemma4_drafter::Gemma4DrafterRuntime>>,
     /// Held to keep the primary CUDA context alive.
     _ctx: CudaContextHandle,
 }
@@ -420,7 +433,7 @@ impl Gemma4Nvfp4Bringup {
         // Load forward-path kernels.
         let manifest_path = kernels_dir.join("manifest.json");
         let manifest = rvllm_kernels::KernelManifest::load_and_verify(&manifest_path)?;
-        let loader = KernelLoader::new(manifest);
+        let loader = Arc::new(KernelLoader::new(manifest));
 
         let embed_mod = loader.load_ptx("embedding_gather_bf16")?;
         let fn_embedding_gather_bf16 =
@@ -501,10 +514,10 @@ impl Gemma4Nvfp4Bringup {
         // batched-N attention path.
         let attn_backend_sliding = rvllm_attention::AttentionBackend::Fa2Ptx(
             rvllm_attention::Fa2PtxKernels::load(
-                &loader, arch.head_dim_sliding as u32)?);
+                &*loader, arch.head_dim_sliding as u32)?);
         let attn_backend_global = rvllm_attention::AttentionBackend::Fa2Ptx(
             rvllm_attention::Fa2PtxKernels::load(
-                &loader, arch.head_dim_global as u32)?);
+                &*loader, arch.head_dim_global as u32)?);
 
         // MLP kernels (commit #3).
         let mlp_gemv_mod = loader.load_ptx("mistral35_w4a16_gemv_bf16")?;
@@ -567,6 +580,8 @@ impl Gemma4Nvfp4Bringup {
             arena,
             forward_checkpoint,
             kv_state_allocated: false,
+            kernels: loader,
+            drafter: std::sync::Mutex::new(None),
             _ctx: ctx,
         })
     }
@@ -772,6 +787,178 @@ impl Gemma4Nvfp4Bringup {
         self.forward_checkpoint = self.arena.checkpoint();
         self.kv_state_allocated = true;
         Ok(kv)
+    }
+
+    /// Stream-6a part 2 (Option B-side spec-decode prereq).
+    /// Lazy-load the Gemma 4 assistant drafter against Option B's
+    /// arena + kernel manifest. Mirrors production's
+    /// `Gemma4Bringup::ensure_drafter` (gemma4_bring_up.rs:2324)
+    /// but stays self-contained — does NOT touch production
+    /// fields or call into any Gemma4Bringup method.
+    ///
+    /// Loads:
+    ///   1. Drafter weight layout from `drafter_dir` (HF
+    ///      `Gemma4ForAssistant` checkpoint, e.g.
+    ///      /home/r00t/gemma-4-31B-it-assistant).
+    ///   2. Drafter weights into the Option B arena via
+    ///      `Gemma4DrafterRuntime::load`.
+    ///   3. Four PTX modules + entry handles:
+    ///      - gemma4_masked_embedder (drafter argmax)
+    ///      - flash_attention (f16io decode for cross-attn)
+    ///      - flash_attention_decode_f16io_bc16 (head_dim=512)
+    ///      - gemma4_drafter_dequant (FP8 + NVFP4 → f16 shadow)
+    ///   4. F16 shadow KV regions sized to Option B's KV layout
+    ///      (block_size=kv.block_size=1, num_blocks_total =
+    ///      kv.max_pos). Codex Stream-6a noted that production's
+    ///      hardcoded `block_size=32` doesn't match Option B's
+    ///      block_size=1 — using kv.block_size keeps the shadow
+    ///      coherent with the actual base cache.
+    ///
+    /// The shadow regions live above `forward_checkpoint` so
+    /// scratch rewinds don't reclaim them.
+    ///
+    /// Call once before the first spec request; subsequent calls
+    /// are no-ops (the slot is `Some` after the first init).
+    /// `kv.assistant_shared_kv_sources()` MUST resolve — 31B
+    /// returns `(58, 59)`, but if a future variant lacks the
+    /// pair this errors clearly instead of panicking.
+    pub fn ensure_drafter_nvfp4(
+        &mut self,
+        drafter_dir: &std::path::Path,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<()> {
+        if self.drafter.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        let sources = self.arch.assistant_shared_kv_sources()
+            .ok_or_else(|| corrupt_runtime_err(
+                "ensure_drafter_nvfp4: base arch has no \
+                 assistant_shared_kv_sources — Gemma 4 assistant \
+                 cross-attends to (sliding, full) layer pair; 31B \
+                 returns (58, 59). Unsupported checkpoint.".into()))?;
+        let layout = rvllm_loader::gemma4_drafter::Gemma4DrafterWeightLayout
+            ::from_dir(drafter_dir)?;
+        if layout.arch.backbone_hidden_size != self.arch.hidden_size {
+            return Err(corrupt_runtime_err(format!(
+                "ensure_drafter_nvfp4: drafter backbone_hidden_size={} \
+                 != base hidden_size={}",
+                layout.arch.backbone_hidden_size, self.arch.hidden_size)));
+        }
+        if layout.arch.vocab_size != self.arch.vocab_size {
+            return Err(corrupt_runtime_err(format!(
+                "ensure_drafter_nvfp4: drafter vocab_size={} != base \
+                 vocab_size={}", layout.arch.vocab_size,
+                self.arch.vocab_size)));
+        }
+        if layout.arch.pre_projection_in_dim != 2 * self.arch.hidden_size {
+            return Err(corrupt_runtime_err(format!(
+                "ensure_drafter_nvfp4: drafter pre_projection_in_dim={} \
+                 != 2 * base hidden_size={}",
+                layout.arch.pre_projection_in_dim, self.arch.hidden_size)));
+        }
+
+        let mut rt = crate::gemma4_drafter::Gemma4DrafterRuntime
+            ::load(&layout, &self.arena)?;
+
+        // Attach the 4 PTX bundles. Same kernel symbol set as
+        // production's ensure_drafter.
+        let me_mod = self.kernels.load_ptx("gemma4_masked_embedder")?;
+        let me_fn = me_mod.get_function(
+            "gemma4_masked_embedder_argmax_f16_kernel")?;
+        rt.attach_masked_embedder_kernel(me_mod, me_fn);
+
+        let fa_mod = self.kernels.load_ptx("flash_attention")?;
+        let fa_fn = fa_mod.get_function(
+            "flash_attention_2_decode_f16io_kernel")?;
+        rt.attach_flash_attention_kernel(fa_mod, fa_fn);
+
+        let fa_bc16_mod = self.kernels.load_ptx(
+            "flash_attention_decode_f16io_bc16")?;
+        let fa_bc16_fn = fa_bc16_mod.get_function(
+            "flash_attention_2_decode_f16io_kernel")?;
+        rt.attach_flash_attention_bc16_kernel(fa_bc16_mod, fa_bc16_fn);
+
+        let dq_mod = self.kernels.load_ptx("gemma4_drafter_dequant")?;
+        let dq_fp8 = dq_mod.get_function(
+            "gemma4_drafter_dequant_fp8_to_f16_kernel")?;
+        let dq_nvfp4 = dq_mod.get_function(
+            "gemma4_drafter_dequant_nvfp4_to_f16_kernel")?;
+        rt.attach_drafter_dequant_kernels(dq_mod, dq_fp8, dq_nvfp4);
+
+        // Allocate f16 shadow KV. Codex Stream-6a fix:
+        // block_size = kv.block_size (= 1 on Option B), NOT the
+        // hardcoded 32 production uses. num_blocks_total =
+        // kv.max_pos.
+        let sliding_li = sources.0;
+        let full_li = sources.1;
+        let block_size = kv.block_size;
+        let num_blocks_total = kv.max_pos;
+        let sliding_nkvh =
+            self.arch.num_kv_heads_for_layer(sliding_li) as u32;
+        let sliding_hd =
+            self.arch.head_dim_for_layer(sliding_li) as u32;
+        let full_nkvh =
+            self.arch.num_kv_heads_for_layer(full_li) as u32;
+        let full_hd =
+            self.arch.head_dim_for_layer(full_li) as u32;
+        let sliding_layer_bytes = (num_blocks_total as usize)
+            * (block_size as usize) * (sliding_nkvh as usize)
+            * (sliding_hd as usize) * 2;
+        let full_layer_bytes = (num_blocks_total as usize)
+            * (block_size as usize) * (full_nkvh as usize)
+            * (full_hd as usize) * 2;
+
+        let alloc_zeroed = |name: &'static str, bytes: usize|
+            -> Result<u64> {
+            let region = self.arena.region(name, bytes.max(16), 256)?;
+            unsafe {
+                use cudarc::driver::sys::*;
+                let rc = cuMemsetD8_v2(region.device_ptr(), 0, bytes);
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "drafter shadow KV zero-init",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup()));
+                }
+            }
+            Ok(region.device_ptr())
+        };
+        let sliding_k_ptr = alloc_zeroed(
+            "g4n_drafter_shadow_k_sliding", sliding_layer_bytes)?;
+        let sliding_v_ptr = alloc_zeroed(
+            "g4n_drafter_shadow_v_sliding", sliding_layer_bytes)?;
+        let full_k_ptr = alloc_zeroed(
+            "g4n_drafter_shadow_k_full", full_layer_bytes)?;
+        let full_v_ptr = alloc_zeroed(
+            "g4n_drafter_shadow_v_full", full_layer_bytes)?;
+
+        rt.attach_shadow_kv(crate::gemma4_drafter::DrafterShadowKv {
+            sliding_k_ptr, sliding_v_ptr, full_k_ptr, full_v_ptr,
+            sliding_layer_bytes, full_layer_bytes,
+            block_size, num_blocks_total,
+            max_blocks_per_seq: num_blocks_total,
+            sliding_num_kv_heads: sliding_nkvh,
+            sliding_head_dim: sliding_hd,
+            full_num_kv_heads: full_nkvh,
+            full_head_dim: full_hd,
+        });
+
+        // Re-anchor scratch checkpoint so the shadow KV survives
+        // forward scratch rewinds.
+        self.forward_checkpoint = self.arena.checkpoint();
+        *self.drafter.lock().unwrap() = Some(rt);
+
+        eprintln!(
+            "[g4n-drafter] ready: drafter layout {}-layer hidden={} \
+             vocab={}, shadow KV (sliding={} MiB, full={} MiB, \
+             block_size={}, num_blocks={}) on Option B arena",
+            layout.arch.num_hidden_layers,
+            layout.arch.hidden_size, layout.arch.vocab_size,
+            sliding_layer_bytes / (1024 * 1024),
+            full_layer_bytes / (1024 * 1024),
+            block_size, num_blocks_total,
+        );
+        Ok(())
     }
 
     /// Codex Stream-6a: build a `DrafterBaseKvView` over
@@ -5677,5 +5864,88 @@ mod tests {
         );
         assert!((next as usize) < bringup.arch.vocab_size,
             "out-of-range prompt argmax {next}");
+    }
+
+    /// Stream-6a smoke: `ensure_drafter_nvfp4` loads the
+    /// Gemma 4 assistant drafter against Option B's arena +
+    /// kernel manifest, attaches all 4 PTX bundles
+    /// (masked_embedder, flash_attention f16io, BC16, NVFP4
+    /// dequant), and allocates F16 shadow KV at the source
+    /// pair `(58, 59)` on 31B.
+    ///
+    /// Run:
+    ///   GEMMA4_NVFP4_DIR=/home/r00t/Gemma-4-31B-IT-NVFP4 \
+    ///   GEMMA4_DRAFTER_DIR=/home/r00t/gemma-4-31B-it-assistant \
+    ///     cargo test --release -p rvllm-runtime \
+    ///       --features cuda,gb10 \
+    ///       gemma4_nvfp4_bring_up::tests::ondisk_bringup_drafter_load \
+    ///       -- --ignored --nocapture
+    ///
+    /// Does NOT run a spec step yet — that's the next commit
+    /// (drafter forward helpers + spec session loop). This
+    /// smoke just verifies the load surface is wired and
+    /// idempotent.
+    #[test]
+    #[ignore]
+    fn ondisk_bringup_drafter_load() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skipping #6a smoke");
+                return;
+            }
+        };
+        let drafter_dir = match std::env::var("GEMMA4_DRAFTER_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => PathBuf::from("/home/r00t/gemma-4-31B-it-assistant"),
+        };
+        if !drafter_dir.is_dir() {
+            eprintln!("drafter dir {drafter_dir:?} missing — skip");
+            return;
+        }
+        let kernels_dir = std::path::PathBuf::from(
+            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121",
+        );
+        let mut bringup = Gemma4Nvfp4Bringup::load(
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
+        ).expect("Gemma4Nvfp4Bringup::load");
+        let kv = bringup.allocate_kv_state_with_chunk(64, 64)
+            .expect("allocate_kv_state_with_chunk");
+
+        bringup.ensure_drafter_nvfp4(&drafter_dir, &kv)
+            .expect("ensure_drafter_nvfp4");
+
+        // Idempotency: second call is a no-op.
+        bringup.ensure_drafter_nvfp4(&drafter_dir, &kv)
+            .expect("ensure_drafter_nvfp4 idempotent");
+
+        // Verify the drafter slot is populated with all
+        // attached handles.
+        let guard = bringup.drafter.lock().unwrap();
+        let rt = guard.as_ref().expect("drafter slot populated");
+        assert!(rt.fn_masked_embedder_argmax_f16.is_some(),
+            "masked_embedder kernel handle missing");
+        assert!(rt.fn_flash_attention_2_decode_f16io.is_some(),
+            "flash_attention f16io kernel handle missing");
+        assert!(rt.fn_flash_attention_2_decode_f16io_bc16.is_some(),
+            "flash_attention bc16 kernel handle missing");
+        assert!(rt.fn_drafter_dequant_fp8_to_f16.is_some(),
+            "dequant FP8 kernel handle missing");
+        assert!(rt.fn_drafter_dequant_nvfp4_to_f16.is_some(),
+            "dequant NVFP4 kernel handle missing");
+        let shadow = rt.shadow_kv.as_ref()
+            .expect("shadow KV not allocated");
+        assert!(shadow.sliding_layer_bytes > 0);
+        assert!(shadow.full_layer_bytes > 0);
+        assert_eq!(shadow.block_size, kv.block_size,
+            "shadow block_size must match Option B's kv.block_size");
+        assert_eq!(shadow.num_blocks_total, kv.max_pos);
+        eprintln!(
+            "[#6a-smoke] drafter loaded: {} bytes resident, \
+             shadow sliding={}MiB full={}MiB ✓",
+            rt.bytes_resident,
+            shadow.sliding_layer_bytes / (1024 * 1024),
+            shadow.full_layer_bytes / (1024 * 1024),
+        );
     }
 }
