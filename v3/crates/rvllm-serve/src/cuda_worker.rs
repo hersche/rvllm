@@ -773,21 +773,32 @@ pub async fn spawn_cuda_worker(
             // stream that lifts it.
             if matches!(family, ModelFamily::Gemma4Nvfp4) {
                 use rvllm_runtime::gemma4_nvfp4_bring_up::Gemma4Nvfp4Bringup;
+                // Spec-decode gate: when on, the drafter dir
+                // must exist and the family-specific resolver
+                // must yield a source-layer pair. Validate up
+                // front so a bad config fails at ready_tx time
+                // rather than mid-request.
                 if spec_decode {
-                    let _ = ready_tx.send(Err(
-                        "RVLLM_GEMMA4_SPEC_DECODE=1 is not yet supported on \
-                         the Option B Gemma4-NVFP4 path. Spec-decode wiring \
-                         (BaseKvSource trait + drafter cross-attn over the \
-                         NVFP4 KV layout) is codex Stream-6a; see \
-                         rvllm-serve/CLAUDE.md for the staging. Unset the \
-                         env to start text-only.".to_string(),
-                    ));
-                    return;
+                    if spec_cfg.k != 1 {
+                        let _ = ready_tx.send(Err(format!(
+                            "RVLLM_GEMMA4_SPEC_K={} is not yet wired \
+                             on the Option B Gemma4-NVFP4 path. Only \
+                             K=1 (greedy, primitive #5) lands this \
+                             commit; batched K>1 verify is a follow-up.",
+                            spec_cfg.k)));
+                        return;
+                    }
+                    if !spec_drafter_dir.is_dir() {
+                        let _ = ready_tx.send(Err(format!(
+                            "RVLLM_GEMMA4_SPEC_DECODE=1 but \
+                             RVLLM_GEMMA4_DRAFTER_DIR={:?} is not a \
+                             directory. Point it at the assistant \
+                             checkpoint (e.g. \
+                             /home/r00t/gemma-4-31B-it-assistant).",
+                             spec_drafter_dir)));
+                        return;
+                    }
                 }
-                // Tracking — keep these fields alive even when
-                // unused on this branch; spec wiring lands in
-                // codex Stream-6a.
-                let _: &PathBuf = &spec_drafter_dir;
                 let _: &WorkerSpecDecode = &spec_cfg;
                 // Conservative max_pos cap for KV cache. The
                 // checkpoint advertises max_position_embeddings =
@@ -822,14 +833,40 @@ pub async fn spawn_cuda_worker(
                         return;
                     }
                 };
+
+                // Spec-decode init (#6b-session): allocate the
+                // persistent base_last_hidden snapshot buffer,
+                // load the drafter checkpoint, and pin the arena
+                // top so subsequent per-request scratch_guard
+                // rewinds don't reclaim the drafter workspace
+                // mid-forward. Done once at worker startup so
+                // each request just calls
+                // `run_spec_session_nvfp4_greedy_k1` directly.
+                if spec_decode {
+                    if let Err(e) = bringup.ensure_base_last_hidden_buffer() {
+                        let _ = ready_tx.send(Err(format!(
+                            "ensure_base_last_hidden_buffer: {e:?}")));
+                        return;
+                    }
+                    if let Err(e) = bringup.ensure_drafter_nvfp4(
+                        &spec_drafter_dir, &kv,
+                    ) {
+                        let _ = ready_tx.send(Err(format!(
+                            "ensure_drafter_nvfp4({:?}): {e:?}",
+                            spec_drafter_dir)));
+                        return;
+                    }
+                }
+
                 let _ = ready_tx.send(Ok(()));
                 tracing::info!(
                     "gemma4-nvfp4 worker ready (Option B native; \
                      max_pos={G4N_KV_MAX_POS}, vocab={}, hidden={}, \
-                     layers={}). Greedy/text-only this commit.",
+                     layers={}, spec_decode={spec_decode}, spec_k={}).",
                     bringup.arch.vocab_size,
                     bringup.arch.hidden_size,
                     bringup.arch.num_hidden_layers,
+                    spec_cfg.k,
                 );
 
                 while let Some(req) = req_rx.blocking_recv() {
@@ -896,8 +933,64 @@ pub async fn spawn_cuda_worker(
                     let stop_set: std::collections::HashSet<u32> =
                         req.stop_token_ids.iter().copied().chain([106u32]).collect();
 
-                    // Prefill all prompt tokens at position 0. The
-                    // first generation token is what
+                    // Spec-decode branch: drive the full
+                    // request through
+                    // `run_spec_session_nvfp4_greedy_k1`, then
+                    // post-process the emitted tokens for stop
+                    // tokens. Cancellation isn't honored inside
+                    // the session (single big call); coarse-
+                    // grained cancel check + finer-grained
+                    // cancellation inside the session is a
+                    // follow-up.
+                    if spec_decode {
+                        let stats = match bringup
+                            .run_spec_session_nvfp4_greedy_k1(
+                                &req.prompt_ids,
+                                max_new as usize, &kv,
+                            )
+                        {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ = req.events_tx.send(GenerateEvent::Error(
+                                    format!(
+                                        "run_spec_session_nvfp4_greedy_k1: \
+                                         {e:?}")));
+                                continue;
+                            }
+                        };
+                        let mut completion_tokens: u32 = 0;
+                        let mut finish = FinishReason::Length;
+                        for (i, &t) in stats.emitted.iter().enumerate() {
+                            let _ = req.events_tx.send(GenerateEvent::Token {
+                                id: t, position: i as u32,
+                            });
+                            completion_tokens += 1;
+                            if stop_set.contains(&t) {
+                                finish = FinishReason::Stop;
+                                break;
+                            }
+                        }
+                        tracing::debug!(
+                            "gemma4-nvfp4 spec-session: prompt={} \
+                             emitted={} iters={} accepted={} \
+                             accept_rate={:.3}",
+                            prompt_len, stats.emitted.len(),
+                            stats.n_iters, stats.n_accepted,
+                            if stats.n_iters > 0 {
+                                stats.n_accepted as f32
+                                    / stats.n_iters as f32
+                            } else { 0.0 },
+                        );
+                        let _ = req.events_tx.send(GenerateEvent::Done {
+                            finish, prompt_tokens: prompt_len,
+                            completion_tokens,
+                        });
+                        continue;
+                    }
+
+                    // Non-spec branch (existing): prefill all
+                    // prompt tokens at position 0. The first
+                    // generation token is what
                     // forward_prompt_to_token returns (argmax of
                     // the last prompt token's final residual).
                     let next_first = match bringup.forward_prompt_to_token(
