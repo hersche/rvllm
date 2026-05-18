@@ -297,6 +297,15 @@ struct ForwardKernels {
     /// shared warp reduction.
     _vnorm_bf16_mod: LoadedModule,
     fn_vnorm_bf16: KernelFn,
+    /// `g4n_scaled_add_bf16_kernel` — fused
+    /// `dst[i] += alpha[0] * src[i]` for bf16 vectors with a
+    /// bf16 scalar `alpha` already on device. Replaces the
+    /// post-MLP host scale loop (DtoH mlp_normed + DtoH
+    /// layer_scalar + host scale + HtoD scaled + vector_add)
+    /// that was the last per-layer fence on the Option B
+    /// device-resident chain.
+    _scaled_add_bf16_mod: LoadedModule,
+    fn_scaled_add_bf16: KernelFn,
 }
 
 /// Restores the arena to the post-load high-water mark when a forward
@@ -443,6 +452,9 @@ impl Gemma4Nvfp4Bringup {
         let vnorm_bf16_mod = loader.load_ptx("vnorm_bf16")?;
         let fn_vnorm_bf16 =
             vnorm_bf16_mod.get_function("vnorm_bf16_kernel")?;
+        let scaled_add_bf16_mod = loader.load_ptx("g4n_scaled_add_bf16")?;
+        let fn_scaled_add_bf16 =
+            scaled_add_bf16_mod.get_function("g4n_scaled_add_bf16_kernel")?;
 
         // MLP kernels (commit #3).
         let mlp_gemv_mod = loader.load_ptx("mistral35_w4a16_gemv_bf16")?;
@@ -483,6 +495,8 @@ impl Gemma4Nvfp4Bringup {
             fn_f32_to_bf16,
             _vnorm_bf16_mod: vnorm_bf16_mod,
             fn_vnorm_bf16,
+            _scaled_add_bf16_mod: scaled_add_bf16_mod,
+            fn_scaled_add_bf16,
         };
         let forward_checkpoint = arena.checkpoint();
 
@@ -616,6 +630,36 @@ impl Gemma4Nvfp4Bringup {
                 self.forward_kernels.fn_vnorm_bf16,
                 (num_kv_heads, 1, 1),
                 (block_x, 1, 1),
+                0, self.stream.raw(), &args,
+            )
+        }
+    }
+
+    /// Stream-ordered fused `dst[i] += alpha[0] * src[i]` for
+    /// bf16 vectors with bf16 alpha on device. Replaces the
+    /// post-MLP host scale loop (the last per-layer fence on
+    /// the Option B device-resident chain).
+    fn launch_scaled_add_bf16(
+        &self, dst: u64, src: u64, alpha_dev: u64, n: u32,
+    ) -> Result<()> {
+        if n == 0 { return Ok(()); }
+        let mut d = dst;
+        let mut s = src;
+        let mut a = alpha_dev;
+        let mut n_i: i32 = n as i32;
+        let args: [*mut core::ffi::c_void; 4] = [
+            (&mut d) as *mut u64 as *mut _,
+            (&mut s) as *mut u64 as *mut _,
+            (&mut a) as *mut u64 as *mut _,
+            (&mut n_i) as *mut i32 as *mut _,
+        ];
+        const BLOCK: u32 = 256;
+        let grid_x = (n + BLOCK - 1) / BLOCK;
+        unsafe {
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_scaled_add_bf16,
+                (grid_x, 1, 1),
+                (BLOCK, 1, 1),
                 0, self.stream.raw(), &args,
             )
         }
@@ -3329,48 +3373,17 @@ impl Gemma4Nvfp4Bringup {
                 stream_u64)?;
         }
 
-        // Layer_scalar host scale — the last per-layer fence
-        // before Stream 5b's bf16 scaled_add kernel removes it.
-        let mut mlp_normed_bf16 = vec![0u16; hidden as usize];
-        let mut scalar_bf16 = [0u16; 1];
-        unsafe {
-            use cudarc::driver::sys::*;
-            let rc = cuMemcpyDtoH_v2(
-                mlp_normed_bf16.as_mut_ptr() as *mut _,
-                mlp_out_region.device_ptr(),
-                (hidden as usize) * 2);
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(RvllmError::cuda(
-                    "forward_layer_post_attn_mlp_dev: mlp_normed DtoH",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
-            }
-            let rc = cuMemcpyDtoH_v2(
-                scalar_bf16.as_mut_ptr() as *mut _,
-                layer.layer_scalar.offset_bytes, 2);
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(RvllmError::cuda(
-                    "forward_layer_post_attn_mlp_dev: layer_scalar DtoH",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
-            }
-        }
-        let layer_scalar_f32 = f32::from_bits((scalar_bf16[0] as u32) << 16);
-        let scaled_bf16: Vec<u16> = mlp_normed_bf16.iter().map(|&b| {
-            let v = f32::from_bits((b as u32) << 16) * layer_scalar_f32;
-            let bits = v.to_bits();
-            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-            (rounded >> 16) as u16
-        }).collect();
-        unsafe {
-            let s: &[u8] = std::slice::from_raw_parts(
-                scaled_bf16.as_ptr() as *const u8, scaled_bf16.len() * 2);
-            mlp_out_region.copy_from_host(s)?;
-            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }
-                .launch(
-                    self.forward_kernels.fn_vector_add_bf16,
-                    residual_dev,
-                    mlp_out_region.device_ptr(),
-                    stream_u64)?;
-        }
+        // Stream 5b: fused `residual_dev += layer_scalar *
+        // mlp_out` on device. Replaces the prior fence + 2×
+        // DtoH + host scale + HtoD + vector_add chain with one
+        // kernel launch on the existing stream.
+        self.launch_scaled_add_bf16(
+            residual_dev,
+            mlp_out_region.device_ptr(),
+            layer.layer_scalar.offset_bytes,
+            hidden,
+        )?;
+        let _ = stream_u64;
         Ok(())
     }
 

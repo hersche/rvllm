@@ -346,6 +346,11 @@
       "path": "g4n_fill_pos_slots_i32.ptx",
       "sha256": "86d73a2a3f261d11e7962b4e2076aa36c8e2f4089b94ef89f8c2cfd053a70ecd"
     },
+    "g4n_scaled_add_bf16": {
+      "bytes": 1672,
+      "path": "g4n_scaled_add_bf16.ptx",
+      "sha256": "c54624b1e7728a4265d574d9f5e852d3cbf705b04b3bcf68d6a07674cd46e6be"
+    },
     "gated_delta_rule_decode_f16": {
       "bytes": 16857,
       "path": "gated_delta_rule_decode_f16.ptx",
@@ -967,5 +972,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "bc89650"
+  "revision": "3ba31ab"
 }
