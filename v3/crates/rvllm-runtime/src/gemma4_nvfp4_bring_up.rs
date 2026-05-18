@@ -718,6 +718,56 @@ impl Gemma4Nvfp4Bringup {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Pin everything currently in the arena (= keep it
+    /// persistent across scratch-guard rewinds). Used by spec
+    /// callers after `alloc_step_workspace`: the drafter
+    /// workspace lives above the previous `forward_checkpoint`,
+    /// so without bumping the checkpoint the next
+    /// `forward_scratch_guard` (inside `verify_base_one_token`
+    /// or any base forward) would rewind into workspace
+    /// territory and the next drafter `mlp_finisher`'s
+    /// `arena.region` would overlap with `workspace.hidden`
+    /// mid-step. After this, subsequent scratch_guard rewinds
+    /// stop at this point.
+    pub fn pin_current_arena_top(&mut self) {
+        self.forward_checkpoint = self.arena.checkpoint();
+    }
+
+    /// Stream-6b spec primitive #3: base verify of one token at
+    /// `position`. Runs the full 60-layer base forward, writes
+    /// the layer K/V into `kv` at `position`, snapshots the
+    /// post-final-norm hidden into `base_last_hidden_ptr` (via
+    /// the hook in `forward_final_to_token`), and returns the
+    /// base's argmax token for that position.
+    ///
+    /// Spec-decode contract: this is the "verify" half of one
+    /// speculation round. Given the drafter speculated `t_draft`
+    /// for position `position+1`, the caller invokes this with
+    /// `token_id = t_committed` (the previous accepted token)
+    /// to get the base's prediction `t_base_argmax`. If
+    /// `t_draft == t_base_argmax` the speculation is accepted.
+    ///
+    /// `base_last_hidden_ptr` MUST be pre-allocated via
+    /// `ensure_base_last_hidden_buffer` — otherwise the snapshot
+    /// hook silently skips and the next drafter step reads stale
+    /// hidden. We fail fast here rather than producing garbage
+    /// drafter speculations downstream.
+    pub fn verify_base_one_token(
+        &self,
+        token_id: u32,
+        position: u32,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<u32> {
+        if self.base_last_hidden_device_ptr() == 0 {
+            return Err(corrupt_runtime_err(
+                "verify_base_one_token: base_last_hidden_ptr is 0 — \
+                 call ensure_base_last_hidden_buffer before invoking \
+                 this so the post-final-norm snapshot is captured \
+                 for the next drafter step".into()));
+        }
+        self.forward_full_to_token(token_id, position, kv)
+    }
+
     /// Stream-6b spec primitive #2: populate the drafter's
     /// `pre_projection_in` buffer with
     /// `cat[base.embed_tokens[token_id], base_last_hidden]`
@@ -750,11 +800,15 @@ impl Gemma4Nvfp4Bringup {
         let half_bytes = backbone_hidden * 2;
         let stream = self.stream.raw();
 
-        // Scratch guard so the bf16 embed lookup buffer is
-        // reclaimed when this method returns. The destination
-        // (workspace.pre_projection_in) lives above the
-        // checkpoint and is unaffected.
-        let _scratch_guard = self.forward_scratch_guard();
+        // LOCAL checkpoint/restore (NOT forward_scratch_guard)
+        // — the drafter workspace buffers live ABOVE
+        // `forward_checkpoint`, so restoring to that value
+        // would invalidate them and the next drafter
+        // mlp_finisher's arena.region would overlap with the
+        // workspace addresses, corrupting `workspace.hidden`
+        // mid-forward. Capture the current bump pointer instead
+        // so we only undo our own scratch alloc.
+        let local_cp = self.arena.checkpoint();
 
         // (1) Gather base.embed_tokens[token_id] (bf16) into a
         //     scratch buffer.
@@ -799,6 +853,14 @@ impl Gemma4Nvfp4Bringup {
                      hidden half DtoDAsync".into()));
             }
         }
+        // Drop the scratch region BEFORE rewinding the bump
+        // pointer (Region's Drop runs the actual cuMemFree-style
+        // bookkeeping for the named allocation). The kernel
+        // launches above are stream-ordered: by the time
+        // anything else queues work that allocates over this
+        // address, the GPU has consumed the source bytes.
+        drop(embed_bf16);
+        unsafe { self.arena.restore(local_cp); }
         Ok(())
     }
 
@@ -6954,6 +7016,18 @@ mod tests {
             "[#6a-smoke] drafter workspace allocated ({} bytes)",
             workspace.bytes,
         );
+        // Pin the arena top so subsequent scratch_guard rewinds
+        // (inside verify_base_one_token, populate_drafter_pre
+        // _projection_input, etc.) don't reclaim workspace
+        // memory. Requires &mut bringup → drop guard, pin,
+        // re-lock. `workspace` and `rt` references survive: rt
+        // is a &Gemma4DrafterRuntime which the second lock will
+        // hand back unchanged, and workspace stores u64 device
+        // pointers, not borrowed handles.
+        drop(guard);
+        bringup.pin_current_arena_top();
+        let guard = bringup.drafter.lock().unwrap();
+        let rt = guard.as_ref().expect("drafter slot populated");
         // Stream-6a primitive #1: zero the pre_projection_in
         // buffer (so f16_gemm sees a defined zero input — real
         // step would populate this with [last_token_embed;
@@ -7167,5 +7241,87 @@ mod tests {
         assert!(tok_after < rt.arch.vocab_size as u32,
             "drafter post-populate produced out-of-vocab token \
              {tok_after} (vocab={})", rt.arch.vocab_size);
+
+        // Drop the drafter guard so we can call verify_base_one
+        // _token (it doesn't need the guard, and we don't need
+        // any drafter primitive again until after).
+        drop(guard);
+
+        // Stream-6b primitive #3 end-to-end: run a real base
+        // verify at position 0, populate the drafter's shadow KV
+        // from the resulting NVFP4 K/V, then redo the drafter
+        // forward. This is the first smoke step where the
+        // drafter cross-attention reads NON-zero K/V, so its
+        // output lifts off the zero-cross-attn fixed point that
+        // collapsed the earlier checks to token=0.
+        let base_argmax = bringup.verify_base_one_token(
+            /* token_id */ 2 /*BOS*/, 0, &kv)
+            .expect("verify_base_one_token(BOS, pos=0)");
+        eprintln!(
+            "[#6a-smoke] verify_base_one_token(BOS, pos=0) → token={base_argmax}");
+        assert!((base_argmax as usize) < bringup.arch.vocab_size);
+
+        // Re-lock the drafter guard for the remaining drafter
+        // primitives.
+        let guard = bringup.drafter.lock().unwrap();
+        let rt = guard.as_ref().expect("drafter slot populated");
+
+        // Populate shadow KV from the real base K/V at slot 0.
+        bringup.populate_drafter_shadow_kv_with_rt(rt, &kv, 0, 1)
+            .expect("populate_drafter_shadow_kv_with_rt(real, 0, 1)");
+        // Re-populate pre_projection_in: embed half from the base
+        // argmax token, hidden half automatically picks up
+        // base_last_hidden updated by verify_base_one_token.
+        bringup.populate_drafter_pre_projection_input(
+            rt, &workspace, base_argmax)
+            .expect("populate_drafter_pre_projection_input(base_argmax)");
+        bringup.run_drafter_forward_one_token(rt, &workspace, 1, &kv)
+            .expect("run_drafter_forward_one_token (real KV + real embed)");
+        bringup.stream.fence().expect("stream fence");
+        let mut tok_real: u32 = u32::MAX;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                &mut tok_real as *mut u32 as *mut _,
+                workspace.out_token_id, 4);
+            assert_eq!(rc, CUresult::CUDA_SUCCESS);
+        }
+        // Also probe the drafter hidden so we can see whether the
+        // residual is non-zero (real cross-attn × real V should
+        // give non-zero output).
+        let drafter_hidden_elems = rt.arch.hidden_size;
+        let mut hidden_real = vec![0u16; drafter_hidden_elems];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                hidden_real.as_mut_ptr() as *mut _,
+                workspace.hidden, drafter_hidden_elems * 2);
+            assert_eq!(rc, CUresult::CUDA_SUCCESS);
+        }
+        let mut real_nonzero = 0usize;
+        let mut real_max_abs: f32 = 0.0;
+        for &b in &hidden_real {
+            let v = half::f16::from_bits(b).to_f32();
+            if v.is_nan() || v.is_infinite() { continue; }
+            if v != 0.0 { real_nonzero += 1; }
+            if v.abs() > real_max_abs { real_max_abs = v.abs(); }
+        }
+        eprintln!(
+            "[#6a-smoke] real-KV drafter step → token={tok_real} \
+             hidden nonzero={real_nonzero}/{drafter_hidden_elems} \
+             max_abs={real_max_abs:.4}");
+        assert!(tok_real < rt.arch.vocab_size as u32,
+            "real-KV drafter produced out-of-vocab token \
+             {tok_real} (vocab={})", rt.arch.vocab_size);
+        // With real shadow KV the drafter hidden should NOT be
+        // identically zero — pre_projection produces non-zero
+        // hidden + cross-attn now contributes real attn_out, so
+        // the residual stream carries information through to the
+        // LM head.
+        assert!(real_nonzero > 0,
+            "real-KV drafter step produced an all-zero hidden — \
+             either the shadow KV population didn't reach the \
+             cross-attn read, or pre_projection_in's hidden half \
+             didn't get the snapshot from verify_base_one_token");
     }
 }
