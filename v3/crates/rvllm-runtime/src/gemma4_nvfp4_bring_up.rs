@@ -306,6 +306,16 @@ struct ForwardKernels {
     /// device-resident chain.
     _scaled_add_bf16_mod: LoadedModule,
     fn_scaled_add_bf16: KernelFn,
+    /// #5f-PRIME scaffold: best-effort load of the unified
+    /// NVFP4 prefill kernels. `Some` when the PTX is present
+    /// (current sm_121 kernel tree); used by future Option B
+    /// prompt-prefill dispatch.
+    /// Wiring is deferred — see `forward_prompt_to_token`
+    /// docstring + codex Stream-5+6+7 review for the scope
+    /// (Fa2PtxKernels plumbing + batched MLP).
+    _unified_prefill_nvfp4kv_mod: Option<LoadedModule>,
+    #[allow(dead_code)]
+    fn_prefill_nvfp4kv_unified_bf16out: Option<KernelFn>,
 }
 
 /// Restores the arena to the post-load high-water mark when a forward
@@ -456,6 +466,33 @@ impl Gemma4Nvfp4Bringup {
         let fn_scaled_add_bf16 =
             scaled_add_bf16_mod.get_function("g4n_scaled_add_bf16_kernel")?;
 
+        // #5f-PRIME scaffold: best-effort load of the unified
+        // NVFP4 prefill kernel. Already in the production
+        // manifest (kernels/flash_attention_unified_prefill_nvfp4kv.cu);
+        // Option B just registers the handle here so a future
+        // commit can wire `forward_prompt_to_token` to call it
+        // instead of looping the decode kernel N times. Wiring
+        // requires Fa2PtxKernels (the full attention backend)
+        // OR an inline launcher mirroring
+        // PagedPrefillNvfp4Launcher::launch_nvfp4kv_unified_sm121,
+        // PLUS a batched M>1 MLP path (current MLP kernels are
+        // M=1 GEMV); ~500-800 LOC of follow-up. Until then the
+        // handle stays unwired and the per-token-decode-loop
+        // fallback runs (codex Stream-5+6+7 scope).
+        let (unified_prefill_nvfp4kv_mod,
+             fn_prefill_nvfp4kv_unified_bf16out) =
+            match loader.load_ptx("flash_attention_unified_prefill_nvfp4kv") {
+                Ok(m) => {
+                    let f = m
+                        .get_function(
+                            "flash_attention_2_prefill_nvfp4kv_unified_bf16out_kernel"
+                        )
+                        .ok();
+                    (Some(m), f)
+                }
+                Err(_) => (None, None),
+            };
+
         // MLP kernels (commit #3).
         let mlp_gemv_mod = loader.load_ptx("mistral35_w4a16_gemv_bf16")?;
         let fn_w4a16_gemv =
@@ -497,6 +534,8 @@ impl Gemma4Nvfp4Bringup {
             fn_vnorm_bf16,
             _scaled_add_bf16_mod: scaled_add_bf16_mod,
             fn_scaled_add_bf16,
+            _unified_prefill_nvfp4kv_mod: unified_prefill_nvfp4kv_mod,
+            fn_prefill_nvfp4kv_unified_bf16out,
         };
         let forward_checkpoint = arena.checkpoint();
 
