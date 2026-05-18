@@ -282,6 +282,21 @@ struct ForwardKernels {
     /// race with kernels on `self.stream`.
     _fill_pos_slots_mod: LoadedModule,
     fn_fill_pos_slots_i32: KernelFn,
+    /// `f32_to_bf16_kernel` — device-side narrow of f32 → bf16.
+    /// Replaces per-call DtoH + host RTNE-narrow + HtoD trios
+    /// after every cublasLt GEMM output. Single launch per
+    /// narrow; per-thread does one __float2bfloat16.
+    _f32_to_bf16_mod: LoadedModule,
+    fn_f32_to_bf16: KernelFn,
+    /// `vnorm_bf16_kernel` — parameter-free RMSNorm for V
+    /// (Gemma 4 v_norm: `Gemma4RMSNorm(head_dim, eps,
+    /// with_scale=False)`). Replaces the per-head host loop
+    /// that DtoH'd v_f32, computed `rsqrt(mean_sq + eps)`,
+    /// rescaled per-element, and re-uploaded bf16 V. Grid
+    /// (num_kv_heads, 1, 1), block (head_dim, 1, 1) with
+    /// shared warp reduction.
+    _vnorm_bf16_mod: LoadedModule,
+    fn_vnorm_bf16: KernelFn,
 }
 
 /// Restores the arena to the post-load high-water mark when a forward
@@ -416,6 +431,19 @@ impl Gemma4Nvfp4Bringup {
         let fn_fill_pos_slots_i32 =
             fill_pos_slots_mod.get_function("g4n_fill_pos_slots_i32_kernel")?;
 
+        // Floor commit 4 / Stream 5a: load device-side narrow +
+        // parameter-free V-RMSNorm so the per-layer attention
+        // chain doesn't have to round-trip Q/K/V through the
+        // host. Both kernels already shipped in the production
+        // manifest (kernels/f32_to_bf16.cu, kernels/vnorm_bf16.cu);
+        // Option B was just not loading them.
+        let f32_to_bf16_mod = loader.load_ptx("f32_to_bf16")?;
+        let fn_f32_to_bf16 =
+            f32_to_bf16_mod.get_function("f32_to_bf16_kernel")?;
+        let vnorm_bf16_mod = loader.load_ptx("vnorm_bf16")?;
+        let fn_vnorm_bf16 =
+            vnorm_bf16_mod.get_function("vnorm_bf16_kernel")?;
+
         // MLP kernels (commit #3).
         let mlp_gemv_mod = loader.load_ptx("mistral35_w4a16_gemv_bf16")?;
         let fn_w4a16_gemv =
@@ -451,6 +479,10 @@ impl Gemma4Nvfp4Bringup {
             fn_attn_decode_gqa_bf16out,
             _fill_pos_slots_mod: fill_pos_slots_mod,
             fn_fill_pos_slots_i32,
+            _f32_to_bf16_mod: f32_to_bf16_mod,
+            fn_f32_to_bf16,
+            _vnorm_bf16_mod: vnorm_bf16_mod,
+            fn_vnorm_bf16,
         };
         let forward_checkpoint = arena.checkpoint();
 
@@ -526,6 +558,67 @@ impl Gemma4Nvfp4Bringup {
             )?;
         }
         Ok(())
+    }
+
+    /// Stream-ordered f32 → bf16 narrow via the
+    /// `f32_to_bf16_kernel`. Replaces a DtoH +
+    /// host-RTNE-narrow + HtoD trio that was costing one
+    /// stream.fence() per call. Launch: grid (ceil(n/256),
+    /// 1, 1), block (256, 1, 1).
+    fn launch_f32_to_bf16(
+        &self, dst_bf16: u64, src_f32: u64, n: u32,
+    ) -> Result<()> {
+        if n == 0 { return Ok(()); }
+        let mut dst = dst_bf16;
+        let mut src = src_f32;
+        let mut n_i: i32 = n as i32;
+        let args: [*mut core::ffi::c_void; 3] = [
+            (&mut dst) as *mut u64 as *mut _,
+            (&mut src) as *mut u64 as *mut _,
+            (&mut n_i) as *mut i32 as *mut _,
+        ];
+        const BLOCK: u32 = 256;
+        let grid_x = (n + BLOCK - 1) / BLOCK;
+        unsafe {
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_f32_to_bf16,
+                (grid_x, 1, 1),
+                (BLOCK, 1, 1),
+                0, self.stream.raw(), &args,
+            )
+        }
+    }
+
+    /// Stream-ordered parameter-free RMSNorm on bf16 V (per
+    /// head): `v[h, :] = v[h, :] / rms(v[h, :])`. Matches
+    /// Gemma 4's `v_norm` = `Gemma4RMSNorm(head_dim, eps,
+    /// with_scale=False)`. Grid (num_kv_heads, 1, 1), block
+    /// (head_dim or 1024 capped, 1, 1) with shared warp
+    /// reduction.
+    fn launch_vnorm_bf16(
+        &self, v_bf16: u64, num_kv_heads: u32, head_dim: u32,
+    ) -> Result<()> {
+        let mut v = v_bf16;
+        let mut eps: f32 = self.arch.rms_norm_eps;
+        let mut hd: i32 = head_dim as i32;
+        let args: [*mut core::ffi::c_void; 3] = [
+            (&mut v) as *mut u64 as *mut _,
+            (&mut eps) as *mut f32 as *mut _,
+            (&mut hd) as *mut i32 as *mut _,
+        ];
+        // Block size capped at 1024 (kernel's __launch_bounds__) and
+        // at head_dim itself (no thread does zero work). Reduction
+        // is warp-shuffle + 1×__syncthreads; non-power-of-2 block
+        // sizes are fine.
+        let block_x = head_dim.min(1024);
+        unsafe {
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_vnorm_bf16,
+                (num_kv_heads, 1, 1),
+                (block_x, 1, 1),
+                0, self.stream.raw(), &args,
+            )
+        }
     }
 
     fn forward_scratch_guard(&self) -> ForwardScratchGuard<'_> {
@@ -2229,53 +2322,42 @@ impl Gemma4Nvfp4Bringup {
                 }
             }
         }
-        self.stream.fence()?;
+        // Stream 5a: stay on-device through Q/K/V → norm → RoPE.
+        // The prior chain was DtoH-each-projection → host bf16
+        // narrow → HtoD → kernel norms → host V-RMSNorm → HtoD.
+        // That cost ~7 fences/HtoDs per layer. Now everything
+        // runs on `self.stream` in kernel order, with one
+        // `stream.fence()` deferred to the very end of the
+        // forward (the existing DtoH for the host-API attn_out
+        // return). Q-norm/K-norm still use the gamma RMSNorm;
+        // V-norm uses the parameter-free `vnorm_bf16`.
 
-        // DtoH the three projections so we can apply host-side Q/K-norm
-        // (existing pattern from forward_layer0_qk_norm — GPU qk_norm
-        // bf16-in-place launch happens after we re-upload Q/K as bf16).
-        let mut q_f32 = vec![0f32; n_q as usize];
-        let mut k_f32 = vec![0f32; n_kv as usize];
-        let mut v_f32 = vec![0f32; n_v as usize];
-        unsafe {
-            use cudarc::driver::sys::*;
-            for (host, dev, sz) in [
-                (q_f32.as_mut_ptr() as *mut _, q_f32_region.device_ptr(), (n_q as usize) * 4),
-                (k_f32.as_mut_ptr() as *mut _, k_f32_region.device_ptr(), (n_kv as usize) * 4),
-                (v_f32.as_mut_ptr() as *mut _, v_f32_region.device_ptr(), (n_v as usize) * 4),
-            ] {
-                let rc = cuMemcpyDtoH_v2(host, dev, sz);
-                if rc != CUresult::CUDA_SUCCESS {
-                    return Err(RvllmError::cuda(
-                        "forward_layer_attn_from_residual: qkv DtoH",
-                        CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
-                }
-            }
-        }
-
-        // -- Q-norm + K-norm via fresh bf16 buffers ----------------------
-        let f32_to_bf16 = |xs: &[f32]| -> Vec<u16> {
-            xs.iter().map(|&x| {
-                let bits = x.to_bits();
-                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-                (rounded >> 16) as u16
-            }).collect()
-        };
-        let q_bf16 = f32_to_bf16(&q_f32);
-        let k_bf16 = f32_to_bf16(&k_f32);
+        // bf16 Q/K/V scratch (per-call). q_fp8 + attn_out
+        // scratch sized to N_q for the decode launch.
         let q_region = self.arena.region(
-            "g4n_lN_q_bf16", q_bf16.len() * 2, 256)?;
+            "g4n_lN_q_bf16", (n_q as usize) * 2, 256)?;
         let k_region = self.arena.region(
-            "g4n_lN_k_bf16", k_bf16.len() * 2, 256)?;
+            "g4n_lN_k_bf16", (n_kv as usize) * 2, 256)?;
+        let v_region = self.arena.region(
+            "g4n_lN_v_bf16", (n_v as usize) * 2, 256)?;
+        let q_fp8_region = self.arena.region(
+            "g4n_lN_q_fp8", n_q as usize, 256)?;
+        let attn_out_region = self.arena.region(
+            "g4n_lN_attn_out_bf16", num_q_heads * head_dim * 2, 256)?;
+
+        // Device narrows: f32 GEMM outputs → bf16 scratch.
+        self.launch_f32_to_bf16(
+            q_region.device_ptr(), q_f32_region.device_ptr(),
+            n_q as u32)?;
+        self.launch_f32_to_bf16(
+            k_region.device_ptr(), k_f32_region.device_ptr(),
+            n_kv as u32)?;
+        self.launch_f32_to_bf16(
+            v_region.device_ptr(), v_f32_region.device_ptr(),
+            n_v as u32)?;
+
         unsafe {
-            let qb: &[u8] = std::slice::from_raw_parts(
-                q_bf16.as_ptr() as *const u8, q_bf16.len() * 2);
-            let kb: &[u8] = std::slice::from_raw_parts(
-                k_bf16.as_ptr() as *const u8, k_bf16.len() * 2);
-            q_region.copy_from_host(qb)?;
-            k_region.copy_from_host(kb)?;
-        }
-        unsafe {
+            // Q-norm + K-norm in place on the bf16 scratches.
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
                 num_tokens: num_q_heads as u32, hidden: head_dim as u32,
                 eps: self.arch.rms_norm_eps,
@@ -2298,30 +2380,11 @@ impl Gemma4Nvfp4Bringup {
             )?;
         }
 
-        // -- V-RMSNorm on host (parameter-free, per-head) ----------------
-        let eps = self.arch.rms_norm_eps;
-        let mut v_normed_f32: Vec<f32> = Vec::with_capacity(v_f32.len());
-        for h in 0..num_kv_heads {
-            let row = &v_f32[h * head_dim .. (h + 1) * head_dim];
-            let mean_sq: f32 = row.iter().map(|x| x * x).sum::<f32>()
-                / (head_dim as f32);
-            let scale = 1.0 / (mean_sq + eps).sqrt();
-            for &x in row { v_normed_f32.push(x * scale); }
-        }
-        let v_bf16 = f32_to_bf16(&v_normed_f32);
-        let v_region = self.arena.region(
-            "g4n_lN_v_bf16", v_bf16.len() * 2, 256)?;
-        unsafe {
-            let vb: &[u8] = std::slice::from_raw_parts(
-                v_bf16.as_ptr() as *const u8, v_bf16.len() * 2);
-            v_region.copy_from_host(vb)?;
-        }
-
-        // -- q_fp8 scratch + attn_out scratch ----------------------------
-        let q_fp8_region = self.arena.region(
-            "g4n_lN_q_fp8", q_bf16.len(), 256)?;
-        let attn_out_region = self.arena.region(
-            "g4n_lN_attn_out_bf16", num_q_heads * head_dim * 2, 256)?;
+        // Parameter-free V-RMSNorm on device, in place on the
+        // bf16 V scratch.
+        self.launch_vnorm_bf16(
+            v_region.device_ptr(),
+            num_kv_heads as u32, head_dim as u32)?;
 
         // Floor commit 3: use the global f16 RoPE table for this
         // layer's type (sliding or global). Mode B fill —
@@ -2618,7 +2681,10 @@ impl Gemma4Nvfp4Bringup {
         }
         let stream_u64 = self.stream.raw();
 
-        // o_proj: bf16 attn_out @ bf16 o_proj^T → f32 hidden.
+        // o_proj: bf16 attn_out @ bf16 o_proj^T → f32 hidden,
+        // then device-side f32→bf16 narrow. Stream 5a replaces
+        // a fence + DtoH + host RTNE-narrow + HtoD with a single
+        // launch on `self.stream`.
         unsafe {
             gemma4_nvfp4_attn_proj(
                 &self.cublaslt,
@@ -2628,32 +2694,11 @@ impl Gemma4Nvfp4Bringup {
                 1, hidden as i32, n_q, stream_u64,
             )?;
         }
-        self.stream.fence()?;
-
-        // f32 → bf16 narrow on host.
-        let mut o_f32_host: Vec<f32> = vec![0.0; hidden as usize];
-        unsafe {
-            use cudarc::driver::sys::*;
-            let rc = cuMemcpyDtoH_v2(
-                o_f32_host.as_mut_ptr() as *mut _,
-                o_f32_region.device_ptr(),
-                (hidden as usize) * 4);
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(RvllmError::cuda(
-                    "forward_layer_post_attn: o f32 DtoH",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
-            }
-        }
-        let o_bf16_host: Vec<u16> = o_f32_host.iter().map(|&x| {
-            let bits = x.to_bits();
-            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-            (rounded >> 16) as u16
-        }).collect();
-        unsafe {
-            let b: &[u8] = std::slice::from_raw_parts(
-                o_bf16_host.as_ptr() as *const u8, o_bf16_host.len() * 2);
-            o_bf16_region.copy_from_host(b)?;
-        }
+        self.launch_f32_to_bf16(
+            o_bf16_region.device_ptr(),
+            o_f32_region.device_ptr(),
+            hidden,
+        )?;
 
         // post_attention_layernorm in-place on o_bf16.
         unsafe {
