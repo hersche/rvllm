@@ -1647,6 +1647,77 @@ impl Gemma4Nvfp4Bringup {
         Ok(())
     }
 
+    /// Stream-6a (cross-attn data flow): populate the drafter's
+    /// f16 shadow KV regions from Option B's NVFP4 K/V cache for
+    /// the source layer pair (sliding + full).
+    ///
+    /// Mirrors production's `populate_shadow_kv*_from_base`
+    /// call site (gemma4_bring_up.rs:4583+ source_view +
+    /// drafter.populate_shadow_kv_range_from_base) but Option
+    /// B-only — production stays untouched.
+    ///
+    /// `slot_start` + `slot_count`: range of cache slots to
+    /// dequant. Used by the spec session loop to do
+    /// incremental updates after each accept (`slot_start =
+    /// committed_len`, `slot_count = newly_accepted`). The
+    /// initial prompt prefill calls this with `slot_start=0`,
+    /// `slot_count=prompt_len`.
+    ///
+    /// The dequant kernel
+    /// (`kernels/gemma4_drafter_dequant.cu:72`) reads
+    /// Option B's NVFP4 layout (`[slot, kv_head, head_dim/2]`
+    /// packed + `[slot, kv_head, head_dim/16]` E4M3 scales)
+    /// directly — codex Stream-6a confirmed the layout
+    /// compatibility.
+    pub fn populate_drafter_shadow_kv(
+        &self,
+        kv: &Gemma4Nvfp4KvState,
+        slot_start: u32,
+        slot_count: u32,
+    ) -> Result<()> {
+        let drafter_guard = self.drafter.lock().unwrap();
+        let drafter = drafter_guard.as_ref().ok_or_else(||
+            corrupt_runtime_err(
+                "populate_drafter_shadow_kv: drafter not loaded; \
+                 call ensure_drafter_nvfp4 first".into()))?;
+        let shadow = drafter.shadow_kv.as_ref().ok_or_else(||
+            corrupt_runtime_err(
+                "populate_drafter_shadow_kv: shadow KV not attached \
+                 (ensure_drafter_nvfp4 should have done this)".into()))?;
+        let (sliding_li, full_li) = self.arch.assistant_shared_kv_sources()
+            .ok_or_else(|| corrupt_runtime_err(
+                "populate_drafter_shadow_kv: arch has no source pair".into()))?;
+
+        // Option B's K/V cache pointers for each source layer.
+        let base_sliding_k = kv.k_packed_layer_ptrs[sliding_li];
+        let base_sliding_v = kv.v_packed_layer_ptrs[sliding_li];
+        let base_full_k    = kv.k_packed_layer_ptrs[full_li];
+        let base_full_v    = kv.v_packed_layer_ptrs[full_li];
+        let base_sliding_k_scale = kv.k_scale_layer_ptrs[sliding_li];
+        let base_sliding_v_scale = kv.v_scale_layer_ptrs[sliding_li];
+        let base_full_k_scale    = kv.k_scale_layer_ptrs[full_li];
+        let base_full_v_scale    = kv.v_scale_layer_ptrs[full_li];
+
+        let stream = self.stream.raw();
+        unsafe {
+            drafter.populate_shadow_kv_range_from_base(
+                base_sliding_k, base_sliding_v,
+                base_full_k, base_full_v,
+                base_sliding_k_scale, base_sliding_v_scale,
+                base_full_k_scale, base_full_v_scale,
+                // Both source layers in Option B are NVFP4 (the
+                // active KV dtype across the whole forward).
+                crate::gemma4_layer_exec::KvDtype::Nvfp4,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4,
+                shadow.sliding_layer_bytes,
+                shadow.full_layer_bytes,
+                slot_start, slot_count,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Codex Stream-6a: build a `DrafterBaseKvView` over
     /// Option B's NVFP4 KV layout for the given `layer_idx`.
     /// The production drafter (`gemma4_drafter.rs`) cross-
@@ -6733,9 +6804,30 @@ mod tests {
         }
         eprintln!(
             "[#6a-smoke] layer0 full chain (q_side + cross_attn + \
-             attn_fin + mlp_fin): nan={nan} inf={inf} max_abs={max_abs:.6}"
+             attn_fin + mlp_fin), shadow KV ZERO: nan={nan} inf={inf} \
+             max_abs={max_abs:.6}"
         );
         assert_eq!(nan, 0, "drafter layer0 produced NaN");
         assert_eq!(inf, 0, "drafter layer0 produced Inf");
+
+        // Drop the drafter MutexGuard before calling
+        // `populate_drafter_shadow_kv` — it re-locks
+        // `self.drafter` internally and would deadlock against
+        // the `guard` held since line 6681. Nothing below this
+        // line uses `rt` or `workspace`.
+        drop(guard);
+
+        // Stream-6a populate call: smoke-test that
+        // `populate_drafter_shadow_kv` runs without panicking
+        // against the (zero-content) NVFP4 KV. Numerical
+        // validation of cross-attn × real-K/V is deferred to the
+        // spec-session smoke (which drives a real prompt prefill
+        // first) — that path hung in the unified-NVFP4-prefill
+        // kernel during 2026-05-18 bring-up and is being
+        // debugged separately. Compilation + dispatch coverage
+        // for the populate path lands here.
+        bringup.populate_drafter_shadow_kv(&kv, 0, 1)
+            .expect("populate_drafter_shadow_kv on empty KV");
+        eprintln!("[#6a-smoke] populate_drafter_shadow_kv dispatch OK");
     }
 }
