@@ -372,6 +372,25 @@ impl Drop for ForwardScratchGuard<'_> {
 /// a stream, a cuBLASLt handle with its own workspace region,
 /// the loaded model (embed + 60 layers + final_norm), and the
 /// kernel handles the forward path uses.
+/// Stream-6b spec primitive #5: return value of one
+/// `run_spec_session_nvfp4_greedy_k1` call.
+#[derive(Clone, Debug, Default)]
+pub struct SpecSessionStats {
+    /// All tokens emitted by the session, in order. First entry
+    /// is the base's prefill argmax for `prompt_ids`; subsequent
+    /// entries are the per-iter base verify argmaxes (always
+    /// committed, the speculative path commits the verify token
+    /// regardless of whether the draft matched).
+    pub emitted: Vec<u32>,
+    /// Number of spec iterations executed (= number of (drafter
+    /// + base) round-trips after prefill).
+    pub n_iters: usize,
+    /// Cumulative count of accepted drafts across all iters
+    /// (0..=n_iters for K=1). Drafter accept-rate = `n_accepted /
+    /// n_iters` once `n_iters > 0`.
+    pub n_accepted: usize,
+}
+
 pub struct Gemma4Nvfp4Bringup {
     /// Drop order matters: ctx must outlive every CUDA resource
     /// allocated under it. Rust drops fields in declaration
@@ -764,6 +783,157 @@ impl Gemma4Nvfp4Bringup {
             n += 1;
         }
         n
+    }
+
+    /// Stream-6b spec primitive #5: greedy K=1 spec-session
+    /// orchestration loop.
+    ///
+    /// Flow per call:
+    ///   1. **Prefill**: `forward_prompt_to_token(prompt_ids,
+    ///      position_start=0, kv)` — runs base over the full
+    ///      prompt, writes K/V slots [0..L-1], snapshots base's
+    ///      post-final-norm hidden into `base_last_hidden_ptr`
+    ///      (via the #6b-base-hidden hook), and returns the
+    ///      base's argmax `t_L` for position L.
+    ///
+    ///   2. **Workspace pin**: allocate the drafter's
+    ///      `DrafterStepWorkspace` on the arena and pin the
+    ///      arena top so subsequent verify scratch_guards don't
+    ///      reclaim workspace memory.
+    ///
+    ///   3. **Iterate** until `emitted.len() >= max_new`:
+    ///        a. Drafter speculate (under the drafter mutex):
+    ///           populate shadow KV for slots [0..ctx_len],
+    ///           pack pre_projection_in with embed(t_committed)
+    ///           + base_last_hidden, run drafter forward at
+    ///           position `ctx_len` → `t_draft`.
+    ///        b. Base verify: `verify_base_one_token
+    ///           (t_committed, ctx_len, kv)` — writes slot
+    ///           `ctx_len`, snapshots fresh base_hidden_last,
+    ///           returns `t_verify`.
+    ///        c. Accept: `spec_greedy_accept_count(&[t_draft],
+    ///           &[t_verify])` → 0 or 1.
+    ///        d. Commit: `emitted.push(t_verify)`, increment
+    ///           `ctx_len`, advance `t_committed = t_verify`.
+    ///
+    /// K=1 commits exactly one token per iter regardless of
+    /// accept (the verify token). The drafter saving for K=1
+    /// is statistical — accept_rate measures drafter quality
+    /// but the wall-clock win lands once batched K>1 verify is
+    /// wired (separate work).
+    ///
+    /// `max_new` caps total emitted token count (including the
+    /// prefill argmax). Returns a [`SpecSessionStats`] with all
+    /// emitted tokens + accept stats; the caller decides what
+    /// to do on EOS / cancel (this primitive doesn't check
+    /// either — it's a pure orchestration loop).
+    pub fn run_spec_session_nvfp4_greedy_k1(
+        &mut self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<SpecSessionStats> {
+        if max_new == 0 {
+            return Err(corrupt_runtime_err(
+                "run_spec_session_nvfp4_greedy_k1: max_new must be \
+                 >= 1".into()));
+        }
+        if prompt_ids.is_empty() {
+            return Err(corrupt_runtime_err(
+                "run_spec_session_nvfp4_greedy_k1: prompt_ids empty".into()));
+        }
+        if self.base_last_hidden_device_ptr() == 0 {
+            return Err(corrupt_runtime_err(
+                "run_spec_session_nvfp4_greedy_k1: \
+                 ensure_base_last_hidden_buffer not called".into()));
+        }
+        {
+            let guard = self.drafter.lock().unwrap();
+            if guard.is_none() {
+                return Err(corrupt_runtime_err(
+                    "run_spec_session_nvfp4_greedy_k1: drafter not \
+                     loaded; call ensure_drafter_nvfp4 first".into()));
+            }
+        }
+
+        // 1. Prefill — runs the full base forward over the
+        //    prompt, populates KV slots [0..L-1], and (via the
+        //    #6b-base-hidden hook in `forward_final_to_token`)
+        //    snapshots base's post-final-norm hidden for the
+        //    last prompt token into `base_last_hidden_ptr`.
+        let mut t_committed = self.forward_prompt_to_token(
+            prompt_ids, 0, kv)?;
+        let mut emitted: Vec<u32> = vec![t_committed];
+        let mut ctx_len: u32 = prompt_ids.len() as u32;
+
+        if emitted.len() >= max_new {
+            return Ok(SpecSessionStats {
+                emitted, n_iters: 0, n_accepted: 0,
+            });
+        }
+
+        // 2. Drafter workspace + arena pin. Workspace is alloc'd
+        //    above the current bump pointer; pin so subsequent
+        //    `verify_base_one_token` scratch_guards stop here.
+        let workspace = {
+            let guard = self.drafter.lock().unwrap();
+            let rt = guard.as_ref()
+                .expect("drafter slot populated (guarded above)");
+            rt.alloc_step_workspace(&self.arena)?
+        };
+        self.pin_current_arena_top();
+
+        // 3. Iterate.
+        let mut n_iters = 0usize;
+        let mut n_accepted_total = 0usize;
+
+        while emitted.len() < max_new {
+            // (a) Drafter speculation (under guard).
+            let t_draft: u32 = {
+                let guard = self.drafter.lock().unwrap();
+                let rt = guard.as_ref().unwrap();
+                self.populate_drafter_shadow_kv_with_rt(
+                    rt, kv, 0, ctx_len)?;
+                self.populate_drafter_pre_projection_input(
+                    rt, &workspace, t_committed)?;
+                self.run_drafter_forward_one_token(
+                    rt, &workspace, ctx_len, kv)?;
+                self.stream.fence()?;
+                let mut t: u32 = 0;
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let rc = cuMemcpyDtoH_v2(
+                        &mut t as *mut u32 as *mut _,
+                        workspace.out_token_id, 4);
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(corrupt_runtime_err(
+                            "run_spec_session_nvfp4_greedy_k1: \
+                             drafter token DtoH".into()));
+                    }
+                }
+                t
+            };
+
+            // (b) Base verify — writes slot `ctx_len`, snapshots
+            //     fresh base_hidden_last for the next iter.
+            let t_verify = self.verify_base_one_token(
+                t_committed, ctx_len, kv)?;
+
+            // (c) Accept count.
+            let n_acc = Self::spec_greedy_accept_count(
+                &[t_draft], &[t_verify]);
+
+            // (d) Commit verify, advance.
+            emitted.push(t_verify);
+            n_accepted_total += n_acc;
+            n_iters += 1;
+            t_committed = t_verify;
+            ctx_len += 1;
+        }
+
+        Ok(SpecSessionStats {
+            emitted, n_iters, n_accepted: n_accepted_total,
+        })
     }
 
     /// Stream-6b spec primitive #3: base verify of one token at
@@ -7409,5 +7579,72 @@ mod tests {
             Gemma4Nvfp4Bringup::spec_greedy_accept_count(
                 &[], &[]),
             0, "empty");
+    }
+
+    /// Stream-6b primitive #5 end-to-end smoke: drive
+    /// `run_spec_session_nvfp4_greedy_k1` over a 1-token prompt
+    /// for max_new=3. Fresh bringup (no shared state with the
+    /// other tests). Asserts:
+    ///   * 3 tokens emitted (1 prefill argmax + 2 spec iter
+    ///     verify argmaxes).
+    ///   * n_iters == 2.
+    ///   * All emitted tokens in vocab range.
+    ///   * `n_accepted <= n_iters`.
+    #[test]
+    #[ignore]
+    fn ondisk_bringup_spec_session_k1() {
+        let dir = match std::env::var("GEMMA4_NVFP4_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("GEMMA4_NVFP4_DIR unset — skip");
+                return;
+            }
+        };
+        let drafter_dir = match std::env::var("GEMMA4_DRAFTER_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => PathBuf::from("/home/r00t/gemma-4-31B-it-assistant"),
+        };
+        if !drafter_dir.is_dir() {
+            eprintln!("drafter dir {drafter_dir:?} missing — skip");
+            return;
+        }
+        let kernels_dir = std::path::PathBuf::from(
+            "/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121");
+
+        let mut bringup = Gemma4Nvfp4Bringup::load(
+            &dir, 40 * 1024 * 1024 * 1024, &kernels_dir,
+        ).expect("Gemma4Nvfp4Bringup::load");
+        // max_pos=64 gives plenty of room for 1-token prompt +
+        // 3 spec iters; max_query_tokens=64 lets the prefill
+        // batched-NVFP4 path run.
+        let kv = bringup.allocate_kv_state_with_chunk(64, 64)
+            .expect("allocate_kv_state_with_chunk");
+
+        bringup.ensure_base_last_hidden_buffer()
+            .expect("ensure_base_last_hidden_buffer");
+        bringup.ensure_drafter_nvfp4(&drafter_dir, &kv)
+            .expect("ensure_drafter_nvfp4");
+
+        let t0 = std::time::Instant::now();
+        let stats = bringup.run_spec_session_nvfp4_greedy_k1(
+            /*prompt_ids=*/ &[2 /*BOS*/], /*max_new=*/ 3, &kv,
+        ).expect("run_spec_session_nvfp4_greedy_k1");
+        let elapsed = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "[#6b-spec-session] emitted={:?} n_iters={} n_accepted={} \
+             elapsed={:.2}s",
+            stats.emitted, stats.n_iters, stats.n_accepted, elapsed);
+
+        assert_eq!(stats.emitted.len(), 3,
+            "expected 3 emitted tokens (1 prefill + 2 iters)");
+        assert_eq!(stats.n_iters, 2,
+            "expected 2 spec iters for max_new=3 with 1-token prefill");
+        assert!(stats.n_accepted <= stats.n_iters,
+            "n_accepted {} > n_iters {}", stats.n_accepted, stats.n_iters);
+        let vocab = bringup.arch.vocab_size as u32;
+        for (i, &t) in stats.emitted.iter().enumerate() {
+            assert!(t < vocab,
+                "emitted[{i}]={t} out of vocab (vocab={vocab})");
+        }
     }
 }
