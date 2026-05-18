@@ -1788,6 +1788,115 @@ fn assert_rope_kernels_match(
     }
 }
 
+/// Stream-#6a: production-side `BaseKvSource` impl. Mirrors the
+/// `source_view` closure in `Gemma4Bringup::run_generate`
+/// (line 4583 / 6752) — same per-layer math, exposed through
+/// the trait so a future drafter refactor can hold
+/// `&dyn BaseKvSource` and consume either backend (production
+/// fp8-block or Option B NVFP4 weights) uniformly.
+///
+/// Constructed per-request inside the spec-decode code path
+/// after the KV cache locals are computed. NOT wired into the
+/// existing `source_view` closure yet — both this impl and the
+/// existing closure call site coexist until
+/// `populate_shadow_kv*_from_base` is refactored to take
+/// `&dyn BaseKvSource`. Plumbing-only: no behavior change to
+/// production runs.
+pub struct Gemma4ProdBaseKvSource<'a> {
+    pub arch: &'a rvllm_loader::gemma4_arch::Gemma4Arch,
+    pub assistant_kv_sources: Gemma4AssistantKvSources,
+    pub kv_base_ptr: u64,
+    pub kv_scale_base_ptr: u64,
+    pub kv_layer_offsets: &'a [u64],
+    pub kv_scale_layer_offsets: &'a [u64],
+    pub kv_dtype_per_layer: &'a [crate::gemma4_layer_exec::KvDtype],
+    pub block_tables_ptr: u64,
+    pub context_lens_ptr: u64,
+    pub block_size: u32,
+    pub max_blocks_per_seq: u32,
+    pub num_blocks_total: u32,
+    pub sliding_blocks: u32,
+}
+
+impl<'a> crate::gemma4_drafter::BaseKvSource
+    for Gemma4ProdBaseKvSource<'a>
+{
+    fn drafter_base_kv_view(
+        &self, layer_idx: usize,
+    ) -> Result<crate::gemma4_drafter::DrafterBaseKvView> {
+        if layer_idx >= self.arch.num_hidden_layers {
+            return Err(RvllmError::Loader {
+                err: LoaderError::Corrupt {
+                    detail: format!(
+                        "Gemma4ProdBaseKvSource::drafter_base_kv_view: \
+                         layer_idx={} >= num_hidden_layers={}",
+                        layer_idx, self.arch.num_hidden_layers),
+                },
+                ctx: LoaderCtx {
+                    path: std::path::PathBuf::from("(prod base kv source)"),
+                    tensor: None,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let off = self.kv_layer_offsets[layer_idx];
+        let scale_off = self.kv_scale_layer_offsets[layer_idx];
+        let is_global = self.arch.layer_types[layer_idx]
+            == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+        let layer_blocks = if is_global {
+            self.num_blocks_total
+        } else {
+            self.sliding_blocks
+        };
+        let nkvh = self.arch.num_kv_heads_for_layer(layer_idx) as u32;
+        let hd = self.arch.head_dim_for_layer(layer_idx) as u32;
+        let layer_elems = 2u64 * layer_blocks as u64 * self.block_size as u64
+            * nkvh as u64 * hd as u64;
+        let dtype = self.kv_dtype_per_layer[layer_idx];
+        let k_v_half_bytes = match dtype {
+            crate::gemma4_layer_exec::KvDtype::F16 => layer_elems,
+            crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems / 2,
+            crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 4,
+        };
+        let scale_half_slots = layer_blocks as u64 * self.block_size as u64
+            * nkvh as u64;
+        let scale_half_bytes = match dtype {
+            crate::gemma4_layer_exec::KvDtype::F16 => 0,
+            crate::gemma4_layer_exec::KvDtype::Fp8 => scale_half_slots * 4,
+            crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 32,
+        };
+        let k_cache = self.kv_base_ptr + off;
+        let v_cache = k_cache + k_v_half_bytes;
+        let (k_scale_cache, v_scale_cache) =
+            if dtype == crate::gemma4_layer_exec::KvDtype::F16 {
+                (0u64, 0u64)
+            } else {
+                let k_s = self.kv_scale_base_ptr + scale_off;
+                (k_s, k_s + scale_half_bytes)
+            };
+        Ok(crate::gemma4_drafter::DrafterBaseKvView {
+            k_cache,
+            v_cache,
+            k_scale_cache,
+            v_scale_cache,
+            q_scale_cache: 0,
+            block_tables: self.block_tables_ptr,
+            context_lens: self.context_lens_ptr,
+            block_size: self.block_size,
+            max_blocks_per_seq: self.max_blocks_per_seq,
+            num_blocks_total: self.num_blocks_total,
+            kv_dtype: dtype,
+        })
+    }
+
+    fn assistant_shared_kv_sources(&self) -> Option<(usize, usize)> {
+        Some((
+            self.assistant_kv_sources.sliding_source_layer as usize,
+            self.assistant_kv_sources.full_source_layer as usize,
+        ))
+    }
+}
+
 impl Gemma4Bringup {
     pub fn load(paths: Gemma4EnginePaths, arena_bytes: usize) -> Result<Self> {
         // RVLLM_NVFP4_SPLIT_GQA defaults to true (operator-validated
