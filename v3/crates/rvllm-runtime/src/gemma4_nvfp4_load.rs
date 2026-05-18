@@ -324,6 +324,17 @@ pub fn upload_gemma4_nvfp4_layer(
     let h = arch.hidden_size;
     let base = format!("{prefix}.layers.{layer_idx}");
 
+    // KEEP BF16 verbatim — Option B loads
+    // `rmsnorm_inplace_bf16_gbf16_kernel` (BF16 gamma, see
+    // kernels/rmsnorm_inplace_bf16_gbf16.cu) and
+    // `fused_qkv_rmsnorm_bf16_kernel` (BF16 q_gamma/k_gamma).
+    // Codex Round 5 (2026-05-18) mis-identified the kernel as
+    // the F16-gamma variant from v3/kernels/rmsnorm_inplace
+    // _bf16.cu — that variant is NOT loaded by Option B. The
+    // BF16→F16 narrow that landed briefly here flipped the
+    // base output from "lalala" (token 1852) to pad-token
+    // spam (token 0) and was reverted; root cause of the
+    // degenerate base forward is still open.
     let input_layernorm = upload_typed_tensor(
         arena, pool, "gemma4n_input_ln",
         &format!("{base}.input_layernorm.weight"),

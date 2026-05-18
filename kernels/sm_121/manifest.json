@@ -341,6 +341,11 @@
       "path": "fused_silu_fp8_quant.ptx",
       "sha256": "2595692666794dff86f5666ec520d1ff6e8bf2b4f1f2c5cd56c492e46e91749e"
     },
+    "g4n_add_then_scale_bf16": {
+      "bytes": 1729,
+      "path": "g4n_add_then_scale_bf16.ptx",
+      "sha256": "0aa8074592fc22ff6a0bd2c3fbf4e6595ad5cd16aef8553ce6e05d6afb278056"
+    },
     "g4n_fill_pos_slots_i32": {
       "bytes": 1643,
       "path": "g4n_fill_pos_slots_i32.ptx",
@@ -972,5 +977,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "037e7d0"
+  "revision": "29cb282"
 }

@@ -307,6 +307,8 @@ struct ForwardKernels {
     /// device-resident chain.
     _scaled_add_bf16_mod: LoadedModule,
     fn_scaled_add_bf16: KernelFn,
+    _add_then_scale_bf16_mod: LoadedModule,
+    fn_add_then_scale_bf16: KernelFn,
     /// #5f-PRIME scaffold: best-effort load of the unified
     /// NVFP4 prefill kernels. `Some` when the PTX is present
     /// (current sm_121 kernel tree); used by future Option B
@@ -560,6 +562,18 @@ impl Gemma4Nvfp4Bringup {
         let scaled_add_bf16_mod = loader.load_ptx("g4n_scaled_add_bf16")?;
         let fn_scaled_add_bf16 =
             scaled_add_bf16_mod.get_function("g4n_scaled_add_bf16_kernel")?;
+        // HF Gemma 4 layer epilogue: `hidden = residual + post_ff_norm(mlp);
+        // hidden *= layer_scalar`. Production folds this into its
+        // fused_norm_add_residual kernel; Option B uses a separate
+        // (add + scale) tail kernel to keep the post-MLP path
+        // matching HF semantics. Codex Round 4 (2026-05-18) traced
+        // the mode-collapse smoking gun to Option B's prior
+        // `residual += layer_scalar * mlp_contrib` semantics (vs
+        // HF's `residual = (residual + mlp_contrib) * layer_scalar`).
+        let add_then_scale_bf16_mod =
+            loader.load_ptx("g4n_add_then_scale_bf16")?;
+        let fn_add_then_scale_bf16 = add_then_scale_bf16_mod
+            .get_function("g4n_add_then_scale_bf16_kernel")?;
 
         // Stream-6a (drafter forward primitive #1): cast
         // module — required by the drafter pre_projection
@@ -667,6 +681,8 @@ impl Gemma4Nvfp4Bringup {
             fn_vnorm_bf16,
             _scaled_add_bf16_mod: scaled_add_bf16_mod,
             fn_scaled_add_bf16,
+            _add_then_scale_bf16_mod: add_then_scale_bf16_mod,
+            fn_add_then_scale_bf16,
             _unified_prefill_nvfp4kv_mod: unified_prefill_nvfp4kv_mod,
             fn_prefill_nvfp4kv_unified_bf16out,
             _cast_fp_mod: cast_fp_mod,
@@ -1219,6 +1235,36 @@ impl Gemma4Nvfp4Bringup {
         unsafe {
             rvllm_fused::launch_raw(
                 self.forward_kernels.fn_scaled_add_bf16,
+                (grid_x, 1, 1),
+                (BLOCK, 1, 1),
+                0, self.stream.raw(), &args,
+            )
+        }
+    }
+
+    /// Stream-ordered fused `dst[i] = (dst[i] + src[i]) * alpha[0]`
+    /// for bf16 vectors with bf16 alpha on device. Matches HF
+    /// Gemma 4 layer epilogue (`hidden = residual + post_ff_norm
+    /// (mlp); hidden *= layer_scalar`).
+    fn launch_add_then_scale_bf16(
+        &self, dst: u64, src: u64, alpha_dev: u64, n: u32,
+    ) -> Result<()> {
+        if n == 0 { return Ok(()); }
+        let mut d = dst;
+        let mut s = src;
+        let mut a = alpha_dev;
+        let mut n_i: i32 = n as i32;
+        let args: [*mut core::ffi::c_void; 4] = [
+            (&mut d) as *mut u64 as *mut _,
+            (&mut s) as *mut u64 as *mut _,
+            (&mut a) as *mut u64 as *mut _,
+            (&mut n_i) as *mut i32 as *mut _,
+        ];
+        const BLOCK: u32 = 256;
+        let grid_x = (n + BLOCK - 1) / BLOCK;
+        unsafe {
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_add_then_scale_bf16,
                 (grid_x, 1, 1),
                 (BLOCK, 1, 1),
                 0, self.stream.raw(), &args,
@@ -4445,48 +4491,20 @@ impl Gemma4Nvfp4Bringup {
             )?;
         }
 
-        // Read mlp_normed back to host, scale by layer_scalar, re-upload.
-        let mut mlp_normed_bf16 = vec![0u16; hidden as usize];
-        let mut scalar_bf16 = [0u16; 1];
-        unsafe {
-            use cudarc::driver::sys::*;
-            let rc = cuMemcpyDtoH_v2(
-                mlp_normed_bf16.as_mut_ptr() as *mut _,
-                mlp_out_region.device_ptr(),
-                (hidden as usize) * 2);
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(RvllmError::cuda(
-                    "forward_layer_post_attn_mlp: mlp_normed DtoH",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
-            }
-            let rc = cuMemcpyDtoH_v2(
-                scalar_bf16.as_mut_ptr() as *mut _,
-                layer.layer_scalar.offset_bytes, 2);
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(RvllmError::cuda(
-                    "forward_layer_post_attn_mlp: layer_scalar DtoH",
-                    CudaErrorKind::MemcpyFailed, CudaCtx::setup()));
-            }
-        }
-        let layer_scalar_f32 = f32::from_bits((scalar_bf16[0] as u32) << 16);
-        let scaled_bf16: Vec<u16> = mlp_normed_bf16.iter().map(|&b| {
-            let v = f32::from_bits((b as u32) << 16) * layer_scalar_f32;
-            let bits = v.to_bits();
-            let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-            (rounded >> 16) as u16
-        }).collect();
-        unsafe {
-            let s: &[u8] = std::slice::from_raw_parts(
-                scaled_bf16.as_ptr() as *const u8, scaled_bf16.len() * 2);
-            mlp_out_region.copy_from_host(s)?;
-            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }
-                .launch(
-                    self.forward_kernels.fn_vector_add_bf16,
-                    h_residual_region.device_ptr(),
-                    mlp_out_region.device_ptr(),
-                    stream_u64,
-                )?;
-        }
+        // HF Gemma 4 epilogue: residual = (residual +
+        // post_ff_norm(mlp)) * layer_scalar (modeling_gemma4.py
+        // :1399-1410). Codex Round 4 (2026-05-18) traced the
+        // mode-collapse smoking gun to the prior host-side
+        // `residual += layer_scalar * mlp_contrib` (which
+        // scaled only the contribution). Replace with the
+        // device-side fused (add + scale) kernel — also drops
+        // the host fence + DtoH/HtoD round-trip.
+        self.launch_add_then_scale_bf16(
+            h_residual_region.device_ptr(),
+            mlp_out_region.device_ptr(),
+            layer.layer_scalar.offset_bytes,
+            hidden,
+        )?;
         self.stream.fence()?;
 
         let mut h_out_bf16 = vec![0u16; hidden as usize];
@@ -5311,11 +5329,16 @@ impl Gemma4Nvfp4Bringup {
                 stream_u64)?;
         }
 
-        // Stream 5b: fused `residual_dev += layer_scalar *
-        // mlp_out` on device. Replaces the prior fence + 2×
-        // DtoH + host scale + HtoD + vector_add chain with one
-        // kernel launch on the existing stream.
-        self.launch_scaled_add_bf16(
+        // HF Gemma 4 layer epilogue: residual = (residual +
+        // post_ff_norm(mlp)) * layer_scalar. Codex Round 4
+        // (2026-05-18) traced the mode-collapse smoking gun to
+        // a prior `residual += layer_scalar * mlp_contrib`
+        // semantic that scaled only the MLP contribution
+        // instead of the full residual. HF (modeling_gemma4.py
+        // :1399-1410) and production's
+        // `fused_norm_add_residual_*_kernel` both scale the
+        // whole residual.
+        self.launch_add_then_scale_bf16(
             residual_dev,
             mlp_out_region.device_ptr(),
             layer.layer_scalar.offset_bytes,
@@ -5451,10 +5474,11 @@ impl Gemma4Nvfp4Bringup {
                 layer.post_feedforward_layernorm.offset_bytes,
                 stream_u64)?;
         }
-        // scaled_add on N*hidden flat (alpha broadcast across all
-        // elements of all tokens — layer_scalar is per-layer not
-        // per-token).
-        self.launch_scaled_add_bf16(
+        // HF Gemma 4 epilogue: residual = (residual + post_ff_norm(mlp))
+        // * layer_scalar. Alpha broadcasts across all elements of all
+        // tokens (layer_scalar is per-layer not per-token). Same fix as
+        // the single-token _dev path (codex Round 4 mode-collapse fix).
+        self.launch_add_then_scale_bf16(
             residual_dev,
             mlp_out_region.device_ptr(),
             layer.layer_scalar.offset_bytes,
