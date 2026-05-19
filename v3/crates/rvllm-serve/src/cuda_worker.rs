@@ -281,12 +281,61 @@ pub async fn spawn_cuda_worker(
                             .ok()
                             .and_then(|s| s.parse::<u32>().ok())
                             .unwrap_or(64);
+                        let spec_min_full_draft_hits = std::env::var(
+                            "RVLLM_QWEN35_SPEC_PREFLIGHT_MIN_FULL_DRAFTS")
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let spec_k = std::env::var("RVLLM_QWEN35_SPEC_K")
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(4)
+                            .max(1);
+                        let spec_ngram = std::env::var("RVLLM_QWEN35_SPEC_NGRAM")
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(2)
+                            .max(1);
+                        let enough_full_draft_hits = if spec_min_full_draft_hits == 0 {
+                            true
+                        } else if prompt_ids.len() < spec_ngram + spec_k + 1 {
+                            false
+                        } else if spec_ngram == 2 {
+                            let mut seen = std::collections::HashSet::<(u32, u32)>::new();
+                            let mut hits = 0usize;
+                            let last_start = prompt_ids.len() - spec_ngram - spec_k;
+                            for start in 0..=last_start {
+                                let key = (prompt_ids[start], prompt_ids[start + 1]);
+                                if !seen.insert(key) {
+                                    hits += 1;
+                                    if hits >= spec_min_full_draft_hits {
+                                        break;
+                                    }
+                                }
+                            }
+                            hits >= spec_min_full_draft_hits
+                        } else {
+                            let mut seen = std::collections::HashSet::<Vec<u32>>::new();
+                            let mut hits = 0usize;
+                            let last_start = prompt_ids.len() - spec_ngram - spec_k;
+                            for start in 0..=last_start {
+                                let key = prompt_ids[start..start + spec_ngram].to_vec();
+                                if !seen.insert(key) {
+                                    hits += 1;
+                                    if hits >= spec_min_full_draft_hits {
+                                        break;
+                                    }
+                                }
+                            }
+                            hits >= spec_min_full_draft_hits
+                        };
                         let spec_decode_on = std::env::var("RVLLM_QWEN35_SPEC_DECODE")
                             .map(|v| v != "0" && !v.is_empty())
                             .unwrap_or(false)
                             && splices.is_empty()
                             && prompt_ids.len() >= spec_min_prompt_tokens
-                            && max_new >= spec_min_max_new_tokens;
+                            && max_new >= spec_min_max_new_tokens
+                            && enough_full_draft_hits;
                         let result = if spec_decode_on {
                             rvllm_runtime::qwen35_spec_decode::run_qwen35_prompt_lookup_spec(
                                 &bringup, &prompt_ids, max_new,
