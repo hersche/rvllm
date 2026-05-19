@@ -154,6 +154,17 @@ pub async fn spawn_cuda_worker(
                         return;
                     }
                 };
+                if std::env::var("RVLLM_QWEN35_SPEC_STATE_SELFTEST").as_deref() == Ok("1") {
+                    if let Err(e) = bringup.spec_state_snapshot_selftest() {
+                        let _ = ready_tx.send(Err(format!(
+                            "qwen35 spec-state snapshot selftest: {e:?}"
+                        )));
+                        return;
+                    }
+                    tracing::info!(
+                        "qwen35 spec-state snapshot selftest passed"
+                    );
+                }
                 let _ = ready_tx.send(Ok(()));
                 tracing::info!(
                     "Qwen 3.5 dense — Phase 2c-A complete (substrate + \

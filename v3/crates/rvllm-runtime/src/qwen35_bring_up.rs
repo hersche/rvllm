@@ -4280,6 +4280,165 @@ impl Qwen35Bringup {
         Ok(())
     }
 
+    /// Recurrent-state snapshot for future Qwen 3.5 prompt-lookup
+    /// speculative decode. Like Qwen 3.6, Qwen 3.5 carries
+    /// Gated-DeltaNet delta state plus causal-conv1d state across
+    /// decode steps, so a verifier that advances through rejected
+    /// drafts must be able to roll those recurrent buffers back.
+    ///
+    /// The caller owns `dst_*_ptr` scratch allocation sized from
+    /// `recurrent_state_bytes()`.
+    pub fn snapshot_recurrent_state(&self, dst_linear_ptr: u64, dst_conv_ptr: u64) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let ls = match self.linear_state.as_ref() {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            let stream = match self.stream.as_ref() {
+                Some(s) => s.raw() as CUstream,
+                None => return Ok(()),
+            };
+            let linear_bytes = ls.n_linear_layers.saturating_mul(ls.per_layer_bytes);
+            if linear_bytes > 0 && ls.base_ptr != 0 {
+                let rc = cuMemcpyDtoDAsync_v2(
+                    dst_linear_ptr,
+                    ls.base_ptr,
+                    linear_bytes,
+                    stream,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 snapshot_recurrent_state(linear)",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            let conv_bytes = ls
+                .n_linear_layers
+                .saturating_mul(ls.conv_state_per_layer_bytes);
+            if conv_bytes > 0 && ls.conv_state_base_ptr != 0 {
+                let rc = cuMemcpyDtoDAsync_v2(
+                    dst_conv_ptr,
+                    ls.conv_state_base_ptr,
+                    conv_bytes,
+                    stream,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 snapshot_recurrent_state(conv)",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+        }
+        let _ = (dst_linear_ptr, dst_conv_ptr);
+        Ok(())
+    }
+
+    /// Restore a recurrent-state snapshot captured by
+    /// `snapshot_recurrent_state`.
+    pub fn restore_recurrent_state(&self, src_linear_ptr: u64, src_conv_ptr: u64) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let ls = match self.linear_state.as_ref() {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            let stream = match self.stream.as_ref() {
+                Some(s) => s.raw() as CUstream,
+                None => return Ok(()),
+            };
+            let linear_bytes = ls.n_linear_layers.saturating_mul(ls.per_layer_bytes);
+            if linear_bytes > 0 && ls.base_ptr != 0 {
+                let rc = cuMemcpyDtoDAsync_v2(
+                    ls.base_ptr,
+                    src_linear_ptr,
+                    linear_bytes,
+                    stream,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 restore_recurrent_state(linear)",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            let conv_bytes = ls
+                .n_linear_layers
+                .saturating_mul(ls.conv_state_per_layer_bytes);
+            if conv_bytes > 0 && ls.conv_state_base_ptr != 0 {
+                let rc = cuMemcpyDtoDAsync_v2(
+                    ls.conv_state_base_ptr,
+                    src_conv_ptr,
+                    conv_bytes,
+                    stream,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 restore_recurrent_state(conv)",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+        }
+        let _ = (src_linear_ptr, src_conv_ptr);
+        Ok(())
+    }
+
+    pub fn recurrent_state_bytes(&self) -> (usize, usize) {
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(ls) = self.linear_state.as_ref() {
+                return (
+                    ls.n_linear_layers.saturating_mul(ls.per_layer_bytes),
+                    ls.n_linear_layers
+                        .saturating_mul(ls.conv_state_per_layer_bytes),
+                );
+            }
+        }
+        (0, 0)
+    }
+
+    /// Debug/startup probe for the snapshot helpers. This does not
+    /// mutate logical model state: it snapshots current recurrent
+    /// buffers to arena scratch, then restores the same bytes.
+    pub fn spec_state_snapshot_selftest(&self) -> Result<()> {
+        let (linear_bytes, conv_bytes) = self.recurrent_state_bytes();
+        #[cfg(feature = "cuda")]
+        {
+            let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+                self.paths.model_dir.clone(),
+                "qwen35 spec_state_snapshot_selftest: arena absent".into()))?;
+            let snap_linear = arena.region(
+                "qwen35_spec_selftest_linear",
+                linear_bytes.max(1),
+                16,
+            )?;
+            let snap_conv = arena.region(
+                "qwen35_spec_selftest_conv",
+                conv_bytes.max(1),
+                16,
+            )?;
+            self.snapshot_recurrent_state(
+                snap_linear.device_ptr(),
+                snap_conv.device_ptr(),
+            )?;
+            self.restore_recurrent_state(
+                snap_linear.device_ptr(),
+                snap_conv.device_ptr(),
+            )?;
+        }
+        let _ = (linear_bytes, conv_bytes);
+        Ok(())
+    }
+
     /// Zero the causal-conv1d state. Mirror of
     /// `Qwen36Bringup::reset_conv_state`.
     pub fn reset_conv_state(&self) -> Result<()> {
