@@ -1,0 +1,40 @@
+# Source with: source profiles/gb10/gemma4-nvfp4
+#
+# Gemma 4 31B IT NVFP4 weights on GB10: NVFP4W MLP weights, NVFP4 KV,
+# unified/batched prefill, MLP MMA v8, and K7 drafter speculation gated
+# away from very long prompts where native decode is faster.
+
+export RVLLM_MODEL_DIR=/home/r00t/Gemma-4-31B-IT-NVFP4
+export RVLLM_MODEL_ID=gemma-4-31b-it-nvfp4
+export RVLLM_MODEL_FAMILY=gemma4-nvfp4
+export RVLLM_KERNELS_DIR=/home/r00t/workspace/upstream/rvllm-serve/kernels
+export RVLLM_CUTLASS_SM120_SO=/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121/libcutlass_sm120.so
+export RVLLM_ARENA_GB=69
+export RVLLM_BIND=127.0.0.1:8010
+export RVLLM_QUEUE_DEPTH=8
+export RVLLM_MAX_TOKENS_CAP=4096
+export RVLLM_REQUEST_TIMEOUT_SECS=600
+
+export RVLLM_BATCH_PREFILL=1
+export RVLLM_UNIFIED_PREFILL_MMA=1
+export RVLLM_GEMMA4_NVFP4_MLP_MMA_V8=1
+export RVLLM_PREFILL_CHUNK_SIZE=128
+export RVLLM_UNIFIED_PREFILL=1
+
+export RVLLM_NVFP4_KV=1
+export RVLLM_Q_SCALE=2.0
+export RVLLM_NVFP4_PARTITION_SIZE=256
+export RVLLM_NVFP4_SPLIT_GQA=1
+export RVLLM_NVFP4_DECODE_GQA=1
+export RVLLM_NVFP4_HADAMARD=0
+export RVLLM_NVFP4_HADAMARD_V=0
+export RVLLM_LEGACY_ALLOWED=1
+
+export RVLLM_GEMMA4_SPEC_DECODE=1
+export RVLLM_GEMMA4_DRAFTER_DIR=/home/r00t/gemma-4-31B-it-assistant
+export RVLLM_GEMMA4_SPEC_K=7
+export RVLLM_GEMMA4_SPEC_PERF_TRACE=0
+export G4N_SPEC_MAX_PROMPT_TOKENS=900
+export G4N_SPEC_ADAPTIVE_WINDOW_ITERS=3
+export G4N_SPEC_ADAPTIVE_MIN_K=1
+export G4N_SPEC_ADAPTIVE_K=0

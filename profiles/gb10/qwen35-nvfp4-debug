@@ -1,0 +1,9 @@
+# Source with: source profiles/gb10/qwen35-nvfp4-debug
+
+_rvllm_profile_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$_rvllm_profile_dir/qwen35-nvfp4"
+unset _rvllm_profile_dir
+
+export RUST_LOG=info,rvllm_serve=debug,rvllm_runtime=debug
+export RVLLM_QWEN35_SPEC_PERF_TRACE=1
+export RVLLM_DUMP_REQUEST_DIR=/tmp/rvllm_dump

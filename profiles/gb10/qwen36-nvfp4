@@ -1,0 +1,34 @@
+# Source with: source profiles/gb10/qwen36-nvfp4
+#
+# Qwen 3.6 35B-A3B on GB10: FP8 weights, NVFP4 KV, promoted batching.
+# Prompt-lookup spec is intentionally disabled: repeat smoke and c4
+# repeat-concurrency probes showed native decode is slightly faster.
+
+export RVLLM_MODEL_DIR=/home/r00t/.vllm/models/qwen3-6-35b-a3b-fp8
+export RVLLM_MODEL_ID=qwen3-6-35b-a3b
+export RVLLM_MODEL_FAMILY=qwen36
+export RVLLM_KERNELS_DIR=/home/r00t/workspace/upstream/rvllm-serve/kernels
+export RVLLM_CUTLASS_SM120_SO=/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121/libcutlass_sm120.so
+export RVLLM_ARENA_GB=50
+export RVLLM_BIND=127.0.0.1:8010
+export RVLLM_QUEUE_DEPTH=8
+export RVLLM_MAX_TOKENS_CAP=4096
+export RVLLM_REQUEST_TIMEOUT_SECS=600
+
+export RVLLM_BATCH_PREFILL=1
+export RVLLM_UNIFIED_PREFILL_MMA=1
+export RVLLM_NVFP4_KV=1
+export RVLLM_QWEN36_NVFP4_BATCH_FULL_PREFILL=1
+export RVLLM_QWEN36_NVFP4_UNIFIED_BATCH_FULL_PREFILL=1
+export RVLLM_QWEN36_NVFP4_UNIFIED_BATCH_FULL_FROM=5
+
+export RVLLM_QWEN36_SPEC_DECODE=0
+export RVLLM_QWEN36_SPEC_K=4
+export RVLLM_QWEN36_SPEC_NGRAM=2
+export RVLLM_QWEN36_SPEC_MIN_DRAFTS=4
+export RVLLM_QWEN36_SPEC_MIN_PROMPT_TOKENS=1024
+export RVLLM_QWEN36_SPEC_MIN_MAX_NEW_TOKENS=64
+export RVLLM_QWEN36_SPEC_PREFLIGHT_MIN_FULL_DRAFTS=1
+export RVLLM_QWEN36_SPEC_ZERO_ACCEPT_BAILOUT_ITERS=1
+export RVLLM_QWEN36_SPEC_PERF_TRACE=0
+export RVLLM_QWEN36_REPETITION_GUARD_N=12
