@@ -7383,6 +7383,19 @@ impl Gemma4Nvfp4Bringup {
             self.forward_layer_post_attn_mlp_batched_dev(li, n_tokens, residual_dev.device_ptr())?;
         }
 
+        // Common prefill path: `forward_prompt_to_token` only needs
+        // the final row's next-token prediction and, in spec mode,
+        // the matching base_last_hidden snapshot. Do that directly on
+        // device instead of copying all N residual rows to host and
+        // running N separate LM-head GEMVs. The all-row path below is
+        // still used by K>=2 verification / residual diagnostics.
+        if let Some(row) = snapshot_row {
+            let row_ptr = residual_dev.device_ptr() + (row * hidden_bytes) as u64;
+            let tok = self
+                .forward_final_device_to_token_impl(row_ptr, /*snapshot_base_hidden=*/ true)?;
+            return Ok((vec![tok], Vec::new()));
+        }
+
         // DtoH ALL N residual rows, then call the final close-out
         // per row to get N argmax tokens. The caller controls which
         // row, if any, snapshots `base_last_hidden_ptr`.
@@ -7414,6 +7427,102 @@ impl Gemma4Nvfp4Bringup {
             tokens.push(tok);
         }
         Ok((tokens, all_residuals))
+    }
+
+    /// Device-resident final close-out for a single residual row:
+    /// final_norm in-place → tied LM head → argmax. This is the fast
+    /// sibling of `forward_final_to_token_impl` used when the caller
+    /// already has the selected `[hidden]` bf16 row on device.
+    fn forward_final_device_to_token_impl(
+        &self,
+        h_residual_bf16_dev: u64,
+        snapshot_base_hidden: bool,
+    ) -> Result<u32> {
+        let hidden = self.arch.hidden_size as u32;
+        let vocab = self.arch.vocab_size as u32;
+        let stream_u64 = self.stream.raw();
+        let logits_region =
+            self.arena
+                .region("gemma4_nvfp4_final_dev_logits", (vocab as usize) * 4, 256)?;
+        let token_region = self.arena.region("gemma4_nvfp4_final_dev_token", 4, 16)?;
+
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1,
+                hidden,
+                eps: self.arch.rms_norm_eps,
+            }
+            .launch(
+                self.forward_kernels.fn_rmsnorm_inplace_bf16,
+                h_residual_bf16_dev,
+                self.model.outside.final_norm.offset_bytes,
+                stream_u64,
+            )?;
+        }
+
+        let base_last_hidden = self.base_last_hidden_device_ptr();
+        if snapshot_base_hidden && base_last_hidden != 0 {
+            unsafe {
+                rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: hidden }.launch(
+                    self.forward_kernels.fn_bf16_to_f16_sat,
+                    base_last_hidden,
+                    h_residual_bf16_dev,
+                    stream_u64,
+                )?;
+            }
+        }
+
+        unsafe {
+            gemma4_nvfp4_attn_proj(
+                &self.cublaslt,
+                h_residual_bf16_dev,
+                self.model.outside.lm_head_tokens.offset_bytes,
+                logits_region.device_ptr(),
+                1,
+                vocab as i32,
+                hidden as i32,
+                stream_u64,
+            )?;
+        }
+
+        unsafe {
+            let mut logits_ptr = logits_region.device_ptr();
+            let mut out_ptr = token_region.device_ptr();
+            let mut vs = vocab as i32;
+            let args: [*mut core::ffi::c_void; 3] = [
+                (&mut logits_ptr) as *mut u64 as *mut _,
+                (&mut out_ptr) as *mut u64 as *mut _,
+                (&mut vs) as *mut i32 as *mut _,
+            ];
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_argmax_f32,
+                (1, 1, 1),
+                (1024, 1, 1),
+                0,
+                stream_u64,
+                &args,
+            )?;
+        }
+
+        self.stream.fence()?;
+        let mut tok = [0i32; 1];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(tok.as_mut_ptr() as *mut _, token_region.device_ptr(), 4);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(corrupt_runtime_err(
+                    "forward_final_device_to_token: token DtoH".into(),
+                ));
+            }
+        }
+        let id = tok[0];
+        if id < 0 || (id as u32) >= vocab {
+            return Err(corrupt_runtime_err(format!(
+                "forward_final_device_to_token: argmax produced \
+                 out-of-range token id={id} vocab={vocab}"
+            )));
+        }
+        Ok(id as u32)
     }
 
     /// Commit #5e: dump-mode variant of `forward_final_to_token`
