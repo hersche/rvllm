@@ -2834,40 +2834,144 @@ impl Qwen35Bringup {
         }
         let h_residual_buf =
             self.forward_qwen35_tokens_batched(token_ids, start_position)?;
+        self.forward_finalize_argmax_many_streamed(
+            h_residual_buf,
+            token_ids.len() as u32,
+        )
+    }
+
+    /// Exact-math multi-row closer for speculative verification.
+    ///
+    /// This deliberately keeps the production M=1 lm_head path for
+    /// every row so per-row FP8 activation scales stay identical to
+    /// `forward_finalize_argmax()`. The win is host-side: enqueue all
+    /// row closers and device-token copies on the CUDA stream, then
+    /// fence and DtoH once instead of once per row.
+    unsafe fn forward_finalize_argmax_many_streamed(
+        &self,
+        h_residual_buf: u64,
+        rows: u32,
+    ) -> Result<Vec<i32>> {
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
         let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
-            "forward_qwen35_decode_argmax_all: scratch absent".into()))?;
+            "forward_finalize_argmax_many_streamed: scratch absent".into()))?;
+        let ker = self.outside_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_finalize_argmax_many_streamed: outside_kernels absent".into()))?;
+        let cublaslt = self.cublaslt.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_finalize_argmax_many_streamed: cublaslt absent".into()))?;
         let stream = self.stream.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
-            "forward_qwen35_decode_argmax_all: stream absent".into()))?;
-        let row_bytes = self.arch.base.hidden_size * 2;
-        let mut out = Vec::with_capacity(token_ids.len());
+            "forward_finalize_argmax_many_streamed: stream absent".into()))?;
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_finalize_argmax_many_streamed: arena absent".into()))?;
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_finalize_argmax_many_streamed: model absent".into()))?;
+        let arch = &self.arch;
+        let hidden = arch.base.hidden_size as u32;
+        let vocab = arch.base.vocab_size as u32;
+        let eps = arch.base.rms_norm_eps;
+        let stream_raw = stream.raw() as u64;
+        let row_bytes = hidden as usize * 2;
 
-        // Conservative closer loop: the transformer stack runs once
-        // over the full verify chunk, preserving recurrent-state
-        // semantics. The per-row lm_head closer can be replaced by
-        // a Qwen35 closer-all once the per-row FP8 activation-scale
-        // issue is solved for this architecture too.
-        for row in 0..token_ids.len() {
-            #[cfg(feature = "cuda")]
-            unsafe {
-                use cudarc::driver::sys::*;
-                let src = h_residual_buf + (row as u64) * (row_bytes as u64);
-                let rc = cuMemcpyDtoDAsync_v2(
-                    scr.h_residual_ptr,
-                    src,
-                    row_bytes,
-                    stream.raw() as CUstream,
-                );
-                if rc != CUresult::CUDA_SUCCESS {
-                    return Err(rvllm_core::RvllmError::cuda(
-                        "qwen35 argmax_all row DtoD",
-                        rvllm_core::CudaErrorKind::MemcpyFailed,
-                        rvllm_core::CudaCtx::setup(),
-                    ));
-                }
+        let hidden_fp8_region = arena.region(
+            "qwen35_many_hidden_fp8", hidden as usize, 16)?;
+        let hidden_scale_region = arena.region(
+            "qwen35_many_hidden_scale", 4, 4)?;
+        let tokens_region = arena.region(
+            "qwen35_many_tokens", rows as usize * 4, 4)?;
+
+        for row in 0..rows {
+            use cudarc::driver::sys::*;
+            let src = h_residual_buf + (row as u64) * (row_bytes as u64);
+            let rc = cuMemcpyDtoDAsync_v2(
+                scr.h_residual_ptr,
+                src,
+                row_bytes,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 many-finalize row DtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
             }
-            out.push(self.forward_finalize_argmax()? as i32);
+            rvllm_fused::FusedRmsnormFp8QuantLaunch {
+                num_tokens: 1, hidden, eps,
+            }.launch(
+                ker.fn_fused_rmsnorm_fp8_quant,
+                hidden_fp8_region.device_ptr(),
+                hidden_scale_region.device_ptr(),
+                scr.h_residual_ptr,
+                model.outside.final_norm.offset_bytes,
+                stream_raw,
+            )?;
+            cublaslt.fp8_gemm(
+                hidden_fp8_region.device_ptr(),
+                model.outside.lm_head_fp8.offset_bytes,
+                scr.logits_ptr,
+                1, vocab as i32, hidden as i32,
+                hidden_scale_region.device_ptr(),
+                model.outside.lm_head_fp8.scale_ptr,
+                stream_raw,
+            )?;
+            let block_dim: u32 = vocab.min(1024);
+            let mut row_ptr = scr.logits_ptr;
+            let mut out_ptr = scr.token_out_ptr;
+            let mut vsz: i32 = vocab as i32;
+            let args = [
+                (&mut row_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vsz) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_argmax_f16.raw() as CUfunction,
+                1, 1, 1, block_dim, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 many-finalize argmax",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+            let dst = tokens_region.device_ptr() + (row as u64) * 4;
+            let rc = cuMemcpyDtoDAsync_v2(
+                dst,
+                scr.token_out_ptr,
+                4,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 many-finalize token DtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        stream.fence()?;
+        let mut out = vec![0i32; rows as usize];
+        {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                out.as_mut_ptr() as *mut _,
+                tokens_region.device_ptr() as CUdeviceptr,
+                rows as usize * 4);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 many-finalize DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
         }
         Ok(out)
     }
