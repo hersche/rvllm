@@ -75,10 +75,22 @@ LONG_PROMPTS: list[tuple[str, str, str]] = [
     ),
 ]
 
+REPEAT_PROMPTS: list[tuple[str, str, str]] = [
+    (
+        "qwen_repeat_160",
+        (
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu "
+            * 95
+        ) + "\nContinue the exact token pattern for 160 tokens.",
+        "alpha",
+    ),
+]
+
 PROMPT_SETS: dict[str, list[tuple[str, str, str]]] = {
     "short": SHORT_PROMPTS,
     "long": LONG_PROMPTS,
     "mixed": SHORT_PROMPTS + LONG_PROMPTS,
+    "repeat": REPEAT_PROMPTS,
 }
 
 
