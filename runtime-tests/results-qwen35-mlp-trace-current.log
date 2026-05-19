@@ -1,0 +1,194 @@
+May 19 16:50:33 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 stage=embed ms=0.945
+May 19 16:50:33 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=0 kind=linear ms=687.717
+May 19 16:50:35 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=0 total_ms=1546.178 copy_ms=1.642 norm_ms=0.076 gate_up_ms=1030.277 down_ms=514.057 residual_ms=0.126
+May 19 16:50:35 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=0 kind=mlp ms=1546.196
+May 19 16:50:36 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=1 kind=linear ms=688.066
+May 19 16:50:37 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=1 total_ms=1549.360 copy_ms=1.624 norm_ms=0.088 gate_up_ms=1036.031 down_ms=511.492 residual_ms=0.125
+May 19 16:50:37 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=1 kind=mlp ms=1549.379
+May 19 16:50:38 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=2 kind=linear ms=687.552
+May 19 16:50:39 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=2 total_ms=1546.481 copy_ms=1.680 norm_ms=0.087 gate_up_ms=1030.849 down_ms=513.739 residual_ms=0.126
+May 19 16:50:39 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=2 kind=mlp ms=1546.498
+May 19 16:50:40 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=3 kind=full ms=570.338
+May 19 16:50:42 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=3 total_ms=1550.590 copy_ms=1.613 norm_ms=0.080 gate_up_ms=1033.845 down_ms=514.924 residual_ms=0.128
+May 19 16:50:42 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=3 kind=mlp ms=1550.609
+May 19 16:50:42 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=4 kind=linear ms=686.587
+May 19 16:50:44 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=4 total_ms=1553.055 copy_ms=1.625 norm_ms=0.073 gate_up_ms=1036.275 down_ms=514.949 residual_ms=0.134
+May 19 16:50:44 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=4 kind=mlp ms=1553.073
+May 19 16:50:45 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=5 kind=linear ms=689.439
+May 19 16:50:46 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=5 total_ms=1547.774 copy_ms=1.771 norm_ms=0.087 gate_up_ms=1031.441 down_ms=514.346 residual_ms=0.127
+May 19 16:50:46 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=5 kind=mlp ms=1547.790
+May 19 16:50:47 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=6 kind=linear ms=688.742
+May 19 16:50:48 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=6 total_ms=1549.082 copy_ms=2.141 norm_ms=0.082 gate_up_ms=1032.822 down_ms=513.911 residual_ms=0.126
+May 19 16:50:48 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=6 kind=mlp ms=1549.099
+May 19 16:50:49 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=7 kind=full ms=567.811
+May 19 16:50:50 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=7 total_ms=1547.979 copy_ms=1.916 norm_ms=0.089 gate_up_ms=1031.001 down_ms=514.848 residual_ms=0.124
+May 19 16:50:50 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=7 kind=mlp ms=1547.997
+May 19 16:50:51 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=8 kind=linear ms=681.994
+May 19 16:50:53 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=8 total_ms=1550.908 copy_ms=1.912 norm_ms=0.080 gate_up_ms=1036.245 down_ms=512.546 residual_ms=0.124
+May 19 16:50:53 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=8 kind=mlp ms=1550.927
+May 19 16:50:53 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=9 kind=linear ms=689.441
+May 19 16:50:55 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=9 total_ms=1548.294 copy_ms=1.351 norm_ms=0.073 gate_up_ms=1032.035 down_ms=514.708 residual_ms=0.126
+May 19 16:50:55 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=9 kind=mlp ms=1548.311
+May 19 16:50:56 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=10 kind=linear ms=688.128
+May 19 16:50:57 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=10 total_ms=1550.344 copy_ms=1.230 norm_ms=0.078 gate_up_ms=1036.071 down_ms=512.831 residual_ms=0.134
+May 19 16:50:57 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=10 kind=mlp ms=1550.363
+May 19 16:50:58 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=11 kind=full ms=567.824
+May 19 16:50:59 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=11 total_ms=1553.113 copy_ms=1.592 norm_ms=0.079 gate_up_ms=1036.647 down_ms=514.663 residual_ms=0.132
+May 19 16:50:59 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=11 kind=mlp ms=1553.132
+May 19 16:51:00 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=12 kind=linear ms=689.202
+May 19 16:51:02 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=12 total_ms=1559.649 copy_ms=1.673 norm_ms=0.084 gate_up_ms=1035.915 down_ms=521.849 residual_ms=0.128
+May 19 16:51:02 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=12 kind=mlp ms=1559.668
+May 19 16:51:02 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=13 kind=linear ms=686.685
+May 19 16:51:04 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=13 total_ms=1560.783 copy_ms=1.250 norm_ms=0.074 gate_up_ms=1040.725 down_ms=518.607 residual_ms=0.127
+May 19 16:51:04 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=13 kind=mlp ms=1560.801
+May 19 16:51:04 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=14 kind=linear ms=690.007
+May 19 16:51:06 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=14 total_ms=1550.706 copy_ms=1.563 norm_ms=0.083 gate_up_ms=1034.389 down_ms=514.544 residual_ms=0.126
+May 19 16:51:06 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=14 kind=mlp ms=1550.725
+May 19 16:51:07 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=15 kind=full ms=563.796
+May 19 16:51:08 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=15 total_ms=1547.534 copy_ms=0.926 norm_ms=0.075 gate_up_ms=1034.228 down_ms=512.181 residual_ms=0.125
+May 19 16:51:08 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=15 kind=mlp ms=1547.552
+May 19 16:51:09 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=16 kind=linear ms=681.054
+May 19 16:51:10 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=16 total_ms=1544.868 copy_ms=0.888 norm_ms=0.086 gate_up_ms=1029.703 down_ms=514.062 residual_ms=0.128
+May 19 16:51:10 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=16 kind=mlp ms=1544.885
+May 19 16:51:11 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=17 kind=linear ms=682.089
+May 19 16:51:13 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=17 total_ms=1546.400 copy_ms=0.897 norm_ms=0.081 gate_up_ms=1032.461 down_ms=512.830 residual_ms=0.132
+May 19 16:51:13 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=17 kind=mlp ms=1546.417
+May 19 16:51:13 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=18 kind=linear ms=679.844
+May 19 16:51:15 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=18 total_ms=1548.395 copy_ms=1.006 norm_ms=0.076 gate_up_ms=1031.138 down_ms=516.048 residual_ms=0.126
+May 19 16:51:15 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=18 kind=mlp ms=1548.413
+May 19 16:51:15 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=19 kind=full ms=565.866
+May 19 16:51:17 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=19 total_ms=1547.011 copy_ms=1.426 norm_ms=0.088 gate_up_ms=1031.326 down_ms=514.044 residual_ms=0.128
+May 19 16:51:17 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=19 kind=mlp ms=1547.029
+May 19 16:51:18 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=20 kind=linear ms=681.028
+May 19 16:51:19 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=20 total_ms=1548.409 copy_ms=0.926 norm_ms=0.079 gate_up_ms=1033.632 down_ms=513.646 residual_ms=0.126
+May 19 16:51:19 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=20 kind=mlp ms=1548.426
+May 19 16:51:20 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=21 kind=linear ms=683.567
+May 19 16:51:21 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=21 total_ms=1545.570 copy_ms=1.225 norm_ms=0.088 gate_up_ms=1030.135 down_ms=513.996 residual_ms=0.127
+May 19 16:51:21 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=21 kind=mlp ms=1545.589
+May 19 16:51:22 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=22 kind=linear ms=681.234
+May 19 16:51:24 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=22 total_ms=1550.457 copy_ms=1.240 norm_ms=0.083 gate_up_ms=1034.677 down_ms=514.325 residual_ms=0.131
+May 19 16:51:24 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=22 kind=mlp ms=1550.474
+May 19 16:51:24 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=23 kind=full ms=566.922
+May 19 16:51:26 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=23 total_ms=1548.604 copy_ms=0.484 norm_ms=0.086 gate_up_ms=1033.062 down_ms=514.847 residual_ms=0.125
+May 19 16:51:26 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=23 kind=mlp ms=1548.621
+May 19 16:51:26 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=24 kind=linear ms=686.287
+May 19 16:51:28 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=24 total_ms=1549.473 copy_ms=1.266 norm_ms=0.082 gate_up_ms=1034.572 down_ms=513.421 residual_ms=0.132
+May 19 16:51:28 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=24 kind=mlp ms=1549.491
+May 19 16:51:29 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=25 kind=linear ms=686.816
+May 19 16:51:30 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=25 total_ms=1546.335 copy_ms=1.561 norm_ms=0.080 gate_up_ms=1030.685 down_ms=513.883 residual_ms=0.126
+May 19 16:51:30 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=25 kind=mlp ms=1546.352
+May 19 16:51:31 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=26 kind=linear ms=680.439
+May 19 16:51:32 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=26 total_ms=1547.029 copy_ms=1.155 norm_ms=0.090 gate_up_ms=1033.915 down_ms=511.744 residual_ms=0.125
+May 19 16:51:32 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=26 kind=mlp ms=1547.045
+May 19 16:51:33 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=27 kind=full ms=567.357
+May 19 16:51:35 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=27 total_ms=1550.426 copy_ms=1.237 norm_ms=0.080 gate_up_ms=1034.636 down_ms=514.348 residual_ms=0.124
+May 19 16:51:35 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=27 kind=mlp ms=1550.442
+May 19 16:51:35 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=28 kind=linear ms=685.029
+May 19 16:51:37 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=28 total_ms=1548.552 copy_ms=1.612 norm_ms=0.092 gate_up_ms=1032.083 down_ms=514.641 residual_ms=0.125
+May 19 16:51:37 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=28 kind=mlp ms=1548.569
+May 19 16:51:37 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=29 kind=linear ms=690.738
+May 19 16:51:39 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=29 total_ms=1553.193 copy_ms=2.097 norm_ms=0.084 gate_up_ms=1035.793 down_ms=515.087 residual_ms=0.132
+May 19 16:51:39 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=29 kind=mlp ms=1553.210
+May 19 16:51:40 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=30 kind=linear ms=685.539
+May 19 16:51:41 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=30 total_ms=1550.610 copy_ms=1.425 norm_ms=0.087 gate_up_ms=1034.642 down_ms=514.332 residual_ms=0.124
+May 19 16:51:41 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=30 kind=mlp ms=1550.626
+May 19 16:51:42 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=31 kind=full ms=571.203
+May 19 16:51:43 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=31 total_ms=1548.707 copy_ms=1.223 norm_ms=0.085 gate_up_ms=1034.705 down_ms=512.564 residual_ms=0.131
+May 19 16:51:43 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=31 kind=mlp ms=1548.724
+May 19 16:51:44 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=32 kind=linear ms=682.218
+May 19 16:51:46 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=32 total_ms=1548.369 copy_ms=0.874 norm_ms=0.082 gate_up_ms=1032.201 down_ms=515.086 residual_ms=0.126
+May 19 16:51:46 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=32 kind=mlp ms=1548.386
+May 19 16:51:46 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=33 kind=linear ms=687.711
+May 19 16:51:48 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=33 total_ms=1552.899 copy_ms=1.700 norm_ms=0.082 gate_up_ms=1036.940 down_ms=514.051 residual_ms=0.125
+May 19 16:51:48 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=33 kind=mlp ms=1552.916
+May 19 16:51:49 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=34 kind=linear ms=689.587
+May 19 16:51:50 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=34 total_ms=1549.015 copy_ms=1.099 norm_ms=0.088 gate_up_ms=1032.672 down_ms=515.029 residual_ms=0.127
+May 19 16:51:50 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=34 kind=mlp ms=1549.031
+May 19 16:51:51 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=35 kind=full ms=566.295
+May 19 16:51:52 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=35 total_ms=1547.854 copy_ms=1.018 norm_ms=0.074 gate_up_ms=1032.049 down_ms=514.588 residual_ms=0.126
+May 19 16:51:52 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=35 kind=mlp ms=1547.870
+May 19 16:51:53 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=36 kind=linear ms=687.445
+May 19 16:51:54 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=36 total_ms=1552.432 copy_ms=1.842 norm_ms=0.088 gate_up_ms=1036.832 down_ms=513.538 residual_ms=0.132
+May 19 16:51:54 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=36 kind=mlp ms=1552.450
+May 19 16:51:55 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=37 kind=linear ms=687.876
+May 19 16:51:57 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=37 total_ms=1550.303 copy_ms=2.444 norm_ms=0.086 gate_up_ms=1033.034 down_ms=514.614 residual_ms=0.125
+May 19 16:51:57 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=37 kind=mlp ms=1550.318
+May 19 16:51:57 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=38 kind=linear ms=691.727
+May 19 16:51:59 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=38 total_ms=1556.932 copy_ms=2.013 norm_ms=0.088 gate_up_ms=1040.144 down_ms=514.563 residual_ms=0.124
+May 19 16:51:59 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=38 kind=mlp ms=1556.948
+May 19 16:51:59 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=39 kind=full ms=569.946
+May 19 16:52:01 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=39 total_ms=1553.014 copy_ms=1.921 norm_ms=0.082 gate_up_ms=1034.445 down_ms=516.439 residual_ms=0.126
+May 19 16:52:01 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=39 kind=mlp ms=1553.032
+May 19 16:52:02 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=40 kind=linear ms=692.896
+May 19 16:52:03 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=40 total_ms=1552.377 copy_ms=1.413 norm_ms=0.089 gate_up_ms=1038.583 down_ms=512.166 residual_ms=0.126
+May 19 16:52:03 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=40 kind=mlp ms=1552.394
+May 19 16:52:04 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=41 kind=linear ms=686.261
+May 19 16:52:06 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=41 total_ms=1548.535 copy_ms=1.624 norm_ms=0.076 gate_up_ms=1032.136 down_ms=514.573 residual_ms=0.126
+May 19 16:52:06 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=41 kind=mlp ms=1548.553
+May 19 16:52:06 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=42 kind=linear ms=693.956
+May 19 16:52:08 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=42 total_ms=1550.552 copy_ms=1.788 norm_ms=0.085 gate_up_ms=1035.992 down_ms=512.556 residual_ms=0.131
+May 19 16:52:08 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=42 kind=mlp ms=1550.568
+May 19 16:52:08 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=43 kind=full ms=571.409
+May 19 16:52:10 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=43 total_ms=1554.874 copy_ms=1.087 norm_ms=0.081 gate_up_ms=1037.827 down_ms=515.748 residual_ms=0.131
+May 19 16:52:10 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=43 kind=mlp ms=1554.890
+May 19 16:52:11 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=44 kind=linear ms=687.412
+May 19 16:52:12 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=44 total_ms=1554.053 copy_ms=1.520 norm_ms=0.085 gate_up_ms=1038.580 down_ms=513.743 residual_ms=0.125
+May 19 16:52:12 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=44 kind=mlp ms=1554.070
+May 19 16:52:13 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=45 kind=linear ms=689.335
+May 19 16:52:14 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=45 total_ms=1554.110 copy_ms=2.826 norm_ms=0.087 gate_up_ms=1036.448 down_ms=514.622 residual_ms=0.127
+May 19 16:52:14 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=45 kind=mlp ms=1554.127
+May 19 16:52:15 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=46 kind=linear ms=687.816
+May 19 16:52:17 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=46 total_ms=1549.754 copy_ms=1.912 norm_ms=0.093 gate_up_ms=1032.614 down_ms=515.007 residual_ms=0.127
+May 19 16:52:17 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=46 kind=mlp ms=1549.770
+May 19 16:52:17 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=47 kind=full ms=569.920
+May 19 16:52:19 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=47 total_ms=1553.833 copy_ms=1.678 norm_ms=0.084 gate_up_ms=1038.145 down_ms=513.802 residual_ms=0.124
+May 19 16:52:19 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=47 kind=mlp ms=1553.849
+May 19 16:52:19 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=48 kind=linear ms=690.238
+May 19 16:52:21 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=48 total_ms=1553.418 copy_ms=1.729 norm_ms=0.080 gate_up_ms=1036.342 down_ms=515.143 residual_ms=0.124
+May 19 16:52:21 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=48 kind=mlp ms=1553.433
+May 19 16:52:22 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=49 kind=linear ms=690.464
+May 19 16:52:23 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=49 total_ms=1552.744 copy_ms=1.500 norm_ms=0.093 gate_up_ms=1037.674 down_ms=513.345 residual_ms=0.131
+May 19 16:52:23 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=49 kind=mlp ms=1552.760
+May 19 16:52:24 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=50 kind=linear ms=690.367
+May 19 16:52:25 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=50 total_ms=1547.981 copy_ms=1.200 norm_ms=0.084 gate_up_ms=1032.820 down_ms=513.755 residual_ms=0.124
+May 19 16:52:25 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=50 kind=mlp ms=1547.998
+May 19 16:52:26 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=51 kind=full ms=567.230
+May 19 16:52:28 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=51 total_ms=1550.092 copy_ms=1.725 norm_ms=0.083 gate_up_ms=1032.890 down_ms=515.270 residual_ms=0.124
+May 19 16:52:28 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=51 kind=mlp ms=1550.108
+May 19 16:52:28 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=52 kind=linear ms=685.986
+May 19 16:52:30 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=52 total_ms=1553.193 copy_ms=1.646 norm_ms=0.091 gate_up_ms=1037.015 down_ms=514.318 residual_ms=0.122
+May 19 16:52:30 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=52 kind=mlp ms=1553.209
+May 19 16:52:30 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=53 kind=linear ms=687.493
+May 19 16:52:32 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=53 total_ms=1552.037 copy_ms=1.992 norm_ms=0.091 gate_up_ms=1035.429 down_ms=514.398 residual_ms=0.126
+May 19 16:52:32 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=53 kind=mlp ms=1552.053
+May 19 16:52:33 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=54 kind=linear ms=690.159
+May 19 16:52:34 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=54 total_ms=1554.515 copy_ms=1.999 norm_ms=0.086 gate_up_ms=1036.810 down_ms=515.489 residual_ms=0.132
+May 19 16:52:34 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=54 kind=mlp ms=1554.531
+May 19 16:52:35 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=55 kind=full ms=568.846
+May 19 16:52:36 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=55 total_ms=1547.152 copy_ms=1.859 norm_ms=0.079 gate_up_ms=1031.333 down_ms=513.757 residual_ms=0.125
+May 19 16:52:36 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=55 kind=mlp ms=1547.168
+May 19 16:52:37 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=56 kind=linear ms=687.829
+May 19 16:52:39 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=56 total_ms=1549.606 copy_ms=1.761 norm_ms=0.083 gate_up_ms=1034.875 down_ms=512.756 residual_ms=0.131
+May 19 16:52:39 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=56 kind=mlp ms=1549.621
+May 19 16:52:39 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=57 kind=linear ms=687.684
+May 19 16:52:41 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=57 total_ms=1551.278 copy_ms=1.984 norm_ms=0.077 gate_up_ms=1033.261 down_ms=515.831 residual_ms=0.124
+May 19 16:52:41 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=57 kind=mlp ms=1551.295
+May 19 16:52:42 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=58 kind=linear ms=692.739
+May 19 16:52:43 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=58 total_ms=1550.515 copy_ms=1.551 norm_ms=0.090 gate_up_ms=1035.991 down_ms=512.759 residual_ms=0.124
+May 19 16:52:43 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=58 kind=mlp ms=1550.530
+May 19 16:52:44 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=59 kind=full ms=569.404
+May 19 16:52:45 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=59 total_ms=1551.408 copy_ms=1.011 norm_ms=0.086 gate_up_ms=1036.579 down_ms=513.608 residual_ms=0.124
+May 19 16:52:45 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=59 kind=mlp ms=1551.424
+May 19 16:52:46 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=60 kind=linear ms=688.893
+May 19 16:52:47 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=60 total_ms=1550.277 copy_ms=1.677 norm_ms=0.088 gate_up_ms=1034.688 down_ms=513.696 residual_ms=0.126
+May 19 16:52:47 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=60 kind=mlp ms=1550.293
+May 19 16:52:48 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=61 kind=linear ms=688.336
+May 19 16:52:50 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=61 total_ms=1552.956 copy_ms=1.188 norm_ms=0.089 gate_up_ms=1036.993 down_ms=514.555 residual_ms=0.130
+May 19 16:52:50 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=61 kind=mlp ms=1552.973
+May 19 16:52:50 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=62 kind=linear ms=689.470
+May 19 16:52:52 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=62 total_ms=1549.948 copy_ms=1.855 norm_ms=0.090 gate_up_ms=1032.874 down_ms=515.003 residual_ms=0.126
+May 19 16:52:52 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=62 kind=mlp ms=1549.963
+May 19 16:52:53 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=63 kind=full ms=573.074
+May 19 16:52:54 cortex rvllm-server[1942196]: [qwen35-mlp-perf] tokens=944 layer=63 total_ms=1557.245 copy_ms=1.641 norm_ms=0.084 gate_up_ms=1041.695 down_ms=513.693 residual_ms=0.131
+May 19 16:52:54 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 layer=63 kind=mlp ms=1557.260
+May 19 16:52:54 cortex rvllm-server[1942196]: [qwen35-prefill-perf] tokens=944 summary total_ms=141341.444 embed_ms=0.945 linear_ms=32991.125 full_ms=9097.242 mlp_ms=99240.222 finalize_ms=11.110

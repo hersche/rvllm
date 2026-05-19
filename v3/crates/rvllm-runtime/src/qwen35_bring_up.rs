@@ -5403,6 +5403,20 @@ impl Qwen35Bringup {
         let intermediate = arch.base.intermediate_size as i32;
         let eps = arch.base.rms_norm_eps;
         let stream_raw = stream.raw() as u64;
+        let mlp_trace =
+            std::env::var("RVLLM_QWEN35_MLP_PERF_TRACE").as_deref() == Ok("1");
+        let trace_begin = if mlp_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 mlp trace begin")?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut trace_last = trace_begin;
+        let mut trace_copy_ms = 0.0_f64;
+        let mut trace_norm_ms = 0.0_f64;
+        let mut trace_gate_up_ms = 0.0_f64;
+        let mut trace_down_ms = 0.0_f64;
+        let mut trace_residual_ms = 0.0_f64;
         let n = num_tokens as usize;
         let nh = (n * hidden as usize) * 2;
         let ni = (n * intermediate as usize) * 2;
@@ -5423,6 +5437,13 @@ impl Qwen35Bringup {
                     rvllm_core::CudaErrorKind::MemcpyFailed,
                     rvllm_core::CudaCtx::setup()));
             }
+        }
+        if mlp_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 mlp trace copy")?;
+            if let Some(t0) = trace_last {
+                trace_copy_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            trace_last = Some(std::time::Instant::now());
         }
         {
             use cudarc::driver::sys::*;
@@ -5450,6 +5471,13 @@ impl Qwen35Bringup {
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup()));
             }
+        }
+        if mlp_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 mlp trace norm")?;
+            if let Some(t0) = trace_last {
+                trace_norm_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            trace_last = Some(std::time::Instant::now());
         }
 
         // (2) silu_mid ← SiLU(gate(h_work)) * up(h_work)
@@ -5493,6 +5521,13 @@ impl Qwen35Bringup {
                     rvllm_core::CudaCtx::setup()));
             }
         }
+        if mlp_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 mlp trace gate_up")?;
+            if let Some(t0) = trace_last {
+                trace_gate_up_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            trace_last = Some(std::time::Instant::now());
+        }
 
         // (3+4) down_proj at M=num_tokens — one launch via the
         //       row-batched FP8 GEMV (kernel already supports
@@ -5510,6 +5545,13 @@ impl Qwen35Bringup {
             silu_mid_buf,
             stream_raw,
         )?;
+        if mlp_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 mlp trace down")?;
+            if let Some(t0) = trace_last {
+                trace_down_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            trace_last = Some(std::time::Instant::now());
+        }
 
         // (5) h_residual += down_out elementwise over N*hidden.
         {
@@ -5537,6 +5579,28 @@ impl Qwen35Bringup {
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup()));
             }
+        }
+        if mlp_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 mlp trace residual")?;
+            if let Some(t0) = trace_last {
+                trace_residual_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            let total_ms = trace_begin
+                .map(|t0| t0.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            eprintln!(
+                "[qwen35-mlp-perf] tokens={} layer={} total_ms={:.3} \
+                 copy_ms={:.3} norm_ms={:.3} gate_up_ms={:.3} \
+                 down_ms={:.3} residual_ms={:.3}",
+                num_tokens,
+                layer_idx,
+                total_ms,
+                trace_copy_ms,
+                trace_norm_ms,
+                trace_gate_up_ms,
+                trace_down_ms,
+                trace_residual_ms,
+            );
         }
         Ok(())
     }
