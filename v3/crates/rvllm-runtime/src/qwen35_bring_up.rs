@@ -2387,6 +2387,23 @@ impl Qwen35Bringup {
         let fp8_gemv_fn = ker.fn_fp8_gemv_wpr_native_f16in.ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
             "apply_full_attn_layer_batched: fp8_gemv_wpr_native_f16in unavailable".into()))?;
+        let cutlass_full_min_tokens =
+            std::env::var("RVLLM_QWEN35_FULL_CUTLASS_MIN_TOKENS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(128);
+        let cutlass_full_requested =
+            crate::gemma4_bring_up::parse_truthy_env("RVLLM_QWEN35_FULL_CUTLASS_SM120")
+                .unwrap_or(false)
+                && num_tokens >= cutlass_full_min_tokens;
+        let cutlass_full_lib = if cutlass_full_requested {
+            match &self.cutlass {
+                CutlassBackend::SoSm120(lib) => Some(lib),
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         // (1) RMSNorm batched on [N, hidden] copy of h_residual.
         let normed = arena.region("qwen35_bfattn_normed", n * h * 2, 16)?.device_ptr();
@@ -2417,12 +2434,28 @@ impl Qwen35Bringup {
         let qg_region = arena.region(
             "qwen35_bfattn_qg", n * (qg_n as usize) * 2, 16)?.device_ptr();
         let q_bs = full.q_proj.blockscale_ptr.unwrap_or(0);
-        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-            m: num_tokens, n: qg_n, k: hidden_u,
-        }.launch(
-            fp8_gemv_fn, qg_region,
-            full.q_proj.offset_bytes, q_bs, normed, stream_raw,
-        )?;
+        if let Some(lib) = cutlass_full_lib {
+            self.qwen35_fp8_cutlass_blockscale_sm120(
+                ker,
+                lib,
+                qg_region,
+                full.q_proj.offset_bytes,
+                q_bs,
+                normed,
+                num_tokens,
+                qg_n,
+                hidden_u,
+                stream_raw,
+                "qwen35_bfattn_qg_in_fp8",
+            )?;
+        } else {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m: num_tokens, n: qg_n, k: hidden_u,
+            }.launch(
+                fp8_gemv_fn, qg_region,
+                full.q_proj.offset_bytes, q_bs, normed, stream_raw,
+            )?;
+        }
 
         // (3) split_q_gate batched: kernel grid (n_q_heads, N, 1).
         let q_region    = arena.region("qwen35_bfattn_q",    n * qsize_us * 2, 16)?.device_ptr();
@@ -2472,12 +2505,28 @@ impl Qwen35Bringup {
         let k_region = arena.region(
             "qwen35_bfattn_k", n * (k_n as usize) * 2, 16)?.device_ptr();
         let k_bs = full.k_proj.blockscale_ptr.unwrap_or(0);
-        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-            m: num_tokens, n: k_n, k: hidden_u,
-        }.launch(
-            fp8_gemv_fn, k_region,
-            full.k_proj.offset_bytes, k_bs, normed, stream_raw,
-        )?;
+        if let Some(lib) = cutlass_full_lib {
+            self.qwen35_fp8_cutlass_blockscale_sm120(
+                ker,
+                lib,
+                k_region,
+                full.k_proj.offset_bytes,
+                k_bs,
+                normed,
+                num_tokens,
+                k_n,
+                hidden_u,
+                stream_raw,
+                "qwen35_bfattn_k_in_fp8",
+            )?;
+        } else {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m: num_tokens, n: k_n, k: hidden_u,
+            }.launch(
+                fp8_gemv_fn, k_region,
+                full.k_proj.offset_bytes, k_bs, normed, stream_raw,
+            )?;
+        }
         rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: (n_kv_heads as u32) * num_tokens,
             hidden: head_dim as u32, eps,
@@ -2491,12 +2540,28 @@ impl Qwen35Bringup {
         let v_region = arena.region(
             "qwen35_bfattn_v", n * (v_n as usize) * 2, 16)?.device_ptr();
         let v_bs = full.v_proj.blockscale_ptr.unwrap_or(0);
-        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-            m: num_tokens, n: v_n, k: hidden_u,
-        }.launch(
-            fp8_gemv_fn, v_region,
-            full.v_proj.offset_bytes, v_bs, normed, stream_raw,
-        )?;
+        if let Some(lib) = cutlass_full_lib {
+            self.qwen35_fp8_cutlass_blockscale_sm120(
+                ker,
+                lib,
+                v_region,
+                full.v_proj.offset_bytes,
+                v_bs,
+                normed,
+                num_tokens,
+                v_n,
+                hidden_u,
+                stream_raw,
+                "qwen35_bfattn_v_in_fp8",
+            )?;
+        } else {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m: num_tokens, n: v_n, k: hidden_u,
+            }.launch(
+                fp8_gemv_fn, v_region,
+                full.v_proj.offset_bytes, v_bs, normed, stream_raw,
+            )?;
+        }
 
         // (6) RoPE + KV-cache write batched. positions and slot_mapping
         // are both `positions_dev_ptr` ([N] i32) — qwen3-next slot==position.
@@ -2882,12 +2947,28 @@ impl Qwen35Bringup {
         let o_bs = full.o_proj.blockscale_ptr.unwrap_or(0);
         let out_region = arena.region(
             "qwen35_bfattn_out", n * (o_n as usize) * 2, 16)?.device_ptr();
-        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-            m: num_tokens, n: o_n, k: o_k,
-        }.launch(
-            fp8_gemv_fn, out_region,
-            full.o_proj.offset_bytes, o_bs, gated, stream_raw,
-        )?;
+        if let Some(lib) = cutlass_full_lib {
+            self.qwen35_fp8_cutlass_blockscale_sm120(
+                ker,
+                lib,
+                out_region,
+                full.o_proj.offset_bytes,
+                o_bs,
+                gated,
+                num_tokens,
+                o_n,
+                o_k,
+                stream_raw,
+                "qwen35_bfattn_out_in_fp8",
+            )?;
+        } else {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m: num_tokens, n: o_n, k: o_k,
+            }.launch(
+                fp8_gemv_fn, out_region,
+                full.o_proj.offset_bytes, o_bs, gated, stream_raw,
+            )?;
+        }
 
         // (12) Residual: h_residual_buf += out elementwise [N*hidden].
         {
