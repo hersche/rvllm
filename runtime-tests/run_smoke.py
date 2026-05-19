@@ -376,6 +376,7 @@ def run_profile_suite(
     skip_audio: bool,
     text_max_tokens: int,
     include_repeat_probes: bool,
+    request_timeout: int,
 ) -> list[ProbeResult]:
     results: list[ProbeResult] = []
     model_id = PROFILE_MODEL_ID.get(profile)
@@ -402,6 +403,7 @@ def run_profile_suite(
                 profile=profile, model_id=model_id, kind="text", label=label,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_tokens,
+                timeout=request_timeout,
             )
             results.append(r)
             if r.ok:
@@ -428,6 +430,7 @@ def run_profile_suite(
             r = call_chat(
                 profile=profile, model_id=model_id, kind="vision", label=label,
                 messages=messages, max_tokens=40,
+                timeout=request_timeout,
             )
             results.append(r)
             if r.ok:
@@ -453,6 +456,7 @@ def run_profile_suite(
         r = call_chat(
             profile=profile, model_id=model_id, kind="audio", label="440hz_1s",
             messages=messages, max_tokens=5,
+            timeout=request_timeout,
         )
         results.append(r)
         if r.ok:
@@ -532,6 +536,8 @@ def main() -> int:
     ap.add_argument("--include-repeat-probes", action="store_true",
                     help="Add long repeat-heavy probes that trigger Qwen prompt-lookup spec")
     ap.add_argument("--text-max-tokens", type=int, default=80)
+    ap.add_argument("--request-timeout", type=int, default=240,
+                    help="Per-request HTTP timeout in seconds")
     ap.add_argument("--results",  default=str(RESULTS_MD))
     ap.add_argument("--jsonl",    default=str(RESULTS_JSONL))
     ap.add_argument("--restore-profile", default="mobile-e4b-rvllm",
@@ -568,6 +574,7 @@ def main() -> int:
             skip_audio=args.skip_audio,
             text_max_tokens=args.text_max_tokens,
             include_repeat_probes=args.include_repeat_probes,
+            request_timeout=args.request_timeout,
         )
         all_records.extend(recs)
 
