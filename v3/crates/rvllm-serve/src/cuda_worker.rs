@@ -271,15 +271,27 @@ pub async fn spawn_cuda_worker(
                         let stop_ids: std::collections::HashSet<u32> =
                             req.stop_token_ids.iter().copied().collect();
                         let stopped_on_eos = std::cell::Cell::new(false);
-                        let result = unsafe {
-                            bringup.generate_session_with_vision(
-                                &prompt_ids, max_new, &splices,
+                        let spec_min_prompt_tokens = std::env::var(
+                            "RVLLM_QWEN35_SPEC_MIN_PROMPT_TOKENS")
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(1024);
+                        let spec_min_max_new_tokens = std::env::var(
+                            "RVLLM_QWEN35_SPEC_MIN_MAX_NEW_TOKENS")
+                            .ok()
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .unwrap_or(64);
+                        let spec_decode_on = std::env::var("RVLLM_QWEN35_SPEC_DECODE")
+                            .map(|v| v != "0" && !v.is_empty())
+                            .unwrap_or(false)
+                            && splices.is_empty()
+                            && prompt_ids.len() >= spec_min_prompt_tokens
+                            && max_new >= spec_min_max_new_tokens;
+                        let result = if spec_decode_on {
+                            rvllm_runtime::qwen35_spec_decode::run_qwen35_prompt_lookup_spec(
+                                &bringup, &prompt_ids, max_new,
+                                &req.stop_token_ids,
                                 |tok_id, pos| {
-                                    // EOS check: if this token is a
-                                    // stop token, emit nothing and
-                                    // signal short-circuit. The Done
-                                    // event below will carry
-                                    // FinishReason::Stop.
                                     if stop_ids.contains(&tok_id) {
                                         stopped_on_eos.set(true);
                                         return false;
@@ -288,7 +300,27 @@ pub async fn spawn_cuda_worker(
                                         id: tok_id, position: pos,
                                     }).is_ok()
                                 },
-                            )
+                            ).map(|(emitted, _reason)| emitted)
+                        } else {
+                            unsafe {
+                                bringup.generate_session_with_vision(
+                                    &prompt_ids, max_new, &splices,
+                                    |tok_id, pos| {
+                                        // EOS check: if this token is a
+                                        // stop token, emit nothing and
+                                        // signal short-circuit. The Done
+                                        // event below will carry
+                                        // FinishReason::Stop.
+                                        if stop_ids.contains(&tok_id) {
+                                            stopped_on_eos.set(true);
+                                            return false;
+                                        }
+                                        events_tx.send(GenerateEvent::Token {
+                                            id: tok_id, position: pos,
+                                        }).is_ok()
+                                    },
+                                )
+                            }
                         };
                         match result {
                             Ok(emitted) => {

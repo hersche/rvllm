@@ -2734,6 +2734,10 @@ impl Qwen35Bringup {
         token_ids: &[u32],
         start_position: u32,
     ) -> Result<Vec<i32>> {
+        if token_ids.len() == 1 {
+            let tok = self.forward_all_layers_smoke(token_ids[0], start_position)?;
+            return Ok(vec![tok as i32]);
+        }
         let h_residual_buf =
             self.forward_qwen35_tokens_batched(token_ids, start_position)?;
         let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
@@ -2779,6 +2783,10 @@ impl Qwen35Bringup {
         token_ids: &[u32],
         start_position: u32,
     ) -> Result<()> {
+        if token_ids.len() == 1 {
+            self.forward_layers_only(token_ids[0], start_position, None)?;
+            return Ok(());
+        }
         let _ = self.forward_qwen35_tokens_batched(token_ids, start_position)?;
         Ok(())
     }
