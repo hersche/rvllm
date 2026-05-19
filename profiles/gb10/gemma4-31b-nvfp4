@@ -1,4 +1,4 @@
-# Source with: source profiles/gb10/gemma4-nvfp4
+# Source with: source profiles/gb10/gemma4-31b-nvfp4
 #
 # Gemma 4 31B IT NVFP4 weights on GB10: NVFP4W MLP weights, NVFP4 KV,
 # unified/batched prefill, MLP MMA v8, and K7 drafter speculation gated

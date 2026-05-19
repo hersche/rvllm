@@ -1,4 +1,4 @@
-# Source with: source profiles/gb10/qwen35-nvfp4
+# Source with: source profiles/gb10/qwen36-26b-nvfp4
 #
 # Qwen 3.6 27B (Qwen 3.5 runtime path) on GB10: FP8 weights, NVFP4 KV,
 # batched prefill, CUTLASS SM120 projections, and prompt-lookup spec K6.
