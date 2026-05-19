@@ -1,0 +1,4 @@
+{"profile":"mobile-31b-nvfp4w-rvllm-spec","variant":"chunk128","label":"long_summary_800_max1","ok":true,"total_ms":78213.6,"prompt_tokens":1004,"completion_tokens":1,"first_token":"Der","decision":"keep current"}
+{"profile":"mobile-31b-nvfp4w-rvllm-spec","variant":"chunk256","label":"long_summary_800_max1","ok":true,"total_ms":78601.1,"prompt_tokens":1004,"completion_tokens":1,"first_token":"Der","decision":"reject"}
+{"profile":"mobile-31b-nvfp4w-rvllm-spec","variant":"chunk512","label":"long_summary_800_max1","ok":true,"total_ms":78608.8,"prompt_tokens":1004,"completion_tokens":1,"first_token":"Der","decision":"reject"}
+{"profile":"mobile-31b-nvfp4w-rvllm-spec","variant":"chunk0","label":"long_summary_800_max1","ok":true,"total_ms":78766.0,"prompt_tokens":1004,"completion_tokens":1,"first_token":"Der","decision":"reject"}
