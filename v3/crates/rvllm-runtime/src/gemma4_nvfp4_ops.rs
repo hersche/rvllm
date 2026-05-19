@@ -99,6 +99,11 @@ pub struct Gemma4Nvfp4MlpKernels {
     /// `mistral35_w4a16_gemm_mn_bf16_kernel` — M>1 W4A16 GEMM.
     /// Used by K-step batched verify to avoid per-token MLP loops.
     pub fn_w4a16_gemm_mn: KernelFn,
+    /// `mistral35_w4a16_gemm_mma_v8_bf16_kernel` — tensor-core
+    /// persistent-CTA M>1 W4A16 GEMM. Opt-in for Gemma NVFP4W via
+    /// `RVLLM_GEMMA4_NVFP4_MLP_MMA_V8=1` until the benchmark path
+    /// proves it should become the default.
+    pub fn_w4a16_gemm_mma_v8: KernelFn,
     /// `mistral35_w4a16_gate_up_gemv_bf16_kernel` — fused gate+up
     /// (one launch produces both [i_size] outputs). Mistral
     /// confirms shape-generic at runtime (i_size + K are kernel
@@ -149,6 +154,7 @@ pub unsafe fn gemma4_nvfp4_w4a16_gemv(
 /// `out_bf16[M, N] = act_bf16[M, K] @ dequant(W[N, K])^T`.
 pub unsafe fn gemma4_nvfp4_w4a16_gemm_mn(
     fn_w4a16_gemm_mn: KernelFn,
+    fn_w4a16_gemm_mma_v8: KernelFn,
     act_bf16: u64,
     weight: &Gemma4Nvfp4LinearLoaded,
     out_bf16: u64,
@@ -170,6 +176,33 @@ pub unsafe fn gemma4_nvfp4_w4a16_gemm_mn(
     let mut m_arg = m as i32;
     let mut n = weight.shape.n as i32;
     let mut k = weight.shape.k as i32;
+    if std::env::var("RVLLM_GEMMA4_NVFP4_MLP_MMA_V8")
+        .ok()
+        .as_deref()
+        == Some("1")
+        && k % 16 == 0
+        && n % 32 == 0
+    {
+        let args: [*mut std::ffi::c_void; 8] = [
+            (&mut out) as *mut u64 as *mut _,
+            (&mut wp) as *mut u64 as *mut _,
+            (&mut ws) as *mut u64 as *mut _,
+            (&mut gs) as *mut u64 as *mut _,
+            (&mut act) as *mut u64 as *mut _,
+            (&mut m_arg) as *mut i32 as *mut _,
+            (&mut n) as *mut i32 as *mut _,
+            (&mut k) as *mut i32 as *mut _,
+        ];
+        let n_tiles = (((n as u32) + 31) / 32).max(1);
+        return rvllm_fused::launch_raw(
+            fn_w4a16_gemm_mma_v8,
+            (n_tiles, 1, 1),
+            (128, 1, 1),
+            0,
+            stream,
+            &args,
+        );
+    }
     let args: [*mut std::ffi::c_void; 8] = [
         (&mut out) as *mut u64 as *mut _,
         (&mut wp) as *mut u64 as *mut _,
@@ -349,6 +382,7 @@ pub unsafe fn gemma4_nvfp4_mlp_forward_batched(
 
     gemma4_nvfp4_w4a16_gemm_mn(
         kernels.fn_w4a16_gemm_mn,
+        kernels.fn_w4a16_gemm_mma_v8,
         act_bf16,
         gate,
         gate_out_ptr,
@@ -357,6 +391,7 @@ pub unsafe fn gemma4_nvfp4_mlp_forward_batched(
     )?;
     gemma4_nvfp4_w4a16_gemm_mn(
         kernels.fn_w4a16_gemm_mn,
+        kernels.fn_w4a16_gemm_mma_v8,
         act_bf16,
         up,
         up_out_ptr,
@@ -373,6 +408,7 @@ pub unsafe fn gemma4_nvfp4_mlp_forward_batched(
     )?;
     gemma4_nvfp4_w4a16_gemm_mn(
         kernels.fn_w4a16_gemm_mn,
+        kernels.fn_w4a16_gemm_mma_v8,
         gate_out_ptr,
         down,
         out_bf16,
@@ -567,6 +603,11 @@ mod tests {
         let fn_gemm_mn = mod_gemm_mn
             .get_function("mistral35_w4a16_gemm_mn_bf16_kernel")
             .expect("get_function gemm_mn");
+        let mod_gemm_mma_v8 = loader.load_ptx("mistral35_w4a16_gemm_mma_v8_bf16")
+            .expect("load_ptx gemm_mma_v8");
+        let fn_gemm_mma_v8 = mod_gemm_mma_v8
+            .get_function("mistral35_w4a16_gemm_mma_v8_bf16_kernel")
+            .expect("get_function gemm_mma_v8");
         let mod_gateup = loader.load_ptx("mistral35_w4a16_gate_up_gemv_bf16")
             .expect("load_ptx gate_up");
         let fn_gateup = mod_gateup
@@ -580,6 +621,7 @@ mod tests {
         let mlp_kernels = Gemma4Nvfp4MlpKernels {
             fn_w4a16_gemv: fn_gemv,
             fn_w4a16_gemm_mn: fn_gemm_mn,
+            fn_w4a16_gemm_mma_v8: fn_gemm_mma_v8,
             fn_w4a16_gate_up_gemv: fn_gateup,
             fn_gelu_tanh_mul: fn_gelu,
         };

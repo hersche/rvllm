@@ -403,6 +403,7 @@ pub struct Gemma4Nvfp4Bringup {
     /// PTX modules backing `mlp_kernels`. Kept alive here.
     _mlp_w4a16_gemv_mod: LoadedModule,
     _mlp_w4a16_gemm_mn_mod: LoadedModule,
+    _mlp_w4a16_gemm_mma_v8_mod: LoadedModule,
     _mlp_w4a16_gate_up_mod: LoadedModule,
     _mlp_gelu_tanh_mul_mod: LoadedModule,
     pub cublaslt: CublasLt,
@@ -611,6 +612,9 @@ impl Gemma4Nvfp4Bringup {
         let mlp_gemm_mn_mod = loader.load_ptx("mistral35_w4a16_gemm_mn_bf16")?;
         let fn_w4a16_gemm_mn =
             mlp_gemm_mn_mod.get_function("mistral35_w4a16_gemm_mn_bf16_kernel")?;
+        let mlp_gemm_mma_v8_mod = loader.load_ptx("mistral35_w4a16_gemm_mma_v8_bf16")?;
+        let fn_w4a16_gemm_mma_v8 =
+            mlp_gemm_mma_v8_mod.get_function("mistral35_w4a16_gemm_mma_v8_bf16_kernel")?;
         let mlp_gate_up_mod = loader.load_ptx("mistral35_w4a16_gate_up_gemv_bf16")?;
         let fn_w4a16_gate_up_gemv =
             mlp_gate_up_mod.get_function("mistral35_w4a16_gate_up_gemv_bf16_kernel")?;
@@ -620,6 +624,7 @@ impl Gemma4Nvfp4Bringup {
         let mlp_kernels = Gemma4Nvfp4MlpKernels {
             fn_w4a16_gemv,
             fn_w4a16_gemm_mn,
+            fn_w4a16_gemm_mma_v8,
             fn_w4a16_gate_up_gemv,
             fn_gelu_tanh_mul,
         };
@@ -678,6 +683,7 @@ impl Gemma4Nvfp4Bringup {
             attn_backend_global,
             _mlp_w4a16_gemv_mod: mlp_gemv_mod,
             _mlp_w4a16_gemm_mn_mod: mlp_gemm_mn_mod,
+            _mlp_w4a16_gemm_mma_v8_mod: mlp_gemm_mma_v8_mod,
             _mlp_w4a16_gate_up_mod: mlp_gate_up_mod,
             _mlp_gelu_tanh_mul_mod: mlp_gelu_mod,
             cublaslt,
