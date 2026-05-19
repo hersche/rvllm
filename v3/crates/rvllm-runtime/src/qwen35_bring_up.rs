@@ -4110,6 +4110,26 @@ impl Qwen35Bringup {
             self.paths.model_dir.clone(),
             "apply_linear_attn_layer_batched: fp8_gemv_wpr_native_f16in unavailable".into()))?;
         let _ = num_k_heads;
+        let linear_trace =
+            std::env::var("RVLLM_QWEN35_LINEAR_PERF_TRACE").as_deref() == Ok("1");
+        let trace_begin = if linear_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 linear trace begin")?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut trace_last = trace_begin;
+        let mut trace_norm_ms = 0.0_f64;
+        let mut trace_qkv_ms = 0.0_f64;
+        let mut trace_conv_state_ms = 0.0_f64;
+        let mut trace_conv1d_ms = 0.0_f64;
+        let mut trace_silu_l2_ms = 0.0_f64;
+        let mut trace_alpha_beta_ms = 0.0_f64;
+        let mut trace_delta_ms = 0.0_f64;
+        let mut trace_z_ms = 0.0_f64;
+        let mut trace_rms_gated_ms = 0.0_f64;
+        let mut trace_out_ms = 0.0_f64;
+        let mut trace_residual_ms = 0.0_f64;
 
         // (1) RMSNorm a [N, hidden] copy of the chunk.
         let normed_bytes = n * h * 2;
@@ -4133,6 +4153,13 @@ impl Qwen35Bringup {
             la.input_layernorm.offset_bytes,
             stream_raw,
         )?;
+        if linear_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 linear trace norm")?;
+            if let Some(t0) = trace_last {
+                trace_norm_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            trace_last = Some(std::time::Instant::now());
+        }
 
         // (2) in_proj_qkv [N, hidden] → [N, conv_dim].
         let qkv_n = conv_dim as u32;
@@ -4146,6 +4173,13 @@ impl Qwen35Bringup {
             fp8_gemv_fn, qkv_region,
             la.in_proj_qkv.offset_bytes, qkv_bs, normed, stream_raw,
         )?;
+        if linear_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 linear trace qkv")?;
+            if let Some(t0) = trace_last {
+                trace_qkv_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            trace_last = Some(std::time::Instant::now());
+        }
 
         // (3) conv1d batched state advance + causal_conv1d.
         let conv_in_bytes  = (n + (ks - 1)) * conv_dim * 2;
@@ -4183,6 +4217,13 @@ impl Qwen35Bringup {
                     rvllm_core::CudaCtx::setup()));
             }
         }
+        if linear_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 linear trace conv_state")?;
+            if let Some(t0) = trace_last {
+                trace_conv_state_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            trace_last = Some(std::time::Instant::now());
+        }
         {
             use cudarc::driver::sys::*;
             let mut output = conv_out;
@@ -4214,6 +4255,13 @@ impl Qwen35Bringup {
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup()));
             }
+        }
+        if linear_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 linear trace conv1d")?;
+            if let Some(t0) = trace_last {
+                trace_conv1d_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            trace_last = Some(std::time::Instant::now());
         }
 
         // (4) silu_l2_gqa over (vus, N).
@@ -4259,6 +4307,13 @@ impl Qwen35Bringup {
                     rvllm_core::CudaCtx::setup()));
             }
         }
+        if linear_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 linear trace silu_l2")?;
+            if let Some(t0) = trace_last {
+                trace_silu_l2_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            trace_last = Some(std::time::Instant::now());
+        }
 
         // (5) alpha_beta over (vus, N).
         let alpha_region = arena.region("qwen35_blattn_alpha", n * num_v_heads * 4, 16)?.device_ptr();
@@ -4299,6 +4354,13 @@ impl Qwen35Bringup {
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup()));
             }
+        }
+        if linear_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 linear trace alpha_beta")?;
+            if let Some(t0) = trace_last {
+                trace_alpha_beta_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            trace_last = Some(std::time::Instant::now());
         }
 
         // (6) gated_delta_rule_prefill — one launch over all N
@@ -4350,6 +4412,13 @@ impl Qwen35Bringup {
                     rvllm_core::CudaCtx::setup()));
             }
         }
+        if linear_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 linear trace delta")?;
+            if let Some(t0) = trace_last {
+                trace_delta_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            trace_last = Some(std::time::Instant::now());
+        }
 
         // (7) in_proj_z batched FP8 GEMV [N, hidden] → [N, value_dim].
         let z_n = la.in_proj_z.shape[0] as u32;
@@ -4363,6 +4432,13 @@ impl Qwen35Bringup {
             fp8_gemv_fn, z_region,
             la.in_proj_z.offset_bytes, z_bs, normed, stream_raw,
         )?;
+        if linear_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 linear trace z")?;
+            if let Some(t0) = trace_last {
+                trace_z_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            trace_last = Some(std::time::Instant::now());
+        }
 
         // (8) rmsnorm_gated over (vus, N).
         let gated_region = arena.region("qwen35_blattn_gated", n * num_v_heads * head_v_dim * 2, 16)?.device_ptr();
@@ -4399,6 +4475,13 @@ impl Qwen35Bringup {
                     rvllm_core::CudaCtx::setup()));
             }
         }
+        if linear_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 linear trace rms_gated")?;
+            if let Some(t0) = trace_last {
+                trace_rms_gated_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            trace_last = Some(std::time::Instant::now());
+        }
 
         // (9) out_proj batched FP8 GEMV [N, value_dim] → [N, hidden].
         let out_n = la.out_proj.shape[0] as u32;
@@ -4413,6 +4496,13 @@ impl Qwen35Bringup {
             fp8_gemv_fn, out_region,
             la.out_proj.offset_bytes, out_bs, gated_region, stream_raw,
         )?;
+        if linear_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 linear trace out")?;
+            if let Some(t0) = trace_last {
+                trace_out_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            trace_last = Some(std::time::Instant::now());
+        }
 
         // (10) h_residual += out elementwise over N*hidden.
         {
@@ -4441,6 +4531,36 @@ impl Qwen35Bringup {
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup()));
             }
+        }
+        if linear_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 linear trace residual")?;
+            if let Some(t0) = trace_last {
+                trace_residual_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            let total_ms = trace_begin
+                .map(|t0| t0.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            eprintln!(
+                "[qwen35-linear-perf] tokens={} layer={} total_ms={:.3} \
+                 norm_ms={:.3} qkv_ms={:.3} conv_state_ms={:.3} \
+                 conv1d_ms={:.3} silu_l2_ms={:.3} alpha_beta_ms={:.3} \
+                 delta_ms={:.3} z_ms={:.3} rms_gated_ms={:.3} \
+                 out_ms={:.3} residual_ms={:.3}",
+                num_tokens,
+                layer_idx,
+                total_ms,
+                trace_norm_ms,
+                trace_qkv_ms,
+                trace_conv_state_ms,
+                trace_conv1d_ms,
+                trace_silu_l2_ms,
+                trace_alpha_beta_ms,
+                trace_delta_ms,
+                trace_z_ms,
+                trace_rms_gated_ms,
+                trace_out_ms,
+                trace_residual_ms,
+            );
         }
         Ok(())
     }
