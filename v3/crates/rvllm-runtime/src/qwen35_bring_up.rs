@@ -373,6 +373,9 @@ pub struct Qwen35Bringup {
     pub scratch: Option<Qwen35Scratch>,
     #[cfg(feature = "cuda")]
     pub outside_kernels: Option<Qwen35OutsideKernels>,
+    /// SM121 FA2 backend for the NVFP4 batched-prefill full-attn path.
+    #[cfg(feature = "cuda")]
+    pub attn_backend_full: Option<rvllm_attention::AttentionBackend>,
     #[cfg(feature = "cuda")]
     pub cublaslt: Option<CublasLt>,
     /// Linear-attn head/dim config. Always present once `load()`
@@ -960,6 +963,12 @@ impl Qwen35Bringup {
                 scale_inplace_f32_mod,
                 fn_scale_inplace_f32,
             };
+            let attn_backend_full = rvllm_attention::AttentionBackend::Fa2Ptx(
+                rvllm_attention::Fa2PtxKernels::load(
+                    &*kernels,
+                    arch.base.head_dim as u32,
+                )?,
+            );
 
             // cuBLASLt for the FP8 lm_head matmul. 32 MiB workspace
             // (matches Qwen 3.6 / Gemma 4 sizing).
@@ -1001,6 +1010,7 @@ impl Qwen35Bringup {
                 rope_tables: Some(rope_tables),
                 scratch: Some(scratch),
                 outside_kernels: Some(outside_kernels),
+                attn_backend_full: Some(attn_backend_full),
                 cublaslt: Some(cublaslt),
                 la_dims: Some(la_dims),
             });
@@ -2202,60 +2212,6 @@ impl Qwen35Bringup {
             // production decode loop.
             return self.apply_full_attn_qkv_only(layer_idx, start_position);
         }
-        // Step 5 (Qwen 3.6 27B NVFP4 prefill). The batched f16 path
-        // below cannot write into a packed-4-bit KV cache, so when
-        // `kv_dtype == Nvfp4` we fall back to a per-token decode
-        // loop that reuses `apply_full_attn_qkv_only` (already
-        // NVFP4-aware via step 4). Slower than the unified-NVFP4
-        // prefill kernel that the kernels/ tree carries
-        // (`flash_attention_2_prefill_nvfp4kv_unified_kernel`),
-        // but correctness-first — it gives the NVFP4 path a
-        // working prefill today. Optimised batched prefill is a
-        // follow-up (step 5b).
-        {
-            let kvc = self.kv_cache.as_ref().ok_or_else(|| corrupt(
-                self.paths.model_dir.clone(),
-                "apply_full_attn_layer_batched: kv_cache absent".into()))?;
-            if matches!(kvc.dtype, Qwen35KvDtype::Nvfp4) {
-                let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
-                    self.paths.model_dir.clone(),
-                    "apply_full_attn_layer_batched(nvfp4): scratch \
-                     absent".into()))?;
-                let stream = self.stream.as_ref().ok_or_else(|| corrupt(
-                    self.paths.model_dir.clone(),
-                    "apply_full_attn_layer_batched(nvfp4): stream \
-                     absent".into()))?;
-                let h = self.arch.base.hidden_size;
-                let row_bytes: usize = h * 2;
-                let stream_raw = stream.raw() as u64;
-                for t in 0..(num_tokens as usize) {
-                    use cudarc::driver::sys::*;
-                    let src = h_residual_buf + (t * row_bytes) as u64;
-                    let rc = cuMemcpyDtoDAsync_v2(
-                        scr.h_residual_ptr, src, row_bytes,
-                        stream_raw as CUstream);
-                    if rc != CUresult::CUDA_SUCCESS {
-                        return Err(rvllm_core::RvllmError::cuda(
-                            "qwen35_bfattn(nvfp4) DtoD residual→scratch",
-                            rvllm_core::CudaErrorKind::MemcpyFailed,
-                            rvllm_core::CudaCtx::setup()));
-                    }
-                    self.apply_full_attn_qkv_only(
-                        layer_idx, start_position + t as u32)?;
-                    let rc = cuMemcpyDtoDAsync_v2(
-                        src, scr.h_residual_ptr, row_bytes,
-                        stream_raw as CUstream);
-                    if rc != CUresult::CUDA_SUCCESS {
-                        return Err(rvllm_core::RvllmError::cuda(
-                            "qwen35_bfattn(nvfp4) DtoD scratch→residual",
-                            rvllm_core::CudaErrorKind::MemcpyFailed,
-                            rvllm_core::CudaCtx::setup()));
-                    }
-                }
-                return Ok(());
-            }
-        }
-
         let arch = &self.arch;
         let model = self.model.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
@@ -2415,10 +2371,22 @@ impl Qwen35Bringup {
             full.v_proj.offset_bytes, v_bs, normed, stream_raw,
         )?;
 
-        // (6) fused_rope_qwen_partial_f16kv batched. positions and
-        // slot_mapping are both `positions_dev_ptr` ([N] i32) —
-        // qwen3-next slot==position invariant.
-        {
+        // (6) RoPE + KV-cache write batched. positions and slot_mapping
+        // are both `positions_dev_ptr` ([N] i32) — qwen3-next slot==position.
+        let (q_fp8, q_scale_cache) = match layer_kv.dtype {
+            Qwen35KvDtype::F16 => (0u64, 0u64),
+            Qwen35KvDtype::Nvfp4 => {
+                let q_fp8 = arena.region("qwen35_bfattn_q_fp8", n * qsize_us, 16)?;
+                let q_scale = arena.region(
+                    "qwen35_bfattn_q_scale_cache",
+                    n * (n_q_heads as usize) * 4,
+                    16,
+                )?;
+                (q_fp8.device_ptr(), q_scale.device_ptr())
+            }
+        };
+        match layer_kv.dtype {
+        Qwen35KvDtype::F16 => {
             use cudarc::driver::sys::*;
             let mut q_in  = q_region;
             let mut k_in  = k_region;
@@ -2468,9 +2436,76 @@ impl Qwen35Bringup {
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup()));
             }
+        },
+        Qwen35KvDtype::Nvfp4 => {
+            let fn_rope = ker.fn_fused_rope_qwen_partial_nvfp4kv
+                .ok_or_else(|| corrupt(
+                    self.paths.model_dir.clone(),
+                    "qwen35_bfattn: NVFP4 RoPE kernel not loaded".into()))?;
+            use cudarc::driver::sys::*;
+            let mut q_in = q_region;
+            let mut k_in = k_region;
+            let mut v_in = v_region;
+            let mut q_fp8_out = q_fp8;
+            let mut key_packed = layer_kv.k_ptr;
+            let mut value_packed = layer_kv.v_ptr;
+            let mut key_scale = layer_kv.k_scale_ptr;
+            let mut value_scale = layer_kv.v_scale_ptr;
+            let mut cos = rope.cos_ptr;
+            let mut sin = rope.sin_ptr;
+            let mut pos = positions_dev_ptr;
+            let mut slot = positions_dev_ptr;
+            let mut q_scale_static = q_scale_cache;
+            let mut q_scale_dyn = q_scale_cache;
+            let mut nt: i32 = num_tokens as i32;
+            let mut nh: i32 = n_q_heads;
+            let mut nkh: i32 = n_kv_heads;
+            let mut hd: i32 = head_dim;
+            let mut rd: i32 = rope.rotary_dim as i32;
+            let args = [
+                (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_fp8_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut key_packed) as *mut u64 as *mut core::ffi::c_void,
+                (&mut value_packed) as *mut u64 as *mut core::ffi::c_void,
+                (&mut key_scale) as *mut u64 as *mut core::ffi::c_void,
+                (&mut value_scale) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+                (&mut pos) as *mut u64 as *mut core::ffi::c_void,
+                (&mut slot) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_scale_static) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_scale_dyn) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let max_h = n_q_heads.max(n_kv_heads) as u32;
+            let rc = cuLaunchKernel(
+                fn_rope.raw() as CUfunction,
+                num_tokens, max_h, 1,
+                head_dim as u32, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35_bfattn fused_rope_qwen_partial_nvfp4kv",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
         }
 
-        // (7) Cast q [N, q_size] f16 → f32 for the prefill kernel.
+        // (7-9) Attention. F16 uses the existing f32-ABI prefill kernel;
+        // NVFP4 uses the unified packed-KV prefill and returns f16 directly.
+        let attn_out = match layer_kv.dtype {
+        Qwen35KvDtype::F16 => {
+        // Cast q [N, q_size] f16 -> f32 for the prefill kernel.
         let q_f32_bytes = n * qsize_us * 4;
         let q_f32 = arena.region("qwen35_bfattn_qf32", q_f32_bytes, 16)?.device_ptr();
         {
@@ -2591,7 +2626,7 @@ impl Qwen35Bringup {
             }
         }
 
-        // (9) Cast attn_out [N, q_size] f32 → f16.
+        // Cast attn_out [N, q_size] f32 -> f16.
         let attn_out = arena.region(
             "qwen35_bfattn_attn_f16", n * qsize_us * 2, 16)?.device_ptr();
         {
@@ -2621,6 +2656,65 @@ impl Qwen35Bringup {
                     rvllm_core::CudaCtx::setup()));
             }
         }
+        attn_out
+        },
+        Qwen35KvDtype::Nvfp4 => {
+            let attn_out = arena.region(
+                "qwen35_bfattn_attn_f16", n * qsize_us * 2, 16)?.device_ptr();
+            let cu_seqlens = arena.region(
+                "qwen35_bfattn_cu_seqlens", 2 * 4, 16)?;
+            unsafe {
+                let cu: [i32; 2] = [0, num_tokens as i32];
+                let bytes = std::slice::from_raw_parts(
+                    cu.as_ptr() as *const u8,
+                    std::mem::size_of_val(&cu),
+                );
+                cu_seqlens.copy_from_host(bytes)?;
+                let params = rvllm_attention::PagedPrefillParams {
+                    num_seqs: 1,
+                    num_tokens,
+                    num_heads: n_q_heads as u32,
+                    num_kv_heads: n_kv_heads as u32,
+                    head_dim: head_dim as u32,
+                    block_size: 1,
+                    max_blocks_per_seq: kv_cache.max_pos as u32,
+                    num_blocks_total: kv_cache.max_pos as u32,
+                    scale: 1.0_f32 / (head_dim as f32).sqrt(),
+                    window_size_left: -1,
+                };
+                let num_queries_per_kv = (n_q_heads / n_kv_heads) as u32;
+                let unified = rvllm_attention::UnifiedPrefillParams {
+                    num_queries_per_kv,
+                    tile_size: if head_dim <= 256 { 32 } else { 16 },
+                    block_q: (rvllm_attention::UNIFIED_PREFILL_BLOCK_M
+                        / num_queries_per_kv.max(1)).max(1),
+                    use_mma: true,
+                };
+                let backend = self.attn_backend_full.as_ref().ok_or_else(|| corrupt(
+                    self.paths.model_dir.clone(),
+                    "qwen35_bfattn: attention backend absent".into()))?;
+                let prefill = rvllm_attention::PagedPrefillNvfp4Launcher::new(backend);
+                prefill.launch_nvfp4kv_unified_sm121(
+                    params,
+                    unified,
+                    attn_out,
+                    q_fp8,
+                    layer_kv.k_ptr,
+                    layer_kv.v_ptr,
+                    layer_kv.k_scale_ptr,
+                    layer_kv.v_scale_ptr,
+                    q_scale_cache,
+                    kv_cache.block_tables_ptr,
+                    cu_seqlens.device_ptr(),
+                    prefill_ctx_len_dev_ptr,
+                    q_scale_cache,
+                    false,
+                    stream_raw,
+                )?;
+            }
+            attn_out
+        }
+        };
 
         // (10) attn_output_gate (sigmoid_mul) over N * q_size.
         let gated = arena.region(
