@@ -4110,6 +4110,23 @@ impl Qwen35Bringup {
             self.paths.model_dir.clone(),
             "apply_linear_attn_layer_batched: fp8_gemv_wpr_native_f16in unavailable".into()))?;
         let _ = num_k_heads;
+        let cutlass_linear_min_tokens =
+            std::env::var("RVLLM_QWEN35_LINEAR_CUTLASS_MIN_TOKENS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(128);
+        let cutlass_linear_requested =
+            crate::gemma4_bring_up::parse_truthy_env("RVLLM_QWEN35_LINEAR_CUTLASS_SM120")
+                .unwrap_or(false)
+                && num_tokens >= cutlass_linear_min_tokens;
+        let cutlass_linear_lib = if cutlass_linear_requested {
+            match &self.cutlass {
+                CutlassBackend::SoSm120(lib) => Some(lib),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let linear_trace =
             std::env::var("RVLLM_QWEN35_LINEAR_PERF_TRACE").as_deref() == Ok("1");
         let trace_begin = if linear_trace {
@@ -4167,12 +4184,28 @@ impl Qwen35Bringup {
             self.paths.model_dir.clone(),
             "apply_linear_attn_layer_batched: in_proj_qkv blockscale missing".into()))?;
         let qkv_region = arena.region("qwen35_blattn_qkv", n * conv_dim * 2, 16)?.device_ptr();
-        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-            m: num_tokens, n: qkv_n, k: hidden_u,
-        }.launch(
-            fp8_gemv_fn, qkv_region,
-            la.in_proj_qkv.offset_bytes, qkv_bs, normed, stream_raw,
-        )?;
+        if let Some(lib) = cutlass_linear_lib {
+            self.qwen35_fp8_cutlass_blockscale_sm120(
+                ker,
+                lib,
+                qkv_region,
+                la.in_proj_qkv.offset_bytes,
+                qkv_bs,
+                normed,
+                num_tokens,
+                qkv_n,
+                hidden_u,
+                stream_raw,
+                "qwen35_blattn_qkv_in_fp8",
+            )?;
+        } else {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m: num_tokens, n: qkv_n, k: hidden_u,
+            }.launch(
+                fp8_gemv_fn, qkv_region,
+                la.in_proj_qkv.offset_bytes, qkv_bs, normed, stream_raw,
+            )?;
+        }
         if linear_trace {
             qwen35_sync_stream(stream_raw, "qwen35 linear trace qkv")?;
             if let Some(t0) = trace_last {
@@ -4426,12 +4459,28 @@ impl Qwen35Bringup {
             self.paths.model_dir.clone(),
             "apply_linear_attn_layer_batched: in_proj_z blockscale missing".into()))?;
         let z_region = arena.region("qwen35_blattn_z", n * (z_n as usize) * 2, 16)?.device_ptr();
-        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-            m: num_tokens, n: z_n, k: hidden_u,
-        }.launch(
-            fp8_gemv_fn, z_region,
-            la.in_proj_z.offset_bytes, z_bs, normed, stream_raw,
-        )?;
+        if let Some(lib) = cutlass_linear_lib {
+            self.qwen35_fp8_cutlass_blockscale_sm120(
+                ker,
+                lib,
+                z_region,
+                la.in_proj_z.offset_bytes,
+                z_bs,
+                normed,
+                num_tokens,
+                z_n,
+                hidden_u,
+                stream_raw,
+                "qwen35_blattn_z_in_fp8",
+            )?;
+        } else {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m: num_tokens, n: z_n, k: hidden_u,
+            }.launch(
+                fp8_gemv_fn, z_region,
+                la.in_proj_z.offset_bytes, z_bs, normed, stream_raw,
+            )?;
+        }
         if linear_trace {
             qwen35_sync_stream(stream_raw, "qwen35 linear trace z")?;
             if let Some(t0) = trace_last {
@@ -4490,12 +4539,28 @@ impl Qwen35Bringup {
             self.paths.model_dir.clone(),
             "apply_linear_attn_layer_batched: out_proj blockscale missing".into()))?;
         let out_region = arena.region("qwen35_blattn_out", n * (out_n as usize) * 2, 16)?.device_ptr();
-        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-            m: num_tokens, n: out_n, k: out_k,
-        }.launch(
-            fp8_gemv_fn, out_region,
-            la.out_proj.offset_bytes, out_bs, gated_region, stream_raw,
-        )?;
+        if let Some(lib) = cutlass_linear_lib {
+            self.qwen35_fp8_cutlass_blockscale_sm120(
+                ker,
+                lib,
+                out_region,
+                la.out_proj.offset_bytes,
+                out_bs,
+                gated_region,
+                num_tokens,
+                out_n,
+                out_k,
+                stream_raw,
+                "qwen35_blattn_out_in_fp8",
+            )?;
+        } else {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m: num_tokens, n: out_n, k: out_k,
+            }.launch(
+                fp8_gemv_fn, out_region,
+                la.out_proj.offset_bytes, out_bs, gated_region, stream_raw,
+            )?;
+        }
         if linear_trace {
             qwen35_sync_stream(stream_raw, "qwen35 linear trace out")?;
             if let Some(t0) = trace_last {
