@@ -165,6 +165,20 @@ pub async fn spawn_cuda_worker(
                         "qwen35 spec-state snapshot selftest passed"
                     );
                 }
+                if std::env::var("RVLLM_QWEN35_SPEC_PRIMITIVE_SELFTEST").as_deref() == Ok("1") {
+                    let primitive_selftest = unsafe {
+                        bringup.spec_decode_primitives_selftest()
+                    };
+                    if let Err(e) = primitive_selftest {
+                        let _ = ready_tx.send(Err(format!(
+                            "qwen35 spec primitive selftest: {e:?}"
+                        )));
+                        return;
+                    }
+                    tracing::info!(
+                        "qwen35 spec primitive selftest passed"
+                    );
+                }
                 let _ = ready_tx.send(Ok(()));
                 tracing::info!(
                     "Qwen 3.5 dense — Phase 2c-A complete (substrate + \

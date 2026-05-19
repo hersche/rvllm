@@ -2729,6 +2729,191 @@ impl Qwen35Bringup {
     /// Caller is responsible for restoring the arena to the
     /// checkpoint after this returns — same contract as the
     /// per-token forward_all_layers_with_splice path.
+    pub unsafe fn forward_qwen35_decode_argmax_all(
+        &self,
+        token_ids: &[u32],
+        start_position: u32,
+    ) -> Result<Vec<i32>> {
+        let h_residual_buf =
+            self.forward_qwen35_tokens_batched(token_ids, start_position)?;
+        let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_qwen35_decode_argmax_all: scratch absent".into()))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_qwen35_decode_argmax_all: stream absent".into()))?;
+        let row_bytes = self.arch.base.hidden_size * 2;
+        let mut out = Vec::with_capacity(token_ids.len());
+
+        // Conservative closer loop: the transformer stack runs once
+        // over the full verify chunk, preserving recurrent-state
+        // semantics. The per-row lm_head closer can be replaced by
+        // a Qwen35 closer-all once the per-row FP8 activation-scale
+        // issue is solved for this architecture too.
+        for row in 0..token_ids.len() {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let src = h_residual_buf + (row as u64) * (row_bytes as u64);
+                let rc = cuMemcpyDtoDAsync_v2(
+                    scr.h_residual_ptr,
+                    src,
+                    row_bytes,
+                    stream.raw() as CUstream,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 argmax_all row DtoD",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            out.push(self.forward_finalize_argmax()? as i32);
+        }
+        Ok(out)
+    }
+
+    pub unsafe fn forward_qwen35_decode_commit_only(
+        &self,
+        token_ids: &[u32],
+        start_position: u32,
+    ) -> Result<()> {
+        let _ = self.forward_qwen35_tokens_batched(token_ids, start_position)?;
+        Ok(())
+    }
+
+    unsafe fn forward_qwen35_tokens_batched(
+        &self,
+        token_ids: &[u32],
+        start_position: u32,
+    ) -> Result<u64> {
+        let num_tokens_usize = token_ids.len();
+        if num_tokens_usize == 0 {
+            return Err(corrupt(
+                self.paths.model_dir.clone(),
+                "forward_qwen35_tokens_batched: empty token_ids".into()));
+        }
+        let ker = self.outside_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_qwen35_tokens_batched: outside_kernels absent".into()))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_qwen35_tokens_batched: stream absent".into()))?;
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_qwen35_tokens_batched: arena absent".into()))?;
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_qwen35_tokens_batched: model absent".into()))?;
+        let arch = &self.arch;
+        let hidden = arch.base.hidden_size as u32;
+        let vocab = arch.base.vocab_size as u32;
+        let row_bytes = (hidden as usize) * 2;
+        let stream_raw = stream.raw() as u64;
+        let num_tokens = num_tokens_usize as u32;
+
+        let h_residual_buf = arena.region(
+            "qwen35_spec_h_residual",
+            num_tokens_usize * row_bytes,
+            16,
+        )?.device_ptr();
+        let positions_dev = arena.region(
+            "qwen35_spec_positions",
+            num_tokens_usize * 4,
+            16,
+        )?.device_ptr();
+        let ctx_len_dev = arena.region(
+            "qwen35_spec_ctx_len",
+            4,
+            4,
+        )?.device_ptr();
+        let token_ids_dev = arena.region(
+            "qwen35_spec_token_ids",
+            num_tokens_usize * 4,
+            16,
+        )?.device_ptr();
+
+        let mut positions_host: Vec<u8> = Vec::with_capacity(num_tokens_usize * 4);
+        for i in 0..num_tokens_usize {
+            let pos = start_position
+                .checked_add(i as u32)
+                .ok_or_else(|| corrupt(
+                    self.paths.model_dir.clone(),
+                    "forward_qwen35_tokens_batched: position overflow".into()))?;
+            positions_host.extend_from_slice(&(pos as i32).to_le_bytes());
+        }
+        let mut token_ids_host: Vec<u8> = Vec::with_capacity(num_tokens_usize * 4);
+        for &t in token_ids {
+            token_ids_host.extend_from_slice(&(t as i32).to_le_bytes());
+        }
+        let ctx_len = start_position
+            .checked_add(num_tokens)
+            .ok_or_else(|| corrupt(
+                self.paths.model_dir.clone(),
+                "forward_qwen35_tokens_batched: context length overflow".into()))?;
+        let ctx_len_bytes = (ctx_len as i32).to_le_bytes();
+        {
+            use cudarc::driver::sys::*;
+            for (dst, src, n) in [
+                (positions_dev, positions_host.as_ptr(), positions_host.len()),
+                (token_ids_dev, token_ids_host.as_ptr(), token_ids_host.len()),
+                (ctx_len_dev, ctx_len_bytes.as_ptr(), 4usize),
+            ] {
+                let rc = cuMemcpyHtoDAsync_v2(
+                    dst as CUdeviceptr,
+                    src as *const _,
+                    n,
+                    stream_raw as CUstream,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 spec HtoD per-request scalars",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup()));
+                }
+            }
+        }
+
+        rvllm_fused::EmbeddingGatherLaunch {
+            num_tokens,
+            hidden,
+            vocab,
+        }.launch(
+            ker.fn_embedding_gather_f16,
+            h_residual_buf,
+            model.outside.embed_tokens.offset_bytes,
+            token_ids_dev,
+            stream_raw,
+        )?;
+
+        for (li, ty) in arch.base.layer_types.iter().enumerate() {
+            match ty {
+                rvllm_loader::LayerAttnType::Linear => {
+                    self.apply_linear_attn_layer_batched(li, num_tokens, h_residual_buf)?;
+                }
+                rvllm_loader::LayerAttnType::Full => {
+                    self.apply_full_attn_layer_batched(
+                        li,
+                        num_tokens,
+                        start_position,
+                        h_residual_buf,
+                        positions_dev,
+                        ctx_len_dev,
+                    )?;
+                }
+                other => {
+                    return Err(corrupt(
+                        self.paths.model_dir.clone(),
+                        format!("forward_qwen35_tokens_batched: layer {li} has \
+                                 unsupported attn type {other:?}")));
+                }
+            }
+            self.apply_dense_mlp_layer_batched(li, num_tokens, h_residual_buf)?;
+        }
+        Ok(h_residual_buf)
+    }
+
     pub unsafe fn forward_qwen35_prefill_batched<'a>(
         &self,
         prompt_ids: &[u32],
@@ -4436,6 +4621,39 @@ impl Qwen35Bringup {
             )?;
         }
         let _ = (linear_bytes, conv_bytes);
+        Ok(())
+    }
+
+    /// Debug/startup probe for the Qwen35 spec-decode building
+    /// blocks. Runs a tiny batched verifier chunk and a commit-only
+    /// chunk, then resets persistent caches so normal serving starts
+    /// from a clean state.
+    pub unsafe fn spec_decode_primitives_selftest(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+                self.paths.model_dir.clone(),
+                "qwen35 spec_decode_primitives_selftest: arena absent".into()))?;
+            let ck = arena.checkpoint();
+            self.reset_linear_state()?;
+            self.reset_conv_state()?;
+            self.reset_kv_cache()?;
+            let argmaxes = self.forward_qwen35_decode_argmax_all(&[1, 100], 0)?;
+            if argmaxes.len() != 2 {
+                return Err(corrupt(
+                    self.paths.model_dir.clone(),
+                    format!("qwen35 spec_decode_primitives_selftest: expected 2 \
+                             argmaxes, got {}", argmaxes.len())));
+            }
+            self.reset_linear_state()?;
+            self.reset_conv_state()?;
+            self.reset_kv_cache()?;
+            self.forward_qwen35_decode_commit_only(&[1], 0)?;
+            self.reset_linear_state()?;
+            self.reset_conv_state()?;
+            self.reset_kv_cache()?;
+            arena.restore(ck);
+        }
         Ok(())
     }
 
