@@ -1050,7 +1050,14 @@ pub async fn spawn_cuda_worker(
                     let stop_set: std::collections::HashSet<u32> =
                         req.stop_token_ids.iter().copied().chain([106u32]).collect();
 
+                    let spec_max_prompt_tokens = std::env::var("G4N_SPEC_MAX_PROMPT_TOKENS")
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    let spec_prompt_allowed =
+                        spec_max_prompt_tokens == 0 || prompt_len <= spec_max_prompt_tokens;
                     let spec_probe_this_request = spec_decode
+                        && spec_prompt_allowed
                         && spec_circuit_skip_remaining == 0;
                     if spec_decode && spec_circuit_skip_remaining > 0 {
                         spec_circuit_skip_remaining -= 1;
