@@ -367,10 +367,10 @@ pub struct Qwen36OutsideKernels {
 /// alpha/beta computation in place of per-token DtoH+f16→f32.
 #[derive(Debug)]
 pub struct Qwen36LinearAttnHostCache {
-    pub a_w_f32: Vec<f32>,    // [vus, h_us]  row-major
-    pub b_w_f32: Vec<f32>,    // [vus, h_us]  row-major
-    pub a_log_f32: Vec<f32>,  // [vus]
-    pub dt_bias_f32: Vec<f32>,// [vus]
+    pub a_w_f32: Vec<f32>,     // [vus, h_us]  row-major
+    pub b_w_f32: Vec<f32>,     // [vus, h_us]  row-major
+    pub a_log_f32: Vec<f32>,   // [vus]
+    pub dt_bias_f32: Vec<f32>, // [vus]
     pub vus: usize,
     pub h_us: usize,
 }
@@ -385,6 +385,10 @@ pub struct Qwen36Bringup {
     pub model: Qwen36LoadedModel,
     pub kernels: Arc<KernelLoader>,
     pub outside_kernels: Qwen36OutsideKernels,
+    /// SM121 FA2 backend for Qwen full-attention layers. Used by the
+    /// NVFP4 batched-prefill path; single-token decode still uses the
+    /// already-loaded direct kernel handles in `outside_kernels`.
+    attn_backend_full: rvllm_attention::AttentionBackend,
     pub cublaslt: CublasLt,
     /// CUTLASS SM120 backend for blockwise FP8 GEMM at m≥128.
     /// Loaded at bring-up; on sm_121 this resolves to
@@ -536,12 +540,24 @@ impl Qwen36Bringup {
         let arena: HbmArena<'static> = unsafe { std::mem::transmute(arena) };
         let stream = Stream::new(&ctx)?;
 
-        let model = rvllm_loader::qwen36_load::load_qwen36_model(
+        let mut model = rvllm_loader::qwen36_load::load_qwen36_model(
             &paths.model_dir,
             &arena,
             &arch.base.layer_types,
             arch.num_experts,
         )?;
+        if std::env::var("RVLLM_QWEN36_LOAD_MTP")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            let mtp = rvllm_loader::qwen36_load::load_qwen36_mtp(
+                &paths.model_dir,
+                &arena,
+                arch.num_experts,
+            )?;
+            println!("[qwen36-loader] MTP block uploaded");
+            model.mtp = Some(mtp);
+        }
 
         // Phase 3a: load + verify the PTX kernel manifest the same way
         // Gemma 4 does. The Qwen forward path will need the same
@@ -553,13 +569,11 @@ impl Qwen36Bringup {
         // bring-up before Phase 3b starts wiring kernel calls.
         let kernels_dir = crate::bring_up::resolve_kernels_dir(&ctx, &paths.kernels_dir)?;
         let manifest_path = kernels_dir.join("manifest.json");
-        let manifest =
-            rvllm_kernels::manifest::KernelManifest::load_and_verify(&manifest_path)?;
+        let manifest = rvllm_kernels::manifest::KernelManifest::load_and_verify(&manifest_path)?;
         if let Some(t) = compile_target {
             manifest.assert_arch(t.as_sm_str())?;
         }
-        manifest
-            .warn_if_revision_drift(rvllm_kernels::manifest::VerifiedManifest::BUILD_REVISION);
+        manifest.warn_if_revision_drift(rvllm_kernels::manifest::VerifiedManifest::BUILD_REVISION);
         let kernels = Arc::new(KernelLoader::new(manifest));
 
         // Phase 3b: resolve the outside-path kernel function pointers
@@ -577,23 +591,18 @@ impl Qwen36Bringup {
             rmsnorm_inplace_f16_mod.get_function("rmsnorm_inplace_f16_kernel")?;
         let fp8_gemv_mod = kernels.load_ptx(rvllm_kernels::FP8_GEMV_PTX_STEM)?;
         let fn_fp8_gemv_wpr_native_f16in = match compile_target {
-            Some(t)
-                if rvllm_kernels::Fp8GemvVariant::WprNativeF16In.available_for(t) =>
-            {
-                Some(
-                    fp8_gemv_mod.get_function(
-                        rvllm_kernels::Fp8GemvVariant::WprNativeF16In.entry_point(),
-                    )?,
-                )
-            }
+            Some(t) if rvllm_kernels::Fp8GemvVariant::WprNativeF16In.available_for(t) => Some(
+                fp8_gemv_mod
+                    .get_function(rvllm_kernels::Fp8GemvVariant::WprNativeF16In.entry_point())?,
+            ),
             _ => None,
         };
         let argmax_mod = kernels.load_ptx("argmax")?;
         let fn_argmax = argmax_mod.get_function("argmax_kernel")?;
         let fn_argmax_f16 = argmax_mod.get_function("argmax_f16_kernel")?;
         let fp8_quantize_per_token_f16_mod = kernels.load_ptx("fp8_quantize_per_token_f16")?;
-        let fn_fp8_quantize_per_token_f16 = fp8_quantize_per_token_f16_mod
-            .get_function("fp8_quantize_per_token_f16_kernel")?;
+        let fn_fp8_quantize_per_token_f16 =
+            fp8_quantize_per_token_f16_mod.get_function("fp8_quantize_per_token_f16_kernel")?;
         let fp8_quantize_per_token_amax_f16_mod =
             kernels.load_ptx("fp8_quantize_per_token_amax_f16")?;
         let fn_fp8_quantize_per_token_amax_f16 = fp8_quantize_per_token_amax_f16_mod
@@ -601,10 +610,9 @@ impl Qwen36Bringup {
         let fused_rmsnorm_fp8_quant_mod = kernels.load_ptx("fused_rmsnorm_fp8_quant")?;
         let fn_fused_rmsnorm_fp8_quant =
             fused_rmsnorm_fp8_quant_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
-        let fused_rope_partial_f16kv_mod =
-            kernels.load_ptx("fused_rope_partial_f16kv")?;
-        let fn_fused_rope_partial_f16kv = fused_rope_partial_f16kv_mod
-            .get_function("fused_rope_partial_f16kv_kernel")?;
+        let fused_rope_partial_f16kv_mod = kernels.load_ptx("fused_rope_partial_f16kv")?;
+        let fn_fused_rope_partial_f16kv =
+            fused_rope_partial_f16kv_mod.get_function("fused_rope_partial_f16kv_kernel")?;
         let fused_rope_qwen_partial_f16kv_mod =
             kernels.load_ptx("fused_rope_qwen_partial_f16kv")?;
         let fn_fused_rope_qwen_partial_f16kv = fused_rope_qwen_partial_f16kv_mod
@@ -616,18 +624,19 @@ impl Qwen36Bringup {
         // later in `load()`; reading the env here keeps the source
         // of truth single (the env var itself), no plumbing needed.
         let nvfp4_kv_on = std::env::var("RVLLM_NVFP4_KV")
-            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+            .ok()
+            .as_deref()
+            .map(|s| s != "0" && !s.is_empty())
             .unwrap_or(false);
-        let (fused_rope_qwen_partial_nvfp4kv_mod,
-             fn_fused_rope_qwen_partial_nvfp4kv) = if nvfp4_kv_on {
-            let m = kernels.load_ptx("fused_rope_qwen_partial_nvfp4kv")?;
-            let f = m.get_function("fused_rope_qwen_partial_nvfp4kv_kernel")?;
-            (Some(m), Some(f))
-        } else {
-            (None, None)
-        };
-        let (flash_attention_nvfp4kv_mod,
-             fn_flash_attention_2_decode_nvfp4kv) = if nvfp4_kv_on {
+        let (fused_rope_qwen_partial_nvfp4kv_mod, fn_fused_rope_qwen_partial_nvfp4kv) =
+            if nvfp4_kv_on {
+                let m = kernels.load_ptx("fused_rope_qwen_partial_nvfp4kv")?;
+                let f = m.get_function("fused_rope_qwen_partial_nvfp4kv_kernel")?;
+                (Some(m), Some(f))
+            } else {
+                (None, None)
+            };
+        let (flash_attention_nvfp4kv_mod, fn_flash_attention_2_decode_nvfp4kv) = if nvfp4_kv_on {
             let m = kernels.load_ptx("flash_attention_nvfp4kv")?;
             let f = m.get_function("flash_attention_2_decode_nvfp4kv_kernel")?;
             (Some(m), Some(f))
@@ -635,57 +644,46 @@ impl Qwen36Bringup {
             (None, None)
         };
         let split_q_gate_f16_mod = kernels.load_ptx("split_q_gate_f16")?;
-        let fn_split_q_gate_f16 = split_q_gate_f16_mod
-            .get_function("split_q_gate_f16_kernel")?;
+        let fn_split_q_gate_f16 = split_q_gate_f16_mod.get_function("split_q_gate_f16_kernel")?;
         let conv_state_advance_f16_mod = kernels.load_ptx("conv_state_advance_f16")?;
-        let fn_conv_state_advance_f16 = conv_state_advance_f16_mod
-            .get_function("conv_state_advance_f16_kernel")?;
-        let qwen_linear_alpha_beta_f16_mod =
-            kernels.load_ptx("qwen_linear_alpha_beta_f16")?;
-        let fn_qwen_linear_alpha_beta_f16 = qwen_linear_alpha_beta_f16_mod
-            .get_function("qwen_linear_alpha_beta_f16_kernel")?;
-        let qwen_linear_silu_l2_gqa_f16_mod =
-            kernels.load_ptx("qwen_linear_silu_l2_gqa_f16")?;
-        let fn_qwen_linear_silu_l2_gqa_f16 = qwen_linear_silu_l2_gqa_f16_mod
-            .get_function("qwen_linear_silu_l2_gqa_f16_kernel")?;
+        let fn_conv_state_advance_f16 =
+            conv_state_advance_f16_mod.get_function("conv_state_advance_f16_kernel")?;
+        let qwen_linear_alpha_beta_f16_mod = kernels.load_ptx("qwen_linear_alpha_beta_f16")?;
+        let fn_qwen_linear_alpha_beta_f16 =
+            qwen_linear_alpha_beta_f16_mod.get_function("qwen_linear_alpha_beta_f16_kernel")?;
+        let qwen_linear_silu_l2_gqa_f16_mod = kernels.load_ptx("qwen_linear_silu_l2_gqa_f16")?;
+        let fn_qwen_linear_silu_l2_gqa_f16 =
+            qwen_linear_silu_l2_gqa_f16_mod.get_function("qwen_linear_silu_l2_gqa_f16_kernel")?;
         let qwen_linear_rmsnorm_gated_f16_mod =
             kernels.load_ptx("qwen_linear_rmsnorm_gated_f16")?;
         let fn_qwen_linear_rmsnorm_gated_f16 = qwen_linear_rmsnorm_gated_f16_mod
             .get_function("qwen_linear_rmsnorm_gated_f16_kernel")?;
         let silu_mul_f16_mod = kernels.load_ptx("silu_mul_f16")?;
-        let fn_silu_mul_f16 =
-            silu_mul_f16_mod.get_function("silu_mul_f16_kernel")?;
-        let router_gemv_f16_to_f32_mod =
-            kernels.load_ptx("router_gemv_f16_to_f32")?;
-        let fn_router_gemv_f16_to_f32 = router_gemv_f16_to_f32_mod
-            .get_function("router_gemv_f16_to_f32_kernel")?;
-        let scaled_add_f16_to_f32_mod =
-            kernels.load_ptx("scaled_add_f16_to_f32")?;
-        let fn_scaled_add_f16_to_f32 = scaled_add_f16_to_f32_mod
-            .get_function("scaled_add_f16_to_f32_kernel")?;
-        let f16_plus_f32_inplace_f16_mod =
-            kernels.load_ptx("f16_plus_f32_inplace_f16")?;
-        let fn_f16_plus_f32_inplace_f16 = f16_plus_f32_inplace_f16_mod
-            .get_function("f16_plus_f32_inplace_f16_kernel")?;
-        let shared_gate_dot_sigmoid_f16_mod =
-            kernels.load_ptx("shared_gate_dot_sigmoid_f16")?;
-        let fn_shared_gate_dot_sigmoid_f16 = shared_gate_dot_sigmoid_f16_mod
-            .get_function("shared_gate_dot_sigmoid_f16_kernel")?;
-        let scaled_add_f16_to_f32_devw_mod =
-            kernels.load_ptx("scaled_add_f16_to_f32_devw")?;
-        let fn_scaled_add_f16_to_f32_devw = scaled_add_f16_to_f32_devw_mod
-            .get_function("scaled_add_f16_to_f32_devw_kernel")?;
-        let fp8_gemv_dual_mod =
-            kernels.load_ptx("fp8_gemv_blockwise_wpr_native_f16in_dual")?;
-        let fn_fp8_gemv_dual = fp8_gemv_dual_mod
-            .get_function("fp8_gemv_blockwise_wpr_native_f16in_dual_kernel")?;
+        let fn_silu_mul_f16 = silu_mul_f16_mod.get_function("silu_mul_f16_kernel")?;
+        let router_gemv_f16_to_f32_mod = kernels.load_ptx("router_gemv_f16_to_f32")?;
+        let fn_router_gemv_f16_to_f32 =
+            router_gemv_f16_to_f32_mod.get_function("router_gemv_f16_to_f32_kernel")?;
+        let scaled_add_f16_to_f32_mod = kernels.load_ptx("scaled_add_f16_to_f32")?;
+        let fn_scaled_add_f16_to_f32 =
+            scaled_add_f16_to_f32_mod.get_function("scaled_add_f16_to_f32_kernel")?;
+        let f16_plus_f32_inplace_f16_mod = kernels.load_ptx("f16_plus_f32_inplace_f16")?;
+        let fn_f16_plus_f32_inplace_f16 =
+            f16_plus_f32_inplace_f16_mod.get_function("f16_plus_f32_inplace_f16_kernel")?;
+        let shared_gate_dot_sigmoid_f16_mod = kernels.load_ptx("shared_gate_dot_sigmoid_f16")?;
+        let fn_shared_gate_dot_sigmoid_f16 =
+            shared_gate_dot_sigmoid_f16_mod.get_function("shared_gate_dot_sigmoid_f16_kernel")?;
+        let scaled_add_f16_to_f32_devw_mod = kernels.load_ptx("scaled_add_f16_to_f32_devw")?;
+        let fn_scaled_add_f16_to_f32_devw =
+            scaled_add_f16_to_f32_devw_mod.get_function("scaled_add_f16_to_f32_devw_kernel")?;
+        let fp8_gemv_dual_mod = kernels.load_ptx("fp8_gemv_blockwise_wpr_native_f16in_dual")?;
+        let fn_fp8_gemv_dual =
+            fp8_gemv_dual_mod.get_function("fp8_gemv_blockwise_wpr_native_f16in_dual_kernel")?;
         let fp8_gemv_dual_silu_mod =
             kernels.load_ptx("fp8_gemv_blockwise_wpr_native_f16in_dual_silu")?;
         let fn_fp8_gemv_dual_silu = fp8_gemv_dual_silu_mod
             .get_function("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_kernel")?;
         let topk_softmax_f32_mod = kernels.load_ptx("topk_softmax_f32")?;
-        let fn_topk_softmax_f32 = topk_softmax_f32_mod
-            .get_function("topk_softmax_f32_kernel")?;
+        let fn_topk_softmax_f32 = topk_softmax_f32_mod.get_function("topk_softmax_f32_kernel")?;
         let fp8_gemv_dual_silu_indirect_mod =
             kernels.load_ptx("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect")?;
         let fn_fp8_gemv_dual_silu_indirect = fp8_gemv_dual_silu_indirect_mod
@@ -695,55 +693,50 @@ impl Qwen36Bringup {
         let fn_fp8_gemv_indirect = fp8_gemv_indirect_mod
             .get_function("fp8_gemv_blockwise_wpr_native_f16in_indirect_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
-        let fn_flash_attention_2_f16kv = flash_attention_mod
-            .get_function("flash_attention_2_f16kv_kernel")?;
-        let fn_flash_attention_2_decode_f16io = flash_attention_mod
-            .get_function("flash_attention_2_decode_f16io_kernel")?;
+        let fn_flash_attention_2_f16kv =
+            flash_attention_mod.get_function("flash_attention_2_f16kv_kernel")?;
+        let fn_flash_attention_2_decode_f16io =
+            flash_attention_mod.get_function("flash_attention_2_decode_f16io_kernel")?;
         let sigmoid_mul_f16_mod = kernels.load_ptx("sigmoid_mul_f16")?;
-        let fn_sigmoid_mul_f16 =
-            sigmoid_mul_f16_mod.get_function("sigmoid_mul_f16_kernel")?;
+        let fn_sigmoid_mul_f16 = sigmoid_mul_f16_mod.get_function("sigmoid_mul_f16_kernel")?;
         let causal_conv1d_f16_mod = kernels.load_ptx("causal_conv1d_f16")?;
         let fn_causal_conv1d_f16 =
             causal_conv1d_f16_mod.get_function("causal_conv1d_f16_kernel")?;
-        let gated_delta_state_update_f16_mod =
-            kernels.load_ptx("gated_delta_state_update_f16")?;
-        let fn_gated_delta_state_update_f16 = gated_delta_state_update_f16_mod
-            .get_function("gated_delta_state_update_f16_kernel")?;
-        let gated_delta_rule_decode_f16_mod =
-            kernels.load_ptx("gated_delta_rule_decode_f16")?;
-        let fn_gated_delta_rule_decode_f16 = gated_delta_rule_decode_f16_mod
-            .get_function("gated_delta_rule_decode_f16_kernel")?;
+        let gated_delta_state_update_f16_mod = kernels.load_ptx("gated_delta_state_update_f16")?;
+        let fn_gated_delta_state_update_f16 =
+            gated_delta_state_update_f16_mod.get_function("gated_delta_state_update_f16_kernel")?;
+        let gated_delta_rule_decode_f16_mod = kernels.load_ptx("gated_delta_rule_decode_f16")?;
+        let fn_gated_delta_rule_decode_f16 =
+            gated_delta_rule_decode_f16_mod.get_function("gated_delta_rule_decode_f16_kernel")?;
         // Phase 4b/Linear: prefill-batched delta-rule + conv-state-advance.
-        let gated_delta_rule_prefill_f16_mod =
-            kernels.load_ptx("gated_delta_rule_prefill_f16")?;
-        let fn_gated_delta_rule_prefill_f16 = gated_delta_rule_prefill_f16_mod
-            .get_function("gated_delta_rule_prefill_f16_kernel")?;
+        let gated_delta_rule_prefill_f16_mod = kernels.load_ptx("gated_delta_rule_prefill_f16")?;
+        let fn_gated_delta_rule_prefill_f16 =
+            gated_delta_rule_prefill_f16_mod.get_function("gated_delta_rule_prefill_f16_kernel")?;
         let conv_state_advance_batched_f16_mod =
             kernels.load_ptx("conv_state_advance_batched_f16")?;
         let fn_conv_state_advance_batched_f16 = conv_state_advance_batched_f16_mod
             .get_function("conv_state_advance_batched_f16_kernel")?;
-        let qwen_fill_pos_slots_i32_mod =
-            kernels.load_ptx("qwen_fill_pos_slots_i32")?;
-        let fn_qwen_fill_pos_slots_i32 = qwen_fill_pos_slots_i32_mod
-            .get_function("qwen_fill_pos_slots_i32_kernel")?;
+        let qwen_fill_pos_slots_i32_mod = kernels.load_ptx("qwen_fill_pos_slots_i32")?;
+        let fn_qwen_fill_pos_slots_i32 =
+            qwen_fill_pos_slots_i32_mod.get_function("qwen_fill_pos_slots_i32_kernel")?;
         let router_gemv_batched_f16_to_f32_mod =
             kernels.load_ptx("router_gemv_batched_f16_to_f32")?;
         let fn_router_gemv_batched_f16_to_f32 = router_gemv_batched_f16_to_f32_mod
             .get_function("router_gemv_batched_f16_to_f32_kernel")?;
-        let topk_softmax_batched_f32_mod =
-            kernels.load_ptx("topk_softmax_batched_f32")?;
-        let fn_topk_softmax_batched_f32 = topk_softmax_batched_f32_mod
-            .get_function("topk_softmax_batched_f32_kernel")?;
+        let topk_softmax_batched_f32_mod = kernels.load_ptx("topk_softmax_batched_f32")?;
+        let fn_topk_softmax_batched_f32 =
+            topk_softmax_batched_f32_mod.get_function("topk_softmax_batched_f32_kernel")?;
         let fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk_mod =
             kernels.load_ptx("fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk")?;
         let fn_fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk =
             fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk_mod
                 .get_function("fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk_kernel")?;
-        let fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk_mod =
-            kernels.load_ptx("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk")?;
+        let fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk_mod = kernels
+            .load_ptx("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk")?;
         let fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk =
-            fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk_mod
-                .get_function("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk_kernel")?;
+            fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk_mod.get_function(
+                "fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk_kernel",
+            )?;
         let scaled_add_f16_to_f32_devw_batched_topk_mod =
             kernels.load_ptx("scaled_add_f16_to_f32_devw_batched_topk")?;
         let fn_scaled_add_f16_to_f32_devw_batched_topk =
@@ -751,14 +744,12 @@ impl Qwen36Bringup {
                 .get_function("scaled_add_f16_to_f32_devw_batched_topk_kernel")?;
         let shared_gate_dot_sigmoid_f16_batched_mod =
             kernels.load_ptx("shared_gate_dot_sigmoid_f16_batched")?;
-        let fn_shared_gate_dot_sigmoid_f16_batched =
-            shared_gate_dot_sigmoid_f16_batched_mod
-                .get_function("shared_gate_dot_sigmoid_f16_batched_kernel")?;
+        let fn_shared_gate_dot_sigmoid_f16_batched = shared_gate_dot_sigmoid_f16_batched_mod
+            .get_function("shared_gate_dot_sigmoid_f16_batched_kernel")?;
         let scaled_add_f16_to_f32_devw_batched_mod =
             kernels.load_ptx("scaled_add_f16_to_f32_devw_batched")?;
-        let fn_scaled_add_f16_to_f32_devw_batched =
-            scaled_add_f16_to_f32_devw_batched_mod
-                .get_function("scaled_add_f16_to_f32_devw_batched_kernel")?;
+        let fn_scaled_add_f16_to_f32_devw_batched = scaled_add_f16_to_f32_devw_batched_mod
+            .get_function("scaled_add_f16_to_f32_devw_batched_kernel")?;
         // Vision-tower kernels (Phase 1 .cu added on rusty_sm121_vision).
         let layernorm_inplace_f16_mod = kernels.load_ptx("layernorm_inplace_f16")?;
         let fn_layernorm_inplace_f16 =
@@ -773,41 +764,35 @@ impl Qwen36Bringup {
         let vit_avgpool_f16_mod = kernels.load_ptx("vit_avgpool_f16")?;
         let fn_vit_avgpool_f16 = vit_avgpool_f16_mod.get_function("vit_avgpool_f16_kernel")?;
         let vit_pos_embed_interp_f16_mod = kernels.load_ptx("vit_pos_embed_interp_f16")?;
-        let fn_vit_pos_embed_interp_f16 = vit_pos_embed_interp_f16_mod
-            .get_function("vit_pos_embed_interp_f16_kernel")?;
+        let fn_vit_pos_embed_interp_f16 =
+            vit_pos_embed_interp_f16_mod.get_function("vit_pos_embed_interp_f16_kernel")?;
         let scale_inplace_f16_mod = kernels.load_ptx("scale_inplace_f16")?;
         let fn_scale_inplace_f16 =
             scale_inplace_f16_mod.get_function("scale_inplace_f16_kernel")?;
         let transpose_2d_f16_mod = kernels.load_ptx("transpose_2d_f16")?;
-        let fn_transpose_2d_f16 =
-            transpose_2d_f16_mod.get_function("transpose_2d_f16_kernel")?;
+        let fn_transpose_2d_f16 = transpose_2d_f16_mod.get_function("transpose_2d_f16_kernel")?;
         let add_bias_f16_mod = kernels.load_ptx("add_bias_f16")?;
         let fn_add_bias_f16 = add_bias_f16_mod.get_function("add_bias_f16_kernel")?;
         let cast_fp_mod = kernels.load_ptx("cast_fp")?;
         let fn_cast_f32_to_f16 = cast_fp_mod.get_function("cast_f32_to_f16_kernel")?;
         let fn_cast_f16_to_f32 = cast_fp_mod.get_function("cast_f16_to_f32_kernel")?;
         let vector_add_f16_mod = kernels.load_ptx("vector_add_f16")?;
-        let fn_vector_add_f16 =
-            vector_add_f16_mod.get_function("vector_add_f16_kernel")?;
+        let fn_vector_add_f16 = vector_add_f16_mod.get_function("vector_add_f16_kernel")?;
         let extract_head_f16_mod = kernels.load_ptx("extract_head_f16")?;
-        let fn_extract_head_f16 =
-            extract_head_f16_mod.get_function("extract_head_f16_kernel")?;
-        let fn_scatter_head_f16 =
-            extract_head_f16_mod.get_function("scatter_head_f16_kernel")?;
-        let softmax_row_f32_to_f16_mod =
-            kernels.load_ptx("softmax_row_f32_to_f16")?;
-        let fn_softmax_row_f32_to_f16 = softmax_row_f32_to_f16_mod
-            .get_function("softmax_row_f32_to_f16_kernel")?;
-        let transpose_heads_v_f16_mod =
-            kernels.load_ptx("transpose_heads_v_f16")?;
-        let fn_transpose_heads_v_f16 = transpose_heads_v_f16_mod
-            .get_function("transpose_heads_v_f16_kernel")?;
+        let fn_extract_head_f16 = extract_head_f16_mod.get_function("extract_head_f16_kernel")?;
+        let fn_scatter_head_f16 = extract_head_f16_mod.get_function("scatter_head_f16_kernel")?;
+        let softmax_row_f32_to_f16_mod = kernels.load_ptx("softmax_row_f32_to_f16")?;
+        let fn_softmax_row_f32_to_f16 =
+            softmax_row_f32_to_f16_mod.get_function("softmax_row_f32_to_f16_kernel")?;
+        let transpose_heads_v_f16_mod = kernels.load_ptx("transpose_heads_v_f16")?;
+        let fn_transpose_heads_v_f16 =
+            transpose_heads_v_f16_mod.get_function("transpose_heads_v_f16_kernel")?;
         let scatter_heads_f16_mod = kernels.load_ptx("scatter_heads_f16")?;
-        let fn_scatter_heads_f16 = scatter_heads_f16_mod
-            .get_function("scatter_heads_f16_kernel")?;
+        let fn_scatter_heads_f16 =
+            scatter_heads_f16_mod.get_function("scatter_heads_f16_kernel")?;
         let scale_inplace_f32_mod = kernels.load_ptx("scale_inplace_f32")?;
-        let fn_scale_inplace_f32 = scale_inplace_f32_mod
-            .get_function("scale_inplace_f32_kernel")?;
+        let fn_scale_inplace_f32 =
+            scale_inplace_f32_mod.get_function("scale_inplace_f32_kernel")?;
         let outside_kernels = Qwen36OutsideKernels {
             embedding_gather_f16_mod,
             fn_embedding_gather_f16,
@@ -938,6 +923,9 @@ impl Qwen36Bringup {
              causal_conv1d_f16, gated_delta_state_update_f16.",
             outside_kernels.fn_fp8_gemv_wpr_native_f16in.is_some(),
         );
+        let attn_backend_full = rvllm_attention::AttentionBackend::Fa2Ptx(
+            rvllm_attention::Fa2PtxKernels::load(&*kernels, arch.base.head_dim as u32)?,
+        );
 
         // Phase 3g: cuBLASLt for the lm_head FP8 GEMM. Same 32 MiB
         // workspace size Gemma 4 uses (gemma4_bring_up.rs:1415).
@@ -953,11 +941,7 @@ impl Qwen36Bringup {
         // path on sm_121. Same .so Gemma loads. We don't need the
         // policy variant table (sm_121 ships only the blockscale
         // entry point), so pass an empty variants slice.
-        let cutlass = CutlassBackend::load_for(
-            compile_target,
-            paths.cutlass_so.clone(),
-            &[],
-        )?;
+        let cutlass = CutlassBackend::load_for(compile_target, paths.cutlass_so.clone(), &[])?;
         eprintln!(
             "[qwen36] cutlass backend = {}",
             match &cutlass {
@@ -1037,22 +1021,16 @@ impl Qwen36Bringup {
             .count();
         let num_ssm_heads: usize = 32;
         let d_state: usize = 128;
-        let linear_state_layer_bytes =
-            num_ssm_heads * d_state * d_state * 2; // f16
+        let linear_state_layer_bytes = num_ssm_heads * d_state * d_state * 2; // f16
         let linear_state_bytes = n_linear_layers * linear_state_layer_bytes;
-        let linear_state_region =
-            arena.region("qwen36_linear_state", linear_state_bytes, 16)?;
+        let linear_state_region = arena.region("qwen36_linear_state", linear_state_bytes, 16)?;
         // Zero the state at bring-up (analogous to a session-start
         // reset). cuMemsetD8 is the fastest path; falls back to a
         // host-side zero buffer if needed.
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
-            let rc = cuMemsetD8_v2(
-                linear_state_region.device_ptr(),
-                0,
-                linear_state_bytes,
-            );
+            let rc = cuMemsetD8_v2(linear_state_region.device_ptr(), 0, linear_state_bytes);
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
                     "qwen36_linear_state cuMemsetD8",
@@ -1096,7 +1074,9 @@ impl Qwen36Bringup {
         // `Qwen36Bringup::kv_dtype`. Env gate is shared with the
         // Qwen 3.5 and Gemma 4 NVFP4 paths.
         let nvfp4_kv = std::env::var("RVLLM_NVFP4_KV")
-            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+            .ok()
+            .as_deref()
+            .map(|s| s != "0" && !s.is_empty())
             .unwrap_or(false);
         let kv_dtype = if nvfp4_kv {
             Qwen36KvDtype::Nvfp4
@@ -1104,25 +1084,19 @@ impl Qwen36Bringup {
             Qwen36KvDtype::F16
         };
         // 2 = K + V. Bytes-per-elem differs per dtype.
-        let kv_slots = (kv_cache_num_blocks as usize)
-            * (kv_cache_block_size as usize)
-            * nkvh
-            * hd;
+        let kv_slots = (kv_cache_num_blocks as usize) * (kv_cache_block_size as usize) * nkvh * hd;
         let kv_cache_layer_bytes = match kv_dtype {
             Qwen36KvDtype::F16 => 2usize * kv_slots * 2, // 2-byte f16
             Qwen36KvDtype::Nvfp4 => 2usize * (kv_slots / 2), // 4-bit packed
         };
-        let kv_cache_bytes = n_full_layers * kv_cache_layer_bytes;
-        let kv_cache_region =
-            arena.region("qwen36_kv_cache", kv_cache_bytes, 16)?;
+        let mtp_kv_layers = usize::from(model.mtp.is_some());
+        let kv_cache_layers = n_full_layers + mtp_kv_layers;
+        let kv_cache_bytes = kv_cache_layers * kv_cache_layer_bytes;
+        let kv_cache_region = arena.region("qwen36_kv_cache", kv_cache_bytes, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
-            let rc = cuMemsetD8_v2(
-                kv_cache_region.device_ptr(),
-                0,
-                kv_cache_bytes,
-            );
+            let rc = cuMemsetD8_v2(kv_cache_region.device_ptr(), 0, kv_cache_bytes);
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
                     "qwen36_kv_cache cuMemsetD8",
@@ -1135,15 +1109,13 @@ impl Qwen36Bringup {
         // NVFP4 commit 1: companion microscale buffer. Only present
         // when `kv_dtype == Nvfp4`. One E4M3 scale (1 byte) per
         // 16-element packed block.
-        let (kv_cache_scale_ptr,
-             kv_cache_scale_layer_bytes,
-             kv_cache_scale_bytes) = match kv_dtype {
+        let (kv_cache_scale_ptr, kv_cache_scale_layer_bytes, kv_cache_scale_bytes) = match kv_dtype
+        {
             Qwen36KvDtype::F16 => (0u64, 0usize, 0usize),
             Qwen36KvDtype::Nvfp4 => {
                 let layer_bytes = 2usize * (kv_slots / 16); // K+V × slots/16
-                let total = n_full_layers * layer_bytes;
-                let region = arena.region(
-                    "qwen36_kv_cache_scale", total, 16)?;
+                let total = kv_cache_layers * layer_bytes;
+                let region = arena.region("qwen36_kv_cache_scale", total, 16)?;
                 #[cfg(feature = "cuda")]
                 unsafe {
                     use cudarc::driver::sys::*;
@@ -1161,6 +1133,7 @@ impl Qwen36Bringup {
         };
         eprintln!(
             "[qwen36] paged KV cache allocated: {n_full_layers} full-attn \
+             layers + {mtp_kv_layers} MTP shadow layer(s) = {kv_cache_layers} total \
              layers × {:.1} MiB ({} blocks × {} tokens × 2 (K+V) × \
              {nkvh} kv_heads × {hd} hd × {dt_label}) = {:.1} MiB total \
              (zero-initialised). NVFP4 scale buffer: {:.1} MiB total.",
@@ -1182,8 +1155,7 @@ impl Qwen36Bringup {
         let conv_dim: usize = 8192;
         let conv_state_layer_bytes = conv_kernel_minus_1 * conv_dim * 2;
         let conv_state_bytes = n_linear_layers * conv_state_layer_bytes;
-        let conv_state_region =
-            arena.region("qwen36_conv_state", conv_state_bytes, 16)?;
+        let conv_state_region = arena.region("qwen36_conv_state", conv_state_bytes, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -1205,14 +1177,26 @@ impl Qwen36Bringup {
             conv_state_bytes as f64 / (1024.0 * 1024.0),
         );
 
-        let n_full = model.layers.iter().filter(|l| matches!(
-            l.attn,
-            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(_)
-        )).count();
-        let n_linear = model.layers.iter().filter(|l| matches!(
-            l.attn,
-            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
-        )).count();
+        let n_full = model
+            .layers
+            .iter()
+            .filter(|l| {
+                matches!(
+                    l.attn,
+                    rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(_)
+                )
+            })
+            .count();
+        let n_linear = model
+            .layers
+            .iter()
+            .filter(|l| {
+                matches!(
+                    l.attn,
+                    rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
+                )
+            })
+            .count();
         eprintln!(
             "[qwen36] Phase 5f bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
@@ -1239,6 +1223,7 @@ impl Qwen36Bringup {
             model,
             kernels,
             outside_kernels,
+            attn_backend_full,
             cublaslt,
             cutlass,
             rope_cos,
@@ -1248,8 +1233,8 @@ impl Qwen36Bringup {
             linear_state_bytes,
             linear_state_layer_bytes,
             linear_attn_host_cache: Vec::new(), // populated below
-            router_host_cache: Vec::new(),       // populated below
-            shared_gate_host_cache: Vec::new(),  // populated below
+            router_host_cache: Vec::new(),      // populated below
+            shared_gate_host_cache: Vec::new(), // populated below
 
             kv_cache_ptr,
             kv_cache_bytes,
@@ -1276,7 +1261,9 @@ impl Qwen36Bringup {
             for b in 0..max_blocks {
                 bt_host.extend_from_slice(&(b as i32).to_le_bytes());
             }
-            unsafe { bt_region.copy_from_host(&bt_host)?; }
+            unsafe {
+                bt_region.copy_from_host(&bt_host)?;
+            }
             bringup.bt_persistent_ptr = bt_region.device_ptr();
         }
         // Build per-linear-attn-layer host f32 weight caches BEFORE
@@ -1300,31 +1287,63 @@ impl Qwen36Bringup {
                     #[cfg(feature = "cuda")]
                     unsafe {
                         use cudarc::driver::sys::*;
-                        cuMemcpyDtoH_v2(a_w.as_mut_ptr() as *mut _, la.in_proj_a.offset_bytes, proj_bytes);
-                        cuMemcpyDtoH_v2(b_w.as_mut_ptr() as *mut _, la.in_proj_b.offset_bytes, proj_bytes);
-                        cuMemcpyDtoH_v2(a_log_h.as_mut_ptr() as *mut _, la.a_log.offset_bytes, a_log_h.len());
-                        cuMemcpyDtoH_v2(dt_bias_h.as_mut_ptr() as *mut _, la.dt_bias.offset_bytes, dt_bias_h.len());
+                        cuMemcpyDtoH_v2(
+                            a_w.as_mut_ptr() as *mut _,
+                            la.in_proj_a.offset_bytes,
+                            proj_bytes,
+                        );
+                        cuMemcpyDtoH_v2(
+                            b_w.as_mut_ptr() as *mut _,
+                            la.in_proj_b.offset_bytes,
+                            proj_bytes,
+                        );
+                        cuMemcpyDtoH_v2(
+                            a_log_h.as_mut_ptr() as *mut _,
+                            la.a_log.offset_bytes,
+                            a_log_h.len(),
+                        );
+                        cuMemcpyDtoH_v2(
+                            dt_bias_h.as_mut_ptr() as *mut _,
+                            la.dt_bias.offset_bytes,
+                            dt_bias_h.len(),
+                        );
                     }
                     let mut a_w_f32 = vec![0.0f32; vus * h_us];
                     let mut b_w_f32 = vec![0.0f32; vus * h_us];
                     for i in 0..(vus * h_us) {
-                        a_w_f32[i] = f16_bits_to_f32(u16::from_le_bytes([a_w[i * 2], a_w[i * 2 + 1]]));
-                        b_w_f32[i] = f16_bits_to_f32(u16::from_le_bytes([b_w[i * 2], b_w[i * 2 + 1]]));
+                        a_w_f32[i] =
+                            f16_bits_to_f32(u16::from_le_bytes([a_w[i * 2], a_w[i * 2 + 1]]));
+                        b_w_f32[i] =
+                            f16_bits_to_f32(u16::from_le_bytes([b_w[i * 2], b_w[i * 2 + 1]]));
                     }
                     let mut a_log_f32 = vec![0.0f32; vus];
                     let mut dt_bias_f32 = vec![0.0f32; vus];
                     for v in 0..vus {
-                        a_log_f32[v] = f16_bits_to_f32(u16::from_le_bytes([a_log_h[v * 2], a_log_h[v * 2 + 1]]));
-                        dt_bias_f32[v] = f16_bits_to_f32(u16::from_le_bytes([dt_bias_h[v * 2], dt_bias_h[v * 2 + 1]]));
+                        a_log_f32[v] = f16_bits_to_f32(u16::from_le_bytes([
+                            a_log_h[v * 2],
+                            a_log_h[v * 2 + 1],
+                        ]));
+                        dt_bias_f32[v] = f16_bits_to_f32(u16::from_le_bytes([
+                            dt_bias_h[v * 2],
+                            dt_bias_h[v * 2 + 1],
+                        ]));
                     }
                     linear_caches.push(Qwen36LinearAttnHostCache {
-                        a_w_f32, b_w_f32, a_log_f32, dt_bias_f32, vus, h_us,
+                        a_w_f32,
+                        b_w_f32,
+                        a_log_f32,
+                        dt_bias_f32,
+                        vus,
+                        h_us,
                     });
                 }
             }
-            let cache_bytes: usize = linear_caches.iter()
-                .map(|c| (c.a_w_f32.len() + c.b_w_f32.len()) * 4
-                      + (c.a_log_f32.len() + c.dt_bias_f32.len()) * 4)
+            let cache_bytes: usize = linear_caches
+                .iter()
+                .map(|c| {
+                    (c.a_w_f32.len() + c.b_w_f32.len()) * 4
+                        + (c.a_log_f32.len() + c.dt_bias_f32.len()) * 4
+                })
                 .sum();
             eprintln!(
                 "[qwen36] linear_attn host cache: {} layers, {:.1} MiB",
@@ -1356,7 +1375,8 @@ impl Qwen36Bringup {
                 let mut router_f32 = vec![0.0f32; num_experts * hidden_us];
                 for i in 0..(num_experts * hidden_us) {
                     router_f32[i] = f16_bits_to_f32(u16::from_le_bytes([
-                        router_host[i * 2], router_host[i * 2 + 1],
+                        router_host[i * 2],
+                        router_host[i * 2 + 1],
                     ]));
                 }
                 caches.push(router_f32);
@@ -1389,9 +1409,8 @@ impl Qwen36Bringup {
                 }
                 let mut sg_f32 = vec![0.0f32; hidden_us];
                 for k in 0..hidden_us {
-                    sg_f32[k] = f16_bits_to_f32(u16::from_le_bytes([
-                        sg_host[k * 2], sg_host[k * 2 + 1],
-                    ]));
+                    sg_f32[k] =
+                        f16_bits_to_f32(u16::from_le_bytes([sg_host[k * 2], sg_host[k * 2 + 1]]));
                 }
                 caches.push(sg_f32);
             }
@@ -1487,6 +1506,19 @@ impl Qwen36Bringup {
              split, per-head L2-norm on Q/K, in_proj_a/b for α/β, \
              GQA-expanded K/Q for state update, per-v-head readout)"
         );
+        if std::env::var("RVLLM_QWEN36_MTP_FORWARD_SMOKE").as_deref() == Ok("1") {
+            bringup.reset_linear_state()?;
+            bringup.reset_kv_cache()?;
+            bringup.reset_conv_state()?;
+            let mtp_tok = bringup.forward_qwen36_mtp_one_token_probe(200, 2000, 0)?;
+            bringup.reset_linear_state()?;
+            bringup.reset_kv_cache()?;
+            bringup.reset_conv_state()?;
+            eprintln!(
+                "[qwen36-mtp] one-token forward smoke: hidden_token=200 \
+                 draft_input=2000 -> argmax_token_id={mtp_tok}"
+            );
+        }
 
         // Phase 2b-γ: vision smoke (gated by env). Reads a fixture
         // image from RVLLM_QWEN36_VISION_PROBE_PATH and runs the full
@@ -1500,9 +1532,7 @@ impl Qwen36Bringup {
                         let f32s: Vec<f32> = out
                             .data
                             .chunks_exact(2)
-                            .map(|c| {
-                                f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]]))
-                            })
+                            .map(|c| f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
                             .collect();
                         let l2 = f32s.iter().map(|x| x * x).sum::<f32>().sqrt();
                         let max = f32s.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
@@ -1529,8 +1559,7 @@ impl Qwen36Bringup {
     /// the full-attn layer (0..num_full_layers), NOT the absolute
     /// model layer index — caller maps via the layer_types array.
     pub fn kv_cache_layer_ptr(&self, layer_seq_idx: u32) -> u64 {
-        let off = (layer_seq_idx as usize)
-            .saturating_mul(self.kv_cache_layer_bytes);
+        let off = (layer_seq_idx as usize).saturating_mul(self.kv_cache_layer_bytes);
         if off + self.kv_cache_layer_bytes > self.kv_cache_bytes {
             return 0;
         }
@@ -1543,17 +1572,23 @@ impl Qwen36Bringup {
     /// computed offset overflows the buffer. Same `layer_seq_idx`
     /// semantics as `kv_cache_layer_ptr`.
     pub fn kv_cache_scale_layer_ptr(&self, layer_seq_idx: u32) -> u64 {
-        if self.kv_cache_scale_ptr == 0
-            || self.kv_cache_scale_layer_bytes == 0
-        {
+        if self.kv_cache_scale_ptr == 0 || self.kv_cache_scale_layer_bytes == 0 {
             return 0;
         }
-        let off = (layer_seq_idx as usize)
-            .saturating_mul(self.kv_cache_scale_layer_bytes);
+        let off = (layer_seq_idx as usize).saturating_mul(self.kv_cache_scale_layer_bytes);
         if off + self.kv_cache_scale_layer_bytes > self.kv_cache_scale_bytes {
             return 0;
         }
         self.kv_cache_scale_ptr + off as u64
+    }
+
+    fn mtp_kv_layer_seq_idx(&self) -> u32 {
+        self.arch
+            .base
+            .layer_types
+            .iter()
+            .filter(|t| matches!(t, rvllm_loader::LayerAttnType::Full))
+            .count() as u32
     }
 
     /// Phase 4u: zero out the paged KV cache (all full-attn layers).
@@ -1634,17 +1669,15 @@ impl Qwen36Bringup {
     /// `dst_*_ptr` must point at device buffers sized to
     /// `linear_state_bytes` / `conv_state_bytes` respectively. The
     /// spec session owns the scratch allocation.
-    pub fn snapshot_recurrent_state(
-        &self,
-        dst_linear_ptr: u64,
-        dst_conv_ptr: u64,
-    ) -> Result<()> {
+    pub fn snapshot_recurrent_state(&self, dst_linear_ptr: u64, dst_conv_ptr: u64) -> Result<()> {
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoDAsync_v2(
-                dst_linear_ptr, self.linear_state_ptr,
-                self.linear_state_bytes, self.stream.raw() as CUstream,
+                dst_linear_ptr,
+                self.linear_state_ptr,
+                self.linear_state_bytes,
+                self.stream.raw() as CUstream,
             );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
@@ -1654,8 +1687,10 @@ impl Qwen36Bringup {
                 ));
             }
             let rc = cuMemcpyDtoDAsync_v2(
-                dst_conv_ptr, self.conv_state_ptr,
-                self.conv_state_bytes, self.stream.raw() as CUstream,
+                dst_conv_ptr,
+                self.conv_state_ptr,
+                self.conv_state_bytes,
+                self.stream.raw() as CUstream,
             );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
@@ -1669,17 +1704,15 @@ impl Qwen36Bringup {
         Ok(())
     }
 
-    pub fn restore_recurrent_state(
-        &self,
-        src_linear_ptr: u64,
-        src_conv_ptr: u64,
-    ) -> Result<()> {
+    pub fn restore_recurrent_state(&self, src_linear_ptr: u64, src_conv_ptr: u64) -> Result<()> {
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoDAsync_v2(
-                self.linear_state_ptr, src_linear_ptr,
-                self.linear_state_bytes, self.stream.raw() as CUstream,
+                self.linear_state_ptr,
+                src_linear_ptr,
+                self.linear_state_bytes,
+                self.stream.raw() as CUstream,
             );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
@@ -1689,8 +1722,10 @@ impl Qwen36Bringup {
                 ));
             }
             let rc = cuMemcpyDtoDAsync_v2(
-                self.conv_state_ptr, src_conv_ptr,
-                self.conv_state_bytes, self.stream.raw() as CUstream,
+                self.conv_state_ptr,
+                src_conv_ptr,
+                self.conv_state_bytes,
+                self.stream.raw() as CUstream,
             );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
@@ -1714,7 +1749,9 @@ impl Qwen36Bringup {
         unsafe {
             use cudarc::driver::sys::*;
             let rc = cuMemsetD8Async(
-                self.conv_state_ptr, 0, self.conv_state_bytes,
+                self.conv_state_ptr,
+                0,
+                self.conv_state_bytes,
                 self.stream.raw() as CUstream,
             );
             if rc != CUresult::CUDA_SUCCESS {
@@ -1730,8 +1767,7 @@ impl Qwen36Bringup {
 
     /// Phase 5f: device pointer for layer N's conv-state slice.
     pub fn conv_state_layer_ptr(&self, layer_seq_idx: u32) -> u64 {
-        let off = (layer_seq_idx as usize)
-            .saturating_mul(self.conv_state_layer_bytes);
+        let off = (layer_seq_idx as usize).saturating_mul(self.conv_state_layer_bytes);
         if off + self.conv_state_layer_bytes > self.conv_state_bytes {
             return 0;
         }
@@ -1741,8 +1777,7 @@ impl Qwen36Bringup {
     /// Phase 4t: device pointer for layer N's slice of the state cache.
     /// Returns 0 if the layer index is out of bounds.
     pub fn linear_state_layer_ptr(&self, layer_seq_idx: u32) -> u64 {
-        let off = (layer_seq_idx as usize)
-            .saturating_mul(self.linear_state_layer_bytes);
+        let off = (layer_seq_idx as usize).saturating_mul(self.linear_state_layer_bytes);
         if off + self.linear_state_layer_bytes > self.linear_state_bytes {
             return 0;
         }
@@ -1784,16 +1819,15 @@ impl Qwen36Bringup {
         for t in token_ids {
             token_bytes_owned.extend_from_slice(&t.to_le_bytes());
         }
-        let tokens_region = self.arena.region(
-            "qwen36_outside_tokens",
-            token_bytes_owned.len(),
-            16,
-        )?;
+        let tokens_region =
+            self.arena
+                .region("qwen36_outside_tokens", token_bytes_owned.len(), 16)?;
         unsafe { tokens_region.copy_from_host(&token_bytes_owned)? };
 
         let hidden_bytes = (num_tokens as usize) * (hidden as usize) * 2; // f16
-        let hidden_region =
-            self.arena.region("qwen36_outside_hidden", hidden_bytes, 16)?;
+        let hidden_region = self
+            .arena
+            .region("qwen36_outside_hidden", hidden_bytes, 16)?;
 
         unsafe {
             rvllm_fused::EmbeddingGatherLaunch {
@@ -1815,14 +1849,14 @@ impl Qwen36Bringup {
         let hidden_scale_bytes = (num_tokens as usize) * 4;
         let logits_bytes = (num_tokens as usize) * (vocab as usize) * 2;
         let hidden_fp8_region =
-            self.arena.region("qwen36_outside_hidden_fp8", hidden_fp8_bytes, 16)?;
-        let hidden_scale_region = self.arena.region(
-            "qwen36_outside_hidden_scale",
-            hidden_scale_bytes,
-            16,
-        )?;
-        let logits_region =
-            self.arena.region("qwen36_outside_logits", logits_bytes, 16)?;
+            self.arena
+                .region("qwen36_outside_hidden_fp8", hidden_fp8_bytes, 16)?;
+        let hidden_scale_region =
+            self.arena
+                .region("qwen36_outside_hidden_scale", hidden_scale_bytes, 16)?;
+        let logits_region = self
+            .arena
+            .region("qwen36_outside_logits", logits_bytes, 16)?;
         let stream_raw = self.stream.raw() as u64;
 
         unsafe {
@@ -1882,8 +1916,12 @@ impl Qwen36Bringup {
             ];
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_argmax_f16.raw() as CUfunction,
-                /*grid*/ 1, 1, 1,
-                /*block*/ block_dim, 1, 1,
+                /*grid*/ 1,
+                1,
+                1,
+                /*block*/ block_dim,
+                1,
+                1,
                 /*shared*/ 0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -1902,11 +1940,7 @@ impl Qwen36Bringup {
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
-            let rc = cuMemcpyDtoH_v2(
-                tok_buf.as_mut_ptr() as *mut _,
-                token_region.device_ptr(),
-                4,
-            );
+            let rc = cuMemcpyDtoH_v2(tok_buf.as_mut_ptr() as *mut _, token_region.device_ptr(), 4);
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
                     "qwen36 argmax_f16 DtoH(token)",
@@ -1931,12 +1965,18 @@ impl Qwen36Bringup {
     ///     (Q + per-head gate concat for `attn_output_gate=true`);
     ///     k_proj / v_proj output `num_kv_heads * head_dim`.
     pub fn forward_layer3_qkv_probe(&self) -> Result<()> {
-        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
-            matches!(t, rvllm_loader::LayerAttnType::Full)
-        }) {
+        let layer_idx = match self
+            .arch
+            .base
+            .layer_types
+            .iter()
+            .position(|t| matches!(t, rvllm_loader::LayerAttnType::Full))
+        {
             Some(i) => i,
             None => {
-                eprintln!("[qwen36] forward_layer3_qkv_probe: no full-attention layer found, skipping");
+                eprintln!(
+                    "[qwen36] forward_layer3_qkv_probe: no full-attention layer found, skipping"
+                );
                 return Ok(());
             }
         };
@@ -2031,9 +2071,7 @@ impl Qwen36Bringup {
         eprintln!(
             "[qwen36] forward_layer3_qkv_probe: layer={layer_idx} \
              q={:?} ({:?}) k={:?} ({:?}) v={:?} ({:?})",
-            q, layer.q_proj.shape,
-            k, layer.k_proj.shape,
-            v, layer.v_proj.shape,
+            q, layer.q_proj.shape, k, layer.k_proj.shape, v, layer.v_proj.shape,
         );
 
         // Phase 4e: Q-Norm + K-Norm. Qwen 3.6 ships per-head RMSNorm
@@ -2054,66 +2092,65 @@ impl Qwen36Bringup {
         let num_kv_heads = self.arch.base.num_key_value_heads as u32;
         let eps = self.arch.base.rms_norm_eps;
         let two_bits = 0x4000u16.to_le_bytes(); // f16 2.0
-        let mut q_in_bytes = Vec::with_capacity(
-            (num_heads as usize) * (head_dim as usize) * 2,
-        );
+        let mut q_in_bytes = Vec::with_capacity((num_heads as usize) * (head_dim as usize) * 2);
         for _ in 0..(num_heads as usize) * (head_dim as usize) {
             q_in_bytes.extend_from_slice(&two_bits);
         }
-        let mut k_in_bytes = Vec::with_capacity(
-            (num_kv_heads as usize) * (head_dim as usize) * 2,
-        );
+        let mut k_in_bytes = Vec::with_capacity((num_kv_heads as usize) * (head_dim as usize) * 2);
         for _ in 0..(num_kv_heads as usize) * (head_dim as usize) {
             k_in_bytes.extend_from_slice(&two_bits);
         }
-        let q_norm_in_region =
-            self.arena.region("qwen36_l3qnorm_in", q_in_bytes.len(), 16)?;
-        let k_norm_in_region =
-            self.arena.region("qwen36_l3knorm_in", k_in_bytes.len(), 16)?;
+        let q_norm_in_region = self
+            .arena
+            .region("qwen36_l3qnorm_in", q_in_bytes.len(), 16)?;
+        let k_norm_in_region = self
+            .arena
+            .region("qwen36_l3knorm_in", k_in_bytes.len(), 16)?;
         unsafe {
             q_norm_in_region.copy_from_host(&q_in_bytes)?;
             k_norm_in_region.copy_from_host(&k_in_bytes)?;
         }
 
         // Per-head RMSNorm: num_tokens = num_heads, hidden = head_dim.
-        let launch_norm = |x_ptr: u64,
-                           gamma_ptr: u64,
-                           heads: u32,
-                           label: &'static str|
-         -> Result<()> {
-            #[cfg(feature = "cuda")]
-            unsafe {
-                use cudarc::driver::sys::*;
-                let mut x = x_ptr;
-                let mut g = gamma_ptr;
-                let mut e = eps;
-                let mut h = head_dim as i32;
-                let args = [
-                    (&mut x) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut g) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut e) as *mut f32 as *mut core::ffi::c_void,
-                    (&mut h) as *mut i32 as *mut core::ffi::c_void,
-                ];
-                let block = head_dim.min(1024);
-                let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_rmsnorm_inplace_f16.raw() as CUfunction,
-                    heads, 1, 1,
-                    block, 1, 1,
-                    0,
-                    self.stream.raw() as CUstream,
-                    args.as_ptr() as *mut *mut core::ffi::c_void,
-                    core::ptr::null_mut(),
-                );
-                if rc != CUresult::CUDA_SUCCESS {
-                    return Err(rvllm_core::RvllmError::cuda(
-                        label,
-                        rvllm_core::CudaErrorKind::LaunchFailed,
-                        rvllm_core::CudaCtx::setup(),
-                    ));
+        let launch_norm =
+            |x_ptr: u64, gamma_ptr: u64, heads: u32, label: &'static str| -> Result<()> {
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let mut x = x_ptr;
+                    let mut g = gamma_ptr;
+                    let mut e = eps;
+                    let mut h = head_dim as i32;
+                    let args = [
+                        (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut g) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut e) as *mut f32 as *mut core::ffi::c_void,
+                        (&mut h) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let block = head_dim.min(1024);
+                    let rc = cuLaunchKernel(
+                        self.outside_kernels.fn_rmsnorm_inplace_f16.raw() as CUfunction,
+                        heads,
+                        1,
+                        1,
+                        block,
+                        1,
+                        1,
+                        0,
+                        self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            label,
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
                 }
-            }
-            Ok(())
-        };
+                Ok(())
+            };
 
         launch_norm(
             q_norm_in_region.device_ptr(),
@@ -2189,8 +2226,7 @@ impl Qwen36Bringup {
         // Synthetic f16 all-twos for Q/K/V (per-head, all positions).
         let two_bits = 0x4000u16.to_le_bytes();
         let q_elems = (num_tokens as usize) * (num_heads as usize) * (head_dim as usize);
-        let kv_elems =
-            (num_tokens as usize) * (num_kv_heads as usize) * (head_dim as usize);
+        let kv_elems = (num_tokens as usize) * (num_kv_heads as usize) * (head_dim as usize);
         let mut q_in_bytes = Vec::with_capacity(q_elems * 2);
         for _ in 0..q_elems {
             q_in_bytes.extend_from_slice(&two_bits);
@@ -2201,8 +2237,12 @@ impl Qwen36Bringup {
         }
 
         let q_region = self.arena.region("qwen36_l3rope_q", q_in_bytes.len(), 16)?;
-        let k_region = self.arena.region("qwen36_l3rope_k", kv_in_bytes.len(), 16)?;
-        let v_region = self.arena.region("qwen36_l3rope_v", kv_in_bytes.len(), 16)?;
+        let k_region = self
+            .arena
+            .region("qwen36_l3rope_k", kv_in_bytes.len(), 16)?;
+        let v_region = self
+            .arena
+            .region("qwen36_l3rope_v", kv_in_bytes.len(), 16)?;
         unsafe {
             q_region.copy_from_host(&q_in_bytes)?;
             k_region.copy_from_host(&kv_in_bytes)?;
@@ -2211,10 +2251,12 @@ impl Qwen36Bringup {
         // KV cache stand-in: 1 slot's worth, same byte size as one
         // [num_kv_heads, head_dim] vector. Real KV cache lives in
         // Phase 4h.
-        let k_cache_region =
-            self.arena.region("qwen36_l3rope_kc", kv_in_bytes.len(), 16)?;
-        let v_cache_region =
-            self.arena.region("qwen36_l3rope_vc", kv_in_bytes.len(), 16)?;
+        let k_cache_region = self
+            .arena
+            .region("qwen36_l3rope_kc", kv_in_bytes.len(), 16)?;
+        let v_cache_region = self
+            .arena
+            .region("qwen36_l3rope_vc", kv_in_bytes.len(), 16)?;
 
         // Position [0] + slot_mapping [0] (single-token, slot index 0).
         let zero_i32 = 0i32.to_le_bytes();
@@ -2322,19 +2364,19 @@ impl Qwen36Bringup {
 
         // Sized buffers (all f16 except block_tables/context_lens int).
         let q_bytes = (num_seqs as usize) * (num_heads as usize) * (head_dim as usize) * 2;
-        let kv_cache_bytes =
-            (num_blocks as usize) * (block_size as usize) * (num_kv_heads as usize)
-                * (head_dim as usize) * 2;
+        let kv_cache_bytes = (num_blocks as usize)
+            * (block_size as usize)
+            * (num_kv_heads as usize)
+            * (head_dim as usize)
+            * 2;
         let out_bytes = q_bytes;
 
         // Q = all-twos, V = all-threes, K = all-ones (so softmax weight
         // simplifies but the output isn't trivially equal to V — lets
         // us see that the kernel actually composes Q·K^T·V correctly).
         let q_region = self.arena.region("qwen36_l3pa_q", q_bytes, 16)?;
-        let k_cache_region =
-            self.arena.region("qwen36_l3pa_kc", kv_cache_bytes, 16)?;
-        let v_cache_region =
-            self.arena.region("qwen36_l3pa_vc", kv_cache_bytes, 16)?;
+        let k_cache_region = self.arena.region("qwen36_l3pa_kc", kv_cache_bytes, 16)?;
+        let v_cache_region = self.arena.region("qwen36_l3pa_vc", kv_cache_bytes, 16)?;
         let out_region = self.arena.region("qwen36_l3pa_out", out_bytes, 16)?;
 
         let two_bits = 0x4000u16.to_le_bytes(); // f16 2.0
@@ -2383,13 +2425,10 @@ impl Qwen36Bringup {
             const FA2_THREADS: i32 = 128;
             const FA2_BC: i32 = 32;
             let hd_i = head_dim as i32;
-            let smem_bytes =
-                2 * FA2_BC * hd_i * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+            let smem_bytes = 2 * FA2_BC * hd_i * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
             if smem_bytes as u32 >= 48 * 1024 {
                 let rc = cuFuncSetAttribute(
-                    self.outside_kernels
-                        .fn_flash_attention_2_decode_f16io
-                        .raw() as CUfunction,
+                    self.outside_kernels.fn_flash_attention_2_decode_f16io.raw() as CUfunction,
                     CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     smem_bytes,
                 );
@@ -2431,11 +2470,13 @@ impl Qwen36Bringup {
                 (&mut window) as *mut i32 as *mut core::ffi::c_void,
             ];
             let rc = cuLaunchKernel(
-                self.outside_kernels
-                    .fn_flash_attention_2_decode_f16io
-                    .raw() as CUfunction,
-                num_seqs, num_heads, 1,
-                FA2_THREADS as u32, 1, 1,
+                self.outside_kernels.fn_flash_attention_2_decode_f16io.raw() as CUfunction,
+                num_seqs,
+                num_heads,
+                1,
+                FA2_THREADS as u32,
+                1,
+                1,
                 smem_bytes as u32,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -2481,9 +2522,13 @@ impl Qwen36Bringup {
     /// heads); the output is the residual contribution that feeds
     /// the post-attention residual + MoE block.
     pub fn forward_layer3_o_proj_probe(&self) -> Result<()> {
-        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
-            matches!(t, rvllm_loader::LayerAttnType::Full)
-        }) {
+        let layer_idx = match self
+            .arch
+            .base
+            .layer_types
+            .iter()
+            .position(|t| matches!(t, rvllm_loader::LayerAttnType::Full))
+        {
             Some(i) => i,
             None => return Ok(()),
         };
@@ -2591,8 +2636,12 @@ impl Qwen36Bringup {
             let grid = (n + block - 1) / block;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_sigmoid_mul_f16.raw() as CUfunction,
-                grid, 1, 1,
-                block, 1, 1,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
                 0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -2639,9 +2688,13 @@ impl Qwen36Bringup {
     /// the bf16 router (`mlp.gate`) are deferred to Phase 4l/4m where
     /// the per-token expert selection + grouped-GEMM dispatch land.
     pub fn forward_layer3_moe_shared_probe(&self) -> Result<()> {
-        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
-            matches!(t, rvllm_loader::LayerAttnType::Full)
-        }) {
+        let layer_idx = match self
+            .arch
+            .base
+            .layer_types
+            .iter()
+            .position(|t| matches!(t, rvllm_loader::LayerAttnType::Full))
+        {
             Some(i) => i,
             None => return Ok(()),
         };
@@ -2666,12 +2719,12 @@ impl Qwen36Bringup {
         for _ in 0..k {
             input_bytes.extend_from_slice(&two_bits);
         }
-        let in_region =
-            self.arena.region("qwen36_l3moe_sh_in", input_bytes.len(), 16)?;
+        let in_region = self
+            .arena
+            .region("qwen36_l3moe_sh_in", input_bytes.len(), 16)?;
         unsafe { in_region.copy_from_host(&input_bytes)? };
         let out_bytes = (m as usize) * (n as usize) * 2;
-        let out_region =
-            self.arena.region("qwen36_l3moe_sh_out", out_bytes, 16)?;
+        let out_region = self.arena.region("qwen36_l3moe_sh_out", out_bytes, 16)?;
 
         unsafe {
             rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n, k }.launch(
@@ -2720,9 +2773,13 @@ impl Qwen36Bringup {
     /// The MoE block also stores the router weight as f16 (after the
     /// loader's bf16→f16 upload), so we DtoH the f16 buffer directly.
     pub fn forward_layer3_router_probe(&self) -> Result<()> {
-        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
-            matches!(t, rvllm_loader::LayerAttnType::Full)
-        }) {
+        let layer_idx = match self
+            .arch
+            .base
+            .layer_types
+            .iter()
+            .position(|t| matches!(t, rvllm_loader::LayerAttnType::Full))
+        {
             Some(i) => i,
             None => return Ok(()),
         };
@@ -2754,9 +2811,7 @@ impl Qwen36Bringup {
 
         // Synthetic hidden state h[i] = (i % 8) * 0.125 — small, varied,
         // not constant so the per-expert dot products differentiate.
-        let hidden_state: Vec<f32> = (0..hidden)
-            .map(|i| ((i % 8) as f32) * 0.125)
-            .collect();
+        let hidden_state: Vec<f32> = (0..hidden).map(|i| ((i % 8) as f32) * 0.125).collect();
 
         // Host matmul: logits[e] = Σ_k router[e, k] * hidden[k].
         let mut logits = vec![0.0f32; num_experts];
@@ -2780,7 +2835,10 @@ impl Qwen36Bringup {
         let top: Vec<(usize, f32)> = indexed.iter().take(top_k).copied().collect();
 
         // Softmax-normalize the top-k (Qwen's router head_mode).
-        let max = top.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+        let max = top
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = top.iter().map(|(_, v)| (v - max).exp()).collect();
         let sum: f32 = exps.iter().sum();
         let weights: Vec<f32> = exps.iter().map(|e| e / sum).collect();
@@ -2812,9 +2870,13 @@ impl Qwen36Bringup {
     /// `blockscale_ptr + e * per_expert_blockscale_f32_bytes`. For
     /// e=0 both offsets are zero, which is the simplest-cut probe.
     pub fn forward_layer3_routed_expert_probe(&self) -> Result<()> {
-        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
-            matches!(t, rvllm_loader::LayerAttnType::Full)
-        }) {
+        let layer_idx = match self
+            .arch
+            .base
+            .layer_types
+            .iter()
+            .position(|t| matches!(t, rvllm_loader::LayerAttnType::Full))
+        {
             Some(i) => i,
             None => return Ok(()),
         };
@@ -2841,21 +2903,18 @@ impl Qwen36Bringup {
         for _ in 0..k_in {
             input_bytes.extend_from_slice(&two_bits);
         }
-        let in_region =
-            self.arena.region("qwen36_l3rex_in", input_bytes.len(), 16)?;
+        let in_region = self
+            .arena
+            .region("qwen36_l3rex_in", input_bytes.len(), 16)?;
         unsafe { in_region.copy_from_host(&input_bytes)? };
 
         // Outputs of gate / up are size N_int = 512 each (f16).
         let mid_bytes = (n_int as usize) * 2;
-        let gate_out_region =
-            self.arena.region("qwen36_l3rex_g", mid_bytes, 16)?;
-        let up_out_region =
-            self.arena.region("qwen36_l3rex_u", mid_bytes, 16)?;
-        let silu_mul_region =
-            self.arena.region("qwen36_l3rex_silu", mid_bytes, 16)?;
+        let gate_out_region = self.arena.region("qwen36_l3rex_g", mid_bytes, 16)?;
+        let up_out_region = self.arena.region("qwen36_l3rex_u", mid_bytes, 16)?;
+        let silu_mul_region = self.arena.region("qwen36_l3rex_silu", mid_bytes, 16)?;
         let down_bytes = (n_down as usize) * 2;
-        let down_out_region =
-            self.arena.region("qwen36_l3rex_o", down_bytes, 16)?;
+        let down_out_region = self.arena.region("qwen36_l3rex_o", down_bytes, 16)?;
 
         // Expert 0's weight slice begins at the fused region start.
         // For e>0: weight_ptr += e * (N * K), blockscale_ptr +=
@@ -2922,14 +2981,8 @@ impl Qwen36Bringup {
         }
         let mut silu_mul_host = Vec::with_capacity(mid_bytes);
         for i in 0..(n_int as usize) {
-            let g = f16_bits_to_f32(u16::from_le_bytes([
-                gate_host[i * 2],
-                gate_host[i * 2 + 1],
-            ]));
-            let u = f16_bits_to_f32(u16::from_le_bytes([
-                up_host[i * 2],
-                up_host[i * 2 + 1],
-            ]));
+            let g = f16_bits_to_f32(u16::from_le_bytes([gate_host[i * 2], gate_host[i * 2 + 1]]));
+            let u = f16_bits_to_f32(u16::from_le_bytes([up_host[i * 2], up_host[i * 2 + 1]]));
             // SiLU: x · sigmoid(x) = x / (1 + exp(-x))
             let silu_g = g / (1.0f32 + (-g).exp());
             let v = silu_g * u;
@@ -2999,9 +3052,13 @@ impl Qwen36Bringup {
     ///      shared output
     ///   6. final = routed_sum + gated_shared
     pub fn forward_layer3_full_moe_probe(&self) -> Result<()> {
-        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
-            matches!(t, rvllm_loader::LayerAttnType::Full)
-        }) {
+        let layer_idx = match self
+            .arch
+            .base
+            .layer_types
+            .iter()
+            .position(|t| matches!(t, rvllm_loader::LayerAttnType::Full))
+        {
             Some(i) => i,
             None => return Ok(()),
         };
@@ -3031,18 +3088,14 @@ impl Qwen36Bringup {
                 weight_bytes,
             );
         }
-        let hidden_state: Vec<f32> = (0..hidden)
-            .map(|i| ((i % 8) as f32) * 0.125)
-            .collect();
+        let hidden_state: Vec<f32> = (0..hidden).map(|i| ((i % 8) as f32) * 0.125).collect();
         let mut logits = vec![0.0f32; num_experts];
         for e in 0..num_experts {
             let row = e * hidden * 2;
             let mut acc = 0.0f32;
             for k in 0..hidden {
-                let bits = u16::from_le_bytes([
-                    router_f16[row + k * 2],
-                    router_f16[row + k * 2 + 1],
-                ]);
+                let bits =
+                    u16::from_le_bytes([router_f16[row + k * 2], router_f16[row + k * 2 + 1]]);
                 acc += f16_bits_to_f32(bits) * hidden_state[k];
             }
             logits[e] = acc;
@@ -3051,7 +3104,10 @@ impl Qwen36Bringup {
             logits.iter().enumerate().map(|(i, &l)| (i, l)).collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let top: Vec<(usize, f32)> = indexed.iter().take(top_k).copied().collect();
-        let max = top.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+        let max = top
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = top.iter().map(|(_, v)| (v - max).exp()).collect();
         let sum: f32 = exps.iter().sum();
         let weights: Vec<f32> = exps.iter().map(|e| e / sum).collect();
@@ -3062,7 +3118,9 @@ impl Qwen36Bringup {
         for h in &hidden_state {
             input_bytes.extend_from_slice(&f32_to_f16_bits(*h).to_le_bytes());
         }
-        let in_region = self.arena.region("qwen36_l3moe_in", input_bytes.len(), 16)?;
+        let in_region = self
+            .arena
+            .region("qwen36_l3moe_in", input_bytes.len(), 16)?;
         unsafe { in_region.copy_from_host(&input_bytes)? };
 
         let mid_bytes = (n_int as usize) * 2;
@@ -3074,11 +3132,9 @@ impl Qwen36Bringup {
 
         // Per-expert byte strides into the fused regions.
         let int_per_expert_w = (n_int as u64) * (k_in as u64); // FP8: 1 byte/elem
-        let int_per_expert_bs =
-            ((n_int as u64) / 128) * ((k_in as u64) / 128) * 4; // f32 blockscale
+        let int_per_expert_bs = ((n_int as u64) / 128) * ((k_in as u64) / 128) * 4; // f32 blockscale
         let down_per_expert_w = (n_down as u64) * (k_down as u64);
-        let down_per_expert_bs =
-            ((n_down as u64) / 128) * ((k_down as u64) / 128) * 4;
+        let down_per_expert_bs = ((n_down as u64) / 128) * ((k_down as u64) / 128) * 4;
 
         let gate_bs = moe.experts_gate_proj_fused.blockscale_ptr.unwrap_or(0);
         let up_bs = moe.experts_up_proj_fused.blockscale_ptr.unwrap_or(0);
@@ -3094,8 +3150,11 @@ impl Qwen36Bringup {
             // gate
             unsafe {
                 rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                    m, n: n_int, k: k_in,
-                }.launch(
+                    m,
+                    n: n_int,
+                    k: k_in,
+                }
+                .launch(
                     kernel,
                     gate_region.device_ptr(),
                     moe.experts_gate_proj_fused.offset_bytes + e * int_per_expert_w,
@@ -3104,8 +3163,11 @@ impl Qwen36Bringup {
                     self.stream.raw() as u64,
                 )?;
                 rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                    m, n: n_int, k: k_in,
-                }.launch(
+                    m,
+                    n: n_int,
+                    k: k_in,
+                }
+                .launch(
                     kernel,
                     up_region.device_ptr(),
                     moe.experts_up_proj_fused.offset_bytes + e * int_per_expert_w,
@@ -3121,8 +3183,16 @@ impl Qwen36Bringup {
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
-                let _ = cuMemcpyDtoH_v2(g_host.as_mut_ptr() as *mut _, gate_region.device_ptr(), mid_bytes);
-                let _ = cuMemcpyDtoH_v2(u_host.as_mut_ptr() as *mut _, up_region.device_ptr(), mid_bytes);
+                let _ = cuMemcpyDtoH_v2(
+                    g_host.as_mut_ptr() as *mut _,
+                    gate_region.device_ptr(),
+                    mid_bytes,
+                );
+                let _ = cuMemcpyDtoH_v2(
+                    u_host.as_mut_ptr() as *mut _,
+                    up_region.device_ptr(),
+                    mid_bytes,
+                );
             }
             let mut silu_host = Vec::with_capacity(mid_bytes);
             for i in 0..(n_int as usize) {
@@ -3135,8 +3205,11 @@ impl Qwen36Bringup {
 
             unsafe {
                 rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                    m, n: n_down, k: k_down,
-                }.launch(
+                    m,
+                    n: n_down,
+                    k: k_down,
+                }
+                .launch(
                     kernel,
                     down_region.device_ptr(),
                     moe.experts_down_proj_fused.offset_bytes + e * down_per_expert_w,
@@ -3151,7 +3224,11 @@ impl Qwen36Bringup {
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
-                let _ = cuMemcpyDtoH_v2(d_host.as_mut_ptr() as *mut _, down_region.device_ptr(), down_bytes);
+                let _ = cuMemcpyDtoH_v2(
+                    d_host.as_mut_ptr() as *mut _,
+                    down_region.device_ptr(),
+                    down_bytes,
+                );
             }
             for i in 0..(n_down as usize) {
                 let v = f16_bits_to_f32(u16::from_le_bytes([d_host[i * 2], d_host[i * 2 + 1]]));
@@ -3166,8 +3243,11 @@ impl Qwen36Bringup {
         if sh_gate_bs != 0 && sh_up_bs != 0 && sh_down_bs != 0 {
             unsafe {
                 rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                    m, n: n_int, k: k_in,
-                }.launch(
+                    m,
+                    n: n_int,
+                    k: k_in,
+                }
+                .launch(
                     kernel,
                     gate_region.device_ptr(),
                     moe.shared_expert_gate_proj.offset_bytes,
@@ -3176,8 +3256,11 @@ impl Qwen36Bringup {
                     self.stream.raw() as u64,
                 )?;
                 rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                    m, n: n_int, k: k_in,
-                }.launch(
+                    m,
+                    n: n_int,
+                    k: k_in,
+                }
+                .launch(
                     kernel,
                     up_region.device_ptr(),
                     moe.shared_expert_up_proj.offset_bytes,
@@ -3192,8 +3275,16 @@ impl Qwen36Bringup {
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
-                let _ = cuMemcpyDtoH_v2(g_host.as_mut_ptr() as *mut _, gate_region.device_ptr(), mid_bytes);
-                let _ = cuMemcpyDtoH_v2(u_host.as_mut_ptr() as *mut _, up_region.device_ptr(), mid_bytes);
+                let _ = cuMemcpyDtoH_v2(
+                    g_host.as_mut_ptr() as *mut _,
+                    gate_region.device_ptr(),
+                    mid_bytes,
+                );
+                let _ = cuMemcpyDtoH_v2(
+                    u_host.as_mut_ptr() as *mut _,
+                    up_region.device_ptr(),
+                    mid_bytes,
+                );
             }
             let mut silu_host = Vec::with_capacity(mid_bytes);
             for i in 0..(n_int as usize) {
@@ -3205,8 +3296,11 @@ impl Qwen36Bringup {
             unsafe { silu_region.copy_from_host(&silu_host)? };
             unsafe {
                 rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                    m, n: n_down, k: k_down,
-                }.launch(
+                    m,
+                    n: n_down,
+                    k: k_down,
+                }
+                .launch(
                     kernel,
                     down_region.device_ptr(),
                     moe.shared_expert_down_proj.offset_bytes,
@@ -3220,7 +3314,11 @@ impl Qwen36Bringup {
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
-                let _ = cuMemcpyDtoH_v2(sh_host.as_mut_ptr() as *mut _, down_region.device_ptr(), down_bytes);
+                let _ = cuMemcpyDtoH_v2(
+                    sh_host.as_mut_ptr() as *mut _,
+                    down_region.device_ptr(),
+                    down_bytes,
+                );
             }
             // shared_expert_gate: single-element bf16-as-f16 → sigmoid
             let mut sh_gate_host = [0u8; 2];
@@ -3272,9 +3370,13 @@ impl Qwen36Bringup {
     /// order, or the post-SSM normalisation. Goal here: prove every
     /// kernel + host glue step composes without ABI errors.
     pub fn forward_layer0_linear_chain_probe(&self) -> Result<()> {
-        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
-            matches!(t, rvllm_loader::LayerAttnType::Linear)
-        }) {
+        let layer_idx = match self
+            .arch
+            .base
+            .layer_types
+            .iter()
+            .position(|t| matches!(t, rvllm_loader::LayerAttnType::Linear))
+        {
             Some(i) => i,
             None => return Ok(()),
         };
@@ -3314,8 +3416,11 @@ impl Qwen36Bringup {
         }
         unsafe {
             rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                m, n: qkv_n, k: hidden,
-            }.launch(
+                m,
+                n: qkv_n,
+                k: hidden,
+            }
+            .launch(
                 kernel_gemv,
                 qkv_region.device_ptr(),
                 la.in_proj_qkv.offset_bytes,
@@ -3332,10 +3437,8 @@ impl Qwen36Bringup {
         let ks: u32 = 4;
         let conv_in_elems = ((1 + ks - 1) as usize) * (qkv_n as usize);
         let conv_in_bytes = conv_in_elems * 2;
-        let conv_in_region =
-            self.arena.region("qwen36_l0lc_cin", conv_in_bytes, 16)?;
-        let conv_out_region =
-            self.arena.region("qwen36_l0lc_cout", qkv_bytes, 16)?;
+        let conv_in_region = self.arena.region("qwen36_l0lc_cin", conv_in_bytes, 16)?;
+        let conv_out_region = self.arena.region("qwen36_l0lc_cout", qkv_bytes, 16)?;
         // Build conv input on host: 3 zero timesteps + qkv_concat.
         let mut conv_in_host = vec![0u8; conv_in_bytes];
         let mut qkv_host = vec![0u8; qkv_bytes];
@@ -3375,20 +3478,24 @@ impl Qwen36Bringup {
             let grid_x = (qkv_n + block - 1) / block;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_causal_conv1d_f16.raw() as CUfunction,
-                grid_x, 1, 1,
-                block, 1, 1,
+                grid_x,
+                1,
+                1,
+                block,
+                1,
+                1,
                 0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
-        if rc != CUresult::CUDA_SUCCESS {
-            return Err(rvllm_core::RvllmError::cuda(
-                "qwen36 causal_conv1d_f16 launch",
-                rvllm_core::CudaErrorKind::LaunchFailed,
-                rvllm_core::CudaCtx::setup(),
-            ));
-        }
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 causal_conv1d_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
         }
         self.stream.fence()?;
 
@@ -3444,11 +3551,14 @@ impl Qwen36Bringup {
                 dt_avg += conv_silu_f32[dt_off + h * per_head + j];
             }
             dt_avg /= per_head as f32;
-            let bias =
-                f16_bits_to_f32(u16::from_le_bytes([dt_bias_host[h * 2], dt_bias_host[h * 2 + 1]]));
+            let bias = f16_bits_to_f32(u16::from_le_bytes([
+                dt_bias_host[h * 2],
+                dt_bias_host[h * 2 + 1],
+            ]));
             let dt = (1.0f32 + (dt_avg + bias).exp()).ln(); // softplus
             let a_log = f16_bits_to_f32(u16::from_le_bytes([
-                a_log_host[h * 2], a_log_host[h * 2 + 1],
+                a_log_host[h * 2],
+                a_log_host[h * 2 + 1],
             ]));
             let a = (-(a_log.exp()) * dt).exp();
             alpha_f32.push(a);
@@ -3473,18 +3583,19 @@ impl Qwen36Bringup {
         }
 
         // 6. ssm state update.
-        let state_bytes =
-            (num_heads as usize) * (d_state as usize) * (d_state as usize) * 2;
+        let state_bytes = (num_heads as usize) * (d_state as usize) * (d_state as usize) * 2;
         let state_region = self.arena.region("qwen36_l0lc_state", state_bytes, 16)?;
         let q_region = self.arena.region("qwen36_l0lc_q", q_host.len(), 16)?;
         let k_region = self.arena.region("qwen36_l0lc_k", k_host.len(), 16)?;
         let v_region = self.arena.region("qwen36_l0lc_v", v_host.len(), 16)?;
         let alpha_bytes: Vec<u8> = alpha_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
         let beta_bytes: Vec<u8> = beta_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let alpha_region =
-            self.arena.region("qwen36_l0lc_alpha", alpha_bytes.len(), 16)?;
-        let beta_region =
-            self.arena.region("qwen36_l0lc_beta", beta_bytes.len(), 16)?;
+        let alpha_region = self
+            .arena
+            .region("qwen36_l0lc_alpha", alpha_bytes.len(), 16)?;
+        let beta_region = self
+            .arena
+            .region("qwen36_l0lc_beta", beta_bytes.len(), 16)?;
         let zero_state = vec![0u8; state_bytes];
         unsafe {
             state_region.copy_from_host(&zero_state)?;
@@ -3517,20 +3628,24 @@ impl Qwen36Bringup {
             ];
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_gated_delta_state_update_f16.raw() as CUfunction,
-                num_heads, 1, 1,
-                16, 16, 1,
+                num_heads,
+                1,
+                1,
+                16,
+                16,
+                1,
                 0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
-        if rc != CUresult::CUDA_SUCCESS {
-            return Err(rvllm_core::RvllmError::cuda(
-                "qwen36 gated_delta_state_update_f16 launch",
-                rvllm_core::CudaErrorKind::LaunchFailed,
-                rvllm_core::CudaCtx::setup(),
-            ));
-        }
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 gated_delta_state_update_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
         }
         self.stream.fence()?;
 
@@ -3545,8 +3660,7 @@ impl Qwen36Bringup {
                 state_bytes,
             );
         }
-        let mut readout_f32 =
-            vec![0.0f32; (num_heads as usize) * (d_state as usize)];
+        let mut readout_f32 = vec![0.0f32; (num_heads as usize) * (d_state as usize)];
         for h in 0..num_heads as usize {
             for v in 0..d_state as usize {
                 let mut acc = 0.0f32;
@@ -3554,11 +3668,13 @@ impl Qwen36Bringup {
                     let s_idx =
                         h * (d_state as usize) * (d_state as usize) + v * (d_state as usize) + k;
                     let s = f16_bits_to_f32(u16::from_le_bytes([
-                        state_host[s_idx * 2], state_host[s_idx * 2 + 1],
+                        state_host[s_idx * 2],
+                        state_host[s_idx * 2 + 1],
                     ]));
                     let q_idx = h * (d_state as usize) + k;
                     let q = f16_bits_to_f32(u16::from_le_bytes([
-                        q_host[q_idx * 2], q_host[q_idx * 2 + 1],
+                        q_host[q_idx * 2],
+                        q_host[q_idx * 2 + 1],
                     ]));
                     acc += s * q;
                 }
@@ -3577,8 +3693,11 @@ impl Qwen36Bringup {
         }
         unsafe {
             rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                m, n: z_n, k: hidden,
-            }.launch(
+                m,
+                n: z_n,
+                k: hidden,
+            }
+            .launch(
                 kernel_gemv,
                 z_region.device_ptr(),
                 la.in_proj_z.offset_bytes,
@@ -3620,7 +3739,8 @@ impl Qwen36Bringup {
             for d in 0..d_state as usize {
                 let v = readout_f32[h * (d_state as usize) + d] / rms;
                 let g = f16_bits_to_f32(u16::from_le_bytes([
-                    norm_gamma[d * 2], norm_gamma[d * 2 + 1],
+                    norm_gamma[d * 2],
+                    norm_gamma[d * 2 + 1],
                 ]));
                 let z_logit = f16_bits_to_f32(u16::from_le_bytes([
                     z_host_bytes[(h * (d_state as usize) + d) * 2],
@@ -3633,8 +3753,9 @@ impl Qwen36Bringup {
                 gated_readout[(h * (d_state as usize) + d) * 2 + 1] = bytes[1];
             }
         }
-        let gated_region =
-            self.arena.region("qwen36_l0lc_gated", gated_readout.len(), 16)?;
+        let gated_region = self
+            .arena
+            .region("qwen36_l0lc_gated", gated_readout.len(), 16)?;
         unsafe { gated_region.copy_from_host(&gated_readout)? };
 
         // out_proj: [hidden, num_heads*d_state=4096] FP8 GEMV.
@@ -3646,8 +3767,11 @@ impl Qwen36Bringup {
         }
         unsafe {
             rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                m, n: out_n, k: out_k,
-            }.launch(
+                m,
+                n: out_n,
+                k: out_k,
+            }
+            .launch(
                 kernel_gemv,
                 out_region.device_ptr(),
                 la.out_proj.offset_bytes,
@@ -3786,12 +3910,8 @@ impl Qwen36Bringup {
         for _ in 0..(num_heads as usize) * (d_v as usize) {
             v_bytes.extend_from_slice(&one_bits);
         }
-        let alpha_host: Vec<u8> = (0..num_heads)
-            .flat_map(|_| 0.5f32.to_le_bytes())
-            .collect();
-        let beta_host: Vec<u8> = (0..num_heads)
-            .flat_map(|_| 2.0f32.to_le_bytes())
-            .collect();
+        let alpha_host: Vec<u8> = (0..num_heads).flat_map(|_| 0.5f32.to_le_bytes()).collect();
+        let beta_host: Vec<u8> = (0..num_heads).flat_map(|_| 2.0f32.to_le_bytes()).collect();
 
         let state_region = self.arena.region("qwen36_l0ssm_s", state_bytes, 16)?;
         let k_region = self.arena.region("qwen36_l0ssm_k", k_bytes.len(), 16)?;
@@ -3831,8 +3951,12 @@ impl Qwen36Bringup {
             // its share of the 128*128=16384 state elements.
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_gated_delta_state_update_f16.raw() as CUfunction,
-                num_heads, 1, 1,
-                16, 16, 1,
+                num_heads,
+                1,
+                1,
+                16,
+                16,
+                1,
                 0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -3879,9 +4003,13 @@ impl Qwen36Bringup {
     /// weight values. Probes the per-channel shape + ABI + first
     /// channel's actual weight sum.
     pub fn forward_layer0_conv1d_probe(&self) -> Result<()> {
-        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
-            matches!(t, rvllm_loader::LayerAttnType::Linear)
-        }) {
+        let layer_idx = match self
+            .arch
+            .base
+            .layer_types
+            .iter()
+            .position(|t| matches!(t, rvllm_loader::LayerAttnType::Linear))
+        {
             Some(i) => i,
             None => return Ok(()),
         };
@@ -3902,8 +4030,7 @@ impl Qwen36Bringup {
         for _ in 0..in_elems {
             input_bytes.extend_from_slice(&one_bits);
         }
-        let in_region =
-            self.arena.region("qwen36_l0c1_in", input_bytes.len(), 16)?;
+        let in_region = self.arena.region("qwen36_l0c1_in", input_bytes.len(), 16)?;
         unsafe { in_region.copy_from_host(&input_bytes)? };
 
         let out_bytes = (seq_len as usize) * (channels as usize) * 2;
@@ -3930,8 +4057,12 @@ impl Qwen36Bringup {
             let grid_x = (channels + block - 1) / block;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_causal_conv1d_f16.raw() as CUfunction,
-                grid_x, seq_len, 1,
-                block, 1, 1,
+                grid_x,
+                seq_len,
+                1,
+                block,
+                1,
+                1,
                 0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -4002,9 +4133,13 @@ impl Qwen36Bringup {
     /// still need a custom kernel — this only exercises the FP8
     /// matmul entry points to the linear-attn block.
     pub fn forward_layer0_linear_in_proj_probe(&self) -> Result<()> {
-        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
-            matches!(t, rvllm_loader::LayerAttnType::Linear)
-        }) {
+        let layer_idx = match self
+            .arch
+            .base
+            .layer_types
+            .iter()
+            .position(|t| matches!(t, rvllm_loader::LayerAttnType::Linear))
+        {
             Some(i) => i,
             None => return Ok(()),
         };
@@ -4025,64 +4160,63 @@ impl Qwen36Bringup {
         for _ in 0..hidden {
             input_bytes.extend_from_slice(&two_bits);
         }
-        let in_region =
-            self.arena.region("qwen36_l0lin_in", input_bytes.len(), 16)?;
+        let in_region = self
+            .arena
+            .region("qwen36_l0lin_in", input_bytes.len(), 16)?;
         unsafe { in_region.copy_from_host(&input_bytes)? };
 
         // Closure to launch one FP8 projection role.
-        let project = |w: &rvllm_loader::weights::Fp8Weight,
-                       region_name: &'static str|
-         -> Result<[f32; 4]> {
-            let n = w.shape[0] as u32;
-            let k = w.shape[1] as u32;
-            let bs = match w.blockscale_ptr {
-                Some(p) => p,
-                None => {
-                    return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36_l0lin missing blockscale",
-                        rvllm_core::CudaErrorKind::Other,
-                        rvllm_core::CudaCtx::setup(),
-                    ));
+        let project =
+            |w: &rvllm_loader::weights::Fp8Weight, region_name: &'static str| -> Result<[f32; 4]> {
+                let n = w.shape[0] as u32;
+                let k = w.shape[1] as u32;
+                let bs = match w.blockscale_ptr {
+                    Some(p) => p,
+                    None => {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36_l0lin missing blockscale",
+                            rvllm_core::CudaErrorKind::Other,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                };
+                let out_bytes = (m as usize) * (n as usize) * 2;
+                let out_region = self.arena.region(region_name, out_bytes, 16)?;
+                unsafe {
+                    rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n, k }.launch(
+                        kernel,
+                        out_region.device_ptr(),
+                        w.offset_bytes,
+                        bs,
+                        in_region.device_ptr(),
+                        self.stream.raw() as u64,
+                    )?;
                 }
+                self.stream.fence()?;
+                let mut probe = [0u8; 8];
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(
+                        probe.as_mut_ptr() as *mut _,
+                        out_region.device_ptr(),
+                        probe.len(),
+                    );
+                }
+                Ok([
+                    f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]])),
+                    f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]])),
+                    f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]])),
+                    f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]])),
+                ])
             };
-            let out_bytes = (m as usize) * (n as usize) * 2;
-            let out_region = self.arena.region(region_name, out_bytes, 16)?;
-            unsafe {
-                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n, k }.launch(
-                    kernel,
-                    out_region.device_ptr(),
-                    w.offset_bytes,
-                    bs,
-                    in_region.device_ptr(),
-                    self.stream.raw() as u64,
-                )?;
-            }
-            self.stream.fence()?;
-            let mut probe = [0u8; 8];
-            #[cfg(feature = "cuda")]
-            unsafe {
-                use cudarc::driver::sys::*;
-                let _ = cuMemcpyDtoH_v2(
-                    probe.as_mut_ptr() as *mut _,
-                    out_region.device_ptr(),
-                    probe.len(),
-                );
-            }
-            Ok([
-                f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]])),
-                f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]])),
-                f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]])),
-                f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]])),
-            ])
-        };
 
         let qkv = project(&la.in_proj_qkv, "qwen36_l0lin_qkv")?;
         let z = project(&la.in_proj_z, "qwen36_l0lin_z")?;
         eprintln!(
             "[qwen36] forward_layer0_linear_in_proj_probe: layer={layer_idx} \
              in_proj_qkv={:?} ({:?}) in_proj_z={:?} ({:?})",
-            qkv, la.in_proj_qkv.shape,
-            z, la.in_proj_z.shape,
+            qkv, la.in_proj_qkv.shape, z, la.in_proj_z.shape,
         );
         Ok(())
     }
@@ -4095,9 +4229,13 @@ impl Qwen36Bringup {
     /// reachable and shapes match the qwen3-next architecture so the
     /// future kernel implementation can pick up the right weights.
     pub fn forward_layer0_linear_attn_probe(&self) -> Result<()> {
-        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
-            matches!(t, rvllm_loader::LayerAttnType::Linear)
-        }) {
+        let layer_idx = match self
+            .arch
+            .base
+            .layer_types
+            .iter()
+            .position(|t| matches!(t, rvllm_loader::LayerAttnType::Linear))
+        {
             Some(i) => i,
             None => return Ok(()),
         };
@@ -4111,10 +4249,15 @@ impl Qwen36Bringup {
              in_proj_b={:?} in_proj_qkv={:?} in_proj_z={:?} norm={:?} \
              out_proj={:?} (Gated-DeltaNet recurrent kernel TODO — \
              needs new CUDA work for ssm-scan + per-sequence state cache)",
-            la.a_log.shape, la.dt_bias.shape, la.conv1d.shape,
-            la.in_proj_a.shape, la.in_proj_b.shape,
-            la.in_proj_qkv.shape, la.in_proj_z.shape,
-            la.norm.shape, la.out_proj.shape,
+            la.a_log.shape,
+            la.dt_bias.shape,
+            la.conv1d.shape,
+            la.in_proj_a.shape,
+            la.in_proj_b.shape,
+            la.in_proj_qkv.shape,
+            la.in_proj_z.shape,
+            la.norm.shape,
+            la.out_proj.shape,
         );
         Ok(())
     }
@@ -4182,10 +4325,7 @@ impl Qwen36Bringup {
         })
     }
 
-    pub fn forward_qwen_vision(
-        &self,
-        image_bytes: &[u8],
-    ) -> Result<VisionForwardOutput> {
+    pub fn forward_qwen_vision(&self, image_bytes: &[u8]) -> Result<VisionForwardOutput> {
         // Phase 3-a-ii: body extracted to a shared free fn in
         // `crate::qwen_vision_forward`. Both Qwen 3.5 + Qwen 3.6
         // drive the same forward chain via `vision_deps()`.
@@ -4235,9 +4375,13 @@ impl Qwen36Bringup {
     ) -> Result<Vec<i32>> {
         let mut out = Vec::with_capacity(token_ids.len());
         self.forward_qwen36_decode_inner(
-            token_ids, start_position, vision_splice, cancel,
+            token_ids,
+            start_position,
+            vision_splice,
+            cancel,
             /* all_argmaxes */ Some(&mut out),
             /* skip_closer */ false,
+            /* mtp_shadow_out */ None,
         )?;
         Ok(out)
     }
@@ -4255,9 +4399,13 @@ impl Qwen36Bringup {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         self.forward_qwen36_decode_inner(
-            token_ids, start_position, vision_splice, cancel,
+            token_ids,
+            start_position,
+            vision_splice,
+            cancel,
             /* all_argmaxes */ None,
             /* skip_closer */ true,
+            /* mtp_shadow_out */ None,
         )?;
         Ok(())
     }
@@ -4275,9 +4423,34 @@ impl Qwen36Bringup {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<i32> {
         self.forward_qwen36_decode_inner(
-            token_ids, start_position, vision_splice, cancel, None,
+            token_ids,
+            start_position,
+            vision_splice,
+            cancel,
+            None,
             /* skip_closer */ false,
+            /* mtp_shadow_out */ None,
         )
+    }
+
+    pub fn forward_qwen36_decode_cancellable_with_mtp_shadow(
+        &self,
+        token_ids: &[i32],
+        start_position: u32,
+        vision_splice: &[(usize, &[u8])],
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(i32, Option<i32>)> {
+        let mut mtp_shadow = None;
+        let base = self.forward_qwen36_decode_inner(
+            token_ids,
+            start_position,
+            vision_splice,
+            cancel,
+            None,
+            /* skip_closer */ false,
+            Some(&mut mtp_shadow),
+        )?;
+        Ok((base, mtp_shadow))
     }
 
     fn forward_qwen36_decode_inner(
@@ -4288,6 +4461,7 @@ impl Qwen36Bringup {
         cancel: Option<&std::sync::atomic::AtomicBool>,
         mut all_argmaxes: Option<&mut Vec<i32>>,
         skip_closer: bool,
+        mtp_shadow_out: Option<&mut Option<i32>>,
     ) -> Result<i32> {
         if token_ids.is_empty() {
             return Err(rvllm_core::RvllmError::cuda(
@@ -4308,12 +4482,10 @@ impl Qwen36Bringup {
         for t in token_ids {
             tok_bytes.extend_from_slice(&t.to_le_bytes());
         }
-        let tok_region =
-            self.arena.region("qwen36_pl_tok", tok_bytes.len(), 16)?;
+        let tok_region = self.arena.region("qwen36_pl_tok", tok_bytes.len(), 16)?;
         unsafe { tok_region.copy_from_host(&tok_bytes)? };
         let hidden_bytes = (num_tokens as usize) * (hidden as usize) * 2;
-        let hidden_region =
-            self.arena.region("qwen36_pl_hidden", hidden_bytes, 16)?;
+        let hidden_region = self.arena.region("qwen36_pl_hidden", hidden_bytes, 16)?;
         unsafe {
             rvllm_fused::EmbeddingGatherLaunch {
                 num_tokens,
@@ -4385,15 +4557,18 @@ impl Qwen36Bringup {
         // server honest: an operator with a broken kernel build
         // sees the failure at the first request, not days later
         // when "the model got dumber."
-        let kernel_gemv = self.outside_kernels.fn_fp8_gemv_wpr_native_f16in.ok_or_else(|| {
-            rvllm_core::RvllmError::cuda(
-                "qwen36 forward: fn_fp8_gemv_wpr_native_f16in not loaded — \
+        let kernel_gemv = self
+            .outside_kernels
+            .fn_fp8_gemv_wpr_native_f16in
+            .ok_or_else(|| {
+                rvllm_core::RvllmError::cuda(
+                    "qwen36 forward: fn_fp8_gemv_wpr_native_f16in not loaded — \
                  transformer layers cannot run; refusing to fall back to \
                  embed/final-norm-only path which would produce garbage tokens",
-                rvllm_core::CudaErrorKind::Other,
-                rvllm_core::CudaCtx::setup(),
-            )
-        })?;
+                    rvllm_core::CudaErrorKind::Other,
+                    rvllm_core::CudaCtx::setup(),
+                )
+            })?;
         // Phase 1 of the batched-prefill plan: the per-token slot
         // is now read/written through `tok_ptr = hidden_region +
         // tok_local × hidden_bytes` directly. The previous
@@ -4437,16 +4612,17 @@ impl Qwen36Bringup {
         // scalar view is a single-element array view of one token's
         // slot in the shared array.)
         let n_tokens_usize = num_tokens as usize;
-        let positions_region = self.arena.region(
-            "qwen36_pf_positions", n_tokens_usize * 4, 16)?;
-        let context_lens_region = self.arena.region(
-            "qwen36_pf_clens", n_tokens_usize * 4, 16)?;
+        let positions_region = self
+            .arena
+            .region("qwen36_pf_positions", n_tokens_usize * 4, 16)?;
+        let context_lens_region = self
+            .arena
+            .region("qwen36_pf_clens", n_tokens_usize * 4, 16)?;
         // Phase Full: a single-element [1] i32 with value N for the
         // f16kv prefill kernel's `context_lens[seq_idx=0]` slot. Same
         // self.stream for the memset → no race vs subsequent kernel
         // reads.
-        let prefill_ctx_len_region = self.arena.region(
-            "qwen36_pf_prefill_clen", 4, 16)?;
+        let prefill_ctx_len_region = self.arena.region("qwen36_pf_prefill_clen", 4, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -4473,15 +4649,21 @@ impl Qwen36Bringup {
             let mut nt = num_tokens as i32;
             let args = [
                 (&mut pos_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut cl_ptr)  as *mut u64 as *mut core::ffi::c_void,
-                (&mut start)   as *mut i32 as *mut core::ffi::c_void,
-                (&mut nt)      as *mut i32 as *mut core::ffi::c_void,
+                (&mut cl_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut start) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = 256;
             let grid: u32 = ((num_tokens + block - 1) / block).max(1);
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_qwen_fill_pos_slots_i32.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1, 0,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -4549,8 +4731,8 @@ impl Qwen36Bringup {
                     self.stream.fence()?;
                     for t in 0..num_tokens {
                         let mut buf = vec![0u8; last_hidden_bytes];
-                        let row_ptr = hidden_region.device_ptr()
-                            + (t as u64) * (last_hidden_bytes as u64);
+                        let row_ptr =
+                            hidden_region.device_ptr() + (t as u64) * (last_hidden_bytes as u64);
                         #[cfg(feature = "cuda")]
                         unsafe {
                             use cudarc::driver::sys::*;
@@ -4560,8 +4742,7 @@ impl Qwen36Bringup {
                                 last_hidden_bytes,
                             );
                         }
-                        let _ = std::fs::write(
-                            format!("{dir}/embed_tok{t:02}.f16"), &buf);
+                        let _ = std::fs::write(format!("{dir}/embed_tok{t:02}.f16"), &buf);
                     }
                 }
             }
@@ -4598,9 +4779,8 @@ impl Qwen36Bringup {
                         // token-major path, the layer-major orchestration
                         // is correct and any divergence is in the batched
                         // kernel itself.
-                        let host_loop_only = std::env::var(
-                            "RVLLM_QWEN36_BATCH_LINEAR_HOST_LOOP")
-                            .map(|s| matches!(s.as_str(), "1"|"true"|"TRUE"|"yes"))
+                        let host_loop_only = std::env::var("RVLLM_QWEN36_BATCH_LINEAR_HOST_LOOP")
+                            .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
                             .unwrap_or(false);
                         if host_loop_only {
                             for t in 0..num_tokens {
@@ -4608,15 +4788,25 @@ impl Qwen36Bringup {
                                     + (t as u64) * (last_hidden_bytes as u64);
                                 let inner_ck = self.arena.checkpoint();
                                 self.apply_layer_linear_attn(
-                                    la, linear_seq, tok_ptr,
-                                    kernel_gemv, hidden, last_hidden_bytes,
+                                    la,
+                                    linear_seq,
+                                    tok_ptr,
+                                    kernel_gemv,
+                                    hidden,
+                                    last_hidden_bytes,
                                 )?;
-                                unsafe { self.arena.restore(inner_ck); }
+                                unsafe {
+                                    self.arena.restore(inner_ck);
+                                }
                             }
                         } else {
                             self.apply_layer_linear_attn_batched(
-                                la, linear_seq, hidden_region.device_ptr(),
-                                num_tokens, kernel_gemv, hidden,
+                                la,
+                                linear_seq,
+                                hidden_region.device_ptr(),
+                                num_tokens,
+                                kernel_gemv,
+                                hidden,
                             )?;
                         }
                         linear_seq += 1;
@@ -4633,49 +4823,61 @@ impl Qwen36Bringup {
                         // per-token path.
                         // Round-27d: default-ON post-audit. "0"/"false"
                         // selects the legacy per-token sub-loop.
-                        // NVFP4 commit 4: when `kv_dtype == Nvfp4` we
-                        // unconditionally take the per-token else-branch
-                        // — the batched body still calls f16
-                        // RoPE+KV-write that would corrupt a packed-4-bit
-                        // cache. The per-token branch invokes
-                        // `apply_layer_full_attn`, which is NVFP4-aware
-                        // from commit 3. Optimised batched NVFP4 prefill
-                        // (unified-NVFP4-prefill kernel exists in PTX) is
-                        // a follow-up.
+                        // NVFP4 batched full-attn prefill remains opt-in
+                        // while it is validated against the per-token
+                        // reference. The opt-in path uses the conservative
+                        // non-unified NVFP4 prefill kernel by default; the
+                        // faster unified kernel has its own separate flag
+                        // because it is not yet output-equivalent on the
+                        // repeat-pattern probe.
+                        let nvfp4_batch_full = !matches!(self.kv_dtype, Qwen36KvDtype::Nvfp4)
+                            || std::env::var("RVLLM_QWEN36_NVFP4_BATCH_FULL_PREFILL")
+                                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+                                .unwrap_or(false);
                         let batch_full = start_position == 0
-                            && !matches!(self.kv_dtype, Qwen36KvDtype::Nvfp4)
+                            && nvfp4_batch_full
                             && std::env::var("RVLLM_QWEN36_BATCH_FULL_PREFILL")
-                                .map(|s| !matches!(s.as_str(),
-                                    "0"|"false"|"FALSE"|"no"))
+                                .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE" | "no"))
                                 .unwrap_or(true);
                         if batch_full {
                             let inner_ck = self.arena.checkpoint();
                             self.apply_layer_full_attn_batched(
-                                fl, full_seq,
+                                fl,
+                                full_seq,
                                 hidden_region.device_ptr(),
                                 num_tokens,
-                                kernel_gemv, hidden, last_hidden_bytes,
+                                kernel_gemv,
+                                hidden,
+                                last_hidden_bytes,
                                 positions_region.device_ptr(),
                                 prefill_ctx_len_region.device_ptr(),
+                                full_seq,
                             )?;
-                            unsafe { self.arena.restore(inner_ck); }
+                            unsafe {
+                                self.arena.restore(inner_ck);
+                            }
                         } else {
                             for t in 0..num_tokens {
                                 let tok_pos = start_position + t;
                                 let tok_ptr = hidden_region.device_ptr()
                                     + (t as u64) * (last_hidden_bytes as u64);
-                                let pos_p = positions_region.device_ptr()
-                                    + (t as u64) * 4;
-                                let cl_p = context_lens_region.device_ptr()
-                                    + (t as u64) * 4;
+                                let pos_p = positions_region.device_ptr() + (t as u64) * 4;
+                                let cl_p = context_lens_region.device_ptr() + (t as u64) * 4;
                                 let inner_ck = self.arena.checkpoint();
                                 self.apply_layer_full_attn(
-                                    fl, full_seq, tok_pos,
+                                    fl,
+                                    full_seq,
+                                    tok_pos,
                                     tok_ptr,
-                                    kernel_gemv, hidden, last_hidden_bytes,
-                                    pos_p, cl_p,
+                                    kernel_gemv,
+                                    hidden,
+                                    last_hidden_bytes,
+                                    pos_p,
+                                    cl_p,
                                 )?;
-                                unsafe { self.arena.restore(inner_ck); }
+                                unsafe {
+                                    self.arena.restore(inner_ck);
+                                }
                             }
                         }
                         full_seq += 1;
@@ -4687,8 +4889,8 @@ impl Qwen36Bringup {
                     self.stream.fence()?;
                     for t in 0..num_tokens {
                         let mut buf = vec![0u8; last_hidden_bytes];
-                        let row_ptr = hidden_region.device_ptr()
-                            + (t as u64) * (last_hidden_bytes as u64);
+                        let row_ptr =
+                            hidden_region.device_ptr() + (t as u64) * (last_hidden_bytes as u64);
                         #[cfg(feature = "cuda")]
                         unsafe {
                             use cudarc::driver::sys::*;
@@ -4700,7 +4902,8 @@ impl Qwen36Bringup {
                         }
                         let _ = std::fs::write(
                             format!("{dir}/layer_{layer_idx:02}_attn_tok{t:02}.f16"),
-                            &buf);
+                            &buf,
+                        );
                     }
                 }
                 // MoE: env-gated batched routing (Phase 6a /
@@ -4712,8 +4915,7 @@ impl Qwen36Bringup {
                 // Round-27d: default-ON post-audit.
                 let batch_moe = start_position == 0
                     && std::env::var("RVLLM_QWEN36_BATCH_MOE_PREFILL")
-                        .map(|s| !matches!(s.as_str(),
-                            "0"|"false"|"FALSE"|"no"))
+                        .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE" | "no"))
                         .unwrap_or(true);
                 if batch_moe {
                     let inner_ck = self.arena.checkpoint();
@@ -4722,23 +4924,31 @@ impl Qwen36Bringup {
                         post_attn_norm_ptr,
                         hidden_region.device_ptr(),
                         num_tokens,
-                        kernel_gemv, hidden, last_hidden_bytes,
+                        kernel_gemv,
+                        hidden,
+                        last_hidden_bytes,
                         layer_idx,
                     )?;
-                    unsafe { self.arena.restore(inner_ck); }
+                    unsafe {
+                        self.arena.restore(inner_ck);
+                    }
                 } else {
                     for t in 0..num_tokens {
-                        let tok_ptr = hidden_region.device_ptr()
-                            + (t as u64) * (last_hidden_bytes as u64);
+                        let tok_ptr =
+                            hidden_region.device_ptr() + (t as u64) * (last_hidden_bytes as u64);
                         let inner_ck = self.arena.checkpoint();
                         self.apply_layer_moe(
                             &self.model.layers[layer_idx].moe,
                             post_attn_norm_ptr,
                             tok_ptr,
-                            kernel_gemv, hidden, last_hidden_bytes,
+                            kernel_gemv,
+                            hidden,
+                            last_hidden_bytes,
                             layer_idx,
                         )?;
-                        unsafe { self.arena.restore(inner_ck); }
+                        unsafe {
+                            self.arena.restore(inner_ck);
+                        }
                     }
                 }
                 if dump_active {
@@ -4746,8 +4956,8 @@ impl Qwen36Bringup {
                     self.stream.fence()?;
                     for t in 0..num_tokens {
                         let mut buf = vec![0u8; last_hidden_bytes];
-                        let row_ptr = hidden_region.device_ptr()
-                            + (t as u64) * (last_hidden_bytes as u64);
+                        let row_ptr =
+                            hidden_region.device_ptr() + (t as u64) * (last_hidden_bytes as u64);
                         #[cfg(feature = "cuda")]
                         unsafe {
                             use cudarc::driver::sys::*;
@@ -4759,7 +4969,8 @@ impl Qwen36Bringup {
                         }
                         let _ = std::fs::write(
                             format!("{dir}/layer_{layer_idx:02}_moe_tok{t:02}.f16"),
-                            &buf);
+                            &buf,
+                        );
                     }
                 }
                 if let Some(c) = cancel {
@@ -4771,7 +4982,9 @@ impl Qwen36Bringup {
                         ));
                     }
                 }
-                unsafe { self.arena.restore(layer_ck); }
+                unsafe {
+                    self.arena.restore(layer_ck);
+                }
             }
 
             // Skip the legacy token-major loop below by jumping to
@@ -4803,7 +5016,9 @@ impl Qwen36Bringup {
             // Reset scratch from the previous token's pass. First
             // iteration's restore is a no-op (used == per_token_ck
             // already).
-            unsafe { self.arena.restore(per_token_ck); }
+            unsafe {
+                self.arena.restore(per_token_ck);
+            }
             let tok_pos = start_position + tok_local;
             // Update pos+context_len for THIS token. Sync HtoD; runs
             // outside any future graph-captured region (it's a
@@ -4813,10 +5028,8 @@ impl Qwen36Bringup {
             // device-filled arrays from the single launch above; no
             // per-token HtoD anymore. Per-token full-attn calls below
             // pass `positions + t*4` / `context_lens + t*4`.
-            let tok_pos_dev_ptr = positions_region.device_ptr()
-                + (tok_local as u64) * 4;
-            let tok_cl_dev_ptr = context_lens_region.device_ptr()
-                + (tok_local as u64) * 4;
+            let tok_pos_dev_ptr = positions_region.device_ptr() + (tok_local as u64) * 4;
+            let tok_cl_dev_ptr = context_lens_region.device_ptr() + (tok_local as u64) * 4;
             // Phase 1 of the Qwen batched-prefill plan: the layer
             // functions now accept a raw device pointer to the
             // per-token slot in `hidden_region`. The previous
@@ -4824,7 +5037,8 @@ impl Qwen36Bringup {
             // and DtoD-writeback are gone — `apply_layer_*` reads and
             // writes through `tok_ptr` directly, eliminating two
             // launches per token.
-            let tok_ptr = hidden_region.device_ptr() + (tok_local as u64) * (last_hidden_bytes as u64);
+            let tok_ptr =
+                hidden_region.device_ptr() + (tok_local as u64) * (last_hidden_bytes as u64);
 
             // Phase 5e: optional per-layer activation dump for
             // numerical-correctness audit vs vLLM. Set
@@ -4839,8 +5053,7 @@ impl Qwen36Bringup {
             // cmp harness can compare per-token rows between token-
             // major and layer-major paths and localise where any
             // intermediate token rows diverge.
-            let dump_dir =
-                std::env::var("RVLLM_QWEN36_DUMP_DIR").ok();
+            let dump_dir = std::env::var("RVLLM_QWEN36_DUMP_DIR").ok();
             let dump_this_token = dump_dir.is_some() && start_position == 0;
             if let Some(dir) = dump_dir.as_ref() {
                 if dump_this_token {
@@ -4851,14 +5064,10 @@ impl Qwen36Bringup {
                     #[cfg(feature = "cuda")]
                     unsafe {
                         use cudarc::driver::sys::*;
-                        let _ = cuMemcpyDtoH_v2(
-                            buf.as_mut_ptr() as *mut _,
-                            tok_ptr,
-                            last_hidden_bytes,
-                        );
+                        let _ =
+                            cuMemcpyDtoH_v2(buf.as_mut_ptr() as *mut _, tok_ptr, last_hidden_bytes);
                     }
-                    let _ = std::fs::write(
-                        format!("{dir}/embed_tok{tok_local:02}.f16"), &buf);
+                    let _ = std::fs::write(format!("{dir}/embed_tok{tok_local:02}.f16"), &buf);
                 }
             }
 
@@ -4868,18 +5077,27 @@ impl Qwen36Bringup {
                 let post_attn_norm_ptr = match &self.model.layers[layer_idx].attn {
                     rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(la) => {
                         self.apply_layer_linear_attn(
-                            la, linear_seq, tok_ptr,
-                            kernel_gemv, hidden, last_hidden_bytes,
+                            la,
+                            linear_seq,
+                            tok_ptr,
+                            kernel_gemv,
+                            hidden,
+                            last_hidden_bytes,
                         )?;
                         linear_seq += 1;
                         la.post_attention_layernorm.offset_bytes
                     }
                     rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(fl) => {
                         self.apply_layer_full_attn(
-                            fl, full_seq, tok_pos,
+                            fl,
+                            full_seq,
+                            tok_pos,
                             tok_ptr,
-                            kernel_gemv, hidden, last_hidden_bytes,
-                            tok_pos_dev_ptr, tok_cl_dev_ptr,
+                            kernel_gemv,
+                            hidden,
+                            last_hidden_bytes,
+                            tok_pos_dev_ptr,
+                            tok_cl_dev_ptr,
                         )?;
                         full_seq += 1;
                         fl.post_attention_layernorm.offset_bytes
@@ -4892,21 +5110,21 @@ impl Qwen36Bringup {
                     #[cfg(feature = "cuda")]
                     unsafe {
                         use cudarc::driver::sys::*;
-                        let _ = cuMemcpyDtoH_v2(
-                            buf.as_mut_ptr() as *mut _,
-                            tok_ptr,
-                            last_hidden_bytes,
-                        );
+                        let _ =
+                            cuMemcpyDtoH_v2(buf.as_mut_ptr() as *mut _, tok_ptr, last_hidden_bytes);
                     }
                     let _ = std::fs::write(
                         format!("{dir}/layer_{layer_idx:02}_attn_tok{tok_local:02}.f16"),
-                        &buf);
+                        &buf,
+                    );
                 }
                 self.apply_layer_moe(
                     &self.model.layers[layer_idx].moe,
                     post_attn_norm_ptr,
                     tok_ptr,
-                    kernel_gemv, hidden, last_hidden_bytes,
+                    kernel_gemv,
+                    hidden,
+                    last_hidden_bytes,
                     layer_idx,
                 )?;
                 if dump_this_token {
@@ -4916,15 +5134,13 @@ impl Qwen36Bringup {
                     #[cfg(feature = "cuda")]
                     unsafe {
                         use cudarc::driver::sys::*;
-                        let _ = cuMemcpyDtoH_v2(
-                            buf.as_mut_ptr() as *mut _,
-                            tok_ptr,
-                            last_hidden_bytes,
-                        );
+                        let _ =
+                            cuMemcpyDtoH_v2(buf.as_mut_ptr() as *mut _, tok_ptr, last_hidden_bytes);
                     }
                     let _ = std::fs::write(
                         format!("{dir}/layer_{layer_idx:02}_moe_tok{tok_local:02}.f16"),
-                        &buf);
+                        &buf,
+                    );
                 }
             }
             // No DtoD writeback needed: the layer functions wrote
@@ -4996,13 +5212,16 @@ impl Qwen36Bringup {
             //       MATMUL_DESC_A_SCALE_MODE = ROW or VECTOR),
             //       then re-bisect.
             // Until (b) lands: gate is OFF by default.
-            let closer_all = std::env::var("RVLLM_QWEN36_SPEC_CLOSER_ALL")
-                .as_deref() == Ok("1");
+            let closer_all = std::env::var("RVLLM_QWEN36_SPEC_CLOSER_ALL").as_deref() == Ok("1");
             if closer_all {
                 #[cfg(feature = "cuda")]
                 {
                     self.forward_qwen36_outside_closer_all(
-                        &hidden_region, num_tokens, hidden, vocab, out,
+                        &hidden_region,
+                        num_tokens,
+                        hidden,
+                        vocab,
+                        out,
                     )?;
                 }
                 #[cfg(not(feature = "cuda"))]
@@ -5015,20 +5234,29 @@ impl Qwen36Bringup {
                 out.reserve(num_tokens as usize);
                 for i in 0..(num_tokens as usize) {
                     let t = self.forward_qwen36_outside_closer(
-                        &hidden_region, num_tokens, hidden, vocab, i,
+                        &hidden_region,
+                        num_tokens,
+                        hidden,
+                        vocab,
+                        i,
                     )?;
                     out.push(t);
                 }
             }
             Ok(*out.last().unwrap_or(&0))
         } else {
-            self.forward_qwen36_outside_closer(
-                &hidden_region,
-                num_tokens,
-                hidden,
-                vocab,
-                last_idx,
-            )
+            let base =
+                self.forward_qwen36_outside_closer(&hidden_region, num_tokens, hidden, vocab, last_idx)?;
+            if let Some(out) = mtp_shadow_out {
+                let last_hidden_row_ptr =
+                    hidden_region.device_ptr() + (last_idx as u64) * (hidden as u64) * 2;
+                *out = Some(self.forward_qwen36_mtp_from_hidden_ptr(
+                    last_hidden_row_ptr,
+                    base,
+                    start_position + last_idx as u32,
+                )?);
+            }
+            Ok(base)
         }
     }
 
@@ -5089,9 +5317,18 @@ impl Qwen36Bringup {
         let out_n = la.out_proj.shape[0] as u32; // 2048 = hidden
         let out_k = la.out_proj.shape[1] as u32; // 4096 = value_dim
         let m: u32 = 1;
-        let qkv_bs = match la.in_proj_qkv.blockscale_ptr { Some(p) => p, None => return Ok(()) };
-        let z_bs = match la.in_proj_z.blockscale_ptr { Some(p) => p, None => return Ok(()) };
-        let out_bs = match la.out_proj.blockscale_ptr { Some(p) => p, None => return Ok(()) };
+        let qkv_bs = match la.in_proj_qkv.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let z_bs = match la.in_proj_z.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let out_bs = match la.out_proj.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
 
         // Hardcoded for Qwen 3.6 35B-A3B; could be plumbed from arch.
         let num_k_heads: u32 = 16;
@@ -5107,8 +5344,9 @@ impl Qwen36Bringup {
         let hvd = head_v_dim as usize;
 
         // 1. input_layernorm on copy of last_hidden.
-        let normed_region =
-            self.arena.region("qwen36_pl_normed", last_hidden_bytes, 16)?;
+        let normed_region = self
+            .arena
+            .region("qwen36_pl_normed", last_hidden_bytes, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -5122,8 +5360,11 @@ impl Qwen36Bringup {
         let eps = self.arch.base.rms_norm_eps;
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps,
-            }.launch(
+                num_tokens: 1,
+                hidden,
+                eps,
+            }
+            .launch(
                 self.outside_kernels.fn_rmsnorm_inplace_f16,
                 normed_region.device_ptr(),
                 la.input_layernorm.offset_bytes,
@@ -5138,9 +5379,17 @@ impl Qwen36Bringup {
         let qkv_bytes_dev = (qkv_n as usize) * 2;
         let qkv_region = self.arena.region("qwen36_pl_qkv", qkv_bytes_dev, 16)?;
         unsafe {
-            self.fp8_proj_dispatch(kernel_gemv, qkv_region.device_ptr(),
-                la.in_proj_qkv.offset_bytes, qkv_bs, normed_region.device_ptr(),
-                m, qkv_n, hidden, stream_raw)?;
+            self.fp8_proj_dispatch(
+                kernel_gemv,
+                qkv_region.device_ptr(),
+                la.in_proj_qkv.offset_bytes,
+                qkv_bs,
+                normed_region.device_ptr(),
+                m,
+                qkv_n,
+                hidden,
+                stream_raw,
+            )?;
         }
         // No fence: conv_state_advance + conv1d run on the same
         // stream and read qkv after the GEMV has written to it.
@@ -5151,10 +5400,8 @@ impl Qwen36Bringup {
         //    by shifting (drop oldest, append current).
         let ks: u32 = 4;
         let conv_in_bytes = ((ks as usize) * (qkv_n as usize)) * 2;
-        let conv_in_region =
-            self.arena.region("qwen36_pl_cin", conv_in_bytes, 16)?;
-        let conv_out_region =
-            self.arena.region("qwen36_pl_cout", qkv_bytes_dev, 16)?;
+        let conv_in_region = self.arena.region("qwen36_pl_cin", conv_in_bytes, 16)?;
+        let conv_out_region = self.arena.region("qwen36_pl_cout", qkv_bytes_dev, 16)?;
         // GPU-side conv_in assembly + state advance. One launch
         // replaces 2× DtoH + 2× HtoD + two CPU vec slicings.
         let conv_state_ptr_layer = self.conv_state_layer_ptr(linear_seq_idx);
@@ -5175,9 +5422,14 @@ impl Qwen36Bringup {
             let grid: u32 = ((qkv_n + block - 1) / block).max(1);
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_conv_state_advance_f16.raw() as CUfunction,
-                grid, 1, 1,
-                block, 1, 1,
-                0, self.stream.raw() as CUstream,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
@@ -5210,20 +5462,24 @@ impl Qwen36Bringup {
             let grid_x = (qkv_n + block - 1) / block;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_causal_conv1d_f16.raw() as CUfunction,
-                grid_x, 1, 1,
-                block, 1, 1,
+                grid_x,
+                1,
+                1,
+                block,
+                1,
+                1,
                 0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
-        if rc != CUresult::CUDA_SUCCESS {
-            return Err(rvllm_core::RvllmError::cuda(
-                "qwen36 causal_conv1d_f16 launch",
-                rvllm_core::CudaErrorKind::LaunchFailed,
-                rvllm_core::CudaCtx::setup(),
-            ));
-        }
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 causal_conv1d_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
         }
         // No fence: silu_l2_gqa runs on the same stream after conv1d.
 
@@ -5233,7 +5489,7 @@ impl Qwen36Bringup {
         // conv_out + CPU silu + per-k-head L2 + GQA-expand into
         // host bytes + HtoD q/k/v).
         let qk_bytes_pre = vus * hkd * 2;
-        let v_bytes_pre  = vus * hvd * 2;
+        let v_bytes_pre = vus * hvd * 2;
         let q_region = self.arena.region("qwen36_pl_q", qk_bytes_pre, 16)?;
         let k_region = self.arena.region("qwen36_pl_k", qk_bytes_pre, 16)?;
         let v_region = self.arena.region("qwen36_pl_v", v_bytes_pre, 16)?;
@@ -5247,9 +5503,9 @@ impl Qwen36Bringup {
             let mut vus_i: i32 = vus as i32;
             let mut hkd_i: i32 = hkd as i32;
             let mut hvd_i: i32 = hvd as i32;
-            let mut kd_i:  i32 = key_dim as i32;
-            let mut nvh:   i32 = num_v_heads as i32;
-            let mut vpk:   i32 = v_per_k as i32;
+            let mut kd_i: i32 = key_dim as i32;
+            let mut nvh: i32 = num_v_heads as i32;
+            let mut vpk: i32 = v_per_k as i32;
             let args = [
                 (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
                 (&mut k_out) as *mut u64 as *mut core::ffi::c_void,
@@ -5265,9 +5521,14 @@ impl Qwen36Bringup {
             let block: u32 = (hkd.max(hvd)) as u32;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_qwen_linear_silu_l2_gqa_f16.raw() as CUfunction,
-                vus as u32, 1, 1,
-                block, 1, 1,
-                0, self.stream.raw() as CUstream,
+                vus as u32,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
@@ -5290,7 +5551,7 @@ impl Qwen36Bringup {
         // reference for diagnostics.
         let h_us = hidden as usize;
         let alpha_region = self.arena.region("qwen36_pl_alpha", vus * 4, 16)?;
-        let beta_region  = self.arena.region("qwen36_pl_beta",  vus * 4, 16)?;
+        let beta_region = self.arena.region("qwen36_pl_beta", vus * 4, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -5317,9 +5578,14 @@ impl Qwen36Bringup {
             let block: u32 = 256u32.min(h_us as u32).max(1);
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_qwen_linear_alpha_beta_f16.raw() as CUfunction,
-                vus as u32, 1, 1,
-                block, 1, 1,
-                0, self.stream.raw() as CUstream,
+                vus as u32,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
@@ -5345,8 +5611,7 @@ impl Qwen36Bringup {
         // the silu_l2_gqa GPU kernel in step 4+5; alpha_region and
         // beta_region by the alpha_beta kernel in step 6. All four
         // are device-resident already — no further HtoD needed.
-        let readout_region =
-            self.arena.region("qwen36_pl_readout", v_bytes, 16)?;
+        let readout_region = self.arena.region("qwen36_pl_readout", v_bytes, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -5377,20 +5642,24 @@ impl Qwen36Bringup {
             let smem = (2 * head_k_dim + head_v_dim) * 4;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_gated_delta_rule_decode_f16.raw() as CUfunction,
-                num_v_heads, 1, 1,
-                head_v_dim, 1, 1,
+                num_v_heads,
+                1,
+                1,
+                head_v_dim,
+                1,
+                1,
                 smem,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
-        if rc != CUresult::CUDA_SUCCESS {
-            return Err(rvllm_core::RvllmError::cuda(
-                "qwen36 gated_delta_rule_decode_f16 launch",
-                rvllm_core::CudaErrorKind::LaunchFailed,
-                rvllm_core::CudaCtx::setup(),
-            ));
-        }
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 gated_delta_rule_decode_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
         }
         // No fence: in_proj_z + rmsnorm_gated run on the same
         // stream after the delta-rule kernel.
@@ -5399,9 +5668,17 @@ impl Qwen36Bringup {
         let z_bytes_dev = (z_n as usize) * 2;
         let z_region = self.arena.region("qwen36_pl_z", z_bytes_dev, 16)?;
         unsafe {
-            self.fp8_proj_dispatch(kernel_gemv, z_region.device_ptr(),
-                la.in_proj_z.offset_bytes, z_bs, normed_region.device_ptr(),
-                m, z_n, hidden, stream_raw)?;
+            self.fp8_proj_dispatch(
+                kernel_gemv,
+                z_region.device_ptr(),
+                la.in_proj_z.offset_bytes,
+                z_bs,
+                normed_region.device_ptr(),
+                m,
+                z_n,
+                hidden,
+                stream_raw,
+            )?;
         }
 
         // 11. GPU per-v-head RMSNormGated + silu(z) gate fused into
@@ -5430,9 +5707,14 @@ impl Qwen36Bringup {
             let block: u32 = hvd as u32;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_qwen_linear_rmsnorm_gated_f16.raw() as CUfunction,
-                vus as u32, 1, 1,
-                block, 1, 1,
-                0, self.stream.raw() as CUstream,
+                vus as u32,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
@@ -5446,11 +5728,21 @@ impl Qwen36Bringup {
         }
 
         // 12. out_proj FP8 GEMV → o_buf [hidden].
-        let out_region = self.arena.region("qwen36_pl_out", (out_n as usize) * 2, 16)?;
+        let out_region = self
+            .arena
+            .region("qwen36_pl_out", (out_n as usize) * 2, 16)?;
         unsafe {
-            self.fp8_proj_dispatch(kernel_gemv, out_region.device_ptr(),
-                la.out_proj.offset_bytes, out_bs, gated_region.device_ptr(),
-                m, out_n, out_k, stream_raw)?;
+            self.fp8_proj_dispatch(
+                kernel_gemv,
+                out_region.device_ptr(),
+                la.out_proj.offset_bytes,
+                out_bs,
+                gated_region.device_ptr(),
+                m,
+                out_n,
+                out_k,
+                stream_raw,
+            )?;
         }
         // No fence: residual vector_add runs on the same stream
         // after out_proj.
@@ -5476,7 +5768,13 @@ impl Qwen36Bringup {
             let grid = ((n_elem as u32 + block - 1) / block).max(1);
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_vector_add_f16.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1, 0,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -5555,35 +5853,45 @@ impl Qwen36Bringup {
         let stream_raw = self.stream.raw() as u64;
         let n = num_tokens as usize;
         let h = hidden as usize;
-        let qkv_n = la.in_proj_qkv.shape[0] as u32;   // 8192
-        let z_n   = la.in_proj_z.shape[0] as u32;     // 4096
-        let out_n = la.out_proj.shape[0] as u32;      // 2048
-        let out_k = la.out_proj.shape[1] as u32;      // 4096
-        let qkv_bs = match la.in_proj_qkv.blockscale_ptr { Some(p) => p, None => return Ok(()) };
-        let z_bs   = match la.in_proj_z.blockscale_ptr   { Some(p) => p, None => return Ok(()) };
-        let out_bs = match la.out_proj.blockscale_ptr    { Some(p) => p, None => return Ok(()) };
+        let qkv_n = la.in_proj_qkv.shape[0] as u32; // 8192
+        let z_n = la.in_proj_z.shape[0] as u32; // 4096
+        let out_n = la.out_proj.shape[0] as u32; // 2048
+        let out_k = la.out_proj.shape[1] as u32; // 4096
+        let qkv_bs = match la.in_proj_qkv.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let z_bs = match la.in_proj_z.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let out_bs = match la.out_proj.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
 
         let num_k_heads: u32 = 16;
         let num_v_heads: u32 = 32;
-        let head_k_dim: u32  = 128;
-        let head_v_dim: u32  = 128;
-        let key_dim    = num_k_heads * head_k_dim;
-        let v_per_k    = num_v_heads / num_k_heads;
+        let head_k_dim: u32 = 128;
+        let head_v_dim: u32 = 128;
+        let key_dim = num_k_heads * head_k_dim;
+        let v_per_k = num_v_heads / num_k_heads;
         let vus = num_v_heads as usize;
         let hkd = head_k_dim as usize;
         let hvd = head_v_dim as usize;
         let qk_bytes_per_token = vus * hkd * 2;
-        let v_bytes_per_token  = vus * hvd * 2;
+        let v_bytes_per_token = vus * hvd * 2;
 
         // 1. RMSNorm on a [N, hidden] copy of the chunk.
         let normed_bytes = n * h * 2;
-        let normed_region =
-            self.arena.region("qwen36_plb_normed", normed_bytes, 16)?;
+        let normed_region = self.arena.region("qwen36_plb_normed", normed_bytes, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let r = cuMemcpyDtoDAsync_v2(
-                normed_region.device_ptr(), hidden_ptr, normed_bytes,
+                normed_region.device_ptr(),
+                hidden_ptr,
+                normed_bytes,
                 self.stream.raw() as _,
             );
             if r != CUresult::CUDA_SUCCESS {
@@ -5597,8 +5905,11 @@ impl Qwen36Bringup {
         let eps = self.arch.base.rms_norm_eps;
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens, hidden, eps,
-            }.launch(
+                num_tokens,
+                hidden,
+                eps,
+            }
+            .launch(
                 self.outside_kernels.fn_rmsnorm_inplace_f16,
                 normed_region.device_ptr(),
                 la.input_layernorm.offset_bytes,
@@ -5607,13 +5918,20 @@ impl Qwen36Bringup {
         }
 
         // 2. in_proj_qkv: [N, hidden] → [N, qkv_n].
-        let qkv_region = self.arena.region(
-            "qwen36_plb_qkv", n * (qkv_n as usize) * 2, 16)?;
+        let qkv_region = self
+            .arena
+            .region("qwen36_plb_qkv", n * (qkv_n as usize) * 2, 16)?;
         unsafe {
             self.fp8_proj_dispatch(
-                kernel_gemv, qkv_region.device_ptr(),
-                la.in_proj_qkv.offset_bytes, qkv_bs, normed_region.device_ptr(),
-                num_tokens, qkv_n, hidden, stream_raw,
+                kernel_gemv,
+                qkv_region.device_ptr(),
+                la.in_proj_qkv.offset_bytes,
+                qkv_bs,
+                normed_region.device_ptr(),
+                num_tokens,
+                qkv_n,
+                hidden,
+                stream_raw,
             )?;
         }
 
@@ -5623,11 +5941,9 @@ impl Qwen36Bringup {
         // is rotated to (s_{N-2}, s_{N-1}, s_N) inside the same kernel.
         let ks: u32 = 4;
         let conv_in_bytes = (n + (ks as usize - 1)) * (qkv_n as usize) * 2;
-        let conv_in_region =
-            self.arena.region("qwen36_plb_cin", conv_in_bytes, 16)?;
+        let conv_in_region = self.arena.region("qwen36_plb_cin", conv_in_bytes, 16)?;
         let conv_out_bytes = n * (qkv_n as usize) * 2;
-        let conv_out_region =
-            self.arena.region("qwen36_plb_cout", conv_out_bytes, 16)?;
+        let conv_out_region = self.arena.region("qwen36_plb_cout", conv_out_bytes, 16)?;
         let conv_state_ptr_layer = self.conv_state_layer_ptr(linear_seq_idx);
         #[cfg(feature = "cuda")]
         unsafe {
@@ -5639,16 +5955,22 @@ impl Qwen36Bringup {
             let mut nt_i: i32 = num_tokens as i32;
             let args = [
                 (&mut conv_in) as *mut u64 as *mut core::ffi::c_void,
-                (&mut state)   as *mut u64 as *mut core::ffi::c_void,
-                (&mut cur)     as *mut u64 as *mut core::ffi::c_void,
-                (&mut ts_i)    as *mut i32 as *mut core::ffi::c_void,
-                (&mut nt_i)    as *mut i32 as *mut core::ffi::c_void,
+                (&mut state) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cur) as *mut u64 as *mut core::ffi::c_void,
+                (&mut ts_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nt_i) as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = 256;
             let grid: u32 = ((qkv_n + block - 1) / block).max(1);
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_conv_state_advance_batched_f16.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1, 0,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -5673,17 +5995,23 @@ impl Qwen36Bringup {
             let mut k_arg: i32 = ks as i32;
             let args = [
                 (&mut output) as *mut u64 as *mut core::ffi::c_void,
-                (&mut input)  as *mut u64 as *mut core::ffi::c_void,
+                (&mut input) as *mut u64 as *mut core::ffi::c_void,
                 (&mut weight) as *mut u64 as *mut core::ffi::c_void,
-                (&mut sl)     as *mut i32 as *mut core::ffi::c_void,
-                (&mut ch)     as *mut i32 as *mut core::ffi::c_void,
-                (&mut k_arg)  as *mut i32 as *mut core::ffi::c_void,
+                (&mut sl) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ch) as *mut i32 as *mut core::ffi::c_void,
+                (&mut k_arg) as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = 256;
             let grid_x = (qkv_n + block - 1) / block;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_causal_conv1d_f16.raw() as CUfunction,
-                grid_x, num_tokens, 1, block, 1, 1, 0,
+                grid_x,
+                num_tokens,
+                1,
+                block,
+                1,
+                1,
+                0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -5701,9 +6029,15 @@ impl Qwen36Bringup {
         // produces `[vus, head_k_dim] q + k` and `[vus, head_v_dim] v`
         // for a single token; we stride into per-token offsets within
         // the [N, vus, *] output regions.
-        let q_region = self.arena.region("qwen36_plb_q", n * qk_bytes_per_token, 16)?;
-        let k_region = self.arena.region("qwen36_plb_k", n * qk_bytes_per_token, 16)?;
-        let v_region = self.arena.region("qwen36_plb_v", n * v_bytes_per_token,  16)?;
+        let q_region = self
+            .arena
+            .region("qwen36_plb_q", n * qk_bytes_per_token, 16)?;
+        let k_region = self
+            .arena
+            .region("qwen36_plb_k", n * qk_bytes_per_token, 16)?;
+        let v_region = self
+            .arena
+            .region("qwen36_plb_v", n * v_bytes_per_token, 16)?;
         // Single batched launch over (vus, num_tokens) — replaces
         // the per-token host loop. Kernel folds `blockIdx.y *
         // per_token_stride` into its pointer math; base pointers
@@ -5718,9 +6052,9 @@ impl Qwen36Bringup {
             let mut vus_i: i32 = vus as i32;
             let mut hkd_i: i32 = hkd as i32;
             let mut hvd_i: i32 = hvd as i32;
-            let mut kd_i:  i32 = key_dim as i32;
-            let mut nvh:   i32 = num_v_heads as i32;
-            let mut vpk:   i32 = v_per_k as i32;
+            let mut kd_i: i32 = key_dim as i32;
+            let mut nvh: i32 = num_v_heads as i32;
+            let mut vpk: i32 = v_per_k as i32;
             let args = [
                 (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
                 (&mut k_out) as *mut u64 as *mut core::ffi::c_void,
@@ -5729,14 +6063,20 @@ impl Qwen36Bringup {
                 (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
                 (&mut hkd_i) as *mut i32 as *mut core::ffi::c_void,
                 (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
-                (&mut kd_i)  as *mut i32 as *mut core::ffi::c_void,
-                (&mut nvh)   as *mut i32 as *mut core::ffi::c_void,
-                (&mut vpk)   as *mut i32 as *mut core::ffi::c_void,
+                (&mut kd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nvh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut vpk) as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = (hkd.max(hvd)) as u32;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_qwen_linear_silu_l2_gqa_f16.raw() as CUfunction,
-                vus as u32, num_tokens as u32, 1, block, 1, 1, 0,
+                vus as u32,
+                num_tokens as u32,
+                1,
+                block,
+                1,
+                1,
+                0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -5753,7 +6093,7 @@ impl Qwen36Bringup {
         // 6. alpha/beta per token (host-loop bridge). Outputs
         // [num_tokens, vus] f32 each.
         let alpha_region = self.arena.region("qwen36_plb_alpha", n * vus * 4, 16)?;
-        let beta_region  = self.arena.region("qwen36_plb_beta",  n * vus * 4, 16)?;
+        let beta_region = self.arena.region("qwen36_plb_beta", n * vus * 4, 16)?;
         // Single batched launch (vus, num_tokens). Kernel folds
         // per-token offsets into input / alpha_out / beta_out.
         #[cfg(feature = "cuda")]
@@ -5773,7 +6113,7 @@ impl Qwen36Bringup {
                 (&mut b_out) as *mut u64 as *mut core::ffi::c_void,
                 (&mut a_w_p) as *mut u64 as *mut core::ffi::c_void,
                 (&mut b_w_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut a_log_p)  as *mut u64 as *mut core::ffi::c_void,
+                (&mut a_log_p) as *mut u64 as *mut core::ffi::c_void,
                 (&mut dt_bias_p) as *mut u64 as *mut core::ffi::c_void,
                 (&mut in_p) as *mut u64 as *mut core::ffi::c_void,
                 (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
@@ -5782,7 +6122,13 @@ impl Qwen36Bringup {
             let block: u32 = 256u32.min(h as u32).max(1);
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_qwen_linear_alpha_beta_f16.raw() as CUfunction,
-                vus as u32, num_tokens as u32, 1, block, 1, 1, 0,
+                vus as u32,
+                num_tokens as u32,
+                1,
+                block,
+                1,
+                1,
+                0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -5800,8 +6146,9 @@ impl Qwen36Bringup {
         // state across all N tokens internally.
         let layer_state_ptr = self.linear_state_layer_ptr(linear_seq_idx);
         let scale = 1.0f32 / (head_k_dim as f32).sqrt();
-        let readout_region =
-            self.arena.region("qwen36_plb_readout", n * v_bytes_per_token, 16)?;
+        let readout_region = self
+            .arena
+            .region("qwen36_plb_readout", n * v_bytes_per_token, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -5813,7 +6160,7 @@ impl Qwen36Bringup {
             let mut b_ptr = beta_region.device_ptr();
             let mut o_ptr = readout_region.device_ptr();
             let mut scale_arg = scale;
-            let mut nt_i  = num_tokens as i32;
+            let mut nt_i = num_tokens as i32;
             let mut nvh_i = num_v_heads as i32;
             let mut hvd_i = head_v_dim as i32;
             let mut hkd_i = head_k_dim as i32;
@@ -5826,7 +6173,7 @@ impl Qwen36Bringup {
                 (&mut b_ptr) as *mut u64 as *mut core::ffi::c_void,
                 (&mut o_ptr) as *mut u64 as *mut core::ffi::c_void,
                 (&mut scale_arg) as *mut f32 as *mut core::ffi::c_void,
-                (&mut nt_i)  as *mut i32 as *mut core::ffi::c_void,
+                (&mut nt_i) as *mut i32 as *mut core::ffi::c_void,
                 (&mut nvh_i) as *mut i32 as *mut core::ffi::c_void,
                 (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
                 (&mut hkd_i) as *mut i32 as *mut core::ffi::c_void,
@@ -5834,8 +6181,12 @@ impl Qwen36Bringup {
             let smem = (2 * head_k_dim + head_v_dim) * 4;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_gated_delta_rule_prefill_f16.raw() as CUfunction,
-                num_v_heads, 1, 1,
-                head_v_dim, 1, 1,
+                num_v_heads,
+                1,
+                1,
+                head_v_dim,
+                1,
+                1,
                 smem,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -5851,35 +6202,44 @@ impl Qwen36Bringup {
         }
 
         // 8. in_proj_z: [N, hidden] → [N, z_n].
-        let z_region = self.arena.region("qwen36_plb_z", n * (z_n as usize) * 2, 16)?;
+        let z_region = self
+            .arena
+            .region("qwen36_plb_z", n * (z_n as usize) * 2, 16)?;
         unsafe {
             self.fp8_proj_dispatch(
-                kernel_gemv, z_region.device_ptr(),
-                la.in_proj_z.offset_bytes, z_bs, normed_region.device_ptr(),
-                num_tokens, z_n, hidden, stream_raw,
+                kernel_gemv,
+                z_region.device_ptr(),
+                la.in_proj_z.offset_bytes,
+                z_bs,
+                normed_region.device_ptr(),
+                num_tokens,
+                z_n,
+                hidden,
+                stream_raw,
             )?;
         }
 
         // 9. rmsnorm_gated per token (host-loop bridge). Each call
         // produces [vus, head_v_dim] from one token's readout + z
         // slices.
-        let gated_region = self.arena.region(
-            "qwen36_plb_gated", n * vus * hvd * 2, 16)?;
+        let gated_region = self
+            .arena
+            .region("qwen36_plb_gated", n * vus * hvd * 2, 16)?;
         // Single batched launch (vus, num_tokens).
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let mut g_out = gated_region.device_ptr();
-            let mut r_in  = readout_region.device_ptr();
-            let mut z_in  = z_region.device_ptr();
+            let mut r_in = readout_region.device_ptr();
+            let mut z_in = z_region.device_ptr();
             let mut gamma_p = la.norm.offset_bytes;
             let mut vus_i: i32 = vus as i32;
             let mut hvd_i: i32 = hvd as i32;
             let mut eps_f: f32 = 1e-6;
             let args = [
                 (&mut g_out) as *mut u64 as *mut core::ffi::c_void,
-                (&mut r_in)  as *mut u64 as *mut core::ffi::c_void,
-                (&mut z_in)  as *mut u64 as *mut core::ffi::c_void,
+                (&mut r_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut z_in) as *mut u64 as *mut core::ffi::c_void,
                 (&mut gamma_p) as *mut u64 as *mut core::ffi::c_void,
                 (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
                 (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
@@ -5888,7 +6248,13 @@ impl Qwen36Bringup {
             let block: u32 = hvd as u32;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_qwen_linear_rmsnorm_gated_f16.raw() as CUfunction,
-                vus as u32, num_tokens as u32, 1, block, 1, 1, 0,
+                vus as u32,
+                num_tokens as u32,
+                1,
+                block,
+                1,
+                1,
+                0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -5903,12 +6269,20 @@ impl Qwen36Bringup {
         }
 
         // 10. out_proj: [N, out_k] → [N, out_n].
-        let out_region = self.arena.region("qwen36_plb_out", n * (out_n as usize) * 2, 16)?;
+        let out_region = self
+            .arena
+            .region("qwen36_plb_out", n * (out_n as usize) * 2, 16)?;
         unsafe {
             self.fp8_proj_dispatch(
-                kernel_gemv, out_region.device_ptr(),
-                la.out_proj.offset_bytes, out_bs, gated_region.device_ptr(),
-                num_tokens, out_n, out_k, stream_raw,
+                kernel_gemv,
+                out_region.device_ptr(),
+                la.out_proj.offset_bytes,
+                out_bs,
+                gated_region.device_ptr(),
+                num_tokens,
+                out_n,
+                out_k,
+                stream_raw,
             )?;
         }
 
@@ -5923,13 +6297,19 @@ impl Qwen36Bringup {
             let args = [
                 (&mut dst) as *mut u64 as *mut core::ffi::c_void,
                 (&mut src) as *mut u64 as *mut core::ffi::c_void,
-                (&mut nn)  as *mut i32 as *mut core::ffi::c_void,
+                (&mut nn) as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = 1024.min(n_elem as u32).max(1);
             let grid = ((n_elem as u32 + block - 1) / block).max(1);
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_vector_add_f16.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1, 0,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -5971,6 +6351,7 @@ impl Qwen36Bringup {
         last_hidden_bytes: usize,
         positions_dev_ptr: u64,
         prefill_ctx_len_dev_ptr: u64,
+        full_layer_ordinal: u32,
     ) -> Result<()> {
         if num_tokens == 0 {
             return Ok(());
@@ -5979,9 +6360,15 @@ impl Qwen36Bringup {
             // Degenerate: delegate to the per-token path so the
             // single-token decode case stays byte-identical.
             return self.apply_layer_full_attn(
-                fl, full_seq_idx, 0,
-                hidden_ptr, kernel_gemv, hidden, last_hidden_bytes,
-                positions_dev_ptr, prefill_ctx_len_dev_ptr,
+                fl,
+                full_seq_idx,
+                0,
+                hidden_ptr,
+                kernel_gemv,
+                hidden,
+                last_hidden_bytes,
+                positions_dev_ptr,
+                prefill_ctx_len_dev_ptr,
             );
         }
         let stream_raw = self.stream.raw() as u64;
@@ -5994,10 +6381,22 @@ impl Qwen36Bringup {
         let v_n = fl.v_proj.shape[0] as u32;
         let o_n = fl.o_proj.shape[0] as u32;
         let o_k = fl.o_proj.shape[1] as u32;
-        let q_bs = match fl.q_proj.blockscale_ptr { Some(p) => p, None => return Ok(()) };
-        let k_bs = match fl.k_proj.blockscale_ptr { Some(p) => p, None => return Ok(()) };
-        let v_bs = match fl.v_proj.blockscale_ptr { Some(p) => p, None => return Ok(()) };
-        let o_bs = match fl.o_proj.blockscale_ptr { Some(p) => p, None => return Ok(()) };
+        let q_bs = match fl.q_proj.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let k_bs = match fl.k_proj.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let v_bs = match fl.v_proj.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let o_bs = match fl.o_proj.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
 
         let q_size = num_heads * head_dim;
         let _ = last_hidden_bytes;
@@ -6005,13 +6404,14 @@ impl Qwen36Bringup {
 
         // 1. RMSNorm batched on a [N, hidden] copy of the chunk.
         let normed_bytes = n * h * 2;
-        let normed_region =
-            self.arena.region("qwen36_pfb_normed", normed_bytes, 16)?;
+        let normed_region = self.arena.region("qwen36_pfb_normed", normed_bytes, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let r = cuMemcpyDtoDAsync_v2(
-                normed_region.device_ptr(), hidden_ptr, normed_bytes,
+                normed_region.device_ptr(),
+                hidden_ptr,
+                normed_bytes,
                 self.stream.raw() as _,
             );
             if r != CUresult::CUDA_SUCCESS {
@@ -6025,8 +6425,11 @@ impl Qwen36Bringup {
         let eps = self.arch.base.rms_norm_eps;
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens, hidden, eps,
-            }.launch(
+                num_tokens,
+                hidden,
+                eps,
+            }
+            .launch(
                 self.outside_kernels.fn_rmsnorm_inplace_f16,
                 normed_region.device_ptr(),
                 fl.input_layernorm.offset_bytes,
@@ -6035,34 +6438,56 @@ impl Qwen36Bringup {
         }
 
         // 2. Q/K/V projections at m=num_tokens via dispatcher.
-        let q_region = self.arena.region("qwen36_pfb_qg", n * (q_n as usize) * 2, 16)?;
-        let k_region = self.arena.region("qwen36_pfb_k",  n * (k_n as usize) * 2, 16)?;
-        let v_region = self.arena.region("qwen36_pfb_v",  n * (v_n as usize) * 2, 16)?;
+        let q_region = self
+            .arena
+            .region("qwen36_pfb_qg", n * (q_n as usize) * 2, 16)?;
+        let k_region = self
+            .arena
+            .region("qwen36_pfb_k", n * (k_n as usize) * 2, 16)?;
+        let v_region = self
+            .arena
+            .region("qwen36_pfb_v", n * (v_n as usize) * 2, 16)?;
         unsafe {
             self.fp8_proj_dispatch(
-                kernel_gemv, q_region.device_ptr(),
-                fl.q_proj.offset_bytes, q_bs, normed_region.device_ptr(),
-                num_tokens, q_n, hidden, stream_raw,
+                kernel_gemv,
+                q_region.device_ptr(),
+                fl.q_proj.offset_bytes,
+                q_bs,
+                normed_region.device_ptr(),
+                num_tokens,
+                q_n,
+                hidden,
+                stream_raw,
             )?;
             self.fp8_proj_dispatch(
-                kernel_gemv, k_region.device_ptr(),
-                fl.k_proj.offset_bytes, k_bs, normed_region.device_ptr(),
-                num_tokens, k_n, hidden, stream_raw,
+                kernel_gemv,
+                k_region.device_ptr(),
+                fl.k_proj.offset_bytes,
+                k_bs,
+                normed_region.device_ptr(),
+                num_tokens,
+                k_n,
+                hidden,
+                stream_raw,
             )?;
             self.fp8_proj_dispatch(
-                kernel_gemv, v_region.device_ptr(),
-                fl.v_proj.offset_bytes, v_bs, normed_region.device_ptr(),
-                num_tokens, v_n, hidden, stream_raw,
+                kernel_gemv,
+                v_region.device_ptr(),
+                fl.v_proj.offset_bytes,
+                v_bs,
+                normed_region.device_ptr(),
+                num_tokens,
+                v_n,
+                hidden,
+                stream_raw,
             )?;
         }
 
         // 3. split_q_gate batched: kernel grid is (num_heads, m, 1).
         // m=num_tokens works out of the box.
         let qsize_us = q_size as usize;
-        let q_split_region =
-            self.arena.region("qwen36_pfb_qs", n * qsize_us * 2, 16)?;
-        let gate_region =
-            self.arena.region("qwen36_pfb_gt", n * qsize_us * 2, 16)?;
+        let q_split_region = self.arena.region("qwen36_pfb_qs", n * qsize_us * 2, 16)?;
+        let gate_region = self.arena.region("qwen36_pfb_gt", n * qsize_us * 2, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -6080,9 +6505,14 @@ impl Qwen36Bringup {
             ];
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_split_q_gate_f16.raw() as CUfunction,
-                num_heads, num_tokens, 1,
-                head_dim, 1, 1,
-                0, self.stream.raw() as CUstream,
+                num_heads,
+                num_tokens,
+                1,
+                head_dim,
+                1,
+                1,
+                0,
+                self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
@@ -6104,7 +6534,8 @@ impl Qwen36Bringup {
                 num_tokens: num_heads * num_tokens,
                 hidden: head_dim,
                 eps,
-            }.launch(
+            }
+            .launch(
                 self.outside_kernels.fn_rmsnorm_inplace_f16,
                 q_split_region.device_ptr(),
                 fl.q_norm.offset_bytes,
@@ -6114,7 +6545,8 @@ impl Qwen36Bringup {
                 num_tokens: num_kv_heads * num_tokens,
                 hidden: head_dim,
                 eps,
-            }.launch(
+            }
+            .launch(
                 self.outside_kernels.fn_rmsnorm_inplace_f16,
                 k_region.device_ptr(),
                 fl.k_norm.offset_bytes,
@@ -6122,241 +6554,436 @@ impl Qwen36Bringup {
             )?;
         }
 
-        // 5. RoPE + KV-cache write batched. fused_rope_qwen_partial_f16kv
-        // already has array semantics for positions/slot_mapping —
-        // launching with grid.x=num_tokens drives the array index. The
-        // existing per-token apply_layer_full_attn already passes
-        // slot=positions (qwen3-next slot==position invariant); we keep
-        // that here.
+        // 5. RoPE + KV-cache write batched. Both Qwen RoPE kernels
+        // have array semantics for positions/slot_mapping, so
+        // grid.x=num_tokens drives the per-row slot. The NVFP4 branch
+        // also quantizes Q to FP8 and writes per-(token, head) Q
+        // descales for unified prefill.
         let rotary_dim = (head_dim as f32 * 0.25) as u32; // 64
         let kv_layer_ptr = self.kv_cache_layer_ptr(full_seq_idx);
         let half = (self.kv_cache_layer_bytes / 2) as u64;
         let k_cache_layer_ptr = kv_layer_ptr;
         let v_cache_layer_ptr = kv_layer_ptr + half;
+        let scale_layer_ptr = self.kv_cache_scale_layer_ptr(full_seq_idx);
+        let scale_half = (self.kv_cache_scale_layer_bytes / 2) as u64;
+        let k_scale_layer_ptr = scale_layer_ptr;
+        let v_scale_layer_ptr = if scale_layer_ptr == 0 {
+            0
+        } else {
+            scale_layer_ptr + scale_half
+        };
+        let (q_fp8_ptr, q_scale_cache_ptr) = match self.kv_dtype {
+            Qwen36KvDtype::F16 => (0u64, 0u64),
+            Qwen36KvDtype::Nvfp4 => {
+                let q_fp8_region = self.arena.region("qwen36_pfb_q_fp8", n * qsize_us, 16)?;
+                let q_scale_region = self.arena.region(
+                    "qwen36_pfb_q_scale_cache",
+                    n * (num_heads as usize) * 4,
+                    16,
+                )?;
+                (q_fp8_region.device_ptr(), q_scale_region.device_ptr())
+            }
+        };
         #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let mut q_in_p = q_split_region.device_ptr();
-            let mut k_in_p = k_region.device_ptr();
-            let mut v_in_p = v_region.device_ptr();
-            let mut q_out_p = q_split_region.device_ptr(); // in-place
-            let mut kc = k_cache_layer_ptr;
-            let mut vc = v_cache_layer_ptr;
-            let mut cos_p = self.rope_cos;
-            let mut sin_p = self.rope_sin;
-            let mut pos_p = positions_dev_ptr;
-            let mut slot_p = positions_dev_ptr; // slot==pos in qwen3-next
-            let mut nt: i32 = num_tokens as i32;
-            let mut nh: i32 = num_heads as i32;
-            let mut nkh: i32 = num_kv_heads as i32;
-            let mut hd_i: i32 = head_dim as i32;
-            let mut rd: i32 = rotary_dim as i32;
-            let args = [
-                (&mut q_in_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut k_in_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut v_in_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut q_out_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut kc) as *mut u64 as *mut core::ffi::c_void,
-                (&mut vc) as *mut u64 as *mut core::ffi::c_void,
-                (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
-                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
-                (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
-                (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
-                (&mut rd) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let max_h = num_heads.max(num_kv_heads);
-            let block_x: u32 = (head_dim / 2) as u32;
-            let rc = cuLaunchKernel(
-                self.outside_kernels.fn_fused_rope_qwen_partial_f16kv.raw() as CUfunction,
-                num_tokens, max_h, 1,
-                block_x, 1, 1,
-                0, self.stream.raw() as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 full_attn_batched fused_rope",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
+        match self.kv_dtype {
+            Qwen36KvDtype::F16 => unsafe {
+                use cudarc::driver::sys::*;
+                let mut q_in_p = q_split_region.device_ptr();
+                let mut k_in_p = k_region.device_ptr();
+                let mut v_in_p = v_region.device_ptr();
+                let mut q_out_p = q_split_region.device_ptr(); // in-place
+                let mut kc = k_cache_layer_ptr;
+                let mut vc = v_cache_layer_ptr;
+                let mut cos_p = self.rope_cos;
+                let mut sin_p = self.rope_sin;
+                let mut pos_p = positions_dev_ptr;
+                let mut slot_p = positions_dev_ptr; // slot==pos in qwen3-next
+                let mut nt: i32 = num_tokens as i32;
+                let mut nh: i32 = num_heads as i32;
+                let mut nkh: i32 = num_kv_heads as i32;
+                let mut hd_i: i32 = head_dim as i32;
+                let mut rd: i32 = rotary_dim as i32;
+                let args = [
+                    (&mut q_in_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut k_in_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut v_in_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_out_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut kc) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut vc) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let max_h = num_heads.max(num_kv_heads);
+                let block_x: u32 = (head_dim / 2) as u32;
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_fused_rope_qwen_partial_f16kv.raw() as CUfunction,
+                    num_tokens,
+                    max_h,
+                    1,
+                    block_x,
+                    1,
+                    1,
+                    0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 full_attn_batched fused_rope",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            },
+            Qwen36KvDtype::Nvfp4 => {
+                let fn_rope = self
+                    .outside_kernels
+                    .fn_fused_rope_qwen_partial_nvfp4kv
+                    .expect(
+                        "qwen36 NVFP4 RoPE kernel not loaded — \
+                             RVLLM_NVFP4_KV env gate inconsistency",
+                    );
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let mut q_in_p = q_split_region.device_ptr();
+                    let mut k_in_p = k_region.device_ptr();
+                    let mut v_in_p = v_region.device_ptr();
+                    let mut q_fp8_out = q_fp8_ptr;
+                    let mut key_packed = k_cache_layer_ptr;
+                    let mut value_packed = v_cache_layer_ptr;
+                    let mut key_scale = k_scale_layer_ptr;
+                    let mut value_scale = v_scale_layer_ptr;
+                    let mut cos_p = self.rope_cos;
+                    let mut sin_p = self.rope_sin;
+                    let mut pos_p = positions_dev_ptr;
+                    let mut slot_p = positions_dev_ptr;
+                    let mut q_scale_static = q_scale_cache_ptr;
+                    let mut q_scale_dyn = q_scale_cache_ptr;
+                    let mut nt: i32 = num_tokens as i32;
+                    let mut nh: i32 = num_heads as i32;
+                    let mut nkh: i32 = num_kv_heads as i32;
+                    let mut hd_i: i32 = head_dim as i32;
+                    let mut rd: i32 = rotary_dim as i32;
+                    let args = [
+                        (&mut q_in_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut k_in_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut v_in_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut q_fp8_out) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut key_packed) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut value_packed) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut key_scale) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut value_scale) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut q_scale_static) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut q_scale_dyn) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let grid_y = num_heads.max(num_kv_heads);
+                    let rc = cuLaunchKernel(
+                        fn_rope.raw() as CUfunction,
+                        num_tokens,
+                        grid_y,
+                        1,
+                        head_dim,
+                        1,
+                        1,
+                        0,
+                        self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 full_attn_batched fused_rope_qwen_nvfp4",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
             }
         }
 
-        // 6. Attention via flash_attention_2_f16kv_kernel. The kernel
-        // wants f32 query and produces f32 output, so wrap with cast
-        // launches. With num_seqs=1, num_query_tokens=N, causal=1,
-        // context_lens=[N], seq_start_pos=[0,N], the kernel scans all
-        // N query tokens against KV slots [0..t+1) (causal) per head.
-        let q_f32_bytes = n * qsize_us * 4;
-        let q_f32_region =
-            self.arena.region("qwen36_pfb_qf32", q_f32_bytes, 16)?;
-        // f16 q_split → f32 q_f32 via cast
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let n_elem = n * qsize_us;
-            let mut output = q_f32_region.device_ptr();
-            let mut input  = q_split_region.device_ptr();
-            let mut nn: i32 = n_elem as i32;
-            let args = [
-                (&mut output) as *mut u64 as *mut core::ffi::c_void,
-                (&mut input)  as *mut u64 as *mut core::ffi::c_void,
-                (&mut nn)     as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let block: u32 = 256;
-            let grid = ((n_elem as u32 + block - 1) / block).max(1);
-            let rc = cuLaunchKernel(
-                self.outside_kernels.fn_cast_f16_to_f32.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1, 0,
-                self.stream.raw() as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 full_attn_batched q cast f16→f32",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
-        }
-        let attn_out_f32_region = self.arena.region(
-            "qwen36_pfb_attn_f32", q_f32_bytes, 16)?;
+        // 6. Attention. F16 KV keeps the existing prefill kernel
+        // and casts around its f32 ABI. NVFP4 uses the unified prefill
+        // kernel directly over all prompt rows and returns f16 output.
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let max_blocks_per_seq_i = self.kv_cache_num_blocks as i32;
-        let block_size_i = self.kv_cache_block_size as i32;
-        // The f16kv prefill kernel needs `seq_start_pos[num_seqs+1]`.
-        // For our num_seqs=1 case we need [0, N]. Build a tiny on-arena
-        // 2-element i32 buffer and populate via a one-off device fill
-        // (reusing fn_qwen_fill_pos_slots_i32 isn't quite right since
-        // it produces start..start+N; here we want [0, N]). Build via
-        // a single host-side cuMemsetD32 + cuMemcpyHtoDAsync on
-        // self.stream so it stays stream-ordered.
-        let seq_start_region = self.arena.region("qwen36_pfb_seqstart", 2 * 4, 16)?;
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            // Set [0, N] via two cuMemsetD32 calls on self.stream.
-            // cuMemsetD32 doesn't take an offset, so we do two calls
-            // each with size=1.
-            let zero: u32 = 0;
-            let nval: u32 = num_tokens;
-            let r0 = cuMemsetD32Async(seq_start_region.device_ptr(), zero, 1, self.stream.raw() as _);
-            let r1 = cuMemsetD32Async(seq_start_region.device_ptr() + 4, nval, 1, self.stream.raw() as _);
-            if r0 != CUresult::CUDA_SUCCESS || r1 != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 full_attn_batched seq_start_pos memset",
-                    rvllm_core::CudaErrorKind::MemcpyFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
+        let attn_out_region = match self.kv_dtype {
+            Qwen36KvDtype::F16 => {
+                let q_f32_bytes = n * qsize_us * 4;
+                let q_f32_region = self.arena.region("qwen36_pfb_qf32", q_f32_bytes, 16)?;
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let n_elem = n * qsize_us;
+                    let mut output = q_f32_region.device_ptr();
+                    let mut input = q_split_region.device_ptr();
+                    let mut nn: i32 = n_elem as i32;
+                    let args = [
+                        (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let block: u32 = 256;
+                    let grid = ((n_elem as u32 + block - 1) / block).max(1);
+                    let rc = cuLaunchKernel(
+                        self.outside_kernels.fn_cast_f16_to_f32.raw() as CUfunction,
+                        grid,
+                        1,
+                        1,
+                        block,
+                        1,
+                        1,
+                        0,
+                        self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 full_attn_batched q cast f16->f32",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                let attn_out_f32_region =
+                    self.arena.region("qwen36_pfb_attn_f32", q_f32_bytes, 16)?;
+                let seq_start_region = self.arena.region("qwen36_pfb_seqstart", 2 * 4, 16)?;
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let r0 = cuMemsetD32Async(
+                        seq_start_region.device_ptr(),
+                        0,
+                        1,
+                        self.stream.raw() as _,
+                    );
+                    let r1 = cuMemsetD32Async(
+                        seq_start_region.device_ptr() + 4,
+                        num_tokens,
+                        1,
+                        self.stream.raw() as _,
+                    );
+                    if r0 != CUresult::CUDA_SUCCESS || r1 != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 full_attn_batched seq_start_pos memset",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                const FA2_THREADS: i32 = 128;
+                const FA2_BC: i32 = 32;
+                let smem_bytes =
+                    2 * FA2_BC * head_dim as i32 * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    if smem_bytes as u32 >= 48 * 1024 {
+                        let _ = cuFuncSetAttribute(
+                            self.outside_kernels.fn_flash_attention_2_f16kv.raw() as CUfunction,
+                            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            smem_bytes,
+                        );
+                    }
+                    let mut output = attn_out_f32_region.device_ptr();
+                    let mut query = q_f32_region.device_ptr();
+                    let mut key_cache = k_cache_layer_ptr;
+                    let mut value_cache = v_cache_layer_ptr;
+                    let mut block_tables = self.bt_persistent_ptr;
+                    let mut context_lens = prefill_ctx_len_dev_ptr;
+                    let mut seq_start_pos = seq_start_region.device_ptr();
+                    let mut scale_arg = scale;
+                    let mut nh = num_heads as i32;
+                    let mut nkvh = num_kv_heads as i32;
+                    let mut hd = head_dim as i32;
+                    let mut bs = self.kv_cache_block_size as i32;
+                    let mut max_ctx = num_tokens as i32;
+                    let mut mbps = self.kv_cache_num_blocks as i32;
+                    let mut nqt = num_tokens as i32;
+                    let mut causal: i32 = 1;
+                    let args = [
+                        (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut query) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut key_cache) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut value_cache) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut block_tables) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut context_lens) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut seq_start_pos) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut scale_arg) as *mut f32 as *mut core::ffi::c_void,
+                        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut bs) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut max_ctx) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut mbps) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nqt) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut causal) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let rc = cuLaunchKernel(
+                        self.outside_kernels.fn_flash_attention_2_f16kv.raw() as CUfunction,
+                        1u32,
+                        num_heads,
+                        1,
+                        FA2_THREADS as u32,
+                        1,
+                        1,
+                        smem_bytes as u32,
+                        self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 full_attn_batched flash_attention_2_f16kv",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                let attn_out_region =
+                    self.arena
+                        .region("qwen36_pfb_attn_f16", n * qsize_us * 2, 16)?;
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let n_elem = n * qsize_us;
+                    let mut output = attn_out_region.device_ptr();
+                    let mut input = attn_out_f32_region.device_ptr();
+                    let mut nn: i32 = n_elem as i32;
+                    let args = [
+                        (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let block: u32 = 256;
+                    let grid = ((n_elem as u32 + block - 1) / block).max(1);
+                    let rc = cuLaunchKernel(
+                        self.outside_kernels.fn_cast_f32_to_f16.raw() as CUfunction,
+                        grid,
+                        1,
+                        1,
+                        block,
+                        1,
+                        1,
+                        0,
+                        self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 full_attn_batched out cast f32->f16",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                attn_out_region
             }
-        }
-        const FA2_THREADS: i32 = 128;
-        const FA2_BC: i32 = 32;
-        let smem_bytes = 2 * FA2_BC * head_dim as i32 * 4 + FA2_BC * 4
-            + (FA2_THREADS / 32) * 4;
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            if smem_bytes as u32 >= 48 * 1024 {
-                let _ = cuFuncSetAttribute(
-                    self.outside_kernels.fn_flash_attention_2_f16kv.raw() as CUfunction,
-                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    smem_bytes,
-                );
+            Qwen36KvDtype::Nvfp4 => {
+                let attn_out_region =
+                    self.arena
+                        .region("qwen36_pfb_attn_f16", n * qsize_us * 2, 16)?;
+                let cu_seqlens_region = self.arena.region("qwen36_pfb_cu_seqlens", 2 * 4, 16)?;
+                unsafe {
+                    let cu: [i32; 2] = [0, num_tokens as i32];
+                    let bytes = std::slice::from_raw_parts(
+                        cu.as_ptr() as *const u8,
+                        std::mem::size_of_val(&cu),
+                    );
+                    cu_seqlens_region.copy_from_host(bytes)?;
+                    let params = rvllm_attention::PagedPrefillParams {
+                        num_seqs: 1,
+                        num_tokens,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size: self.kv_cache_block_size,
+                        max_blocks_per_seq: self.kv_cache_num_blocks,
+                        num_blocks_total: self.kv_cache_num_blocks,
+                        scale,
+                        window_size_left: -1,
+                    };
+                    let num_queries_per_kv = num_heads / num_kv_heads;
+                    let unified = rvllm_attention::UnifiedPrefillParams {
+                        num_queries_per_kv,
+                        tile_size: if head_dim <= 256 { 32 } else { 16 },
+                        block_q: (rvllm_attention::UNIFIED_PREFILL_BLOCK_M
+                            / num_queries_per_kv.max(1))
+                        .max(1),
+                        use_mma: true,
+                    };
+                    let prefill =
+                        rvllm_attention::PagedPrefillNvfp4Launcher::new(&self.attn_backend_full);
+                    let unified_from = std::env::var("RVLLM_QWEN36_NVFP4_UNIFIED_BATCH_FULL_FROM")
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    let use_unified = full_layer_ordinal >= unified_from
+                        && std::env::var("RVLLM_QWEN36_NVFP4_UNIFIED_BATCH_FULL_PREFILL")
+                            .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+                            .unwrap_or(false);
+                    if use_unified {
+                        prefill.launch_nvfp4kv_unified_sm121(
+                            params,
+                            unified,
+                            attn_out_region.device_ptr(),
+                            q_fp8_ptr,
+                            k_cache_layer_ptr,
+                            v_cache_layer_ptr,
+                            k_scale_layer_ptr,
+                            v_scale_layer_ptr,
+                            q_scale_cache_ptr,
+                            self.bt_persistent_ptr,
+                            cu_seqlens_region.device_ptr(),
+                            prefill_ctx_len_dev_ptr,
+                            q_scale_cache_ptr,
+                            false,
+                            stream_raw,
+                        )?;
+                    } else {
+                        prefill.launch(
+                            params,
+                            attn_out_region.device_ptr(),
+                            q_fp8_ptr,
+                            k_cache_layer_ptr,
+                            v_cache_layer_ptr,
+                            k_scale_layer_ptr,
+                            v_scale_layer_ptr,
+                            q_scale_cache_ptr,
+                            self.bt_persistent_ptr,
+                            prefill_ctx_len_dev_ptr,
+                            cu_seqlens_region.device_ptr(),
+                            q_scale_cache_ptr,
+                            num_tokens,
+                            stream_raw,
+                        )?;
+                    }
+                }
+                attn_out_region
             }
-            let mut output = attn_out_f32_region.device_ptr();
-            let mut query = q_f32_region.device_ptr();
-            let mut key_cache = k_cache_layer_ptr;
-            let mut value_cache = v_cache_layer_ptr;
-            let mut block_tables = self.bt_persistent_ptr;
-            let mut context_lens = prefill_ctx_len_dev_ptr;
-            let mut seq_start_pos = seq_start_region.device_ptr();
-            let mut scale_arg = scale;
-            let mut nh = num_heads as i32;
-            let mut nkvh = num_kv_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut bs = block_size_i;
-            let mut max_ctx = num_tokens as i32;
-            let mut mbps = max_blocks_per_seq_i;
-            let mut nqt = num_tokens as i32;
-            let mut causal: i32 = 1;
-            let args = [
-                (&mut output) as *mut u64 as *mut core::ffi::c_void,
-                (&mut query) as *mut u64 as *mut core::ffi::c_void,
-                (&mut key_cache) as *mut u64 as *mut core::ffi::c_void,
-                (&mut value_cache) as *mut u64 as *mut core::ffi::c_void,
-                (&mut block_tables) as *mut u64 as *mut core::ffi::c_void,
-                (&mut context_lens) as *mut u64 as *mut core::ffi::c_void,
-                (&mut seq_start_pos) as *mut u64 as *mut core::ffi::c_void,
-                (&mut scale_arg) as *mut f32 as *mut core::ffi::c_void,
-                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
-                (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
-                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
-                (&mut bs) as *mut i32 as *mut core::ffi::c_void,
-                (&mut max_ctx) as *mut i32 as *mut core::ffi::c_void,
-                (&mut mbps) as *mut i32 as *mut core::ffi::c_void,
-                (&mut nqt) as *mut i32 as *mut core::ffi::c_void,
-                (&mut causal) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let rc = cuLaunchKernel(
-                self.outside_kernels.fn_flash_attention_2_f16kv.raw() as CUfunction,
-                1u32, num_heads, 1,
-                FA2_THREADS as u32, 1, 1,
-                smem_bytes as u32,
-                self.stream.raw() as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 full_attn_batched flash_attention_2_f16kv",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
-        }
-        // f32 attn_out → f16 attn_out (replace q_split's storage role)
-        let attn_out_region = self.arena.region(
-            "qwen36_pfb_attn_f16", n * qsize_us * 2, 16)?;
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let n_elem = n * qsize_us;
-            let mut output = attn_out_region.device_ptr();
-            let mut input  = attn_out_f32_region.device_ptr();
-            let mut nn: i32 = n_elem as i32;
-            let args = [
-                (&mut output) as *mut u64 as *mut core::ffi::c_void,
-                (&mut input)  as *mut u64 as *mut core::ffi::c_void,
-                (&mut nn)     as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let block: u32 = 256;
-            let grid = ((n_elem as u32 + block - 1) / block).max(1);
-            let rc = cuLaunchKernel(
-                self.outside_kernels.fn_cast_f32_to_f16.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1, 0,
-                self.stream.raw() as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 full_attn_batched out cast f32→f16",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
-        }
+        };
 
         // 7. attn_output_gate (sigmoid_mul) batched: n_elem = N * q_size
-        let gated_region = self.arena.region(
-            "qwen36_pfb_gated", n * qsize_us * 2, 16)?;
+        let gated_region = self
+            .arena
+            .region("qwen36_pfb_gated", n * qsize_us * 2, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -6375,7 +7002,13 @@ impl Qwen36Bringup {
             let grid = ((n_elem as u32 + block - 1) / block).max(1);
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_sigmoid_mul_f16.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1, 0,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -6390,13 +7023,20 @@ impl Qwen36Bringup {
         }
 
         // 8. o_proj: [N, o_k] → [N, o_n] via dispatcher.
-        let out_region = self.arena.region(
-            "qwen36_pfb_out", n * (o_n as usize) * 2, 16)?;
+        let out_region = self
+            .arena
+            .region("qwen36_pfb_out", n * (o_n as usize) * 2, 16)?;
         unsafe {
             self.fp8_proj_dispatch(
-                kernel_gemv, out_region.device_ptr(),
-                fl.o_proj.offset_bytes, o_bs, gated_region.device_ptr(),
-                num_tokens, o_n, o_k, stream_raw,
+                kernel_gemv,
+                out_region.device_ptr(),
+                fl.o_proj.offset_bytes,
+                o_bs,
+                gated_region.device_ptr(),
+                num_tokens,
+                o_n,
+                o_k,
+                stream_raw,
             )?;
         }
 
@@ -6411,13 +7051,19 @@ impl Qwen36Bringup {
             let args = [
                 (&mut dst) as *mut u64 as *mut core::ffi::c_void,
                 (&mut src) as *mut u64 as *mut core::ffi::c_void,
-                (&mut nn)  as *mut i32 as *mut core::ffi::c_void,
+                (&mut nn) as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = 1024.min(n_elem as u32).max(1);
             let grid = ((n_elem as u32 + block - 1) / block).max(1);
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_vector_add_f16.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1, 0,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -6469,14 +7115,27 @@ impl Qwen36Bringup {
         let o_n = fl.o_proj.shape[0] as u32; // 2048
         let o_k = fl.o_proj.shape[1] as u32; // 4096
         let m: u32 = 1;
-        let q_bs = match fl.q_proj.blockscale_ptr { Some(p) => p, None => return Ok(()) };
-        let k_bs = match fl.k_proj.blockscale_ptr { Some(p) => p, None => return Ok(()) };
-        let v_bs = match fl.v_proj.blockscale_ptr { Some(p) => p, None => return Ok(()) };
-        let o_bs = match fl.o_proj.blockscale_ptr { Some(p) => p, None => return Ok(()) };
+        let q_bs = match fl.q_proj.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let k_bs = match fl.k_proj.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let v_bs = match fl.v_proj.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let o_bs = match fl.o_proj.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
 
         // 1. input_layernorm on copy of last_hidden.
-        let normed_region =
-            self.arena.region("qwen36_pf_normed", last_hidden_bytes, 16)?;
+        let normed_region = self
+            .arena
+            .region("qwen36_pf_normed", last_hidden_bytes, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -6490,8 +7149,11 @@ impl Qwen36Bringup {
         let eps = self.arch.base.rms_norm_eps;
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps,
-            }.launch(
+                num_tokens: 1,
+                hidden,
+                eps,
+            }
+            .launch(
                 self.outside_kernels.fn_rmsnorm_inplace_f16,
                 normed_region.device_ptr(),
                 fl.input_layernorm.offset_bytes,
@@ -6501,12 +7163,9 @@ impl Qwen36Bringup {
         // No fence: q/k/v projections run on the same stream.
 
         // 2. q_proj, k_proj, v_proj GEMVs.
-        let q_region =
-            self.arena.region("qwen36_pf_qg", (q_n as usize) * 2, 16)?;
-        let k_region =
-            self.arena.region("qwen36_pf_k", (k_n as usize) * 2, 16)?;
-        let v_region =
-            self.arena.region("qwen36_pf_v", (v_n as usize) * 2, 16)?;
+        let q_region = self.arena.region("qwen36_pf_qg", (q_n as usize) * 2, 16)?;
+        let k_region = self.arena.region("qwen36_pf_k", (k_n as usize) * 2, 16)?;
+        let v_region = self.arena.region("qwen36_pf_v", (v_n as usize) * 2, 16)?;
         // Phase 4a: route projections through `fp8_proj_dispatch`.
         // At m=1 (today's caller) this dispatches to the same
         // Fp8GemvF16InLaunch byte-identically. Phase 4b/5/7 will
@@ -6514,15 +7173,39 @@ impl Qwen36Bringup {
         // CUTLASS SM120 (m≥128) automatically — no further edits
         // needed in this function.
         unsafe {
-            self.fp8_proj_dispatch(kernel_gemv, q_region.device_ptr(),
-                fl.q_proj.offset_bytes, q_bs, normed_region.device_ptr(),
-                m, q_n, hidden, stream_raw)?;
-            self.fp8_proj_dispatch(kernel_gemv, k_region.device_ptr(),
-                fl.k_proj.offset_bytes, k_bs, normed_region.device_ptr(),
-                m, k_n, hidden, stream_raw)?;
-            self.fp8_proj_dispatch(kernel_gemv, v_region.device_ptr(),
-                fl.v_proj.offset_bytes, v_bs, normed_region.device_ptr(),
-                m, v_n, hidden, stream_raw)?;
+            self.fp8_proj_dispatch(
+                kernel_gemv,
+                q_region.device_ptr(),
+                fl.q_proj.offset_bytes,
+                q_bs,
+                normed_region.device_ptr(),
+                m,
+                q_n,
+                hidden,
+                stream_raw,
+            )?;
+            self.fp8_proj_dispatch(
+                kernel_gemv,
+                k_region.device_ptr(),
+                fl.k_proj.offset_bytes,
+                k_bs,
+                normed_region.device_ptr(),
+                m,
+                k_n,
+                hidden,
+                stream_raw,
+            )?;
+            self.fp8_proj_dispatch(
+                kernel_gemv,
+                v_region.device_ptr(),
+                fl.v_proj.offset_bytes,
+                v_bs,
+                normed_region.device_ptr(),
+                m,
+                v_n,
+                hidden,
+                stream_raw,
+            )?;
         }
         // No fence: split_q_gate runs on the same stream.
 
@@ -6532,10 +7215,12 @@ impl Qwen36Bringup {
         //    round-trip per token with one launch.
         let q_size = (num_heads * head_dim) as usize; // 4096
         let _hd = head_dim as usize;
-        let q_split_region =
-            self.arena.region("qwen36_pf_qs", q_size * (m as usize) * 2, 16)?;
-        let gate_region =
-            self.arena.region("qwen36_pf_gt", q_size * (m as usize) * 2, 16)?;
+        let q_split_region = self
+            .arena
+            .region("qwen36_pf_qs", q_size * (m as usize) * 2, 16)?;
+        let gate_region = self
+            .arena
+            .region("qwen36_pf_gt", q_size * (m as usize) * 2, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -6553,9 +7238,14 @@ impl Qwen36Bringup {
             ];
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_split_q_gate_f16.raw() as CUfunction,
-                num_heads, m, 1,
-                head_dim, 1, 1,
-                0, self.stream.raw() as CUstream,
+                num_heads,
+                m,
+                1,
+                head_dim,
+                1,
+                1,
+                0,
+                self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
@@ -6572,16 +7262,22 @@ impl Qwen36Bringup {
         //    treating heads as "tokens").
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: num_heads, hidden: head_dim, eps,
-            }.launch(
+                num_tokens: num_heads,
+                hidden: head_dim,
+                eps,
+            }
+            .launch(
                 self.outside_kernels.fn_rmsnorm_inplace_f16,
                 q_split_region.device_ptr(),
                 fl.q_norm.offset_bytes,
                 stream_raw,
             )?;
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: num_kv_heads, hidden: head_dim, eps,
-            }.launch(
+                num_tokens: num_kv_heads,
+                hidden: head_dim,
+                eps,
+            }
+            .launch(
                 self.outside_kernels.fn_rmsnorm_inplace_f16,
                 k_region.device_ptr(),
                 fl.k_norm.offset_bytes,
@@ -6611,8 +7307,11 @@ impl Qwen36Bringup {
         let scale_layer_ptr = self.kv_cache_scale_layer_ptr(full_seq_idx);
         let scale_half = (self.kv_cache_scale_layer_bytes / 2) as u64;
         let k_scale_layer_ptr = scale_layer_ptr;
-        let v_scale_layer_ptr = if scale_layer_ptr == 0 { 0 }
-            else { scale_layer_ptr + scale_half };
+        let v_scale_layer_ptr = if scale_layer_ptr == 0 {
+            0
+        } else {
+            scale_layer_ptr + scale_half
+        };
         // NVFP4 commit 3: per-call FP8 Q + dynamic Q scale scratch.
         // Only allocated on the Nvfp4 path. Decode is num_tokens=1,
         // so q_fp8 is [num_heads * head_dim] u8 and q_scale_cache
@@ -6620,12 +7319,12 @@ impl Qwen36Bringup {
         let (q_fp8_ptr, q_scale_cache_ptr) = match self.kv_dtype {
             Qwen36KvDtype::F16 => (0u64, 0u64),
             Qwen36KvDtype::Nvfp4 => {
-                let r_fp8 = self.arena.region(
-                    "qwen36_pf_q_fp8",
-                    (num_heads * head_dim) as usize, 16)?;
-                let r_sc = self.arena.region(
-                    "qwen36_pf_q_scale_cache",
-                    (num_heads as usize) * 4, 16)?;
+                let r_fp8 =
+                    self.arena
+                        .region("qwen36_pf_q_fp8", (num_heads * head_dim) as usize, 16)?;
+                let r_sc =
+                    self.arena
+                        .region("qwen36_pf_q_scale_cache", (num_heads as usize) * 4, 16)?;
                 (r_fp8.device_ptr(), r_sc.device_ptr())
             }
         };
@@ -6639,87 +7338,18 @@ impl Qwen36Bringup {
         // shared with the Qwen 3.5 27B NVFP4 wiring.
         #[cfg(feature = "cuda")]
         match self.kv_dtype {
-        Qwen36KvDtype::F16 =>
-        unsafe {
-            use cudarc::driver::sys::*;
-            let mut q_in_p = q_split_region.device_ptr();
-            let mut k_in_p = k_region.device_ptr();
-            let mut v_in_p = v_region.device_ptr();
-            let mut q_out_p = q_split_region.device_ptr(); // in-place ok
-            let mut kc = k_cache_layer_ptr;
-            let mut vc = v_cache_layer_ptr;
-            let mut cos_p = self.rope_cos;
-            let mut sin_p = self.rope_sin;
-            let mut pos_p = pos_dev_ptr;
-            let mut slot_p = slot_dev_ptr;
-            let mut nt: i32 = m as i32;
-            let mut nh: i32 = num_heads as i32;
-            let mut nkh: i32 = num_kv_heads as i32;
-            let mut hd_i: i32 = head_dim as i32;
-            let mut rd: i32 = rotary_dim as i32;
-            let args = [
-                (&mut q_in_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut k_in_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut v_in_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut q_out_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut kc) as *mut u64 as *mut core::ffi::c_void,
-                (&mut vc) as *mut u64 as *mut core::ffi::c_void,
-                (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
-                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
-                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
-                (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
-                (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
-                (&mut rd) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let max_h = num_heads.max(num_kv_heads);
-            let block_x: u32 = (head_dim / 2) as u32;
-            let rc = cuLaunchKernel(
-                self.outside_kernels.fn_fused_rope_qwen_partial_f16kv.raw() as CUfunction,
-                m as u32, max_h, 1,
-                block_x, 1, 1,
-                0, self.stream.raw() as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 full_attn fused_rope_qwen launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
-        },
-        Qwen36KvDtype::Nvfp4 => {
-            // The NVFP4 RoPE kernel is loaded under the same env
-            // gate (`RVLLM_NVFP4_KV=1`) that drives `kv_dtype ==
-            // Nvfp4`. If this branch fires the kernel must be
-            // present; `.expect` documents that invariant.
-            let fn_rope = self.outside_kernels
-                .fn_fused_rope_qwen_partial_nvfp4kv
-                .expect("qwen36 NVFP4 RoPE kernel not loaded — \
-                         RVLLM_NVFP4_KV env gate inconsistency");
-            unsafe {
+            Qwen36KvDtype::F16 => unsafe {
                 use cudarc::driver::sys::*;
                 let mut q_in_p = q_split_region.device_ptr();
                 let mut k_in_p = k_region.device_ptr();
                 let mut v_in_p = v_region.device_ptr();
-                let mut q_fp8_out = q_fp8_ptr;
-                let mut key_packed = k_cache_layer_ptr;
-                let mut value_packed = v_cache_layer_ptr;
-                let mut key_scale = k_scale_layer_ptr;
-                let mut value_scale = v_scale_layer_ptr;
+                let mut q_out_p = q_split_region.device_ptr(); // in-place ok
+                let mut kc = k_cache_layer_ptr;
+                let mut vc = v_cache_layer_ptr;
                 let mut cos_p = self.rope_cos;
                 let mut sin_p = self.rope_sin;
                 let mut pos_p = pos_dev_ptr;
                 let mut slot_p = slot_dev_ptr;
-                // Static-scalar Q descale fallback: never read on
-                // the dynamic path (q_scale_cache != nullptr) but
-                // must be a valid device pointer; reuse the cache.
-                let mut q_scale_static = q_scale_cache_ptr;
-                let mut q_scale_dyn = q_scale_cache_ptr;
                 let mut nt: i32 = m as i32;
                 let mut nh: i32 = num_heads as i32;
                 let mut nkh: i32 = num_kv_heads as i32;
@@ -6729,43 +7359,124 @@ impl Qwen36Bringup {
                     (&mut q_in_p) as *mut u64 as *mut core::ffi::c_void,
                     (&mut k_in_p) as *mut u64 as *mut core::ffi::c_void,
                     (&mut v_in_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut q_fp8_out) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut key_packed) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut value_packed) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut key_scale) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut value_scale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_out_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut kc) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut vc) as *mut u64 as *mut core::ffi::c_void,
                     (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
                     (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
                     (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
                     (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut q_scale_static) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut q_scale_dyn) as *mut u64 as *mut core::ffi::c_void,
                     (&mut nt) as *mut i32 as *mut core::ffi::c_void,
                     (&mut nh) as *mut i32 as *mut core::ffi::c_void,
                     (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
                     (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
                     (&mut rd) as *mut i32 as *mut core::ffi::c_void,
                 ];
-                // Grid (num_tokens, max(num_heads, num_kv_heads)),
-                // block (head_dim) — one thread per element.
-                let grid_y = num_heads.max(num_kv_heads);
+                let max_h = num_heads.max(num_kv_heads);
+                let block_x: u32 = (head_dim / 2) as u32;
                 let rc = cuLaunchKernel(
-                    fn_rope.raw() as CUfunction,
-                    m as u32, grid_y, 1,
-                    head_dim, 1, 1,
-                    0, self.stream.raw() as CUstream,
+                    self.outside_kernels.fn_fused_rope_qwen_partial_f16kv.raw() as CUfunction,
+                    m as u32,
+                    max_h,
+                    1,
+                    block_x,
+                    1,
+                    1,
+                    0,
+                    self.stream.raw() as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
                 if rc != CUresult::CUDA_SUCCESS {
                     return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 full_attn fused_rope_qwen_nvfp4 launch",
+                        "qwen36 full_attn fused_rope_qwen launch",
                         rvllm_core::CudaErrorKind::LaunchFailed,
                         rvllm_core::CudaCtx::setup(),
                     ));
                 }
+            },
+            Qwen36KvDtype::Nvfp4 => {
+                // The NVFP4 RoPE kernel is loaded under the same env
+                // gate (`RVLLM_NVFP4_KV=1`) that drives `kv_dtype ==
+                // Nvfp4`. If this branch fires the kernel must be
+                // present; `.expect` documents that invariant.
+                let fn_rope = self
+                    .outside_kernels
+                    .fn_fused_rope_qwen_partial_nvfp4kv
+                    .expect(
+                        "qwen36 NVFP4 RoPE kernel not loaded — \
+                         RVLLM_NVFP4_KV env gate inconsistency",
+                    );
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let mut q_in_p = q_split_region.device_ptr();
+                    let mut k_in_p = k_region.device_ptr();
+                    let mut v_in_p = v_region.device_ptr();
+                    let mut q_fp8_out = q_fp8_ptr;
+                    let mut key_packed = k_cache_layer_ptr;
+                    let mut value_packed = v_cache_layer_ptr;
+                    let mut key_scale = k_scale_layer_ptr;
+                    let mut value_scale = v_scale_layer_ptr;
+                    let mut cos_p = self.rope_cos;
+                    let mut sin_p = self.rope_sin;
+                    let mut pos_p = pos_dev_ptr;
+                    let mut slot_p = slot_dev_ptr;
+                    // Static-scalar Q descale fallback: never read on
+                    // the dynamic path (q_scale_cache != nullptr) but
+                    // must be a valid device pointer; reuse the cache.
+                    let mut q_scale_static = q_scale_cache_ptr;
+                    let mut q_scale_dyn = q_scale_cache_ptr;
+                    let mut nt: i32 = m as i32;
+                    let mut nh: i32 = num_heads as i32;
+                    let mut nkh: i32 = num_kv_heads as i32;
+                    let mut hd_i: i32 = head_dim as i32;
+                    let mut rd: i32 = rotary_dim as i32;
+                    let args = [
+                        (&mut q_in_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut k_in_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut v_in_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut q_fp8_out) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut key_packed) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut value_packed) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut key_scale) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut value_scale) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut q_scale_static) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut q_scale_dyn) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    // Grid (num_tokens, max(num_heads, num_kv_heads)),
+                    // block (head_dim) — one thread per element.
+                    let grid_y = num_heads.max(num_kv_heads);
+                    let rc = cuLaunchKernel(
+                        fn_rope.raw() as CUfunction,
+                        m as u32,
+                        grid_y,
+                        1,
+                        head_dim,
+                        1,
+                        1,
+                        0,
+                        self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 full_attn fused_rope_qwen_nvfp4 launch",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
             }
-        }
         }
         // No fence: paged FA2 decode runs on the same stream after
         // the fused_rope kernel writes Q (in-place into q_split_region)
@@ -6783,8 +7494,7 @@ impl Qwen36Bringup {
         // Phase 4b-prep iter25/26: identity block table is uploaded
         // once at bring-up; `context_len` was packed with `position`
         // into pos_region above (one combined HtoD per layer).
-        let attn_out_region =
-            self.arena.region("qwen36_pf_attn_out", q_size * 2, 16)?;
+        let attn_out_region = self.arena.region("qwen36_pf_attn_out", q_size * 2, 16)?;
         let scale = 1.0 / (head_dim as f32).sqrt();
         // NVFP4 commit 3: decode-attention dispatch.
         //   * F16:   existing flash_attention_2_decode_f16io (smem
@@ -6794,98 +7504,25 @@ impl Qwen36Bringup {
         //            K/V tile footprint vs F16 → 32 KiB at hd=256).
         #[cfg(feature = "cuda")]
         match self.kv_dtype {
-        Qwen36KvDtype::F16 =>
-        unsafe {
-            use cudarc::driver::sys::*;
-            const FA2_THREADS: i32 = 128;
-            const FA2_BC: i32 = 32;
-            let hd_i = head_dim as i32;
-            let smem_bytes = 2 * FA2_BC * hd_i * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
-            if smem_bytes as u32 >= 48 * 1024 {
-                let _ = cuFuncSetAttribute(
-                    self.outside_kernels.fn_flash_attention_2_decode_f16io.raw() as CUfunction,
-                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    smem_bytes,
-                );
-            }
-            let mut output = attn_out_region.device_ptr();
-            let mut query = q_split_region.device_ptr();
-            let mut key_cache = k_cache_layer_ptr;
-            let mut value_cache = v_cache_layer_ptr;
-            let mut block_tables = self.bt_persistent_ptr;
-            let mut context_lens = cl_dev_ptr;
-            let mut scale_arg = scale;
-            let mut nh = num_heads as i32;
-            let mut nkvh = num_kv_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut bs = self.kv_cache_block_size as i32;
-            let mut mbps = self.kv_cache_num_blocks as i32;
-            let mut window: i32 = -1;
-            let args = [
-                (&mut output) as *mut u64 as *mut core::ffi::c_void,
-                (&mut query) as *mut u64 as *mut core::ffi::c_void,
-                (&mut key_cache) as *mut u64 as *mut core::ffi::c_void,
-                (&mut value_cache) as *mut u64 as *mut core::ffi::c_void,
-                (&mut block_tables) as *mut u64 as *mut core::ffi::c_void,
-                (&mut context_lens) as *mut u64 as *mut core::ffi::c_void,
-                (&mut scale_arg) as *mut f32 as *mut core::ffi::c_void,
-                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
-                (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
-                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
-                (&mut bs) as *mut i32 as *mut core::ffi::c_void,
-                (&mut mbps) as *mut i32 as *mut core::ffi::c_void,
-                (&mut window) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let rc = cuLaunchKernel(
-                self.outside_kernels.fn_flash_attention_2_decode_f16io.raw() as CUfunction,
-                1, num_heads, 1,
-                FA2_THREADS as u32, 1, 1,
-                smem_bytes as u32,
-                self.stream.raw() as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 flash_attention_2_decode_f16io launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
-        },
-        Qwen36KvDtype::Nvfp4 => {
-            let fn_dec = self.outside_kernels
-                .fn_flash_attention_2_decode_nvfp4kv
-                .expect("qwen36 NVFP4 decode kernel not loaded — \
-                         RVLLM_NVFP4_KV env gate inconsistency");
-            unsafe {
+            Qwen36KvDtype::F16 => unsafe {
                 use cudarc::driver::sys::*;
                 const FA2_THREADS: i32 = 128;
                 const FA2_BC: i32 = 32;
                 let hd_i = head_dim as i32;
-                // f16 smem dequant (2 bytes/elem) vs F16's f32 (4).
-                let smem_bytes = 2 * FA2_BC * hd_i * 2
-                    + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+                let smem_bytes = 2 * FA2_BC * hd_i * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
                 if smem_bytes as u32 >= 48 * 1024 {
                     let _ = cuFuncSetAttribute(
-                        fn_dec.raw() as CUfunction,
+                        self.outside_kernels.fn_flash_attention_2_decode_f16io.raw() as CUfunction,
                         CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                         smem_bytes,
                     );
                 }
                 let mut output = attn_out_region.device_ptr();
-                let mut query = q_fp8_ptr;
-                let mut key_packed = k_cache_layer_ptr;
-                let mut value_packed = v_cache_layer_ptr;
-                let mut key_scale = k_scale_layer_ptr;
-                let mut value_scale = v_scale_layer_ptr;
-                let mut q_scale_dyn = q_scale_cache_ptr;
+                let mut query = q_split_region.device_ptr();
+                let mut key_cache = k_cache_layer_ptr;
+                let mut value_cache = v_cache_layer_ptr;
                 let mut block_tables = self.bt_persistent_ptr;
                 let mut context_lens = cl_dev_ptr;
-                // Static-scalar Q descale fallback ptr; same
-                // never-dereferenced-on-dynamic-path reasoning as
-                // the RoPE kernel above.
-                let mut q_descale = q_scale_cache_ptr;
                 let mut scale_arg = scale;
                 let mut nh = num_heads as i32;
                 let mut nkvh = num_kv_heads as i32;
@@ -6896,14 +7533,10 @@ impl Qwen36Bringup {
                 let args = [
                     (&mut output) as *mut u64 as *mut core::ffi::c_void,
                     (&mut query) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut key_packed) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut value_packed) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut key_scale) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut value_scale) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut q_scale_dyn) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut key_cache) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut value_cache) as *mut u64 as *mut core::ffi::c_void,
                     (&mut block_tables) as *mut u64 as *mut core::ffi::c_void,
                     (&mut context_lens) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut q_descale) as *mut u64 as *mut core::ffi::c_void,
                     (&mut scale_arg) as *mut f32 as *mut core::ffi::c_void,
                     (&mut nh) as *mut i32 as *mut core::ffi::c_void,
                     (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
@@ -6913,9 +7546,13 @@ impl Qwen36Bringup {
                     (&mut window) as *mut i32 as *mut core::ffi::c_void,
                 ];
                 let rc = cuLaunchKernel(
-                    fn_dec.raw() as CUfunction,
-                    1, num_heads, 1,
-                    FA2_THREADS as u32, 1, 1,
+                    self.outside_kernels.fn_flash_attention_2_decode_f16io.raw() as CUfunction,
+                    1,
+                    num_heads,
+                    1,
+                    FA2_THREADS as u32,
+                    1,
+                    1,
                     smem_bytes as u32,
                     self.stream.raw() as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -6923,19 +7560,100 @@ impl Qwen36Bringup {
                 );
                 if rc != CUresult::CUDA_SUCCESS {
                     return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 flash_attention_2_decode_nvfp4kv launch",
+                        "qwen36 flash_attention_2_decode_f16io launch",
                         rvllm_core::CudaErrorKind::LaunchFailed,
                         rvllm_core::CudaCtx::setup(),
                     ));
                 }
+            },
+            Qwen36KvDtype::Nvfp4 => {
+                let fn_dec = self
+                    .outside_kernels
+                    .fn_flash_attention_2_decode_nvfp4kv
+                    .expect(
+                        "qwen36 NVFP4 decode kernel not loaded — \
+                         RVLLM_NVFP4_KV env gate inconsistency",
+                    );
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    const FA2_THREADS: i32 = 128;
+                    const FA2_BC: i32 = 32;
+                    let hd_i = head_dim as i32;
+                    // f16 smem dequant (2 bytes/elem) vs F16's f32 (4).
+                    let smem_bytes = 2 * FA2_BC * hd_i * 2 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+                    if smem_bytes as u32 >= 48 * 1024 {
+                        let _ = cuFuncSetAttribute(
+                            fn_dec.raw() as CUfunction,
+                            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            smem_bytes,
+                        );
+                    }
+                    let mut output = attn_out_region.device_ptr();
+                    let mut query = q_fp8_ptr;
+                    let mut key_packed = k_cache_layer_ptr;
+                    let mut value_packed = v_cache_layer_ptr;
+                    let mut key_scale = k_scale_layer_ptr;
+                    let mut value_scale = v_scale_layer_ptr;
+                    let mut q_scale_dyn = q_scale_cache_ptr;
+                    let mut block_tables = self.bt_persistent_ptr;
+                    let mut context_lens = cl_dev_ptr;
+                    // Static-scalar Q descale fallback ptr; same
+                    // never-dereferenced-on-dynamic-path reasoning as
+                    // the RoPE kernel above.
+                    let mut q_descale = q_scale_cache_ptr;
+                    let mut scale_arg = scale;
+                    let mut nh = num_heads as i32;
+                    let mut nkvh = num_kv_heads as i32;
+                    let mut hd = head_dim as i32;
+                    let mut bs = self.kv_cache_block_size as i32;
+                    let mut mbps = self.kv_cache_num_blocks as i32;
+                    let mut window: i32 = -1;
+                    let args = [
+                        (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut query) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut key_packed) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut value_packed) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut key_scale) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut value_scale) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut q_scale_dyn) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut block_tables) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut context_lens) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut q_descale) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut scale_arg) as *mut f32 as *mut core::ffi::c_void,
+                        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut bs) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut mbps) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut window) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let rc = cuLaunchKernel(
+                        fn_dec.raw() as CUfunction,
+                        1,
+                        num_heads,
+                        1,
+                        FA2_THREADS as u32,
+                        1,
+                        1,
+                        smem_bytes as u32,
+                        self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 flash_attention_2_decode_nvfp4kv launch",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
             }
-        }
         }
         // No fence: attn_output_gate kernel runs on the same stream.
 
         // 7. attn_output_gate: attn_out * sigmoid(gate).
-        let gated_region =
-            self.arena.region("qwen36_pf_gated", q_size * 2, 16)?;
+        let gated_region = self.arena.region("qwen36_pf_gated", q_size * 2, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -6953,30 +7671,41 @@ impl Qwen36Bringup {
             let grid = (q_size as u32 + block - 1) / block;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_sigmoid_mul_f16.raw() as CUfunction,
-                grid, 1, 1,
-                block, 1, 1,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
                 0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
-        if rc != CUresult::CUDA_SUCCESS {
-            return Err(rvllm_core::RvllmError::cuda(
-                "qwen36 sigmoid_mul_f16 launch",
-                rvllm_core::CudaErrorKind::LaunchFailed,
-                rvllm_core::CudaCtx::setup(),
-            ));
-        }
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 sigmoid_mul_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
         }
         // No fence: o_proj runs on the same stream after sigmoid_mul.
 
         // 8. o_proj FP8 GEMV → out_buf [hidden]. (Phase 4a routing.)
-        let out_region =
-            self.arena.region("qwen36_pf_out", (o_n as usize) * 2, 16)?;
+        let out_region = self.arena.region("qwen36_pf_out", (o_n as usize) * 2, 16)?;
         unsafe {
-            self.fp8_proj_dispatch(kernel_gemv, out_region.device_ptr(),
-                fl.o_proj.offset_bytes, o_bs, gated_region.device_ptr(),
-                m, o_n, o_k, stream_raw)?;
+            self.fp8_proj_dispatch(
+                kernel_gemv,
+                out_region.device_ptr(),
+                fl.o_proj.offset_bytes,
+                o_bs,
+                gated_region.device_ptr(),
+                m,
+                o_n,
+                o_k,
+                stream_raw,
+            )?;
         }
         // No fence: residual vector_add runs on the same stream
         // after o_proj.
@@ -7003,7 +7732,13 @@ impl Qwen36Bringup {
             let grid = ((n_elem as u32 + block - 1) / block).max(1);
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_vector_add_f16.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1, 0,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
                 self.stream.raw() as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -7040,9 +7775,15 @@ impl Qwen36Bringup {
         _layer_idx: usize,
     ) -> Result<()> {
         self.apply_layer_moe_with_override(
-            moe, post_attn_norm_ptr, last_hidden_ptr,
-            kernel_gemv, hidden, last_hidden_bytes, _layer_idx,
-            None, None,
+            moe,
+            post_attn_norm_ptr,
+            last_hidden_ptr,
+            kernel_gemv,
+            hidden,
+            last_hidden_bytes,
+            _layer_idx,
+            None,
+            None,
         )
     }
 
@@ -7078,8 +7819,13 @@ impl Qwen36Bringup {
         }
         if num_tokens == 1 {
             return self.apply_layer_moe(
-                moe, post_attn_norm_ptr, hidden_ptr,
-                kernel_gemv, hidden, last_hidden_bytes, layer_idx,
+                moe,
+                post_attn_norm_ptr,
+                hidden_ptr,
+                kernel_gemv,
+                hidden,
+                last_hidden_bytes,
+                layer_idx,
             );
         }
         let n = num_tokens as usize;
@@ -7090,13 +7836,14 @@ impl Qwen36Bringup {
 
         // 1. Batched RMSNorm on a [N, hidden] copy.
         let normed_bytes = n * h * 2;
-        let normed_region =
-            self.arena.region("qwen36_pmb_normed", normed_bytes, 16)?;
+        let normed_region = self.arena.region("qwen36_pmb_normed", normed_bytes, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let r = cuMemcpyDtoDAsync_v2(
-                normed_region.device_ptr(), hidden_ptr, normed_bytes,
+                normed_region.device_ptr(),
+                hidden_ptr,
+                normed_bytes,
                 self.stream.raw() as _,
             );
             if r != CUresult::CUDA_SUCCESS {
@@ -7110,8 +7857,11 @@ impl Qwen36Bringup {
         let eps = self.arch.base.rms_norm_eps;
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens, hidden, eps,
-            }.launch(
+                num_tokens,
+                hidden,
+                eps,
+            }
+            .launch(
                 self.outside_kernels.fn_rmsnorm_inplace_f16,
                 normed_region.device_ptr(),
                 post_attn_norm_ptr,
@@ -7121,8 +7871,7 @@ impl Qwen36Bringup {
 
         // 2. Batched router GEMV → logits [N, num_experts] f32.
         let logits_bytes = n * num_experts * 4;
-        let logits_region =
-            self.arena.region("qwen36_pmb_logits", logits_bytes, 16)?;
+        let logits_region = self.arena.region("qwen36_pmb_logits", logits_bytes, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -7145,7 +7894,13 @@ impl Qwen36Bringup {
             let grid_y: u32 = num_tokens;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_router_gemv_batched_f16_to_f32.raw() as CUfunction,
-                grid_x, grid_y, 1, block, 1, 1, 0,
+                grid_x,
+                grid_y,
+                1,
+                block,
+                1,
+                1,
+                0,
                 stream_raw as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -7160,10 +7915,10 @@ impl Qwen36Bringup {
         }
 
         // 3. Batched topk+softmax → top_idx [N, K] i32, top_w [N, K] f32.
-        let topk_idx_region =
-            self.arena.region("qwen36_pmb_topk_idx", n * top_k * 4, 16)?;
-        let topk_w_region =
-            self.arena.region("qwen36_pmb_topk_w", n * top_k * 4, 16)?;
+        let topk_idx_region = self
+            .arena
+            .region("qwen36_pmb_topk_idx", n * top_k * 4, 16)?;
+        let topk_w_region = self.arena.region("qwen36_pmb_topk_w", n * top_k * 4, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -7185,7 +7940,13 @@ impl Qwen36Bringup {
             let grid: u32 = num_tokens;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_topk_softmax_batched_f32.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1, 0,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
                 stream_raw as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -7205,9 +7966,8 @@ impl Qwen36Bringup {
         // batched plan: 8 k-rounds × 3 batched kernels = 24 launches
         // per layer, retains the per-token k=0..7 add order.
         // Round-27d: default-ON post-audit.
-        let routed_ffn_batched = std::env::var(
-            "RVLLM_QWEN36_BATCH_MOE_ROUTED_FFN")
-            .map(|s| !matches!(s.as_str(), "0"|"false"|"FALSE"|"no"))
+        let routed_ffn_batched = std::env::var("RVLLM_QWEN36_BATCH_MOE_ROUTED_FFN")
+            .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE" | "no"))
             .unwrap_or(true);
         let topk_idx_base = topk_idx_region.device_ptr();
         let topk_w_base = topk_w_region.device_ptr();
@@ -7218,22 +7978,26 @@ impl Qwen36Bringup {
         let n_down = moe.experts_down_proj_fused.shape[1] as u32;
         let k_down = moe.experts_down_proj_fused.shape[2] as u32;
         let int_per_expert_w = (n_int as u64) * (k_in as u64);
-        let int_per_expert_bs =
-            ((n_int as u64) / 128) * ((k_in as u64) / 128) * 4;
+        let int_per_expert_bs = ((n_int as u64) / 128) * ((k_in as u64) / 128) * 4;
         let down_per_expert_w = (n_down as u64) * (k_down as u64);
-        let down_per_expert_bs =
-            ((n_down as u64) / 128) * ((k_down as u64) / 128) * 4;
+        let down_per_expert_bs = ((n_down as u64) / 128) * ((k_down as u64) / 128) * 4;
         let n_int_us = n_int as usize;
         let n_down_us = n_down as usize;
         let h_us = hidden as usize;
         let mut rs_batched_ptr_opt: Option<u64> = None;
         if routed_ffn_batched {
             let gate_bs = match moe.experts_gate_proj_fused.blockscale_ptr {
-                Some(p) => p, None => return Ok(()) };
+                Some(p) => p,
+                None => return Ok(()),
+            };
             let up_bs = match moe.experts_up_proj_fused.blockscale_ptr {
-                Some(p) => p, None => return Ok(()) };
+                Some(p) => p,
+                None => return Ok(()),
+            };
             let down_bs = match moe.experts_down_proj_fused.blockscale_ptr {
-                Some(p) => p, None => return Ok(()) };
+                Some(p) => p,
+                None => return Ok(()),
+            };
             let silu_b_bytes = n * n_int_us * 2;
             let down_b_bytes = n * n_down_us * 2;
             let rs_b_bytes = n * h_us * 4;
@@ -7244,7 +8008,9 @@ impl Qwen36Bringup {
             unsafe {
                 use cudarc::driver::sys::*;
                 let rc = cuMemsetD8Async(
-                    rs_b.device_ptr(), 0, rs_b_bytes,
+                    rs_b.device_ptr(),
+                    0,
+                    rs_b_bytes,
                     self.stream.raw() as CUstream,
                 );
                 if rc != CUresult::CUDA_SUCCESS {
@@ -7300,7 +8066,13 @@ impl Qwen36Bringup {
                         self.outside_kernels
                             .fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk
                             .raw() as CUfunction,
-                        grid_x, num_tokens, 1, block, 1, 1, 0,
+                        grid_x,
+                        num_tokens,
+                        1,
+                        block,
+                        1,
+                        1,
+                        0,
                         self.stream.raw() as CUstream,
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
@@ -7351,7 +8123,13 @@ impl Qwen36Bringup {
                         self.outside_kernels
                             .fn_fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk
                             .raw() as CUfunction,
-                        grid_x, num_tokens, 1, block, 1, 1, 0,
+                        grid_x,
+                        num_tokens,
+                        1,
+                        block,
+                        1,
+                        1,
+                        0,
                         self.stream.raw() as CUstream,
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
@@ -7378,11 +8156,11 @@ impl Qwen36Bringup {
                     let args = [
                         (&mut acc) as *mut u64 as *mut core::ffi::c_void,
                         (&mut inp) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut wp)  as *mut u64 as *mut core::ffi::c_void,
-                        (&mut hd)  as *mut i32 as *mut core::ffi::c_void,
-                        (&mut tk)  as *mut i32 as *mut core::ffi::c_void,
-                        (&mut kr)  as *mut i32 as *mut core::ffi::c_void,
-                        (&mut nt)  as *mut i32 as *mut core::ffi::c_void,
+                        (&mut wp) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut tk) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut kr) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
                     ];
                     let block: u32 = 256;
                     let grid_x: u32 = ((hidden + block - 1) / block).max(1);
@@ -7390,7 +8168,13 @@ impl Qwen36Bringup {
                         self.outside_kernels
                             .fn_scaled_add_f16_to_f32_devw_batched_topk
                             .raw() as CUfunction,
-                        grid_x, num_tokens, 1, block, 1, 1, 0,
+                        grid_x,
+                        num_tokens,
+                        1,
+                        block,
+                        1,
+                        1,
+                        0,
                         self.stream.raw() as CUstream,
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
@@ -7424,21 +8208,31 @@ impl Qwen36Bringup {
         // Round-27d: default-ON post-audit.
         let shared_batched = routed_ffn_batched
             && std::env::var("RVLLM_QWEN36_BATCH_MOE_SHARED")
-                .map(|s| !matches!(s.as_str(), "0"|"false"|"FALSE"|"no"))
+                .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE" | "no"))
                 .unwrap_or(true);
         if shared_batched {
             let sh_gate_bs = match moe.shared_expert_gate_proj.blockscale_ptr {
-                Some(p) => p, None => return Ok(()) };
+                Some(p) => p,
+                None => return Ok(()),
+            };
             let sh_up_bs = match moe.shared_expert_up_proj.blockscale_ptr {
-                Some(p) => p, None => return Ok(()) };
+                Some(p) => p,
+                None => return Ok(()),
+            };
             let sh_down_bs = match moe.shared_expert_down_proj.blockscale_ptr {
-                Some(p) => p, None => return Ok(()) };
-            let kernel_gemv_unwrap = self.outside_kernels.fn_fp8_gemv_wpr_native_f16in
-                .ok_or_else(|| rvllm_core::RvllmError::cuda(
-                    "qwen36 moe shared batched: fn_fp8_gemv_wpr_native_f16in missing",
-                    rvllm_core::CudaErrorKind::Other,
-                    rvllm_core::CudaCtx::setup(),
-                ))?;
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            let kernel_gemv_unwrap = self
+                .outside_kernels
+                .fn_fp8_gemv_wpr_native_f16in
+                .ok_or_else(|| {
+                    rvllm_core::RvllmError::cuda(
+                        "qwen36 moe shared batched: fn_fp8_gemv_wpr_native_f16in missing",
+                        rvllm_core::CudaErrorKind::Other,
+                        rvllm_core::CudaCtx::setup(),
+                    )
+                })?;
             let _ = kernel_gemv;
 
             let silu_sh_bytes = n * n_int_us * 2;
@@ -7477,7 +8271,13 @@ impl Qwen36Bringup {
                 let block: u32 = 256;
                 let rc = cuLaunchKernel(
                     self.outside_kernels.fn_fp8_gemv_dual_silu.raw() as CUfunction,
-                    grid_x, num_tokens, 1, block, 1, 1, 0,
+                    grid_x,
+                    num_tokens,
+                    1,
+                    block,
+                    1,
+                    1,
+                    0,
                     self.stream.raw() as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
@@ -7496,8 +8296,11 @@ impl Qwen36Bringup {
             // m≥2 GEMM path; codex round-27 explicit).
             unsafe {
                 rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                    m: num_tokens, n: n_down, k: k_down,
-                }.launch(
+                    m: num_tokens,
+                    n: n_down,
+                    k: k_down,
+                }
+                .launch(
                     kernel_gemv_unwrap,
                     down_sh.device_ptr(),
                     moe.shared_expert_down_proj.offset_bytes,
@@ -7526,8 +8329,16 @@ impl Qwen36Bringup {
                 let block: u32 = 256;
                 let grid: u32 = num_tokens;
                 let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_shared_gate_dot_sigmoid_f16_batched.raw() as CUfunction,
-                    grid, 1, 1, block, 1, 1, 0,
+                    self.outside_kernels
+                        .fn_shared_gate_dot_sigmoid_f16_batched
+                        .raw() as CUfunction,
+                    grid,
+                    1,
+                    1,
+                    block,
+                    1,
+                    1,
+                    0,
                     self.stream.raw() as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
@@ -7554,15 +8365,23 @@ impl Qwen36Bringup {
                 let args = [
                     (&mut acc) as *mut u64 as *mut core::ffi::c_void,
                     (&mut inp) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut wp)  as *mut u64 as *mut core::ffi::c_void,
-                    (&mut hd)  as *mut i32 as *mut core::ffi::c_void,
-                    (&mut nt)  as *mut i32 as *mut core::ffi::c_void,
+                    (&mut wp) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nt) as *mut i32 as *mut core::ffi::c_void,
                 ];
                 let block: u32 = 256;
                 let grid_x: u32 = ((hidden + block - 1) / block).max(1);
                 let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_scaled_add_f16_to_f32_devw_batched.raw() as CUfunction,
-                    grid_x, num_tokens, 1, block, 1, 1, 0,
+                    self.outside_kernels
+                        .fn_scaled_add_f16_to_f32_devw_batched
+                        .raw() as CUfunction,
+                    grid_x,
+                    num_tokens,
+                    1,
+                    block,
+                    1,
+                    1,
+                    0,
                     self.stream.raw() as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
@@ -7588,13 +8407,19 @@ impl Qwen36Bringup {
                 let args = [
                     (&mut dst) as *mut u64 as *mut core::ffi::c_void,
                     (&mut src) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut nn)  as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
                 ];
                 let block: u32 = 1024.min(n_elem as u32).max(1);
                 let grid: u32 = ((n_elem as u32 + block - 1) / block).max(1);
                 let rc = cuLaunchKernel(
                     self.outside_kernels.fn_f16_plus_f32_inplace_f16.raw() as CUfunction,
-                    grid, 1, 1, block, 1, 1, 0,
+                    grid,
+                    1,
+                    1,
+                    block,
+                    1,
+                    1,
+                    0,
                     self.stream.raw() as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
@@ -7619,12 +8444,19 @@ impl Qwen36Bringup {
             let w_t = topk_w_base + (t as u64) * topk_stride_bytes;
             let rs_seed = rs_batched_ptr_opt.map(|p| p + (t as u64) * (h_us as u64) * 4);
             self.apply_layer_moe_with_override(
-                moe, post_attn_norm_ptr, tok_ptr,
-                kernel_gemv, hidden, last_hidden_bytes, layer_idx,
+                moe,
+                post_attn_norm_ptr,
+                tok_ptr,
+                kernel_gemv,
+                hidden,
+                last_hidden_bytes,
+                layer_idx,
                 Some((idx_t, w_t)),
                 rs_seed,
             )?;
-            unsafe { self.arena.restore(inner_ck); }
+            unsafe {
+                self.arena.restore(inner_ck);
+            }
         }
         Ok(())
     }
@@ -7659,8 +8491,9 @@ impl Qwen36Bringup {
         let m: u32 = 1;
 
         // 1. post_attention_layernorm on copy of last_hidden.
-        let normed_region =
-            self.arena.region("qwen36_pm_normed", last_hidden_bytes, 16)?;
+        let normed_region = self
+            .arena
+            .region("qwen36_pm_normed", last_hidden_bytes, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -7674,8 +8507,11 @@ impl Qwen36Bringup {
         let eps = self.arch.base.rms_norm_eps;
         unsafe {
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: 1, hidden, eps,
-            }.launch(
+                num_tokens: 1,
+                hidden,
+                eps,
+            }
+            .launch(
                 self.outside_kernels.fn_rmsnorm_inplace_f16,
                 normed_region.device_ptr(),
                 post_attn_norm_ptr,
@@ -7697,8 +8533,7 @@ impl Qwen36Bringup {
             (idx, w)
         } else {
             let logits_bytes = num_experts * 4;
-            let logits_region =
-                self.arena.region("qwen36_pm_logits", logits_bytes, 16)?;
+            let logits_region = self.arena.region("qwen36_pm_logits", logits_bytes, 16)?;
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
@@ -7718,7 +8553,13 @@ impl Qwen36Bringup {
                 let grid: u32 = num_experts as u32;
                 let rc = cuLaunchKernel(
                     self.outside_kernels.fn_router_gemv_f16_to_f32.raw() as CUfunction,
-                    grid, 1, 1, block, 1, 1, 0,
+                    grid,
+                    1,
+                    1,
+                    block,
+                    1,
+                    1,
+                    0,
                     stream_raw as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
@@ -7731,10 +8572,8 @@ impl Qwen36Bringup {
                     ));
                 }
             }
-            let topk_idx_region =
-                self.arena.region("qwen36_pm_topk_idx", top_k * 4, 16)?;
-            let topk_w_region =
-                self.arena.region("qwen36_pm_topk_w", top_k * 4, 16)?;
+            let topk_idx_region = self.arena.region("qwen36_pm_topk_idx", top_k * 4, 16)?;
+            let topk_w_region = self.arena.region("qwen36_pm_topk_w", top_k * 4, 16)?;
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
@@ -7753,7 +8592,13 @@ impl Qwen36Bringup {
                 let block: u32 = num_experts as u32;
                 let rc = cuLaunchKernel(
                     self.outside_kernels.fn_topk_softmax_f32.raw() as CUfunction,
-                    1, 1, 1, block, 1, 1, 0,
+                    1,
+                    1,
+                    1,
+                    block,
+                    1,
+                    1,
+                    0,
                     stream_raw as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
@@ -7777,22 +8622,28 @@ impl Qwen36Bringup {
         let silu_region = self.arena.region("qwen36_pm_s", mid_bytes, 16)?;
         let down_region = self.arena.region("qwen36_pm_d", down_bytes, 16)?;
         let int_per_expert_w = (n_int as u64) * (k_in as u64);
-        let int_per_expert_bs =
-            ((n_int as u64) / 128) * ((k_in as u64) / 128) * 4;
+        let int_per_expert_bs = ((n_int as u64) / 128) * ((k_in as u64) / 128) * 4;
         let down_per_expert_w = (n_down as u64) * (k_down as u64);
-        let down_per_expert_bs =
-            ((n_down as u64) / 128) * ((k_down as u64) / 128) * 4;
-        let gate_bs = match moe.experts_gate_proj_fused.blockscale_ptr { Some(p) => p, None => return Ok(()) };
-        let up_bs = match moe.experts_up_proj_fused.blockscale_ptr { Some(p) => p, None => return Ok(()) };
-        let down_bs = match moe.experts_down_proj_fused.blockscale_ptr { Some(p) => p, None => return Ok(()) };
+        let down_per_expert_bs = ((n_down as u64) / 128) * ((k_down as u64) / 128) * 4;
+        let gate_bs = match moe.experts_gate_proj_fused.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let up_bs = match moe.experts_up_proj_fused.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let down_bs = match moe.experts_down_proj_fused.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
         // Phase 4b-prep iter18: keep routed_sum on the GPU for the
         // entire expert loop. f32 accumulator, zeroed once on
         // stream_raw, then DtoH'd ONCE after the shared expert
         // finishes (with a self.stream.fence() before the DtoH —
         // that fence is the iter17-discovered invariant).
         let routed_sum_bytes = (n_down as usize) * 4;
-        let routed_sum_region =
-            self.arena.region("qwen36_pm_rs", routed_sum_bytes, 16)?;
+        let routed_sum_region = self.arena.region("qwen36_pm_rs", routed_sum_bytes, 16)?;
         // Phase 6b: when `rs_seed = Some(seed)`, the routed FFN was
         // already computed batched by the caller into `seed`. Copy
         // that into our local routed_sum_region (so downstream
@@ -7836,11 +8687,11 @@ impl Qwen36Bringup {
             }
         }
         let topk_idx_base = route_idx_ptr;
-        let topk_w_base   = route_w_ptr;
+        let topk_w_base = route_w_ptr;
         let skip_routed_ffn = rs_seed.is_some();
         for i in 0..(if skip_routed_ffn { 0 } else { top_k }) {
             let idx_ptr_i = topk_idx_base + (i as u64) * 4;
-            let w_ptr_i   = topk_w_base   + (i as u64) * 4;
+            let w_ptr_i = topk_w_base + (i as u64) * 4;
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
@@ -7876,20 +8727,24 @@ impl Qwen36Bringup {
                 let block = (256u32, 1u32, 1u32);
                 let rc = cuLaunchKernel(
                     self.outside_kernels.fn_fp8_gemv_dual_silu_indirect.raw() as CUfunction,
-                    grid.0, grid.1, grid.2,
-                    block.0, block.1, block.2,
+                    grid.0,
+                    grid.1,
+                    grid.2,
+                    block.0,
+                    block.1,
+                    block.2,
                     0,
                     stream_raw as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 fp8_gemv_dual_silu_indirect launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 fp8_gemv_dual_silu_indirect launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
             // Indirect down GEMV: reads expert idx from device.
             #[cfg(feature = "cuda")]
@@ -7923,20 +8778,24 @@ impl Qwen36Bringup {
                 let block = (256u32, 1u32, 1u32);
                 let rc = cuLaunchKernel(
                     self.outside_kernels.fn_fp8_gemv_indirect.raw() as CUfunction,
-                    grid.0, grid.1, grid.2,
-                    block.0, block.1, block.2,
+                    grid.0,
+                    grid.1,
+                    grid.2,
+                    block.0,
+                    block.1,
+                    block.2,
                     0,
                     stream_raw as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 fp8_gemv_indirect launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 fp8_gemv_indirect launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
             // scaled_add_devw: routed_sum_region += topk_w[i] * down_region.
             #[cfg(feature = "cuda")]
@@ -7956,20 +8815,24 @@ impl Qwen36Bringup {
                 let grid = (n_down as u32 + block - 1) / block;
                 let rc = cuLaunchKernel(
                     self.outside_kernels.fn_scaled_add_f16_to_f32_devw.raw() as CUfunction,
-                    grid, 1, 1,
-                    block, 1, 1,
+                    grid,
+                    1,
+                    1,
+                    block,
+                    1,
+                    1,
                     0,
                     stream_raw as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 scaled_add_f16_to_f32_devw launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 scaled_add_f16_to_f32_devw launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
         }
         // Optional debug L2 of routed-only sum.
@@ -7985,8 +8848,10 @@ impl Qwen36Bringup {
                     routed_sum_bytes,
                 );
             }
-            rs_host.iter().map(|x| x*x).sum::<f32>().sqrt()
-        } else { 0.0 };
+            rs_host.iter().map(|x| x * x).sum::<f32>().sqrt()
+        } else {
+            0.0
+        };
 
         // 4. Shared expert FFN scaled by sigmoid(shared_expert_gate_logit).
         let sh_gate_bs = moe.shared_expert_gate_proj.blockscale_ptr.unwrap_or(0);
@@ -8024,26 +8889,37 @@ impl Qwen36Bringup {
                 let block = (256u32, 1u32, 1u32);
                 let rc = cuLaunchKernel(
                     self.outside_kernels.fn_fp8_gemv_dual_silu.raw() as CUfunction,
-                    grid.0, grid.1, grid.2,
-                    block.0, block.1, block.2,
+                    grid.0,
+                    grid.1,
+                    grid.2,
+                    block.0,
+                    block.1,
+                    block.2,
                     0,
                     stream_raw as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 fp8_gemv_dual_silu launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 fp8_gemv_dual_silu launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
             unsafe {
-                self.fp8_proj_dispatch(kernel_gemv, down_region.device_ptr(),
-                    moe.shared_expert_down_proj.offset_bytes, sh_down_bs,
+                self.fp8_proj_dispatch(
+                    kernel_gemv,
+                    down_region.device_ptr(),
+                    moe.shared_expert_down_proj.offset_bytes,
+                    sh_down_bs,
                     silu_region.device_ptr(),
-                    m, n_down, k_down, stream_raw)?;
+                    m,
+                    n_down,
+                    k_down,
+                    stream_raw,
+                )?;
             }
             // shared_expert_gate is Linear(hidden→1) per vLLM
             // qwen3_next.py:127-133: gate_logit = weight · normed_hidden
@@ -8056,8 +8932,7 @@ impl Qwen36Bringup {
             // DtoH that an iter20 attempt regressed on. Both kernels
             // run on stream_raw, chained via the device scalar
             // `sg_sigmoid_region`; host never sees the value.
-            let sg_sigmoid_region =
-                self.arena.region("qwen36_pm_sg_sigmoid", 4, 16)?;
+            let sg_sigmoid_region = self.arena.region("qwen36_pm_sg_sigmoid", 4, 16)?;
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
@@ -8075,20 +8950,24 @@ impl Qwen36Bringup {
                 let grid: u32 = 1;
                 let rc = cuLaunchKernel(
                     self.outside_kernels.fn_shared_gate_dot_sigmoid_f16.raw() as CUfunction,
-                    grid, 1, 1,
-                    block, 1, 1,
+                    grid,
+                    1,
+                    1,
+                    block,
+                    1,
+                    1,
                     0,
                     stream_raw as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 shared_gate_dot_sigmoid_f16 launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 shared_gate_dot_sigmoid_f16 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
             // GPU scaled_add (devw variant): routed_sum_region +=
             // *sg_sigmoid_region * down_region. Reads the sigmoid
@@ -8111,20 +8990,24 @@ impl Qwen36Bringup {
                 let grid = (n_down as u32 + block - 1) / block;
                 let rc = cuLaunchKernel(
                     self.outside_kernels.fn_scaled_add_f16_to_f32_devw.raw() as CUfunction,
-                    grid, 1, 1,
-                    block, 1, 1,
+                    grid,
+                    1,
+                    1,
+                    block,
+                    1,
+                    1,
                     0,
                     stream_raw as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 scaled_add_f16_to_f32_devw launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 scaled_add_f16_to_f32_devw launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
         }
         // 5. Residual sum, GPU-side (Phase 4b-prep iter19):
@@ -8158,12 +9041,15 @@ impl Qwen36Bringup {
                     last_hidden_bytes,
                 );
             }
-            let total_l2: f32 = rs_host.iter().map(|x| x*x).sum::<f32>().sqrt();
-            let shared_l2 = (total_l2*total_l2 - routed_only_l2*routed_only_l2).max(0.0).sqrt();
+            let total_l2: f32 = rs_host.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let shared_l2 = (total_l2 * total_l2 - routed_only_l2 * routed_only_l2)
+                .max(0.0)
+                .sqrt();
             let mut normed_l2_sq = 0.0f32;
             for i in 0..hidden_us {
                 let v = f16_bits_to_f32(u16::from_le_bytes([
-                    normed_host[i * 2], normed_host[i * 2 + 1],
+                    normed_host[i * 2],
+                    normed_host[i * 2 + 1],
                 ]));
                 normed_l2_sq += v * v;
             }
@@ -8186,8 +9072,12 @@ impl Qwen36Bringup {
             let grid = (hidden + block - 1) / block;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_f16_plus_f32_inplace_f16.raw() as CUfunction,
-                grid, 1, 1,
-                block, 1, 1,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
                 0,
                 stream_raw as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -8205,6 +9095,635 @@ impl Qwen36Bringup {
         // layer's first read of last_hidden_ptr is also on stream_raw,
         // so ordering is automatic.
         Ok(())
+    }
+
+    /// Debug/probe path for the native Qwen MTP block. This is not
+    /// production speculative decoding yet: it uses an embedding row
+    /// as the "current hidden" stand-in so we can validate the real
+    /// MTP tensor chain and kernel ABI before threading the method
+    /// into the live generation loop.
+    fn forward_qwen36_mtp_one_token_probe(
+        &self,
+        hidden_token_id: i32,
+        draft_input_token_id: i32,
+        position: u32,
+    ) -> Result<i32> {
+        let mtp = self.model.mtp.as_ref().ok_or_else(|| {
+            rvllm_core::RvllmError::cuda(
+                "qwen36 MTP probe requested but model.mtp is not loaded; set RVLLM_QWEN36_LOAD_MTP=1",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+        let kernel_gemv = self
+            .outside_kernels
+            .fn_fp8_gemv_wpr_native_f16in
+            .ok_or_else(|| {
+                rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP probe: fn_fp8_gemv_wpr_native_f16in not loaded",
+                    rvllm_core::CudaErrorKind::Other,
+                    rvllm_core::CudaCtx::setup(),
+                )
+            })?;
+        let hidden = self.arch.base.hidden_size as u32;
+        let vocab = self.arch.base.vocab_size as u32;
+        let hidden_bytes = hidden as usize * 2;
+        let stream_raw = self.stream.raw() as u64;
+
+        let token_region = self.arena.region("qwen36_mtp_probe_tokens", 8, 16)?;
+        let mut token_bytes = Vec::with_capacity(8);
+        token_bytes.extend_from_slice(&hidden_token_id.to_le_bytes());
+        token_bytes.extend_from_slice(&draft_input_token_id.to_le_bytes());
+        unsafe { token_region.copy_from_host(&token_bytes)? };
+        let embed_region = self
+            .arena
+            .region("qwen36_mtp_probe_embed", hidden_bytes * 2, 16)?;
+        unsafe {
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens: 2,
+                hidden,
+                vocab,
+            }
+            .launch(
+                self.outside_kernels.fn_embedding_gather_f16,
+                embed_region.device_ptr(),
+                self.model.outside.embed_tokens.offset_bytes,
+                token_region.device_ptr(),
+                stream_raw,
+            )?;
+        }
+
+        let norm_hidden = self
+            .arena
+            .region("qwen36_mtp_probe_norm_h", hidden_bytes, 16)?;
+        let norm_embedding = self
+            .arena
+            .region("qwen36_mtp_probe_norm_e", hidden_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                norm_hidden.device_ptr(),
+                embed_region.device_ptr(),
+                hidden_bytes,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP probe hidden DtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+            let rc = cuMemcpyDtoDAsync_v2(
+                norm_embedding.device_ptr(),
+                embed_region.device_ptr() + hidden_bytes as u64,
+                hidden_bytes,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP probe embedding DtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let eps = self.arch.base.rms_norm_eps;
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1,
+                hidden,
+                eps,
+            }
+            .launch(
+                self.outside_kernels.fn_rmsnorm_inplace_f16,
+                norm_hidden.device_ptr(),
+                mtp.pre_fc_norm_hidden.offset_bytes,
+                stream_raw,
+            )?;
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1,
+                hidden,
+                eps,
+            }
+            .launch(
+                self.outside_kernels.fn_rmsnorm_inplace_f16,
+                norm_embedding.device_ptr(),
+                mtp.pre_fc_norm_embedding.offset_bytes,
+                stream_raw,
+            )?;
+        }
+
+        let fc_input = self
+            .arena
+            .region("qwen36_mtp_probe_fc_input", hidden_bytes * 2, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                fc_input.device_ptr(),
+                norm_embedding.device_ptr(),
+                hidden_bytes,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP probe fc input embedding DtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+            let rc = cuMemcpyDtoDAsync_v2(
+                fc_input.device_ptr() + hidden_bytes as u64,
+                norm_hidden.device_ptr(),
+                hidden_bytes,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP probe fc input hidden DtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        let mtp_hidden_f32 = self
+            .arena
+            .region("qwen36_mtp_probe_fc_out_f32", hidden as usize * 4, 16)?;
+        let mtp_hidden = self
+            .arena
+            .region("qwen36_mtp_probe_hidden", hidden_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                fc_input.device_ptr(),
+                mtp.fc.offset_bytes,
+                mtp_hidden_f32.device_ptr(),
+                1,
+                hidden as i32,
+                (hidden * 2) as i32,
+                stream_raw,
+            )?;
+            use cudarc::driver::sys::*;
+            let mut output = mtp_hidden.device_ptr();
+            let mut input = mtp_hidden_f32.device_ptr();
+            let mut n = hidden as i32;
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                (&mut n) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid = ((hidden + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_cast_f32_to_f16.raw() as CUfunction,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP probe cast fc output",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        let pos_region = self.arena.region("qwen36_mtp_probe_pos", 4, 16)?;
+        let clen_region = self.arena.region("qwen36_mtp_probe_clen", 4, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemsetD32Async(
+                pos_region.device_ptr(),
+                position,
+                1,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP probe pos memset",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+            let rc = cuMemsetD32Async(
+                clen_region.device_ptr(),
+                position + 1,
+                1,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP probe context-len memset",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        let post_attn_norm_ptr = match &mtp.layer.attn {
+            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(fl) => {
+                self.apply_layer_full_attn(
+                    fl,
+                    self.mtp_kv_layer_seq_idx(),
+                    position,
+                    mtp_hidden.device_ptr(),
+                    kernel_gemv,
+                    hidden,
+                    hidden_bytes,
+                    pos_region.device_ptr(),
+                    clen_region.device_ptr(),
+                )?;
+                fl.post_attention_layernorm.offset_bytes
+            }
+            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_) => {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP probe expected a full-attention MTP layer",
+                    rvllm_core::CudaErrorKind::Other,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        };
+        self.apply_layer_moe(
+            &mtp.layer.moe,
+            post_attn_norm_ptr,
+            mtp_hidden.device_ptr(),
+            kernel_gemv,
+            hidden,
+            hidden_bytes,
+            0,
+        )?;
+        self.forward_qwen36_mtp_closer(mtp_hidden.device_ptr(), mtp.norm.offset_bytes, hidden, vocab)
+    }
+
+    fn forward_qwen36_mtp_from_hidden_ptr(
+        &self,
+        source_hidden_ptr: u64,
+        draft_input_token_id: i32,
+        position: u32,
+    ) -> Result<i32> {
+        let mtp = self.model.mtp.as_ref().ok_or_else(|| {
+            rvllm_core::RvllmError::cuda(
+                "qwen36 MTP shadow requested but model.mtp is not loaded; set RVLLM_QWEN36_LOAD_MTP=1",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+        let kernel_gemv = self
+            .outside_kernels
+            .fn_fp8_gemv_wpr_native_f16in
+            .ok_or_else(|| {
+                rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP shadow: fn_fp8_gemv_wpr_native_f16in not loaded",
+                    rvllm_core::CudaErrorKind::Other,
+                    rvllm_core::CudaCtx::setup(),
+                )
+            })?;
+        let hidden = self.arch.base.hidden_size as u32;
+        let vocab = self.arch.base.vocab_size as u32;
+        let hidden_bytes = hidden as usize * 2;
+        let stream_raw = self.stream.raw() as u64;
+
+        let token_region = self.arena.region("qwen36_mtp_shadow_token", 4, 16)?;
+        unsafe { token_region.copy_from_host(&draft_input_token_id.to_le_bytes())? };
+        let embed_region = self
+            .arena
+            .region("qwen36_mtp_shadow_embed", hidden_bytes, 16)?;
+        unsafe {
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens: 1,
+                hidden,
+                vocab,
+            }
+            .launch(
+                self.outside_kernels.fn_embedding_gather_f16,
+                embed_region.device_ptr(),
+                self.model.outside.embed_tokens.offset_bytes,
+                token_region.device_ptr(),
+                stream_raw,
+            )?;
+        }
+
+        let norm_hidden = self
+            .arena
+            .region("qwen36_mtp_shadow_norm_h", hidden_bytes, 16)?;
+        let norm_embedding = self
+            .arena
+            .region("qwen36_mtp_shadow_norm_e", hidden_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                norm_hidden.device_ptr(),
+                source_hidden_ptr,
+                hidden_bytes,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP shadow hidden DtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+            let rc = cuMemcpyDtoDAsync_v2(
+                norm_embedding.device_ptr(),
+                embed_region.device_ptr(),
+                hidden_bytes,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP shadow embedding DtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let eps = self.arch.base.rms_norm_eps;
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1,
+                hidden,
+                eps,
+            }
+            .launch(
+                self.outside_kernels.fn_rmsnorm_inplace_f16,
+                norm_hidden.device_ptr(),
+                mtp.pre_fc_norm_hidden.offset_bytes,
+                stream_raw,
+            )?;
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1,
+                hidden,
+                eps,
+            }
+            .launch(
+                self.outside_kernels.fn_rmsnorm_inplace_f16,
+                norm_embedding.device_ptr(),
+                mtp.pre_fc_norm_embedding.offset_bytes,
+                stream_raw,
+            )?;
+        }
+
+        let fc_input = self
+            .arena
+            .region("qwen36_mtp_shadow_fc_input", hidden_bytes * 2, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                fc_input.device_ptr(),
+                norm_embedding.device_ptr(),
+                hidden_bytes,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP shadow fc input embedding DtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+            let rc = cuMemcpyDtoDAsync_v2(
+                fc_input.device_ptr() + hidden_bytes as u64,
+                norm_hidden.device_ptr(),
+                hidden_bytes,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP shadow fc input hidden DtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        let mtp_hidden_f32 = self
+            .arena
+            .region("qwen36_mtp_shadow_fc_out_f32", hidden as usize * 4, 16)?;
+        let mtp_hidden = self
+            .arena
+            .region("qwen36_mtp_shadow_hidden", hidden_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            self.cublaslt.f16_gemm_f32(
+                fc_input.device_ptr(),
+                mtp.fc.offset_bytes,
+                mtp_hidden_f32.device_ptr(),
+                1,
+                hidden as i32,
+                (hidden * 2) as i32,
+                stream_raw,
+            )?;
+            use cudarc::driver::sys::*;
+            let mut output = mtp_hidden.device_ptr();
+            let mut input = mtp_hidden_f32.device_ptr();
+            let mut n = hidden as i32;
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                (&mut n) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid = ((hidden + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_cast_f32_to_f16.raw() as CUfunction,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP shadow cast fc output",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        let pos_region = self.arena.region("qwen36_mtp_shadow_pos", 4, 16)?;
+        let clen_region = self.arena.region("qwen36_mtp_shadow_clen", 4, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemsetD32Async(
+                pos_region.device_ptr(),
+                position,
+                1,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP shadow pos memset",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+            let rc = cuMemsetD32Async(
+                clen_region.device_ptr(),
+                position + 1,
+                1,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP shadow context-len memset",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        let post_attn_norm_ptr = match &mtp.layer.attn {
+            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(fl) => {
+                self.apply_layer_full_attn(
+                    fl,
+                    self.mtp_kv_layer_seq_idx(),
+                    position,
+                    mtp_hidden.device_ptr(),
+                    kernel_gemv,
+                    hidden,
+                    hidden_bytes,
+                    pos_region.device_ptr(),
+                    clen_region.device_ptr(),
+                )?;
+                fl.post_attention_layernorm.offset_bytes
+            }
+            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_) => {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP shadow expected a full-attention MTP layer",
+                    rvllm_core::CudaErrorKind::Other,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        };
+        self.apply_layer_moe(
+            &mtp.layer.moe,
+            post_attn_norm_ptr,
+            mtp_hidden.device_ptr(),
+            kernel_gemv,
+            hidden,
+            hidden_bytes,
+            0,
+        )?;
+        self.forward_qwen36_mtp_closer(mtp_hidden.device_ptr(), mtp.norm.offset_bytes, hidden, vocab)
+    }
+
+    fn forward_qwen36_mtp_closer(
+        &self,
+        hidden_ptr: u64,
+        norm_ptr: u64,
+        hidden: u32,
+        vocab: u32,
+    ) -> Result<i32> {
+        let eps = self.arch.base.rms_norm_eps;
+        let stream_raw = self.stream.raw() as u64;
+        let hidden_fp8_region =
+            self.arena
+                .region("qwen36_mtp_probe_closer_h_fp8", hidden as usize, 16)?;
+        let hidden_scale_region =
+            self.arena
+                .region("qwen36_mtp_probe_closer_h_scale", 4, 16)?;
+        let logits_region =
+            self.arena
+                .region("qwen36_mtp_probe_closer_logits", vocab as usize * 2, 16)?;
+        unsafe {
+            rvllm_fused::FusedRmsnormFp8QuantLaunch {
+                num_tokens: 1,
+                hidden,
+                eps,
+            }
+            .launch(
+                self.outside_kernels.fn_fused_rmsnorm_fp8_quant,
+                hidden_fp8_region.device_ptr(),
+                hidden_scale_region.device_ptr(),
+                hidden_ptr,
+                norm_ptr,
+                stream_raw,
+            )?;
+        }
+        #[cfg(feature = "cuda")]
+        unsafe {
+            self.cublaslt.fp8_gemm(
+                hidden_fp8_region.device_ptr(),
+                self.model.outside.lm_head_fp8.offset_bytes,
+                logits_region.device_ptr(),
+                1,
+                vocab as i32,
+                hidden as i32,
+                hidden_scale_region.device_ptr(),
+                self.model.outside.lm_head_fp8.scale_ptr,
+                stream_raw,
+            )?;
+        }
+        let token_region = self.arena.region("qwen36_mtp_probe_token", 4, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut logits_ptr = logits_region.device_ptr();
+            let mut out_ptr = token_region.device_ptr();
+            let mut vs = vocab as i32;
+            let args = [
+                (&mut logits_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vs) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_argmax_f16.raw() as CUfunction,
+                1,
+                1,
+                1,
+                512,
+                1,
+                1,
+                0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP probe argmax",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        self.stream.fence()?;
+        let mut tok_buf = [0i32; 1];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(tok_buf.as_mut_ptr() as *mut _, token_region.device_ptr(), 4);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 MTP probe token DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(tok_buf[0])
     }
 
     /// Helper: shared closer for `forward_outside_only` and the
@@ -8230,9 +9749,7 @@ impl Qwen36Bringup {
         let hidden_fp8_bytes = hidden as usize;
         let hidden_scale_bytes = 4usize;
         let logits_bytes = (vocab as usize) * 2;
-        let hidden_fp8_region = self
-            .arena
-            .region("qwen36_pl_h_fp8", hidden_fp8_bytes, 16)?;
+        let hidden_fp8_region = self.arena.region("qwen36_pl_h_fp8", hidden_fp8_bytes, 16)?;
         let hidden_scale_region = self
             .arena
             .region("qwen36_pl_h_scale", hidden_scale_bytes, 16)?;
@@ -8240,8 +9757,8 @@ impl Qwen36Bringup {
         let stream_raw = self.stream.raw() as u64;
         // Pointer to the last token's hidden row inside the full
         // [num_tokens, hidden] f16 region.
-        let last_hidden_row_ptr = hidden_region.device_ptr()
-            + (last_idx as u64) * (hidden as u64) * 2;
+        let last_hidden_row_ptr =
+            hidden_region.device_ptr() + (last_idx as u64) * (hidden as u64) * 2;
         unsafe {
             rvllm_fused::FusedRmsnormFp8QuantLaunch {
                 num_tokens: 1,
@@ -8256,6 +9773,107 @@ impl Qwen36Bringup {
                 self.model.outside.final_norm.offset_bytes,
                 stream_raw,
             )?;
+        }
+        if std::env::var("RVLLM_QWEN36_LM_HEAD_F16").as_deref() == Ok("1") {
+            let normed_f16_region =
+                self.arena
+                    .region("qwen36_pl_h_normed_f16", hidden as usize * 2, 16)?;
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let rc = cuMemcpyDtoDAsync_v2(
+                    normed_f16_region.device_ptr(),
+                    last_hidden_row_ptr,
+                    hidden as usize * 2,
+                    stream_raw as CUstream,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 closer f16 row DtoD",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            unsafe {
+                rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                    num_tokens: 1,
+                    hidden,
+                    eps,
+                }
+                .launch(
+                    self.outside_kernels.fn_rmsnorm_inplace_f16,
+                    normed_f16_region.device_ptr(),
+                    self.model.outside.final_norm.offset_bytes,
+                    stream_raw,
+                )?;
+            }
+            let logits_f32_region =
+                self.arena
+                    .region("qwen36_pl_logits_f32", vocab as usize * 4, 16)?;
+            #[cfg(feature = "cuda")]
+            unsafe {
+                self.cublaslt.f16_gemm_f32(
+                    normed_f16_region.device_ptr(),
+                    self.model.outside.lm_head.offset_bytes,
+                    logits_f32_region.device_ptr(),
+                    1,
+                    vocab as i32,
+                    hidden as i32,
+                    stream_raw,
+                )?;
+            }
+            let token_region = self.arena.region("qwen36_pl_token_f32", 4, 16)?;
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut logits_ptr = logits_f32_region.device_ptr();
+                let mut out_ptr = token_region.device_ptr();
+                let mut vs = vocab as i32;
+                let args = [
+                    (&mut logits_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut vs) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 512;
+                let grid: u32 = 1;
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_argmax.raw() as CUfunction,
+                    grid,
+                    1,
+                    1,
+                    block,
+                    1,
+                    1,
+                    0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 argmax_f32 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            self.stream.fence()?;
+            let mut tok_buf = [0i32; 1];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let rc =
+                    cuMemcpyDtoH_v2(tok_buf.as_mut_ptr() as *mut _, token_region.device_ptr(), 4);
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 closer f32 token DtoH",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            return Ok(tok_buf[0]);
         }
         #[cfg(feature = "cuda")]
         unsafe {
@@ -8292,8 +9910,12 @@ impl Qwen36Bringup {
             let grid: u32 = 1;
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_argmax_f16.raw() as CUfunction,
-                grid, 1, 1,
-                block, 1, 1,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
                 0,
                 stream_raw as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -8315,11 +9937,7 @@ impl Qwen36Bringup {
             // Consistency with the gemma4 closer: a swallowed DtoH
             // failure used to leave `tok_buf[0] == 0`, which the
             // server then emitted as a valid output token.
-            let rc = cuMemcpyDtoH_v2(
-                tok_buf.as_mut_ptr() as *mut _,
-                token_region.device_ptr(),
-                4,
-            );
+            let rc = cuMemcpyDtoH_v2(tok_buf.as_mut_ptr() as *mut _, token_region.device_ptr(), 4);
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
                     "qwen36 closer token DtoH",
@@ -8364,22 +9982,18 @@ impl Qwen36Bringup {
         let hidden_us = hidden as usize;
         let vocab_us = vocab as usize;
         // [rows, hidden] fp8 + [rows] f32 scales + [rows, vocab] f16 logits + [rows] i32 tokens.
-        let hidden_fp8_region = self.arena.region(
-            "qwen36_spec_closer_h_fp8",
-            rows_us * hidden_us, 16,
-        )?;
-        let hidden_scale_region = self.arena.region(
-            "qwen36_spec_closer_h_scale",
-            rows_us * 4, 16,
-        )?;
-        let logits_region = self.arena.region(
-            "qwen36_spec_closer_logits",
-            rows_us * vocab_us * 2, 16,
-        )?;
-        let tokens_region = self.arena.region(
-            "qwen36_spec_closer_tokens",
-            rows_us * 4, 16,
-        )?;
+        let hidden_fp8_region =
+            self.arena
+                .region("qwen36_spec_closer_h_fp8", rows_us * hidden_us, 16)?;
+        let hidden_scale_region =
+            self.arena
+                .region("qwen36_spec_closer_h_scale", rows_us * 4, 16)?;
+        let logits_region =
+            self.arena
+                .region("qwen36_spec_closer_logits", rows_us * vocab_us * 2, 16)?;
+        let tokens_region = self
+            .arena
+            .region("qwen36_spec_closer_tokens", rows_us * 4, 16)?;
         let stream_raw = self.stream.raw() as u64;
 
         unsafe {
@@ -8441,8 +10055,12 @@ impl Qwen36Bringup {
             // grid=rows: argmax_f16_kernel uses blockIdx.x to pick its row.
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_argmax_f16.raw() as CUfunction,
-                rows, 1, 1,
-                block, 1, 1,
+                rows,
+                1,
+                1,
+                block,
+                1,
+                1,
                 0,
                 stream_raw as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -8487,11 +10105,9 @@ impl Qwen36Bringup {
         let num_tokens = token_ids.len() as u32;
 
         // Allocate device regions: token IDs (i32) + hidden state (f16).
-        let tokens_region = self.arena.region(
-            "qwen36_smoke_tokens",
-            std::mem::size_of_val(&token_ids),
-            16,
-        )?;
+        let tokens_region =
+            self.arena
+                .region("qwen36_smoke_tokens", std::mem::size_of_val(&token_ids), 16)?;
         let mut token_bytes = Vec::with_capacity(token_ids.len() * 4);
         for t in &token_ids {
             token_bytes.extend_from_slice(&t.to_le_bytes());
@@ -8526,9 +10142,11 @@ impl Qwen36Bringup {
         let hidden_scale_bytes = (num_tokens as usize) * 4; // f32/token
         let logits_bytes = (num_tokens as usize) * (vocab as usize) * 2; // f16
         let hidden_fp8_region =
-            self.arena.region("qwen36_smoke_hidden_fp8", hidden_fp8_bytes, 16)?;
+            self.arena
+                .region("qwen36_smoke_hidden_fp8", hidden_fp8_bytes, 16)?;
         let hidden_scale_region =
-            self.arena.region("qwen36_smoke_hidden_scale", hidden_scale_bytes, 16)?;
+            self.arena
+                .region("qwen36_smoke_hidden_scale", hidden_scale_bytes, 16)?;
         let logits_region = self.arena.region("qwen36_smoke_logits", logits_bytes, 16)?;
 
         let stream_raw = self.stream.raw() as u64;
@@ -8604,10 +10222,7 @@ impl Qwen36Bringup {
         let mut best_logit = f32::NEG_INFINITY;
         let mut best_token: i32 = -1;
         for v in 0..vocab as usize {
-            let bits = u16::from_le_bytes([
-                logits_row_f16[v * 2],
-                logits_row_f16[v * 2 + 1],
-            ]);
+            let bits = u16::from_le_bytes([logits_row_f16[v * 2], logits_row_f16[v * 2 + 1]]);
             let l = f16_bits_to_f32(bits);
             if l > best_logit {
                 best_logit = l;
@@ -8726,9 +10341,7 @@ impl Qwen36Bringup {
                 let in_fp8 = self
                     .arena
                     .region("qwen36_proj_in_fp8_cutlass", fp8_bytes, 16)?;
-                let in_amax = self
-                    .arena
-                    .region("qwen36_proj_in_amax", amax_bytes, 16)?;
+                let in_amax = self.arena.region("qwen36_proj_in_amax", amax_bytes, 16)?;
                 unsafe {
                     use cudarc::driver::sys::*;
                     let block_dim: u32 = (k as u32).min(1024);
@@ -8743,9 +10356,15 @@ impl Qwen36Bringup {
                         (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
                     ];
                     let rc = cuLaunchKernel(
-                        self.outside_kernels.fn_fp8_quantize_per_token_amax_f16.raw() as CUfunction,
-                        m, 1, 1,
-                        block_dim, 1, 1,
+                        self.outside_kernels
+                            .fn_fp8_quantize_per_token_amax_f16
+                            .raw() as CUfunction,
+                        m,
+                        1,
+                        1,
+                        block_dim,
+                        1,
+                        1,
                         0,
                         stream as CUstream,
                         args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -8778,8 +10397,20 @@ impl Qwen36Bringup {
                     .arena
                     .region("qwen36_proj_cutlass_ws", ws_n.max(16), 256)?;
                 unsafe {
-                    lib.launch_prep_sfa(in_amax.device_ptr(), sfa.device_ptr(), m as i32, k as i32, stream)?;
-                    lib.launch_prep_sfb(b_blockscale, sfb.device_ptr(), n as i32, k as i32, stream)?;
+                    lib.launch_prep_sfa(
+                        in_amax.device_ptr(),
+                        sfa.device_ptr(),
+                        m as i32,
+                        k as i32,
+                        stream,
+                    )?;
+                    lib.launch_prep_sfb(
+                        b_blockscale,
+                        sfb.device_ptr(),
+                        n as i32,
+                        k as i32,
+                        stream,
+                    )?;
                     lib.launch_fp8_gemm_blockscale(
                         out_f16,
                         in_fp8.device_ptr(),
@@ -8848,15 +10479,20 @@ impl Qwen36Bringup {
         // CUTLASS path that preserves f16 activations) can
         // re-evaluate quickly.
         let pad_debug = std::env::var("RVLLM_QWEN36_FP8_PAD_DEBUG")
-            .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
         #[cfg(feature = "cuda")]
         if pad_debug && m >= 2 && m < 128 {
             if let CutlassBackend::SoSm120(ref lib) = self.cutlass {
                 const PAD_M: u32 = 128;
-                let pad_in_bytes  = (PAD_M as usize) * (k as usize) * 2;
+                let pad_in_bytes = (PAD_M as usize) * (k as usize) * 2;
                 let pad_out_bytes = (PAD_M as usize) * (n as usize) * 2;
-                let pad_in  = self.arena.region("qwen36_proj_pad_in_f16",  pad_in_bytes,  16)?;
-                let pad_out = self.arena.region("qwen36_proj_pad_out_f16", pad_out_bytes, 16)?;
+                let pad_in = self
+                    .arena
+                    .region("qwen36_proj_pad_in_f16", pad_in_bytes, 16)?;
+                let pad_out = self
+                    .arena
+                    .region("qwen36_proj_pad_out_f16", pad_out_bytes, 16)?;
                 // Build pad_in as: real m rows from input_f16, then
                 // replicate row 0 into rows m..PAD_M-1. Replicating
                 // (rather than zero-padding) gives all 128 rows a
@@ -8871,8 +10507,10 @@ impl Qwen36Bringup {
                     // (a) DtoD M real rows starting at row 0.
                     let m_rows_bytes = (m as usize) * row_bytes;
                     let rc = cuMemcpyDtoDAsync_v2(
-                        pad_in.device_ptr(), input_f16,
-                        m_rows_bytes, stream as CUstream,
+                        pad_in.device_ptr(),
+                        input_f16,
+                        m_rows_bytes,
+                        stream as CUstream,
                     );
                     if rc != CUresult::CUDA_SUCCESS {
                         return Err(rvllm_core::RvllmError::cuda(
@@ -8885,10 +10523,8 @@ impl Qwen36Bringup {
                     //     (PAD_M-m small DtoD copies).
                     for r in (m as u64)..(PAD_M as u64) {
                         let dst = pad_in.device_ptr() + r * (row_bytes as u64);
-                        let rc = cuMemcpyDtoDAsync_v2(
-                            dst, input_f16, row_bytes,
-                            stream as CUstream,
-                        );
+                        let rc =
+                            cuMemcpyDtoDAsync_v2(dst, input_f16, row_bytes, stream as CUstream);
                         if rc != CUresult::CUDA_SUCCESS {
                             return Err(rvllm_core::RvllmError::cuda(
                                 "qwen36 fp8_proj_dispatch: pad-in row-0 replication",
@@ -8899,10 +10535,12 @@ impl Qwen36Bringup {
                     }
                 }
                 // Per-token amax-quantise the padded input.
-                let fp8_bytes  = (PAD_M as usize) * (k as usize);
+                let fp8_bytes = (PAD_M as usize) * (k as usize);
                 let amax_bytes = (PAD_M as usize) * 4;
-                let in_fp8  = self.arena.region("qwen36_proj_pad_in_fp8", fp8_bytes, 16)?;
-                let in_amax = self.arena.region("qwen36_proj_pad_in_amax", amax_bytes, 16)?;
+                let in_fp8 = self.arena.region("qwen36_proj_pad_in_fp8", fp8_bytes, 16)?;
+                let in_amax = self
+                    .arena
+                    .region("qwen36_proj_pad_in_amax", amax_bytes, 16)?;
                 unsafe {
                     use cudarc::driver::sys::*;
                     let block_dim: u32 = (k as u32).min(1024);
@@ -8917,10 +10555,17 @@ impl Qwen36Bringup {
                         (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
                     ];
                     let rc = cuLaunchKernel(
-                        self.outside_kernels.fn_fp8_quantize_per_token_amax_f16.raw() as CUfunction,
-                        PAD_M, 1, 1,
-                        block_dim, 1, 1,
-                        0, stream as CUstream,
+                        self.outside_kernels
+                            .fn_fp8_quantize_per_token_amax_f16
+                            .raw() as CUfunction,
+                        PAD_M,
+                        1,
+                        1,
+                        block_dim,
+                        1,
+                        1,
+                        0,
+                        stream as CUstream,
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
                     );
@@ -8935,7 +10580,7 @@ impl Qwen36Bringup {
                 // CUTLASS SM120 launch at M=PAD_M.
                 let sfa_n = lib.sfa_bytes(PAD_M as i32, k as i32);
                 let sfb_n = lib.sfb_bytes(n as i32, k as i32);
-                let ws_n  = lib.workspace_size(PAD_M as i32, n as i32, k as i32);
+                let ws_n = lib.workspace_size(PAD_M as i32, n as i32, k as i32);
                 if sfa_n == 0 || sfb_n == 0 {
                     return Err(rvllm_core::RvllmError::cuda(
                         "qwen36 fp8_proj_dispatch: CUTLASS SM120 pad path \
@@ -8946,18 +10591,34 @@ impl Qwen36Bringup {
                 }
                 let sfa = self.arena.region("qwen36_proj_pad_sfa", sfa_n.max(4), 16)?;
                 let sfb = self.arena.region("qwen36_proj_pad_sfb", sfb_n.max(4), 16)?;
-                let ws  = self.arena.region("qwen36_proj_pad_ws",  ws_n.max(16), 256)?;
+                let ws = self.arena.region("qwen36_proj_pad_ws", ws_n.max(16), 256)?;
                 unsafe {
-                    lib.launch_prep_sfa(in_amax.device_ptr(), sfa.device_ptr(), PAD_M as i32, k as i32, stream)?;
-                    lib.launch_prep_sfb(b_blockscale, sfb.device_ptr(), n as i32, k as i32, stream)?;
+                    lib.launch_prep_sfa(
+                        in_amax.device_ptr(),
+                        sfa.device_ptr(),
+                        PAD_M as i32,
+                        k as i32,
+                        stream,
+                    )?;
+                    lib.launch_prep_sfb(
+                        b_blockscale,
+                        sfb.device_ptr(),
+                        n as i32,
+                        k as i32,
+                        stream,
+                    )?;
                     lib.launch_fp8_gemm_blockscale(
                         pad_out.device_ptr(),
                         in_fp8.device_ptr(),
                         weight_fp8,
                         sfa.device_ptr(),
                         sfb.device_ptr(),
-                        PAD_M as i32, n as i32, k as i32,
-                        ws.device_ptr(), ws_n, stream,
+                        PAD_M as i32,
+                        n as i32,
+                        k as i32,
+                        ws.device_ptr(),
+                        ws_n,
+                        stream,
                     )?;
                 }
                 // Optional diff instrumentation: RVLLM_QWEN36_FP8_PAD_DIFF=1
@@ -8969,14 +10630,12 @@ impl Qwen36Bringup {
                 use std::sync::atomic::{AtomicBool, Ordering};
                 static DIFF_DONE: AtomicBool = AtomicBool::new(false);
                 let diff_on = std::env::var("RVLLM_QWEN36_FP8_PAD_DIFF")
-                    .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+                    .map(|v| v != "0" && !v.is_empty())
+                    .unwrap_or(false);
                 if diff_on && !DIFF_DONE.swap(true, Ordering::Relaxed) {
                     let ref_bytes = (m as usize) * (n as usize) * 2;
-                    let ref_region = self.arena.region(
-                        "qwen36_proj_pad_ref", ref_bytes, 16)?;
-                    rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                        m, n, k,
-                    }.launch(
+                    let ref_region = self.arena.region("qwen36_proj_pad_ref", ref_bytes, 16)?;
+                    rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n, k }.launch(
                         kernel_gemv,
                         ref_region.device_ptr(),
                         weight_fp8,
@@ -8990,24 +10649,36 @@ impl Qwen36Bringup {
                     use cudarc::driver::sys::*;
                     let _ = cuMemcpyDtoH_v2(
                         pad_host.as_mut_ptr() as *mut _,
-                        pad_out.device_ptr(), ref_bytes);
+                        pad_out.device_ptr(),
+                        ref_bytes,
+                    );
                     let _ = cuMemcpyDtoH_v2(
                         ref_host.as_mut_ptr() as *mut _,
-                        ref_region.device_ptr(), ref_bytes);
+                        ref_region.device_ptr(),
+                        ref_bytes,
+                    );
                     let f16_to_f32 = |x: u16| -> f32 {
                         let sign = ((x >> 15) & 1) as u32;
-                        let exp  = ((x >> 10) & 0x1f) as i32;
+                        let exp = ((x >> 10) & 0x1f) as i32;
                         let mant = (x & 0x3ff) as u32;
                         if exp == 0 {
-                            if mant == 0 { return if sign == 1 { -0.0 } else { 0.0 }; }
+                            if mant == 0 {
+                                return if sign == 1 { -0.0 } else { 0.0 };
+                            }
                             // subnormal
                             let f = mant as f32 / 1024.0;
                             return (if sign == 1 { -1.0 } else { 1.0 }) * f * (2.0f32).powi(-14);
                         }
                         if exp == 0x1f {
                             return if mant == 0 {
-                                if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY }
-                            } else { f32::NAN };
+                                if sign == 1 {
+                                    f32::NEG_INFINITY
+                                } else {
+                                    f32::INFINITY
+                                }
+                            } else {
+                                f32::NAN
+                            };
                         }
                         let f = 1.0 + (mant as f32 / 1024.0);
                         (if sign == 1 { -1.0 } else { 1.0 }) * f * (2.0f32).powi(exp - 15)
@@ -9019,26 +10690,36 @@ impl Qwen36Bringup {
                             let p = f16_to_f32(pad_host[r * (n as usize) + c]);
                             let q = f16_to_f32(ref_host[r * (n as usize) + c]);
                             let d = (p - q).abs();
-                            if d > max_abs { max_abs = d; }
+                            if d > max_abs {
+                                max_abs = d;
+                            }
                         }
                         max_per_row.push(max_abs);
                     }
                     let overall_max = max_per_row.iter().fold(0.0f32, |a, &b| a.max(b));
                     let mean_per_row: f32 = max_per_row.iter().sum::<f32>() / (m as f32);
                     tracing::warn!(
-                        m, n, k, overall_max, mean_per_row,
+                        m,
+                        n,
+                        k,
+                        overall_max,
+                        mean_per_row,
                         "fp8_proj_pad_diff: first M<128 dispatch, per-row max-abs-diff stats"
                     );
                     // Sample dump: rows 0, m-1, plus rows with the
                     // largest diffs so we can see whether the bad
                     // rows cluster.
-                    let mut ranked: Vec<(usize, f32)> = max_per_row.iter()
-                        .copied().enumerate().collect();
-                    ranked.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
-                    let worst_rows: Vec<usize> = ranked.iter().take(4).map(|&(r,_)| r).collect();
+                    let mut ranked: Vec<(usize, f32)> =
+                        max_per_row.iter().copied().enumerate().collect();
+                    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    let worst_rows: Vec<usize> = ranked.iter().take(4).map(|&(r, _)| r).collect();
                     let dump_rows: Vec<usize> = {
-                        let mut v: Vec<usize> = vec![0, (m as usize)-1];
-                        for r in worst_rows { if !v.contains(&r) { v.push(r); } }
+                        let mut v: Vec<usize> = vec![0, (m as usize) - 1];
+                        for r in worst_rows {
+                            if !v.contains(&r) {
+                                v.push(r);
+                            }
+                        }
                         v
                     };
                     for r in dump_rows {
@@ -9052,9 +10733,10 @@ impl Qwen36Bringup {
                         let q3 = f16_to_f32(ref_host[r * (n as usize) + 3]);
                         let max_abs = max_per_row[r];
                         tracing::warn!(
-                            row = r, max_abs,
-                            pad_first4 = format!("[{:.4} {:.4} {:.4} {:.4}]", p0,p1,p2,p3),
-                            ref_first4 = format!("[{:.4} {:.4} {:.4} {:.4}]", q0,q1,q2,q3),
+                            row = r,
+                            max_abs,
+                            pad_first4 = format!("[{:.4} {:.4} {:.4} {:.4}]", p0, p1, p2, p3),
+                            ref_first4 = format!("[{:.4} {:.4} {:.4} {:.4}]", q0, q1, q2, q3),
                             "fp8_proj_pad_diff: row sample"
                         );
                     }
@@ -9064,8 +10746,10 @@ impl Qwen36Bringup {
                     use cudarc::driver::sys::*;
                     let m_rows_bytes = (m as usize) * (n as usize) * 2;
                     let rc = cuMemcpyDtoDAsync_v2(
-                        out_f16, pad_out.device_ptr(),
-                        m_rows_bytes, stream as CUstream,
+                        out_f16,
+                        pad_out.device_ptr(),
+                        m_rows_bytes,
+                        stream as CUstream,
                     );
                     if rc != CUresult::CUDA_SUCCESS {
                         return Err(rvllm_core::RvllmError::cuda(
@@ -9133,12 +10817,8 @@ impl Qwen36Bringup {
         let fp8_bytes = (m as usize) * (k as usize);
         let k_blocks = (k as usize + 127) / 128;
         let scale_bytes = (m as usize) * k_blocks * 4;
-        let in_fp8 = self
-            .arena
-            .region("qwen36_proj_in_fp8", fp8_bytes, 16)?;
-        let in_scale = self
-            .arena
-            .region("qwen36_proj_in_scale", scale_bytes, 16)?;
+        let in_fp8 = self.arena.region("qwen36_proj_in_fp8", fp8_bytes, 16)?;
+        let in_scale = self.arena.region("qwen36_proj_in_scale", scale_bytes, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -9154,8 +10834,12 @@ impl Qwen36Bringup {
             ];
             let rc = cuLaunchKernel(
                 self.outside_kernels.fn_fp8_quantize_per_token_f16.raw() as CUfunction,
-                k_blocks as u32, m, 1,
-                128, 1, 1,
+                k_blocks as u32,
+                m,
+                1,
+                128,
+                1,
+                1,
                 0,
                 stream as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,

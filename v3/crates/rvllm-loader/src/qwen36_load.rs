@@ -25,9 +25,9 @@ use crate::fp8_quant::{check_clamp_gate, quantize_per_tensor_ref, FP8_E4M3_MAX};
 
 use crate::load::LayerAttnType;
 use crate::qwen36_weights::{
-    Qwen36FullAttnLayer, Qwen36Layer, Qwen36LayerAttn, Qwen36LinearAttnLayer,
-    Qwen36LoadedModel, Qwen36LoadedOutside, Qwen36MoeBlock, Qwen36PatchMerger,
-    Qwen36Vision, Qwen36VisionBlock, Qwen36VisionPatchEmbed,
+    Qwen36FullAttnLayer, Qwen36Layer, Qwen36LayerAttn, Qwen36LinearAttnLayer, Qwen36LoadedModel,
+    Qwen36LoadedOutside, Qwen36MoeBlock, Qwen36MtpBlock, Qwen36PatchMerger, Qwen36Vision,
+    Qwen36VisionBlock, Qwen36VisionPatchEmbed,
 };
 use crate::safetensors::{ShardHeader, ShardIndex, TensorEntry};
 use crate::weights::{F16Weight, Fp8Weight};
@@ -218,7 +218,9 @@ impl<'a> LoadCtx<'a> {
                 });
             }
         };
-        let bs_region = self.arena.region("qwen36_fp8_blockscale", scale_bytes.len(), 16)?;
+        let bs_region = self
+            .arena
+            .region("qwen36_fp8_blockscale", scale_bytes.len(), 16)?;
         unsafe { bs_region.copy_from_host(&scale_bytes)? };
 
         // Per-tensor scalar `1.0` placeholder (the blockwise path drives
@@ -273,9 +275,7 @@ impl<'a> LoadCtx<'a> {
         check_clamp_gate(tensor_name, q.clamp_ppm, self.model_dir)?;
         let fp8: Vec<u8> = f32_vals
             .par_iter()
-            .map(|v| {
-                fp8_e4m3_encode((*v / q.scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX))
-            })
+            .map(|v| fp8_e4m3_encode((*v / q.scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)))
             .collect();
 
         let region_name: &'static str = "qwen36_lm_head_fp8";
@@ -311,19 +311,19 @@ impl<'a> LoadCtx<'a> {
     /// `Fp8Weight` is `[num_experts, N, K]` (3-D), making it explicit
     /// to downstream MoE-GEMM kernels that the leading axis is the
     /// expert index rather than a row of a 2-D matrix.
-    fn upload_experts_fused(
+    fn upload_experts_fused_by_name<F>(
         &self,
         region_name: &'static str,
+        ln: &F,
         layer_idx: usize,
         num_experts: usize,
         projection: &str,
-    ) -> Result<Fp8Weight> {
-        let first_w_name = format!(
-            "{QWEN36_PREFIX}.layers.{layer_idx}.mlp.experts.0.{projection}.weight"
-        );
-        let first_s_name = format!(
-            "{QWEN36_PREFIX}.layers.{layer_idx}.mlp.experts.0.{projection}.weight_scale_inv"
-        );
+    ) -> Result<Fp8Weight>
+    where
+        F: Fn(&str) -> String,
+    {
+        let first_w_name = ln(&format!("experts.0.{projection}.weight"));
+        let first_s_name = ln(&format!("experts.0.{projection}.weight_scale_inv"));
         let (_, w0) = self.must_get(&first_w_name)?;
         let (_, s0) = self.must_get(&first_s_name)?;
         if w0.dtype != DType::Fp8E4M3 {
@@ -352,12 +352,8 @@ impl<'a> LoadCtx<'a> {
         let k0 = if w0.shape.len() >= 2 { w0.shape[1] } else { 0 };
 
         for e in 0..num_experts {
-            let wn = format!(
-                "{QWEN36_PREFIX}.layers.{layer_idx}.mlp.experts.{e}.{projection}.weight"
-            );
-            let sn = format!(
-                "{QWEN36_PREFIX}.layers.{layer_idx}.mlp.experts.{e}.{projection}.weight_scale_inv"
-            );
+            let wn = ln(&format!("experts.{e}.{projection}.weight"));
+            let sn = ln(&format!("experts.{e}.{projection}.weight_scale_inv"));
             let (wsi, we) = self.must_get(&wn)?;
             if we.nbytes as usize != per_w_bytes
                 || we.shape.first().copied() != Some(n0)
@@ -366,7 +362,8 @@ impl<'a> LoadCtx<'a> {
                 return Err(RvllmError::Loader {
                     err: LoaderError::Corrupt {
                         detail: format!(
-                            "expert {e} {projection} shape {:?} mismatches expert 0 shape {:?}",
+                            "layer {layer_idx} expert {e} {projection} shape {:?} \
+                             mismatches expert 0 shape {:?}",
                             we.shape, w0.shape
                         ),
                     },
@@ -403,7 +400,9 @@ impl<'a> LoadCtx<'a> {
 
         let region = self.arena.region(region_name, fused_w.len(), 16)?;
         unsafe { region.copy_from_host(&fused_w)? };
-        let bs_region = self.arena.region("qwen36_moe_blockscale", fused_s.len(), 16)?;
+        let bs_region = self
+            .arena
+            .region("qwen36_moe_blockscale", fused_s.len(), 16)?;
         unsafe { bs_region.copy_from_host(&fused_s)? };
 
         let one = 1.0f32;
@@ -429,10 +428,7 @@ impl<'a> LoadCtx<'a> {
 }
 
 /// Phase 1 entry point: outside tensors only.
-pub fn load_qwen36_outside(
-    model_dir: &Path,
-    arena: &HbmArena,
-) -> Result<Qwen36LoadedOutside> {
+pub fn load_qwen36_outside(model_dir: &Path, arena: &HbmArena) -> Result<Qwen36LoadedOutside> {
     let ctx = LoadCtx::new(model_dir, arena)?;
     load_outside_via_ctx(&ctx)
 }
@@ -498,9 +494,61 @@ pub fn load_qwen36_model(
     if vision.is_some() {
         eprintln!("[qwen36-loader] vision tower loaded (27 ViT blocks + PatchMerger)");
     } else {
-        eprintln!("[qwen36-loader] vision tower SKIPPED (no model.visual.* tensors or load failed)");
+        eprintln!(
+            "[qwen36-loader] vision tower SKIPPED (no model.visual.* tensors or load failed)"
+        );
     }
-    Ok(Qwen36LoadedModel { outside, layers, vision })
+    Ok(Qwen36LoadedModel {
+        outside,
+        layers,
+        vision,
+        mtp: None,
+    })
+}
+
+/// Load the native Qwen MTP block from `mtp.safetensors`.
+///
+/// This is kept as an on-demand entry point so ordinary Qwen serving
+/// does not pay the extra ~814 MiB checkpoint upload. The returned
+/// block is sufficient for the next runtime slice: combine embedding
+/// + hidden through `mtp.fc`, run the one full-attention/MoE layer,
+/// then close through the shared lm_head.
+pub fn load_qwen36_mtp(
+    model_dir: &Path,
+    arena: &HbmArena,
+    num_experts: usize,
+) -> Result<Qwen36MtpBlock> {
+    let ctx = LoadCtx::new(model_dir, arena)?;
+
+    let (pre_fc_norm_embedding, _) = ctx.upload_f16_with_bias(
+        "qwen36_mtp_pre_fc_emb",
+        "mtp.pre_fc_norm_embedding.weight",
+        1.0,
+    )?;
+    let (pre_fc_norm_hidden, _) = ctx.upload_f16_with_bias(
+        "qwen36_mtp_pre_fc_hid",
+        "mtp.pre_fc_norm_hidden.weight",
+        1.0,
+    )?;
+    let (fc, fc_bytes) = ctx.upload_f16("qwen36_mtp_fc", "mtp.fc.weight")?;
+    let attn = Qwen36LayerAttn::Full(load_full_attn_layer_with_prefix(&ctx, "mtp.layers.0")?);
+    let moe = load_moe_block_with_prefix(&ctx, "mtp.layers.0.mlp", num_experts)?;
+    let (norm, _) = ctx.upload_f16("qwen36_mtp_norm", "mtp.norm.weight")?;
+
+    eprintln!(
+        "[qwen36-loader] MTP block uploaded: fc {:?} ({:.1} MiB), \
+         one full-attn layer + {num_experts} experts",
+        fc.shape,
+        fc_bytes as f64 / (1024.0 * 1024.0),
+    );
+
+    Ok(Qwen36MtpBlock {
+        pre_fc_norm_embedding,
+        pre_fc_norm_hidden,
+        fc,
+        layer: Qwen36Layer { attn, moe },
+        norm,
+    })
 }
 
 const QWEN36_VISION_PREFIX: &str = "model.visual";
@@ -514,7 +562,10 @@ fn load_qwen36_vision(ctx: &LoadCtx) -> Result<Qwen36Vision> {
     let _ = ctx.must_get(&pe_b_name)?;
     let (proj_weight, _) = ctx.upload_f16("qwen36_vis_pe_w", &pe_w_name)?;
     let (proj_bias, _) = ctx.upload_f16("qwen36_vis_pe_b", &pe_b_name)?;
-    let patch_embed = Qwen36VisionPatchEmbed { proj_weight, proj_bias };
+    let patch_embed = Qwen36VisionPatchEmbed {
+        proj_weight,
+        proj_bias,
+    };
 
     let pos_embed_name = format!("{QWEN36_VISION_PREFIX}.pos_embed.weight");
     let (pos_embed, _) = ctx.upload_f16("qwen36_vis_pos_embed", &pos_embed_name)?;
@@ -535,8 +586,18 @@ fn load_qwen36_vision(ctx: &LoadCtx) -> Result<Qwen36Vision> {
         let (fc2_w, _) = ctx.upload_f16("qwen36_vis_fc2w", &p("mlp.linear_fc2.weight"))?;
         let (fc2_b, _) = ctx.upload_f16("qwen36_vis_fc2b", &p("mlp.linear_fc2.bias"))?;
         blocks.push(Qwen36VisionBlock {
-            norm1_w, norm1_b, qkv_w, qkv_b, proj_w, proj_b,
-            norm2_w, norm2_b, fc1_w, fc1_b, fc2_w, fc2_b,
+            norm1_w,
+            norm1_b,
+            qkv_w,
+            qkv_b,
+            proj_w,
+            proj_b,
+            norm2_w,
+            norm2_b,
+            fc1_w,
+            fc1_b,
+            fc2_w,
+            fc2_b,
         });
     }
 
@@ -548,9 +609,12 @@ fn load_qwen36_vision(ctx: &LoadCtx) -> Result<Qwen36Vision> {
     let (mfc2_w, _) = ctx.upload_f16("qwen36_vis_mg_fc2w", &mp("linear_fc2.weight"))?;
     let (mfc2_b, _) = ctx.upload_f16("qwen36_vis_mg_fc2b", &mp("linear_fc2.bias"))?;
     let merger = Qwen36PatchMerger {
-        norm_w, norm_b,
-        fc1_w: mfc1_w, fc1_b: mfc1_b,
-        fc2_w: mfc2_w, fc2_b: mfc2_b,
+        norm_w,
+        norm_b,
+        fc1_w: mfc1_w,
+        fc1_b: mfc1_b,
+        fc2_w: mfc2_w,
+        fc2_b: mfc2_b,
     };
 
     eprintln!(
@@ -619,10 +683,13 @@ fn load_linear_attn_layer(ctx: &LoadCtx, layer_idx: usize) -> Result<Qwen36Linea
     let ln = |s: &str| format!("{QWEN36_PREFIX}.layers.{layer_idx}.{s}");
 
     // GemmaRMSNorm-style: gamma centered at 0, add +1 at load.
-    let (input_layernorm, _) = ctx.upload_f16_with_bias(
-        "qwen36_input_ln", &ln("input_layernorm.weight"), 1.0)?;
+    let (input_layernorm, _) =
+        ctx.upload_f16_with_bias("qwen36_input_ln", &ln("input_layernorm.weight"), 1.0)?;
     let (post_attention_layernorm, _) = ctx.upload_f16_with_bias(
-        "qwen36_post_attn_ln", &ln("post_attention_layernorm.weight"), 1.0)?;
+        "qwen36_post_attn_ln",
+        &ln("post_attention_layernorm.weight"),
+        1.0,
+    )?;
     let (a_log, _) = ctx.upload_f16("qwen36_a_log", &ln("linear_attn.A_log"))?;
     let (dt_bias, _) = ctx.upload_f16("qwen36_dt_bias", &ln("linear_attn.dt_bias"))?;
     let (conv1d, _) = ctx.upload_f16("qwen36_conv1d", &ln("linear_attn.conv1d.weight"))?;
@@ -634,15 +701,13 @@ fn load_linear_attn_layer(ctx: &LoadCtx, layer_idx: usize) -> Result<Qwen36Linea
         ctx.upload_fp8_blockwise("qwen36_la_in_qkv", &ln("linear_attn.in_proj_qkv.weight"))?;
     let in_proj_z =
         ctx.upload_fp8_blockwise("qwen36_la_in_z", &ln("linear_attn.in_proj_z.weight"))?;
-    let out_proj =
-        ctx.upload_fp8_blockwise("qwen36_la_out", &ln("linear_attn.out_proj.weight"))?;
+    let out_proj = ctx.upload_fp8_blockwise("qwen36_la_out", &ln("linear_attn.out_proj.weight"))?;
 
     if layer_idx <= 2 {
         eprintln!(
             "[qwen36-loader] layer {layer_idx} linear-attn: \
              qkv={:?} z={:?} out={:?} a_log={:?} conv1d={:?}",
-            in_proj_qkv.shape, in_proj_z.shape, out_proj.shape,
-            a_log.shape, conv1d.shape,
+            in_proj_qkv.shape, in_proj_z.shape, out_proj.shape, a_log.shape, conv1d.shape,
         );
     }
 
@@ -667,32 +732,55 @@ fn load_linear_attn_layer(ctx: &LoadCtx, layer_idx: usize) -> Result<Qwen36Linea
 /// scales are likewise stacked into a single f32 region per role.
 fn load_moe_block(ctx: &LoadCtx, layer_idx: usize, num_experts: usize) -> Result<Qwen36MoeBlock> {
     let ln = |s: &str| format!("{QWEN36_PREFIX}.layers.{layer_idx}.mlp.{s}");
+    load_moe_block_by_name(ctx, &ln, layer_idx, num_experts)
+}
 
+fn load_moe_block_with_prefix(
+    ctx: &LoadCtx,
+    prefix: &str,
+    num_experts: usize,
+) -> Result<Qwen36MoeBlock> {
+    let ln = |s: &str| format!("{prefix}.{s}");
+    load_moe_block_by_name(ctx, &ln, 0, num_experts)
+}
+
+fn load_moe_block_by_name<F>(
+    ctx: &LoadCtx,
+    ln: &F,
+    layer_idx: usize,
+    num_experts: usize,
+) -> Result<Qwen36MoeBlock>
+where
+    F: Fn(&str) -> String,
+{
     let (router, _) = ctx.upload_f16("qwen36_moe_router", &ln("gate.weight"))?;
     let (shared_expert_gate_logit, _) =
         ctx.upload_f16("qwen36_moe_shared_gate", &ln("shared_expert_gate.weight"))?;
 
-    let shared_expert_gate_proj = ctx
-        .upload_fp8_blockwise("qwen36_moe_sh_gp", &ln("shared_expert.gate_proj.weight"))?;
+    let shared_expert_gate_proj =
+        ctx.upload_fp8_blockwise("qwen36_moe_sh_gp", &ln("shared_expert.gate_proj.weight"))?;
     let shared_expert_up_proj =
         ctx.upload_fp8_blockwise("qwen36_moe_sh_up", &ln("shared_expert.up_proj.weight"))?;
-    let shared_expert_down_proj = ctx
-        .upload_fp8_blockwise("qwen36_moe_sh_dn", &ln("shared_expert.down_proj.weight"))?;
+    let shared_expert_down_proj =
+        ctx.upload_fp8_blockwise("qwen36_moe_sh_dn", &ln("shared_expert.down_proj.weight"))?;
 
-    let experts_gate_proj_fused = ctx.upload_experts_fused(
+    let experts_gate_proj_fused = ctx.upload_experts_fused_by_name(
         "qwen36_moe_exp_gp",
+        ln,
         layer_idx,
         num_experts,
         "gate_proj",
     )?;
-    let experts_up_proj_fused = ctx.upload_experts_fused(
+    let experts_up_proj_fused = ctx.upload_experts_fused_by_name(
         "qwen36_moe_exp_up",
+        ln,
         layer_idx,
         num_experts,
         "up_proj",
     )?;
-    let experts_down_proj_fused = ctx.upload_experts_fused(
+    let experts_down_proj_fused = ctx.upload_experts_fused_by_name(
         "qwen36_moe_exp_dn",
+        ln,
         layer_idx,
         num_experts,
         "down_proj",
@@ -712,16 +800,34 @@ fn load_moe_block(ctx: &LoadCtx, layer_idx: usize, num_experts: usize) -> Result
 
 fn load_full_attn_layer(ctx: &LoadCtx, layer_idx: usize) -> Result<Qwen36FullAttnLayer> {
     let ln = |s: &str| format!("{QWEN36_PREFIX}.layers.{layer_idx}.{s}");
+    load_full_attn_layer_by_name(ctx, &ln, layer_idx)
+}
 
+fn load_full_attn_layer_with_prefix(ctx: &LoadCtx, prefix: &str) -> Result<Qwen36FullAttnLayer> {
+    let ln = |s: &str| format!("{prefix}.{s}");
+    load_full_attn_layer_by_name(ctx, &ln, 0)
+}
+
+fn load_full_attn_layer_by_name<F>(
+    ctx: &LoadCtx,
+    ln: &F,
+    layer_idx: usize,
+) -> Result<Qwen36FullAttnLayer>
+where
+    F: Fn(&str) -> String,
+{
     // All four are GemmaRMSNorm-style; gamma centered at 0, add +1.
-    let (input_layernorm, _) = ctx.upload_f16_with_bias(
-        "qwen36_input_ln", &ln("input_layernorm.weight"), 1.0)?;
+    let (input_layernorm, _) =
+        ctx.upload_f16_with_bias("qwen36_input_ln", &ln("input_layernorm.weight"), 1.0)?;
     let (post_attention_layernorm, _) = ctx.upload_f16_with_bias(
-        "qwen36_post_attn_ln", &ln("post_attention_layernorm.weight"), 1.0)?;
-    let (q_norm, _) = ctx.upload_f16_with_bias(
-        "qwen36_q_norm", &ln("self_attn.q_norm.weight"), 1.0)?;
-    let (k_norm, _) = ctx.upload_f16_with_bias(
-        "qwen36_k_norm", &ln("self_attn.k_norm.weight"), 1.0)?;
+        "qwen36_post_attn_ln",
+        &ln("post_attention_layernorm.weight"),
+        1.0,
+    )?;
+    let (q_norm, _) =
+        ctx.upload_f16_with_bias("qwen36_q_norm", &ln("self_attn.q_norm.weight"), 1.0)?;
+    let (k_norm, _) =
+        ctx.upload_f16_with_bias("qwen36_k_norm", &ln("self_attn.k_norm.weight"), 1.0)?;
 
     let q_proj = ctx.upload_fp8_blockwise("qwen36_q_proj", &ln("self_attn.q_proj.weight"))?;
     let k_proj = ctx.upload_fp8_blockwise("qwen36_k_proj", &ln("self_attn.k_proj.weight"))?;
@@ -816,7 +922,11 @@ fn fp8_e4m3_encode(v: f32) -> u8 {
         let full = mant32 | (1 << 23);
         let rshift = (20 + shift) as u32;
         let mut m = full >> rshift;
-        let round_bit = if rshift > 0 { (full >> (rshift - 1)) & 1 } else { 0 };
+        let round_bit = if rshift > 0 {
+            (full >> (rshift - 1)) & 1
+        } else {
+            0
+        };
         let sticky = if rshift > 1 {
             (full & ((1 << (rshift - 1)) - 1) != 0) as u32
         } else {

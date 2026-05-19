@@ -50,6 +50,14 @@ DEFAULT_PROFILES: list[tuple[str, str]] = [
     ("mobile-31b-rvllm",          "gemma-4-31b-it (FP8 KV)"),
     ("mobile-31b-rvllm-nvfp4",    "gemma-4-31b-it (NVFP4 KV)"),
     ("mobile-qwen-rvllm",         "qwen3-6-35b-a3b (FP8)"),
+    ("mobile-qwen-rvllm-nvfp4",
+                                      "qwen3-6-35b-a3b (NVFP4 KV)"),
+    ("mobile-qwen-rvllm-nvfp4-spec",
+                                      "qwen3-6-35b-a3b (NVFP4 KV + spec)"),
+    ("mobile-31b-nvfp4w-rvllm",
+                                      "gemma-4-31b-it-nvfp4 (NVFP4W)"),
+    ("mobile-31b-nvfp4w-rvllm-spec",
+                                      "gemma-4-31b-it-nvfp4 (NVFP4W + spec)"),
 ]
 
 # The model id the OpenAI request must use. Inferred from the
@@ -60,12 +68,17 @@ PROFILE_MODEL_ID: dict[str, str] = {
     "mobile-31b-rvllm":       "gemma-4-31b-it",
     "mobile-31b-rvllm-nvfp4": "gemma-4-31b-it",
     "mobile-qwen-rvllm":      "qwen3-6-35b-a3b",
+    "mobile-qwen-rvllm-nvfp4": "qwen3-6-35b-a3b",
+    "mobile-qwen-rvllm-nvfp4-spec": "qwen3-6-35b-a3b",
+    "mobile-31b-nvfp4w-rvllm": "gemma-4-31b-it-nvfp4",
+    "mobile-31b-nvfp4w-rvllm-spec": "gemma-4-31b-it-nvfp4",
 }
 
 # Which profiles support which modalities.
 SUPPORTS_VISION = {"mobile-e4b-rvllm", "mobile-e4b-rvllm-nvfp4",
                    "mobile-31b-rvllm", "mobile-31b-rvllm-nvfp4",
-                   "mobile-qwen-rvllm"}
+                   "mobile-qwen-rvllm", "mobile-qwen-rvllm-nvfp4",
+                   "mobile-qwen-rvllm-nvfp4-spec"}
 SUPPORTS_AUDIO  = {"mobile-e4b-rvllm", "mobile-e4b-rvllm-nvfp4"}
 
 # ---------------------------------------------------------------------------
@@ -99,8 +112,19 @@ TEXT_PROMPTS: list[tuple[str, str]] = [
         "describes many aspects of nature at an ordinary (macroscopic) scale, but is not sufficient for describing them at small (atomic and subatomic) scales. ",
         words=800,
     )),
-    ("reasoning_chain",    "Anna hat 3 Äpfel. Sie gibt Tom 2 davon und kauft dann 5 weitere. Wie viele Äpfel hat Anna jetzt? Bitte erkläre kurz den Rechenweg."),
+    ("reasoning_chain",    "Anna hat 3 Äpfel. Sie gibt Tom 2 davon und kauft dann 5 weitere. Wie viele Äpfel hat Anna jetzt? Antworte nur mit der Zahl und dem Wort Äpfel."),
     ("instruction",        "Liste drei Dinge auf, die man beachten sollte, wenn man eine Sauerteig-Brot backt."),
+]
+
+QWEN_REPEAT_PROMPTS: list[tuple[str, str, int]] = [
+    (
+        "qwen_repeat_160",
+        (
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu "
+            * 95
+        ) + "\nContinue the exact token pattern for 160 tokens.",
+        160,
+    ),
 ]
 
 # ---------------------------------------------------------------------------
@@ -186,7 +210,7 @@ def switch_profile(profile_basename: str) -> None:
     )
     subprocess.run(["sudo", "systemctl", "restart", "rvllm-serve.service"], check=True)
 
-def wait_ready(timeout_s: int = 300) -> bool:
+def wait_ready(timeout_s: int = 300, expected_model_id: str | None = None) -> bool:
     start = time.time()
     while time.time() - start < timeout_s:
         try:
@@ -194,14 +218,37 @@ def wait_ready(timeout_s: int = 300) -> bool:
                 "http://127.0.0.1:8010/v1/models", timeout=5
             ) as r:
                 if r.status == 200:
-                    return True
+                    if expected_model_id is None:
+                        return True
+                    body = json.loads(r.read().decode("utf-8", errors="replace"))
+                    ids = [m.get("id") for m in body.get("data", [])]
+                    if expected_model_id in ids:
+                        return True
         except Exception:
-            time.sleep(3)
+            pass
+        time.sleep(3)
     return False
 
 # ---------------------------------------------------------------------------
 #  Request runner
 # ---------------------------------------------------------------------------
+
+def quality_error(label: str, output: str) -> str | None:
+    """Small semantic checks for prompts with objectively checkable answers."""
+    text = output.lower()
+    if label == "short_capital" and "paris" not in text:
+        return "quality check failed: expected Paris"
+    if label == "short_math" and "2" not in text:
+        return "quality check failed: expected 2"
+    if label == "short_pangram" and "dog" not in text:
+        return "quality check failed: expected dog"
+    if label == "medium_translation":
+        if "wurm" not in text or ("frühe" not in text and "fruehe" not in text):
+            return "quality check failed: expected German idiom with fruehe/frühe and Wurm"
+    if label == "reasoning_chain":
+        if "6" not in text or "4 äpfel" in text or "4 apfel" in text or "10" in text:
+            return "quality check failed: expected 3 - 2 + 5 = 6 apples"
+    return None
 
 @dataclass
 class ProbeResult:
@@ -293,6 +340,8 @@ def call_chat(
     # silent ❌ with no diagnostic.
     if error is None and not output_text:
         error = "empty stream — server returned no SSE deltas (likely worker-side error event dropped)"
+    if error is None:
+        error = quality_error(label, output_text)
     return ProbeResult(
         profile=profile,
         model_id=model_id,
@@ -320,6 +369,7 @@ def run_profile_suite(
     skip_vision: bool,
     skip_audio: bool,
     text_max_tokens: int,
+    include_repeat_probes: bool,
 ) -> list[ProbeResult]:
     results: list[ProbeResult] = []
     model_id = PROFILE_MODEL_ID.get(profile)
@@ -335,12 +385,17 @@ def run_profile_suite(
 
     # ----- text -----
     if not skip_text:
-        for label, prompt in TEXT_PROMPTS:
+        text_prompts: list[tuple[str, str, int]] = [
+            (label, prompt, text_max_tokens) for label, prompt in TEXT_PROMPTS
+        ]
+        if include_repeat_probes and profile.startswith("mobile-qwen"):
+            text_prompts.extend(QWEN_REPEAT_PROMPTS)
+        for label, prompt, max_tokens in text_prompts:
             print(f"  [{profile}] text:{label} ...", flush=True)
             r = call_chat(
                 profile=profile, model_id=model_id, kind="text", label=label,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=text_max_tokens,
+                max_tokens=max_tokens,
             )
             results.append(r)
             if r.ok:
@@ -468,6 +523,8 @@ def main() -> int:
     ap.add_argument("--skip-text",   action="store_true")
     ap.add_argument("--skip-vision", action="store_true")
     ap.add_argument("--skip-audio",  action="store_true")
+    ap.add_argument("--include-repeat-probes", action="store_true",
+                    help="Add long repeat-heavy probes that trigger Qwen prompt-lookup spec")
     ap.add_argument("--text-max-tokens", type=int, default=80)
     ap.add_argument("--results",  default=str(RESULTS_MD))
     ap.add_argument("--jsonl",    default=str(RESULTS_JSONL))
@@ -488,8 +545,15 @@ def main() -> int:
         except subprocess.CalledProcessError as e:
             print(f"[skip] profile switch failed: {e}")
             continue
-        if not wait_ready():
-            print(f"[skip] profile {prof} did not come up within timeout")
+        expected_model_id = PROFILE_MODEL_ID.get(prof)
+        if not wait_ready(expected_model_id=expected_model_id):
+            if expected_model_id:
+                print(
+                    f"[skip] profile {prof} did not expose model "
+                    f"{expected_model_id} within timeout"
+                )
+            else:
+                print(f"[skip] profile {prof} did not come up within timeout")
             continue
         recs = run_profile_suite(
             prof,
@@ -497,15 +561,9 @@ def main() -> int:
             skip_vision=args.skip_vision,
             skip_audio=args.skip_audio,
             text_max_tokens=args.text_max_tokens,
+            include_repeat_probes=args.include_repeat_probes,
         )
         all_records.extend(recs)
-
-    # Restore the default profile so the next manual smoke is on a known base.
-    try:
-        switch_profile(args.restore_profile)
-        wait_ready()
-    except Exception:
-        pass
 
     md = format_table(all_records)
     Path(args.results).write_text(md)
@@ -514,6 +572,18 @@ def main() -> int:
             f.write(json.dumps(asdict(r)) + "\n")
     print(f"\nWrote {args.results} ({len(all_records)} records)")
     print(f"Appended {args.jsonl}")
+
+    # Restore the default profile after persisting results. Some
+    # profiles are experimental; a restore startup failure must not
+    # discard a completed benchmark run.
+    try:
+        switch_profile(args.restore_profile)
+        restore_model_id = PROFILE_MODEL_ID.get(args.restore_profile)
+        if not wait_ready(expected_model_id=restore_model_id):
+            print(f"[warn] restore profile {args.restore_profile} did not become ready")
+    except Exception as e:
+        print(f"[warn] restore profile {args.restore_profile} failed: {e}")
+
     return 0 if all(r.ok for r in all_records) else 2
 
 if __name__ == "__main__":

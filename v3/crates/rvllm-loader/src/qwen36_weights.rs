@@ -130,6 +130,24 @@ pub struct Qwen36Layer {
     pub moe: Qwen36MoeBlock,
 }
 
+/// Qwen 3.6 MTP (multi-token prediction) block.
+///
+/// The checkpoint ships this in `mtp.safetensors`, indexed by
+/// `model.safetensors.index.json`. It is a compact one-layer
+/// full-attention + MoE head, plus two pre-fc norms and an `mtp.fc`
+/// projection that combines the current hidden state with the next
+/// token embedding before the MTP block. Runtime execution is wired
+/// separately; this struct is the loader-side representation needed
+/// for a native Qwen drafter path.
+#[derive(Debug)]
+pub struct Qwen36MtpBlock {
+    pub pre_fc_norm_embedding: F16Weight,
+    pub pre_fc_norm_hidden: F16Weight,
+    pub fc: F16Weight,
+    pub layer: Qwen36Layer,
+    pub norm: F16Weight,
+}
+
 /// Qwen 3.6 loaded model — fully populated after Phase 2b.
 ///
 /// Phase 1: `outside` populated, `layers` empty.
@@ -148,6 +166,11 @@ pub struct Qwen36LoadedModel {
     /// `None` for text-only checkpoints or when the bring-up profile
     /// has explicitly disabled vision.
     pub vision: Option<Qwen36Vision>,
+    /// Optional native MTP drafter weights. Present in the 35B-A3B
+    /// checkpoint as `mtp.safetensors`; loaded on demand by
+    /// `load_qwen36_mtp` so existing non-MTP profiles do not pay the
+    /// extra arena cost.
+    pub mtp: Option<Qwen36MtpBlock>,
 }
 
 // ─── Vision (Qwen3-VL ViT) ────────────────────────────────────────────
@@ -192,8 +215,8 @@ pub struct Qwen36VisionPatchEmbed {
 pub struct Qwen36VisionBlock {
     pub norm1_w: F16Weight,
     pub norm1_b: F16Weight,
-    pub qkv_w: F16Weight, // [3456, 1152]
-    pub qkv_b: F16Weight, // [3456]
+    pub qkv_w: F16Weight,  // [3456, 1152]
+    pub qkv_b: F16Weight,  // [3456]
     pub proj_w: F16Weight, // [1152, 1152]
     pub proj_b: F16Weight,
     pub norm2_w: F16Weight,

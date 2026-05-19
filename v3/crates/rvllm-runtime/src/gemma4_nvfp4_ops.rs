@@ -562,6 +562,11 @@ mod tests {
         let fn_gemv = mod_gemv
             .get_function("mistral35_w4a16_gemv_bf16_kernel")
             .expect("get_function gemv");
+        let mod_gemm_mn = loader.load_ptx("mistral35_w4a16_gemm_mn_bf16")
+            .expect("load_ptx gemm_mn");
+        let fn_gemm_mn = mod_gemm_mn
+            .get_function("mistral35_w4a16_gemm_mn_bf16_kernel")
+            .expect("get_function gemm_mn");
         let mod_gateup = loader.load_ptx("mistral35_w4a16_gate_up_gemv_bf16")
             .expect("load_ptx gate_up");
         let fn_gateup = mod_gateup
@@ -574,6 +579,7 @@ mod tests {
             .expect("get_function gelu");
         let mlp_kernels = Gemma4Nvfp4MlpKernels {
             fn_w4a16_gemv: fn_gemv,
+            fn_w4a16_gemm_mn: fn_gemm_mn,
             fn_w4a16_gate_up_gemv: fn_gateup,
             fn_gelu_tanh_mul: fn_gelu,
         };

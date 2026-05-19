@@ -28,9 +28,9 @@ Skip a modality:
 sudo .../run_smoke.py --skip-vision --skip-audio
 ```
 
-Default: walks the 5 mobile profiles (E4B-FP8, E4B-NVFP4,
-31B-FP8, 31B-NVFP4, Qwen-FP8); other Rusty-mode profiles can be
-added via `--profiles`.
+Default: walks the core mobile profiles plus the Qwen36 NVFP4+spec
+profile and Gemma4 NVFP4-weight baseline/spec profiles. Other
+Rusty-mode profiles can be added via `--profiles`.
 
 ## Outputs
 

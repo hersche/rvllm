@@ -958,13 +958,15 @@ pub async fn spawn_cuda_worker(
                     // finer-grained cancellation inside the session is
                     // a follow-up.
                     if spec_probe_this_request {
+                        let stop_vec: Vec<u32> = stop_set.iter().copied().collect();
                         let stats = match if spec_cfg.k == 1 {
                             bringup.run_spec_session_nvfp4_greedy_k1(
-                                &req.prompt_ids, max_new as usize, &kv)
+                                &req.prompt_ids, max_new as usize,
+                                &stop_vec, &kv)
                         } else {
                             bringup.run_spec_session_nvfp4_greedy_k(
                                 &req.prompt_ids, max_new as usize,
-                                spec_cfg.k as usize, &kv)
+                                spec_cfg.k as usize, &stop_vec, &kv)
                         } {
                             Ok(s) => s,
                             Err(e) => {
@@ -988,17 +990,21 @@ pub async fn spawn_cuda_worker(
                                 break;
                             }
                         }
-                        tracing::debug!(
-                            "gemma4-nvfp4 spec-session: prompt={} \
-                             emitted={} iters={} accepted={} \
-                             accept_rate={:.3}",
-                            prompt_len, stats.emitted.len(),
-                            stats.n_iters, stats.n_accepted,
-                            if stats.n_iters > 0 {
-                                stats.n_accepted as f32
-                                    / stats.n_iters as f32
-                            } else { 0.0 },
-                        );
+                        if std::env::var("RVLLM_GEMMA4_SPEC_PERF_TRACE")
+                            .as_deref() == Ok("1")
+                        {
+                            tracing::debug!(
+                                "gemma4-nvfp4 spec-session: prompt={} \
+                                 emitted={} iters={} accepted={} \
+                                 accept_rate={:.3}",
+                                prompt_len, stats.emitted.len(),
+                                stats.n_iters, stats.n_accepted,
+                                if stats.n_iters > 0 {
+                                    stats.n_accepted as f32
+                                        / stats.n_iters as f32
+                                } else { 0.0 },
+                            );
+                        }
                         if stats.n_iters > 0 && stats.n_accepted == 0 {
                             spec_zero_accept_req_streak += 1;
                         } else {
@@ -1307,6 +1313,91 @@ pub async fn spawn_cuda_worker(
                         let spec_decode_on = std::env::var("RVLLM_QWEN36_SPEC_DECODE")
                             .map(|s| matches!(s.as_str(), "1"|"true"|"TRUE"|"yes"))
                             .unwrap_or(false);
+                        let spec_decode_on = if spec_decode_on {
+                            let min_prompt_tokens = std::env::var(
+                                "RVLLM_QWEN36_SPEC_MIN_PROMPT_TOKENS",
+                            )
+                                .ok()
+                                .and_then(|s| s.parse::<usize>().ok())
+                                .unwrap_or(0);
+                            let min_full_draft_hits = std::env::var(
+                                "RVLLM_QWEN36_SPEC_PREFLIGHT_MIN_FULL_DRAFTS",
+                            )
+                                .ok()
+                                .and_then(|s| s.parse::<usize>().ok())
+                                .unwrap_or(0);
+                            let min_max_new_tokens = std::env::var(
+                                "RVLLM_QWEN36_SPEC_MIN_MAX_NEW_TOKENS",
+                            )
+                                .ok()
+                                .and_then(|s| s.parse::<usize>().ok())
+                                .unwrap_or(0);
+                            let spec_k = std::env::var("RVLLM_QWEN36_SPEC_K")
+                                .ok()
+                                .and_then(|s| s.parse::<usize>().ok())
+                                .unwrap_or(4)
+                                .max(1);
+                            let ngram = std::env::var("RVLLM_QWEN36_SPEC_NGRAM")
+                                .ok()
+                                .and_then(|s| s.parse::<usize>().ok())
+                                .unwrap_or(2)
+                                .max(1);
+
+                            let prompt_len_usize = prompt_i32.len();
+                            let requested_max_new = req.max_new_tokens.max(1) as usize;
+                            let enough_prompt = prompt_len_usize >= min_prompt_tokens;
+                            let enough_decode_len = requested_max_new >= min_max_new_tokens;
+                            let enough_full_draft_hits = if min_full_draft_hits == 0 {
+                                true
+                            } else if prompt_len_usize < ngram + spec_k + 1 {
+                                false
+                            } else if ngram == 2 {
+                                let mut seen = std::collections::HashSet::<(i32, i32)>::new();
+                                let mut hits = 0usize;
+                                let last_start = prompt_len_usize - ngram - spec_k;
+                                for start in 0..=last_start {
+                                    let key = (prompt_i32[start], prompt_i32[start + 1]);
+                                    if !seen.insert(key) {
+                                        hits += 1;
+                                        if hits >= min_full_draft_hits {
+                                            break;
+                                        }
+                                    }
+                                }
+                                hits >= min_full_draft_hits
+                            } else {
+                                let mut seen = std::collections::HashSet::<Vec<i32>>::new();
+                                let mut hits = 0usize;
+                                let last_start = prompt_len_usize - ngram - spec_k;
+                                for start in 0..=last_start {
+                                    let key = prompt_i32[start..start + ngram].to_vec();
+                                    if !seen.insert(key) {
+                                        hits += 1;
+                                        if hits >= min_full_draft_hits {
+                                            break;
+                                        }
+                                    }
+                                }
+                                hits >= min_full_draft_hits
+                            };
+                            let enabled =
+                                enough_prompt && enough_decode_len && enough_full_draft_hits;
+                            if !enabled && std::env::var("RVLLM_QWEN36_SPEC_PERF_TRACE")
+                                .as_deref() == Ok("1")
+                            {
+                                tracing::debug!(
+                                    prompt_tokens = prompt_len_usize,
+                                    requested_max_new,
+                                    min_prompt_tokens,
+                                    min_max_new_tokens,
+                                    min_full_draft_hits,
+                                    "qwen36 spec preflight skipped; using native base decode",
+                                );
+                            }
+                            enabled
+                        } else {
+                            false
+                        };
                         if spec_decode_on {
                             let max_new = req.max_new_tokens.max(1);
                             let events_tx = req.events_tx.clone();
@@ -2401,7 +2492,7 @@ mod tests {
         let spec_t0 = std::time::Instant::now();
         let spec_stats = bringup
             .run_spec_session_nvfp4_greedy_k(
-                &prompt_ids, max_new, spec_k, &kv)
+                &prompt_ids, max_new, spec_k, &[], &kv)
             .expect("run_spec_session_nvfp4_greedy_k");
         let spec_elapsed = spec_t0.elapsed().as_secs_f64();
 

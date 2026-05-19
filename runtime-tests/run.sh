@@ -4,7 +4,7 @@
 # Per cell: prompt, response, prompt_tokens, completion_tokens,
 # duration_ms, prefill_tok/s, decode_tok/s.
 #
-# Profiles: 11 (see PROFILES array below). The script switches the
+# Profiles: 14 (see PROFILES array below). The script switches the
 # active-profile symlink, restarts rvllm-serve, waits for readiness,
 # fires 10 text + 3 vision + (3 audio on E4B only) requests, records
 # all metrics, and writes a single timestamped markdown file.
@@ -28,6 +28,8 @@ TIMEOUT=180
 # Format: profile_filename | display_label | model_id | weight | kv | hadamard | audio_capable(yes|no)
 PROFILES=(
   "mobile-31b-rvllm-fp8kv.env                | Gemma 4 31B  / FP8 / FP8 KV       | gemma-4-31b-it    | fp8   | fp8   | n/a | no"
+  "mobile-31b-nvfp4w-rvllm.env               | Gemma 4 31B  / NVFP4W / NVFP4 KV  | gemma-4-31b-it-nvfp4 | nvfp4w | nvfp4 | off | no"
+  "mobile-31b-nvfp4w-rvllm-spec.env          | Gemma 4 31B  / NVFP4W / NVFP4 KV / SPEC | gemma-4-31b-it-nvfp4 | nvfp4w | nvfp4 | off | no"
   "mobile-31b-rvllm-nvfp4-hadamard-on.env    | Gemma 4 31B  / FP8 / NVFP4 KV/HAD | gemma-4-31b-it    | fp8   | nvfp4 | on  | no"
   "mobile-31b-rvllm-nvfp4-hadamard-off.env   | Gemma 4 31B  / FP8 / NVFP4 KV     | gemma-4-31b-it    | fp8   | nvfp4 | off | no"
   "mobile-e4b-rvllm.env                      | Gemma 4 E4B  / F16 / FP8 KV       | gemma-4-e4b-it    | f16   | fp8   | n/a | yes"
@@ -38,6 +40,7 @@ PROFILES=(
   "mobile-qwen35-rvllm-nvfp4.env             | Qwen 3.5 27B / FP8 / NVFP4 KV     | qwen3-5-27b-dense | fp8   | nvfp4 | n/a | no"
   "mobile-qwen-rvllm.env                     | Qwen 3.6 35B / FP8 / F16 KV       | qwen3-6-35b-a3b   | fp8   | f16   | n/a | no"
   "mobile-qwen-rvllm-nvfp4.env               | Qwen 3.6 35B / FP8 / NVFP4 KV     | qwen3-6-35b-a3b   | fp8   | nvfp4 | n/a | no"
+  "mobile-qwen-rvllm-nvfp4-spec.env          | Qwen 3.6 35B / FP8 / NVFP4 KV / SPEC | qwen3-6-35b-a3b | fp8   | nvfp4 | n/a | no"
 )
 
 # === 10 text prompts (varied length, German + English + code + math) ===

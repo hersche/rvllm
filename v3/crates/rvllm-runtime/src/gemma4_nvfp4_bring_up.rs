@@ -34,7 +34,7 @@
 
 #![cfg(feature = "cuda")]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rvllm_core::Result;
 use rvllm_cutlass::cublaslt::CublasLt;
@@ -816,13 +816,14 @@ impl Gemma4Nvfp4Bringup {
     ///
     /// `max_new` caps total emitted token count (including the
     /// prefill argmax). Returns a [`SpecSessionStats`] with all
-    /// emitted tokens + accept stats; the caller decides what
-    /// to do on EOS / cancel (this primitive doesn't check
-    /// either — it's a pure orchestration loop).
+    /// emitted tokens + accept stats. Stop tokens are checked inside
+    /// the loop so short completions do not pay for a full max_new
+    /// speculative session before cuda_worker post-processes EOS.
     pub fn run_spec_session_nvfp4_greedy_k1(
         &mut self,
         prompt_ids: &[u32],
         max_new: usize,
+        stop_token_ids: &[u32],
         kv: &Gemma4Nvfp4KvState,
     ) -> Result<SpecSessionStats> {
         if max_new == 0 {
@@ -864,7 +865,7 @@ impl Gemma4Nvfp4Bringup {
         let mut emitted: Vec<u32> = vec![t_committed];
         let mut ctx_len: u32 = prompt_ids.len() as u32;
 
-        if emitted.len() >= max_new {
+        if emitted.len() >= max_new || stop_token_ids.contains(&t_committed) {
             return Ok(SpecSessionStats {
                 emitted,
                 n_iters: 0,
@@ -875,6 +876,9 @@ impl Gemma4Nvfp4Bringup {
         // 2. Drafter workspace + arena pin. Workspace is alloc'd
         //    above the current bump pointer; pin so subsequent
         //    `verify_base_one_token` scratch_guards stop here.
+        //    Restore this checkpoint before returning so each
+        //    request does not permanently raise the arena high-water.
+        let workspace_checkpoint = self.forward_checkpoint;
         let workspace = {
             let guard = self.drafter.lock().unwrap();
             let rt = guard
@@ -884,55 +888,70 @@ impl Gemma4Nvfp4Bringup {
         };
         self.pin_current_arena_top();
 
-        // 3. Iterate.
-        let mut n_iters = 0usize;
-        let mut n_accepted_total = 0usize;
+        let result = (|| -> Result<SpecSessionStats> {
+            // 3. Iterate.
+            let mut n_iters = 0usize;
+            let mut n_accepted_total = 0usize;
 
-        while emitted.len() < max_new {
-            // (a) Drafter speculation (under guard).
-            let t_draft: u32 = {
-                let guard = self.drafter.lock().unwrap();
-                let rt = guard.as_ref().unwrap();
-                self.populate_drafter_shadow_kv_with_rt(rt, kv, 0, ctx_len)?;
-                self.populate_drafter_pre_projection_input(rt, &workspace, t_committed)?;
-                self.run_drafter_forward_one_token(rt, &workspace, ctx_len, kv)?;
-                self.stream.fence()?;
-                let mut t: u32 = 0;
-                unsafe {
-                    use cudarc::driver::sys::*;
-                    let rc =
-                        cuMemcpyDtoH_v2(&mut t as *mut u32 as *mut _, workspace.out_token_id, 4);
-                    if rc != CUresult::CUDA_SUCCESS {
-                        return Err(corrupt_runtime_err(
-                            "run_spec_session_nvfp4_greedy_k1: \
-                             drafter token DtoH"
-                                .into(),
-                        ));
+            while emitted.len() < max_new {
+                // (a) Drafter speculation (under guard).
+                let t_draft: u32 = {
+                    let guard = self.drafter.lock().unwrap();
+                    let rt = guard.as_ref().unwrap();
+                    self.populate_drafter_shadow_kv_with_rt(rt, kv, 0, ctx_len)?;
+                    self.populate_drafter_pre_projection_input(rt, &workspace, t_committed)?;
+                    self.run_drafter_forward_one_token(rt, &workspace, ctx_len, kv)?;
+                    self.stream.fence()?;
+                    let mut t: u32 = 0;
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let rc = cuMemcpyDtoH_v2(
+                            &mut t as *mut u32 as *mut _,
+                            workspace.out_token_id,
+                            4,
+                        );
+                        if rc != CUresult::CUDA_SUCCESS {
+                            return Err(corrupt_runtime_err(
+                                "run_spec_session_nvfp4_greedy_k1: \
+                                 drafter token DtoH"
+                                    .into(),
+                            ));
+                        }
                     }
+                    t
+                };
+
+                // (b) Base verify — writes slot `ctx_len`, snapshots
+                //     fresh base_hidden_last for the next iter.
+                let t_verify = self.verify_base_one_token(t_committed, ctx_len, kv)?;
+
+                // (c) Accept count.
+                let n_acc = Self::spec_greedy_accept_count(&[t_draft], &[t_verify]);
+
+                // (d) Commit verify, advance.
+                emitted.push(t_verify);
+                n_accepted_total += n_acc;
+                n_iters += 1;
+                if stop_token_ids.contains(&t_verify) {
+                    break;
                 }
-                t
-            };
+                t_committed = t_verify;
+                ctx_len += 1;
+            }
 
-            // (b) Base verify — writes slot `ctx_len`, snapshots
-            //     fresh base_hidden_last for the next iter.
-            let t_verify = self.verify_base_one_token(t_committed, ctx_len, kv)?;
-
-            // (c) Accept count.
-            let n_acc = Self::spec_greedy_accept_count(&[t_draft], &[t_verify]);
-
-            // (d) Commit verify, advance.
-            emitted.push(t_verify);
-            n_accepted_total += n_acc;
-            n_iters += 1;
-            t_committed = t_verify;
-            ctx_len += 1;
+            Ok(SpecSessionStats {
+                emitted,
+                n_iters,
+                n_accepted: n_accepted_total,
+            })
+        })();
+        let fence_result = self.stream.fence();
+        unsafe {
+            self.arena.restore(workspace_checkpoint);
         }
-
-        Ok(SpecSessionStats {
-            emitted,
-            n_iters,
-            n_accepted: n_accepted_total,
-        })
+        self.forward_checkpoint = workspace_checkpoint;
+        fence_result?;
+        result
     }
 
     /// K>=1 greedy spec-session orchestration using one batched base
@@ -963,6 +982,7 @@ impl Gemma4Nvfp4Bringup {
         prompt_ids: &[u32],
         max_new: usize,
         spec_k: usize,
+        stop_token_ids: &[u32],
         kv: &Gemma4Nvfp4KvState,
     ) -> Result<SpecSessionStats> {
         if spec_k == 0 {
@@ -1010,8 +1030,7 @@ impl Gemma4Nvfp4Bringup {
         let mut shadow_slots_total = 0usize;
         let mut bailout_tokens = 0usize;
         let adaptive_k_enabled =
-            std::env::var("G4N_SPEC_ADAPTIVE_K").ok().as_deref() != Some("0")
-                && spec_k > 1;
+            std::env::var("G4N_SPEC_ADAPTIVE_K").ok().as_deref() != Some("0") && spec_k > 1;
         let adaptive_min_k = std::env::var("G4N_SPEC_ADAPTIVE_MIN_K")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -1039,7 +1058,7 @@ impl Gemma4Nvfp4Bringup {
         let mut emitted: Vec<u32> = vec![t_committed];
         let mut ctx_len: u32 = prompt_ids.len() as u32;
 
-        if emitted.len() >= max_new {
+        if emitted.len() >= max_new || stop_token_ids.contains(&t_committed) {
             if spec_timing {
                 eprintln!(
                     "[g4n-spec-timing] prompt={} max_new={} K={} emitted={} \
@@ -1059,6 +1078,7 @@ impl Gemma4Nvfp4Bringup {
             });
         }
 
+        let workspace_checkpoint = self.forward_checkpoint;
         let workspace = {
             let guard = self.drafter.lock().unwrap();
             let rt = guard
@@ -1068,209 +1088,242 @@ impl Gemma4Nvfp4Bringup {
         };
         self.pin_current_arena_top();
 
-        let mut shadow_valid_len = ctx_len;
-        {
-            let shadow_t0 = std::time::Instant::now();
-            let guard = self.drafter.lock().unwrap();
-            let rt = guard.as_ref().unwrap();
-            self.populate_drafter_shadow_kv_with_rt(
-                rt, kv, 0, shadow_valid_len)?;
-            shadow_elapsed += shadow_t0.elapsed();
-            shadow_slots_total += shadow_valid_len as usize;
-        }
-
-        let mut n_iters = 0usize;
-        let mut n_accepted_total = 0usize;
-        let mut zero_accept_iters = 0usize;
-        let zero_accept_bailout_iters = std::env::var("G4N_SPEC_ZERO_ACCEPT_BAILOUT_ITERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(4);
-
-        while emitted.len() < max_new {
-            let remaining = max_new - emitted.len();
-            let target_k = if adaptive_k_enabled {
-                adaptive_k
-            } else {
-                spec_k
-            };
-            let k_eff = if remaining > 1 {
-                target_k.min(remaining - 1)
-            } else {
-                1
-            };
-            adaptive_k_sum += k_eff;
-            let iter_ctx_start = ctx_len;
-
-            let drafter_t0 = std::time::Instant::now();
-            let drafts = {
-                let guard = self.drafter.lock().unwrap();
-                let rt = guard.as_ref().unwrap();
-                self.run_drafter_greedy_k_from_state(
-                    rt,
-                    &workspace,
-                    t_committed,
-                    ctx_len,
-                    k_eff,
-                    kv,
-                )?
-            };
-            drafter_elapsed += drafter_t0.elapsed();
-            draft_steps_total += drafts.len();
-
-            let mut verify_inputs = Vec::with_capacity(drafts.len() + 1);
-            verify_inputs.push(t_committed);
-            verify_inputs.extend_from_slice(&drafts);
-
-            let verify_t0 = std::time::Instant::now();
-            let (verifies, n_acc) =
-                self.verify_base_tokens_batched_with_accept(&verify_inputs, ctx_len, kv, &drafts)?;
-            verify_elapsed += verify_t0.elapsed();
-            verify_rows_total += verify_inputs.len();
-            if verifies.len() != drafts.len() + 1 {
-                return Err(corrupt_runtime_err(format!(
-                    "run_spec_session_nvfp4_greedy_k: verify returned {} \
-                     tokens for {} drafts",
-                    verifies.len(),
-                    drafts.len()
-                )));
-            }
-
-            if n_acc > drafts.len() || n_acc >= verifies.len() {
-                return Err(corrupt_runtime_err(format!(
-                    "run_spec_session_nvfp4_greedy_k: invalid n_acc={} \
-                     drafts={} verifies={}",
-                    n_acc,
-                    drafts.len(),
-                    verifies.len()
-                )));
-            }
-
-            let correction_or_bonus = verifies[n_acc];
-            let before_len = emitted.len();
-            for &tok in &drafts[..n_acc] {
-                if emitted.len() >= max_new {
-                    break;
-                }
-                emitted.push(tok);
-            }
-            if emitted.len() < max_new {
-                emitted.push(correction_or_bonus);
-            }
-            let committed_now = emitted.len() - before_len;
-            if committed_now == 0 {
-                return Err(corrupt_runtime_err(
-                    "run_spec_session_nvfp4_greedy_k: no token committed \
-                     in iteration"
-                        .into(),
-                ));
-            }
-
-            n_accepted_total += n_acc.min(committed_now);
-            n_iters += 1;
-            t_committed = *emitted.last().unwrap();
-            let committed_now_u32 = committed_now as u32;
-            if committed_now_u32 > 0 {
-                if shadow_valid_len != iter_ctx_start {
-                    return Err(corrupt_runtime_err(format!(
-                        "run_spec_session_nvfp4_greedy_k: shadow_valid_len={} \
-                         != iter_ctx_start={}",
-                        shadow_valid_len, iter_ctx_start)));
-                }
-                let guard = self.drafter.lock().unwrap();
-                let rt = guard.as_ref().unwrap();
+        let result = (|| -> Result<SpecSessionStats> {
+            let mut shadow_valid_len = ctx_len;
+            {
                 let shadow_t0 = std::time::Instant::now();
-                self.populate_drafter_shadow_kv_with_rt(
-                    rt, kv, iter_ctx_start, committed_now_u32)?;
+                let guard = self.drafter.lock().unwrap();
+                let rt = guard.as_ref().unwrap();
+                self.populate_drafter_shadow_kv_with_rt(rt, kv, 0, shadow_valid_len)?;
                 shadow_elapsed += shadow_t0.elapsed();
-                shadow_slots_total += committed_now_u32 as usize;
-                shadow_valid_len = iter_ctx_start + committed_now_u32;
-            }
-            ctx_len += committed_now as u32;
-
-            if n_acc == 0 {
-                zero_accept_iters += 1;
-            } else {
-                zero_accept_iters = 0;
+                shadow_slots_total += shadow_valid_len as usize;
             }
 
-            if adaptive_k_enabled {
-                adaptive_window_iter_count += 1;
-                adaptive_window_accept_count += n_acc;
-                if adaptive_window_iter_count >= adaptive_window_iters {
-                    let lhs = adaptive_window_accept_count * 100;
-                    let rhs = adaptive_window_iter_count * adaptive_k;
-                    if adaptive_k > adaptive_min_k && lhs < rhs * 55 {
-                        adaptive_k -= 1;
-                    } else if adaptive_k < spec_k && lhs >= rhs * 90 {
-                        adaptive_k += 1;
-                    }
-                    adaptive_window_iter_count = 0;
-                    adaptive_window_accept_count = 0;
-                }
-            }
+            let mut n_iters = 0usize;
+            let mut n_accepted_total = 0usize;
+            let mut zero_accept_iters = 0usize;
+            let mut verify_inputs: Vec<u32> = Vec::with_capacity(spec_k + 1);
+            let zero_accept_bailout_iters = std::env::var("G4N_SPEC_ZERO_ACCEPT_BAILOUT_ITERS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(4);
 
-            if zero_accept_bailout_iters > 0 && zero_accept_iters >= zero_accept_bailout_iters {
-                let bailout_t0 = std::time::Instant::now();
-                while emitted.len() < max_new {
+            while emitted.len() < max_new {
+                let remaining = max_new - emitted.len();
+                if remaining == 1 {
+                    let bailout_t0 = std::time::Instant::now();
                     let next = self.forward_full_to_token(t_committed, ctx_len, kv)?;
                     emitted.push(next);
-                    t_committed = next;
-                    ctx_len += 1;
                     bailout_tokens += 1;
+                    bailout_elapsed += bailout_t0.elapsed();
+                    break;
                 }
-                bailout_elapsed += bailout_t0.elapsed();
-                break;
-            }
-        }
-
-        if spec_timing {
-            let total_elapsed = total_t0.elapsed();
-            let spec_tokens = emitted.len().saturating_sub(1 + bailout_tokens);
-            let other_elapsed = total_elapsed
-                .saturating_sub(prefill_elapsed)
-                .saturating_sub(shadow_elapsed)
-                .saturating_sub(drafter_elapsed)
-                .saturating_sub(verify_elapsed)
-                .saturating_sub(bailout_elapsed);
-            eprintln!(
-                "[g4n-spec-timing] prompt={} max_new={} K={} emitted={} \
-                 spec_tokens={} bailout_tokens={} iters={} accepted={} \
-                 draft_steps={} verify_rows={} shadow_slots={} k_avg={:.3} \
-                 prefill_ms={:.3} drafter_ms={:.3} verify_ms={:.3} \
-                 shadow_ms={:.3} bailout_ms={:.3} other_ms={:.3} \
-                 total_ms={:.3}",
-                prompt_ids.len(),
-                max_new,
-                spec_k,
-                emitted.len(),
-                spec_tokens,
-                bailout_tokens,
-                n_iters,
-                n_accepted_total,
-                draft_steps_total,
-                verify_rows_total,
-                shadow_slots_total,
-                if n_iters > 0 {
-                    adaptive_k_sum as f64 / n_iters as f64
+                let target_k = if adaptive_k_enabled {
+                    adaptive_k
                 } else {
-                    0.0
-                },
-                prefill_elapsed.as_secs_f64() * 1000.0,
-                drafter_elapsed.as_secs_f64() * 1000.0,
-                verify_elapsed.as_secs_f64() * 1000.0,
-                shadow_elapsed.as_secs_f64() * 1000.0,
-                bailout_elapsed.as_secs_f64() * 1000.0,
-                other_elapsed.as_secs_f64() * 1000.0,
-                total_elapsed.as_secs_f64() * 1000.0
-            );
-        }
+                    spec_k
+                };
+                let k_eff = target_k.min(remaining - 1);
+                adaptive_k_sum += k_eff;
+                let iter_ctx_start = ctx_len;
 
-        Ok(SpecSessionStats {
-            emitted,
-            n_iters,
-            n_accepted: n_accepted_total,
-        })
+                let drafter_t0 = std::time::Instant::now();
+                let drafts = {
+                    let guard = self.drafter.lock().unwrap();
+                    let rt = guard.as_ref().unwrap();
+                    self.run_drafter_greedy_k_from_state(
+                        rt,
+                        &workspace,
+                        t_committed,
+                        ctx_len,
+                        k_eff,
+                        kv,
+                    )?
+                };
+                drafter_elapsed += drafter_t0.elapsed();
+                draft_steps_total += drafts.len();
+
+                verify_inputs.clear();
+                verify_inputs.push(t_committed);
+                verify_inputs.extend_from_slice(&drafts);
+
+                let verify_t0 = std::time::Instant::now();
+                let (verifies, n_acc) = self.verify_base_tokens_batched_with_accept(
+                    &verify_inputs,
+                    ctx_len,
+                    kv,
+                    &drafts,
+                )?;
+                verify_elapsed += verify_t0.elapsed();
+                verify_rows_total += verify_inputs.len();
+                if verifies.len() != drafts.len() + 1 {
+                    return Err(corrupt_runtime_err(format!(
+                        "run_spec_session_nvfp4_greedy_k: verify returned {} \
+                         tokens for {} drafts",
+                        verifies.len(),
+                        drafts.len()
+                    )));
+                }
+
+                if n_acc > drafts.len() || n_acc >= verifies.len() {
+                    return Err(corrupt_runtime_err(format!(
+                        "run_spec_session_nvfp4_greedy_k: invalid n_acc={} \
+                         drafts={} verifies={}",
+                        n_acc,
+                        drafts.len(),
+                        verifies.len()
+                    )));
+                }
+
+                let correction_or_bonus = verifies[n_acc];
+                let before_len = emitted.len();
+                let mut hit_stop = false;
+                for &tok in &drafts[..n_acc] {
+                    if emitted.len() >= max_new {
+                        break;
+                    }
+                    emitted.push(tok);
+                    if stop_token_ids.contains(&tok) {
+                        hit_stop = true;
+                        break;
+                    }
+                }
+                if !hit_stop && emitted.len() < max_new {
+                    emitted.push(correction_or_bonus);
+                    if stop_token_ids.contains(&correction_or_bonus) {
+                        hit_stop = true;
+                    }
+                }
+                let committed_now = emitted.len() - before_len;
+                if committed_now == 0 {
+                    return Err(corrupt_runtime_err(
+                        "run_spec_session_nvfp4_greedy_k: no token committed \
+                         in iteration"
+                            .into(),
+                    ));
+                }
+
+                n_accepted_total += n_acc.min(committed_now);
+                n_iters += 1;
+                if hit_stop {
+                    break;
+                }
+                t_committed = *emitted.last().unwrap();
+                let committed_now_u32 = committed_now as u32;
+                if committed_now_u32 > 0 {
+                    if shadow_valid_len != iter_ctx_start {
+                        return Err(corrupt_runtime_err(format!(
+                            "run_spec_session_nvfp4_greedy_k: shadow_valid_len={} \
+                             != iter_ctx_start={}",
+                            shadow_valid_len, iter_ctx_start
+                        )));
+                    }
+                    let guard = self.drafter.lock().unwrap();
+                    let rt = guard.as_ref().unwrap();
+                    let shadow_t0 = std::time::Instant::now();
+                    self.populate_drafter_shadow_kv_with_rt(
+                        rt,
+                        kv,
+                        iter_ctx_start,
+                        committed_now_u32,
+                    )?;
+                    shadow_elapsed += shadow_t0.elapsed();
+                    shadow_slots_total += committed_now_u32 as usize;
+                    shadow_valid_len = iter_ctx_start + committed_now_u32;
+                }
+                ctx_len += committed_now as u32;
+
+                if n_acc == 0 {
+                    zero_accept_iters += 1;
+                } else {
+                    zero_accept_iters = 0;
+                }
+
+                if adaptive_k_enabled {
+                    adaptive_window_iter_count += 1;
+                    adaptive_window_accept_count += n_acc;
+                    if adaptive_window_iter_count >= adaptive_window_iters {
+                        let lhs = adaptive_window_accept_count * 100;
+                        let rhs = adaptive_window_iter_count * adaptive_k;
+                        if adaptive_k > adaptive_min_k && lhs < rhs * 55 {
+                            adaptive_k -= 1;
+                        } else if adaptive_k < spec_k && lhs >= rhs * 90 {
+                            adaptive_k += 1;
+                        }
+                        adaptive_window_iter_count = 0;
+                        adaptive_window_accept_count = 0;
+                    }
+                }
+
+                if zero_accept_bailout_iters > 0 && zero_accept_iters >= zero_accept_bailout_iters {
+                    let bailout_t0 = std::time::Instant::now();
+                    while emitted.len() < max_new {
+                        let next = self.forward_full_to_token(t_committed, ctx_len, kv)?;
+                        emitted.push(next);
+                        t_committed = next;
+                        ctx_len += 1;
+                        bailout_tokens += 1;
+                    }
+                    bailout_elapsed += bailout_t0.elapsed();
+                    break;
+                }
+            }
+
+            if spec_timing {
+                let total_elapsed = total_t0.elapsed();
+                let spec_tokens = emitted.len().saturating_sub(1 + bailout_tokens);
+                let other_elapsed = total_elapsed
+                    .saturating_sub(prefill_elapsed)
+                    .saturating_sub(shadow_elapsed)
+                    .saturating_sub(drafter_elapsed)
+                    .saturating_sub(verify_elapsed)
+                    .saturating_sub(bailout_elapsed);
+                eprintln!(
+                    "[g4n-spec-timing] prompt={} max_new={} K={} emitted={} \
+                     spec_tokens={} bailout_tokens={} iters={} accepted={} \
+                     draft_steps={} verify_rows={} shadow_slots={} k_avg={:.3} \
+                     prefill_ms={:.3} drafter_ms={:.3} verify_ms={:.3} \
+                     shadow_ms={:.3} bailout_ms={:.3} other_ms={:.3} \
+                     total_ms={:.3}",
+                    prompt_ids.len(),
+                    max_new,
+                    spec_k,
+                    emitted.len(),
+                    spec_tokens,
+                    bailout_tokens,
+                    n_iters,
+                    n_accepted_total,
+                    draft_steps_total,
+                    verify_rows_total,
+                    shadow_slots_total,
+                    if n_iters > 0 {
+                        adaptive_k_sum as f64 / n_iters as f64
+                    } else {
+                        0.0
+                    },
+                    prefill_elapsed.as_secs_f64() * 1000.0,
+                    drafter_elapsed.as_secs_f64() * 1000.0,
+                    verify_elapsed.as_secs_f64() * 1000.0,
+                    shadow_elapsed.as_secs_f64() * 1000.0,
+                    bailout_elapsed.as_secs_f64() * 1000.0,
+                    other_elapsed.as_secs_f64() * 1000.0,
+                    total_elapsed.as_secs_f64() * 1000.0
+                );
+            }
+
+            Ok(SpecSessionStats {
+                emitted,
+                n_iters,
+                n_accepted: n_accepted_total,
+            })
+        })();
+        let fence_result = self.stream.fence();
+        unsafe {
+            self.arena.restore(workspace_checkpoint);
+        }
+        self.forward_checkpoint = workspace_checkpoint;
+        fence_result?;
+        result
     }
 
     /// Stream-6b spec primitive #3: base verify of one token at
@@ -7097,9 +7150,9 @@ impl Gemma4Nvfp4Bringup {
             .max()
             .unwrap_or(0);
         let hidden_bytes = (hidden as usize) * 2;
-        let residual_dev =
-            self.arena
-                .region("g4n_prompt_residual_bf16", n * hidden_bytes, 256)?;
+        let residual_dev = self
+            .arena
+            .region("g4n_prompt_residual_bf16", n * hidden_bytes, 256)?;
         let attn_out_dev = self
             .arena
             .region("g4n_prompt_attn_out_bf16", n * max_n_q * 2, 256)?;
@@ -7130,9 +7183,7 @@ impl Gemma4Nvfp4Bringup {
         let logits_region =
             self.arena
                 .region("g4n_prompt_final_logits", n * (vocab as usize) * 4, 256)?;
-        let token_region = self
-            .arena
-            .region("g4n_prompt_final_tokens", n * 4, 16)?;
+        let token_region = self.arena.region("g4n_prompt_final_tokens", n * 4, 16)?;
         let stream_u64 = self.stream.raw();
 
         unsafe {
@@ -7230,8 +7281,7 @@ impl Gemma4Nvfp4Bringup {
                     .into(),
             ));
         }
-        let selected_hidden =
-            residual_dev.device_ptr() + (n_acc * (hidden as usize) * 2) as u64;
+        let selected_hidden = residual_dev.device_ptr() + (n_acc * (hidden as usize) * 2) as u64;
         unsafe {
             rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: hidden }.launch(
                 self.forward_kernels.fn_bf16_to_f16_sat,
@@ -9440,6 +9490,7 @@ mod tests {
             .run_spec_session_nvfp4_greedy_k1(
                 /*prompt_ids=*/ &[2 /*BOS*/],
                 /*max_new=*/ 3,
+                /*stop_token_ids=*/ &[],
                 &kv,
             )
             .expect("run_spec_session_nvfp4_greedy_k1");
@@ -9514,6 +9565,7 @@ mod tests {
                 /*prompt_ids=*/ &[2 /*BOS*/],
                 /*max_new=*/ 6,
                 /*spec_k=*/ 4,
+                /*stop_token_ids=*/ &[],
                 &kv,
             )
             .expect("run_spec_session_nvfp4_greedy_k(K=4)");
