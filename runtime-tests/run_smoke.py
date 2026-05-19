@@ -376,6 +376,7 @@ def run_profile_suite(
     skip_audio: bool,
     text_max_tokens: int,
     include_repeat_probes: bool,
+    text_labels: set[str] | None,
     request_timeout: int,
 ) -> list[ProbeResult]:
     results: list[ProbeResult] = []
@@ -397,6 +398,12 @@ def run_profile_suite(
         ]
         if include_repeat_probes and profile.startswith("mobile-qwen"):
             text_prompts.extend(QWEN_REPEAT_PROMPTS)
+        if text_labels is not None:
+            text_prompts = [
+                (label, prompt, max_tokens)
+                for label, prompt, max_tokens in text_prompts
+                if label in text_labels
+            ]
         for label, prompt, max_tokens in text_prompts:
             print(f"  [{profile}] text:{label} ...", flush=True)
             r = call_chat(
@@ -535,6 +542,8 @@ def main() -> int:
     ap.add_argument("--skip-audio",  action="store_true")
     ap.add_argument("--include-repeat-probes", action="store_true",
                     help="Add long repeat-heavy probes that trigger Qwen prompt-lookup spec")
+    ap.add_argument("--text-labels", nargs="*", default=None,
+                    help="Optional subset of text probe labels to run")
     ap.add_argument("--text-max-tokens", type=int, default=80)
     ap.add_argument("--request-timeout", type=int, default=240,
                     help="Per-request HTTP timeout in seconds")
@@ -574,6 +583,7 @@ def main() -> int:
             skip_audio=args.skip_audio,
             text_max_tokens=args.text_max_tokens,
             include_repeat_probes=args.include_repeat_probes,
+            text_labels=set(args.text_labels) if args.text_labels is not None else None,
             request_timeout=args.request_timeout,
         )
         all_records.extend(recs)
