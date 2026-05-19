@@ -3152,6 +3152,20 @@ impl Qwen35Bringup {
         let row_bytes = (hidden as usize) * 2;
         let stream_raw = stream.raw() as u64;
         let num_tokens = n_prompt as u32;
+        let prefill_trace =
+            std::env::var("RVLLM_QWEN35_PREFILL_PERF_TRACE").as_deref() == Ok("1");
+        let trace_begin = if prefill_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 prefill trace begin")?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut trace_last = trace_begin;
+        let mut trace_embed_ms: f64 = 0.0;
+        let mut trace_linear_ms: f64 = 0.0;
+        let mut trace_full_ms: f64 = 0.0;
+        let mut trace_mlp_ms: f64 = 0.0;
+        let mut trace_finalize_ms: f64 = 0.0;
 
         // (1) Allocate batched buffers.
         let h_residual_buf = arena.region(
@@ -3202,6 +3216,16 @@ impl Qwen35Bringup {
             token_ids_dev,
             stream_raw,
         )?;
+        if prefill_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 prefill trace embed")?;
+            if let Some(t0) = trace_last {
+                trace_embed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
+                    "[qwen35-prefill-perf] tokens={n_prompt} stage=embed ms={trace_embed_ms:.3}"
+                );
+            }
+            trace_last = Some(std::time::Instant::now());
+        }
 
         // (4) Vision splices: DtoD per-slot over the [N, hidden]
         //     buffer. Each splice is (token_start, &[u8] of
@@ -3239,6 +3263,17 @@ impl Qwen35Bringup {
             match ty {
                 rvllm_loader::LayerAttnType::Linear => {
                     self.apply_linear_attn_layer_batched(li, num_tokens, h_residual_buf)?;
+                    if prefill_trace {
+                        qwen35_sync_stream(stream_raw, "qwen35 prefill trace linear")?;
+                        if let Some(t0) = trace_last {
+                            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                            trace_linear_ms += ms;
+                            eprintln!(
+                                "[qwen35-prefill-perf] tokens={n_prompt} layer={li} kind=linear ms={ms:.3}"
+                            );
+                        }
+                        trace_last = Some(std::time::Instant::now());
+                    }
                 }
                 rvllm_loader::LayerAttnType::Full => {
                     self.apply_full_attn_layer_batched(
@@ -3248,6 +3283,17 @@ impl Qwen35Bringup {
                         positions_dev,
                         ctx_len_dev,
                     )?;
+                    if prefill_trace {
+                        qwen35_sync_stream(stream_raw, "qwen35 prefill trace full")?;
+                        if let Some(t0) = trace_last {
+                            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                            trace_full_ms += ms;
+                            eprintln!(
+                                "[qwen35-prefill-perf] tokens={n_prompt} layer={li} kind=full ms={ms:.3}"
+                            );
+                        }
+                        trace_last = Some(std::time::Instant::now());
+                    }
                 }
                 other => {
                     return Err(corrupt(
@@ -3257,6 +3303,17 @@ impl Qwen35Bringup {
                 }
             }
             self.apply_dense_mlp_layer_batched(li, num_tokens, h_residual_buf)?;
+            if prefill_trace {
+                qwen35_sync_stream(stream_raw, "qwen35 prefill trace mlp")?;
+                if let Some(t0) = trace_last {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    trace_mlp_ms += ms;
+                    eprintln!(
+                        "[qwen35-prefill-perf] tokens={n_prompt} layer={li} kind=mlp ms={ms:.3}"
+                    );
+                }
+                trace_last = Some(std::time::Instant::now());
+            }
         }
 
         // (6) Move last row of h_residual into the single-row
@@ -3278,7 +3335,23 @@ impl Qwen35Bringup {
 
         // (7) Final norm + lm_head + argmax — reuses the existing
         //     single-row finisher.
-        self.forward_finalize_argmax()
+        let predicted = self.forward_finalize_argmax()?;
+        if prefill_trace {
+            qwen35_sync_stream(stream_raw, "qwen35 prefill trace finalize")?;
+            if let Some(t0) = trace_last {
+                trace_finalize_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+            let total_ms = trace_begin
+                .map(|t0| t0.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            eprintln!(
+                "[qwen35-prefill-perf] tokens={n_prompt} summary total_ms={total_ms:.3} \
+                 embed_ms={trace_embed_ms:.3} linear_ms={trace_linear_ms:.3} \
+                 full_ms={trace_full_ms:.3} mlp_ms={trace_mlp_ms:.3} \
+                 finalize_ms={trace_finalize_ms:.3}"
+            );
+        }
+        Ok(predicted)
     }
 
     /// Phase 3-a-v: borrow bundle for the shared Qwen-VL ViT
@@ -5598,6 +5671,22 @@ fn qwen35_la_dims(model_dir: &Path) -> Qwen35LaDims {
         num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_dim, key_dim, value_dim, conv_dim, v_per_k,
     }
+}
+
+#[cfg(feature = "cuda")]
+fn qwen35_sync_stream(stream_raw: u64, op: &'static str) -> Result<()> {
+    unsafe {
+        use cudarc::driver::sys::*;
+        let rc = cuStreamSynchronize(stream_raw as CUstream);
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                op,
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
