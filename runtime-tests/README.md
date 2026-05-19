@@ -37,6 +37,21 @@ Rusty-mode profiles can be added via `--profiles`.
 - `runtime-tests/results.md`     — overwritten every run, markdown summary + per-record table
 - `runtime-tests/results.jsonl`  — appended each run, machine-readable
 
+## Concurrent Profile Benchmark
+
+`run_concurrency.py` switches the same `~/.rvllm/profiles/` service profiles
+but sends multiple chat requests concurrently to measure queue/decode batching
+behavior under the exact promoted runtime profiles.
+
+Example:
+
+```bash
+sudo python3 /home/r00t/workspace/upstream/rvllm-serve/runtime-tests/run_concurrency.py \
+  --profiles mobile-qwen-rvllm-nvfp4-spec mobile-qwen35-rvllm-nvfp4-spec mobile-31b-nvfp4w-rvllm-spec \
+  --concurrency 1,4 --requests 4 --max-tokens 32 \
+  --restore-profile mobile-qwen-rvllm-nvfp4-spec
+```
+
 ## What's measured
 
 - prompt tokens (from response `usage.prompt_tokens`)
