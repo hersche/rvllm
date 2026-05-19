@@ -1504,11 +1504,19 @@ pub async fn spawn_cuda_worker(
                         } else {
                             false
                         };
+                        let qwen36_repetition_guard_n = std::env::var(
+                            "RVLLM_QWEN36_REPETITION_GUARD_N",
+                        )
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
                         if spec_decode_on {
                             let max_new = req.max_new_tokens.max(1);
                             let events_tx = req.events_tx.clone();
                             let cancelled_for_cb = req.cancelled.clone();
                             let stop_tokens = req.stop_token_ids.clone();
+                            let mut emitted_ids: Vec<u32> =
+                                Vec::with_capacity(max_new as usize);
                             let result = rvllm_runtime::qwen36_spec_decode::
                                 run_qwen36_prompt_lookup_spec(
                                     &qwen,
@@ -1522,6 +1530,22 @@ pub async fn spawn_cuda_worker(
                                             id: tok,
                                             position: pos,
                                         });
+                                        emitted_ids.push(tok);
+                                        if qwen36_repetition_guard_n >= 2
+                                            && emitted_ids.len() >= qwen36_repetition_guard_n
+                                        {
+                                            let tail = &emitted_ids[
+                                                emitted_ids.len() - qwen36_repetition_guard_n..
+                                            ];
+                                            if tail.iter().all(|&id| id == tail[0]) {
+                                                tracing::warn!(
+                                                    token_id = tail[0],
+                                                    guard_n = qwen36_repetition_guard_n,
+                                                    "qwen36 repetition guard stopped generation",
+                                                );
+                                                return false;
+                                            }
+                                        }
                                         !cancelled_for_cb.load(Ordering::Relaxed)
                                     },
                                 );
@@ -1591,6 +1615,7 @@ pub async fn spawn_cuda_worker(
                         let mut completion_tokens: u32 = 0;
                         let mut finish = FinishReason::Length;
                         let max_new = req.max_new_tokens.max(1);
+                        let mut emitted_ids: Vec<u32> = Vec::with_capacity(max_new as usize);
                         for step in 0..max_new {
                             let id = if next_token < 0 { 0u32 } else { next_token as u32 };
                             // Round-20 finding #2: stop-token check BEFORE
@@ -1607,7 +1632,23 @@ pub async fn spawn_cuda_worker(
                                 id,
                                 position: prompt_len + step,
                             });
+                            emitted_ids.push(id);
                             completion_tokens += 1;
+                            if qwen36_repetition_guard_n >= 2
+                                && emitted_ids.len() >= qwen36_repetition_guard_n
+                            {
+                                let tail = &emitted_ids[
+                                    emitted_ids.len() - qwen36_repetition_guard_n..
+                                ];
+                                if tail.iter().all(|&id| id == tail[0]) {
+                                    tracing::warn!(
+                                        token_id = tail[0],
+                                        guard_n = qwen36_repetition_guard_n,
+                                        "qwen36 repetition guard stopped generation",
+                                    );
+                                    break;
+                                }
+                            }
                             if req.cancelled.load(Ordering::Relaxed) {
                                 finish = FinishReason::Cancelled;
                                 break;
