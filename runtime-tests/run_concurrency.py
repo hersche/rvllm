@@ -29,7 +29,15 @@ PROFILE_MODEL_ID: dict[str, str] = {
     "mobile-31b-nvfp4w-rvllm-spec": "gemma-4-31b-it-nvfp4",
 }
 
-PROMPTS: list[tuple[str, str, str]] = [
+def long_repeat(seed: str, words: int) -> str:
+    tokens = seed.split()
+    out: list[str] = []
+    while len(out) < words:
+        out.extend(tokens)
+    return " ".join(out[:words]) + " Bitte fasse den vorigen Text in einem Satz zusammen."
+
+
+SHORT_PROMPTS: list[tuple[str, str, str]] = [
     ("capital", "Was ist die Hauptstadt von Frankreich? Antworte kurz.", "paris"),
     ("math", "1 + 1 = ? Antworte nur mit der Zahl.", "2"),
     (
@@ -45,10 +53,39 @@ PROMPTS: list[tuple[str, str, str]] = [
     ),
 ]
 
+LONG_PROMPTS: list[tuple[str, str, str]] = [
+    (
+        "long_summary_300",
+        long_repeat(
+            "Im Frühling blühen die Kirschbäume und die Tage werden länger. "
+            "Die Vögel kehren aus dem Süden zurück und das Gras beginnt zu wachsen. ",
+            words=300,
+        ),
+        "frühling",
+    ),
+    (
+        "long_summary_800",
+        long_repeat(
+            "Quantum mechanics describes nature at the smallest scales of energy levels of atoms and subatomic particles. "
+            "Classical physics, the collection of theories that existed before the advent of quantum mechanics, "
+            "describes many aspects of nature at an ordinary (macroscopic) scale, but is not sufficient for describing them at small (atomic and subatomic) scales. ",
+            words=800,
+        ),
+        "quant",
+    ),
+]
+
+PROMPT_SETS: dict[str, list[tuple[str, str, str]]] = {
+    "short": SHORT_PROMPTS,
+    "long": LONG_PROMPTS,
+    "mixed": SHORT_PROMPTS + LONG_PROMPTS,
+}
+
 
 @dataclass
 class RequestResult:
     profile: str
+    prompt_set: str
     concurrency: int
     request_index: int
     label: str
@@ -64,6 +101,7 @@ class RequestResult:
 class SummaryResult:
     profile: str
     model_id: str
+    prompt_set: str
     concurrency: int
     requested: int
     ok: int
@@ -122,12 +160,14 @@ def quality_ok(label: str, expected: str, output: str) -> tuple[bool, str | None
 def send_chat_sync(
     profile: str,
     model_id: str,
+    prompt_set: str,
+    prompts: list[tuple[str, str, str]],
     concurrency: int,
     request_index: int,
     max_tokens: int,
     timeout_s: int,
 ) -> RequestResult:
-    label, prompt, expected = PROMPTS[request_index % len(PROMPTS)]
+    label, prompt, expected = prompts[request_index % len(prompts)]
     payload = {
         "model": model_id,
         "messages": [{"role": "user", "content": prompt}],
@@ -172,6 +212,7 @@ def send_chat_sync(
             ok, error = quality_ok(label, expected, output)
     return RequestResult(
         profile=profile,
+        prompt_set=prompt_set,
         concurrency=concurrency,
         request_index=request_index,
         label=label,
@@ -195,6 +236,8 @@ def percentile(values: list[float], pct: int) -> float:
 async def run_level(
     profile: str,
     model_id: str,
+    prompt_set: str,
+    prompts: list[tuple[str, str, str]],
     concurrency: int,
     requests: int,
     max_tokens: int,
@@ -209,6 +252,8 @@ async def run_level(
                 send_chat_sync,
                 profile,
                 model_id,
+                prompt_set,
+                prompts,
                 concurrency,
                 i,
                 max_tokens,
@@ -225,6 +270,7 @@ async def run_level(
     summary = SummaryResult(
         profile=profile,
         model_id=model_id,
+        prompt_set=prompt_set,
         concurrency=concurrency,
         requested=requests,
         ok=len(ok_rows),
@@ -249,12 +295,12 @@ def format_markdown(summaries: list[SummaryResult]) -> str:
         "",
         f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
         "",
-        "| Profile | Concurrency | Pass | Fail | Wall ms | total tok/s | completion tok/s | req/s | avg latency ms | p95 latency ms |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Profile | Prompt set | Concurrency | Pass | Fail | Wall ms | total tok/s | completion tok/s | req/s | avg latency ms | p95 latency ms |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for s in summaries:
         lines.append(
-            f"| {s.profile} | {s.concurrency} | {s.ok} | {s.fail} | "
+            f"| {s.profile} | {s.prompt_set} | {s.concurrency} | {s.ok} | {s.fail} | "
             f"{s.wall_ms:.1f} | {s.total_tok_s:.1f} | {s.completion_tok_s:.1f} | "
             f"{s.requests_s:.2f} | {s.avg_latency_ms:.1f} | {s.p95_latency_ms:.1f} |"
         )
@@ -267,6 +313,7 @@ def main() -> int:
     ap.add_argument("--concurrency", default="1,4,8")
     ap.add_argument("--requests", type=int, default=8)
     ap.add_argument("--max-tokens", type=int, default=32)
+    ap.add_argument("--prompt-set", choices=sorted(PROMPT_SETS), default="short")
     ap.add_argument("--request-timeout", type=int, default=300)
     ap.add_argument("--restore-profile", default="mobile-qwen-rvllm-nvfp4-spec")
     ap.add_argument("--results", default=str(HERE / "concurrency-results.md"))
@@ -274,6 +321,7 @@ def main() -> int:
     args = ap.parse_args()
 
     levels = [int(x) for x in args.concurrency.split(",") if x.strip()]
+    prompts = PROMPT_SETS[args.prompt_set]
     summaries: list[SummaryResult] = []
     request_rows: list[RequestResult] = []
 
@@ -290,11 +338,17 @@ def main() -> int:
                     body = json.loads(r.read().decode("utf-8", errors="replace"))
                     model_id = body["data"][0]["id"]
             for level in levels:
-                print(f"  concurrency={level} requests={args.requests}", flush=True)
+                print(
+                    f"  prompt_set={args.prompt_set} concurrency={level} "
+                    f"requests={args.requests}",
+                    flush=True,
+                )
                 summary, rows = asyncio.run(
                     run_level(
                         profile,
                         model_id,
+                        args.prompt_set,
+                        prompts,
                         level,
                         args.requests,
                         args.max_tokens,

@@ -52,6 +52,9 @@ sudo python3 /home/r00t/workspace/upstream/rvllm-serve/runtime-tests/run_concurr
   --restore-profile mobile-qwen-rvllm-nvfp4-spec
 ```
 
+Use `--prompt-set long` to measure batched long-prefill behavior on the same
+300/800-word summary prompts used by `run_smoke.py`.
+
 ## What's measured
 
 - prompt tokens (from response `usage.prompt_tokens`)
