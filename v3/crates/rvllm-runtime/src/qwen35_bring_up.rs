@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use rvllm_core::{LoaderCtx, LoaderError, Result, RvllmError};
 #[cfg(feature = "cuda")]
-use rvllm_cutlass::cublaslt::CublasLt;
+use rvllm_cutlass::{cublaslt::CublasLt, CutlassBackend};
 #[cfg(feature = "cuda")]
 use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
 #[cfg(feature = "cuda")]
@@ -233,6 +233,15 @@ pub struct Qwen35OutsideKernels {
     pub fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu: KernelFn,
     pub fp8_quantize_per_token_f16_mod: LoadedModule,
     pub fn_fp8_quantize_per_token_f16: KernelFn,
+    /// Per-token amax quantizer used by CUTLASS SM120's blockscale
+    /// FP8 GEMM path. Default-off for Qwen35 MLP because it changes
+    /// activation numerics versus the f16-input GEMV reference.
+    pub fp8_quantize_per_token_amax_f16_mod: LoadedModule,
+    pub fn_fp8_quantize_per_token_amax_f16: KernelFn,
+    /// Pointwise SwiGLU epilogue for the experimental CUTLASS MLP path
+    /// (separate gate/up GEMMs followed by SiLU(gate) * up).
+    pub silu_mul_f16_mod: LoadedModule,
+    pub fn_silu_mul_f16: KernelFn,
     /// Single-output FP8 GEMV with F16 input + blockwise scale.
     /// Qwen 3.6's M=1 fallback when cuBLASLt has no blockwise FP8
     /// algo (the sm_121 case). Reused here for down_proj. SM100+
@@ -378,6 +387,8 @@ pub struct Qwen35Bringup {
     pub attn_backend_full: Option<rvllm_attention::AttentionBackend>,
     #[cfg(feature = "cuda")]
     pub cublaslt: Option<CublasLt>,
+    #[cfg(feature = "cuda")]
+    pub cutlass: CutlassBackend,
     /// Linear-attn head/dim config. Always present once `load()`
     /// completes; defaulted to Qwen 3.5 27B (`16/48/128/128, ks=4`)
     /// when the config is missing the keys.
@@ -427,6 +438,10 @@ impl Qwen35Bringup {
             let arena = HbmArena::new(&ctx, arena_bytes)?;
             let arena: HbmArena<'static> = unsafe { std::mem::transmute(arena) };
             let stream = Stream::new(&ctx)?;
+            let compile_target: Option<rvllm_core::CompileTarget> = {
+                let (major, minor) = ctx.compute_capability();
+                rvllm_core::CompileTarget::from_compute_capability(major, minor)
+            };
 
             // Phase 1b: full per-layer upload. Reads `layer_types`
             // from the arch (3:1 linear:full pattern in the 27B
@@ -724,15 +739,18 @@ impl Qwen35Bringup {
                 kernels.load_ptx("fp8_quantize_per_token_f16")?;
             let fn_fp8_quantize_per_token_f16 = fp8_quantize_per_token_f16_mod
                 .get_function("fp8_quantize_per_token_f16_kernel")?;
+            let fp8_quantize_per_token_amax_f16_mod =
+                kernels.load_ptx("fp8_quantize_per_token_amax_f16")?;
+            let fn_fp8_quantize_per_token_amax_f16 = fp8_quantize_per_token_amax_f16_mod
+                .get_function("fp8_quantize_per_token_amax_f16_kernel")?;
+            let silu_mul_f16_mod = kernels.load_ptx("silu_mul_f16")?;
+            let fn_silu_mul_f16 = silu_mul_f16_mod.get_function("silu_mul_f16_kernel")?;
             // Single-output FP8 GEMV (gemma4-launcher Fp8GemvF16InLaunch
             // entry point). Used as the M=1 down_proj fallback when
             // cuBLASLt blockwise FP8 has no sm_121 algo.
             let fp8_gemv_mod = kernels.load_ptx(rvllm_kernels::FP8_GEMV_PTX_STEM)?;
             let fn_fp8_gemv_wpr_native_f16in = {
-                let (major, minor) = ctx.compute_capability();
-                let target = rvllm_core::CompileTarget::from_compute_capability(
-                    major, minor);
-                match target {
+                match compile_target {
                     Some(t) if rvllm_kernels::Fp8GemvVariant::WprNativeF16In
                         .available_for(t) =>
                     {
@@ -897,6 +915,10 @@ impl Qwen35Bringup {
                 fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu,
                 fp8_quantize_per_token_f16_mod,
                 fn_fp8_quantize_per_token_f16,
+                fp8_quantize_per_token_amax_f16_mod,
+                fn_fp8_quantize_per_token_amax_f16,
+                silu_mul_f16_mod,
+                fn_silu_mul_f16,
                 fp8_gemv_mod,
                 fn_fp8_gemv_wpr_native_f16in,
                 split_q_gate_f16_mod,
@@ -977,6 +999,11 @@ impl Qwen35Bringup {
                 "qwen35_cublaslt_ws", cublaslt_ws_bytes, 256)?;
             let cublaslt = CublasLt::new(
                 cublaslt_ws_region.device_ptr(), cublaslt_ws_bytes)?;
+            let cutlass = CutlassBackend::load_for(
+                compile_target,
+                paths.cutlass_so.clone(),
+                &[],
+            )?;
             eprintln!(
                 "[qwen35] cuBLASLt initialised with {} MiB workspace; \
                  outside + per-layer kernel set loaded (embed, rmsnorm \
@@ -1012,6 +1039,7 @@ impl Qwen35Bringup {
                 outside_kernels: Some(outside_kernels),
                 attn_backend_full: Some(attn_backend_full),
                 cublaslt: Some(cublaslt),
+                cutlass,
                 la_dims: Some(la_dims),
             });
         }
@@ -1028,6 +1056,105 @@ impl Qwen35Bringup {
 
 #[cfg(feature = "cuda")]
 impl Qwen35Bringup {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn qwen35_fp8_cutlass_blockscale_sm120(
+        &self,
+        ker: &Qwen35OutsideKernels,
+        lib: &rvllm_cutlass::lib_so::CutlassSm120Lib,
+        out_f16: u64,
+        weight_fp8: u64,
+        weight_blockscale: u64,
+        input_f16: u64,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+        scratch_prefix: &'static str,
+    ) -> Result<()> {
+        if m < 128 || weight_blockscale == 0 {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen35 CUTLASS FP8 path requires m>=128 and blockscale weights",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "qwen35_fp8_cutlass_blockscale_sm120: arena absent".into()))?;
+        let fp8_bytes = (m as usize) * (k as usize);
+        let amax_bytes = (m as usize) * 4;
+        let in_fp8 = arena.region(scratch_prefix, fp8_bytes, 16)?;
+        let in_amax = arena.region("qwen35_cutlass_in_amax", amax_bytes, 16)?;
+        {
+            use cudarc::driver::sys::*;
+            let block_dim: u32 = k.min(1024);
+            let mut o_fp8 = in_fp8.device_ptr();
+            let mut o_amax = in_amax.device_ptr();
+            let mut i_ptr = input_f16;
+            let mut k_i: i32 = k as i32;
+            let args = [
+                (&mut o_fp8) as *mut u64 as *mut core::ffi::c_void,
+                (&mut o_amax) as *mut u64 as *mut core::ffi::c_void,
+                (&mut i_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_fp8_quantize_per_token_amax_f16.raw() as CUfunction,
+                m, 1, 1, block_dim, 1, 1, 0,
+                stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 CUTLASS FP8 path: amax quantize launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let sfa_n = lib.sfa_bytes(m as i32, k as i32);
+        let sfb_n = lib.sfb_bytes(n as i32, k as i32);
+        let ws_n = lib.workspace_size(m as i32, n as i32, k as i32);
+        if sfa_n == 0 || sfb_n == 0 {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen35 CUTLASS FP8 path: SM120 prep helpers unavailable",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        let sfa = arena.region("qwen35_cutlass_sfa", sfa_n.max(4), 16)?;
+        let sfb = arena.region("qwen35_cutlass_sfb", sfb_n.max(4), 16)?;
+        let ws = arena.region("qwen35_cutlass_ws", ws_n.max(16), 256)?;
+        lib.launch_prep_sfa(
+            in_amax.device_ptr(),
+            sfa.device_ptr(),
+            m as i32,
+            k as i32,
+            stream,
+        )?;
+        lib.launch_prep_sfb(
+            weight_blockscale,
+            sfb.device_ptr(),
+            n as i32,
+            k as i32,
+            stream,
+        )?;
+        lib.launch_fp8_gemm_blockscale(
+            out_f16,
+            in_fp8.device_ptr(),
+            weight_fp8,
+            sfa.device_ptr(),
+            sfb.device_ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+            ws.device_ptr(),
+            ws_n,
+            stream,
+        )
+    }
+
     /// Phase 2c-A: outside-only smoke forward. Drives the
     /// embed → final-RMSNorm-with-FP8-quant → cuBLASLt fp8_gemm
     /// lm_head → argmax_f16 pipe end-to-end. ALL 64 TRANSFORMER
@@ -5420,6 +5547,7 @@ impl Qwen35Bringup {
         let n = num_tokens as usize;
         let nh = (n * hidden as usize) * 2;
         let ni = (n * intermediate as usize) * 2;
+        let mlp_ck = arena.checkpoint();
         let h_work_buf  = arena.region("qwen35_bmlp_h_work",  nh, 16)?.device_ptr();
         let silu_mid_buf = arena.region("qwen35_bmlp_silu",   ni, 16)?.device_ptr();
         let down_out_buf = arena.region("qwen35_bmlp_down",   nh, 16)?.device_ptr();
@@ -5480,9 +5608,83 @@ impl Qwen35Bringup {
             trace_last = Some(std::time::Instant::now());
         }
 
-        // (2) silu_mid ← SiLU(gate(h_work)) * up(h_work)
-        //     grid (ceil(intermediate/8), num_tokens), block 256.
-        {
+        // (2) silu_mid ← SiLU(gate(h_work)) * up(h_work).
+        //
+        // Default path: f16-activation row-batched FP8 GEMV, which is
+        // the quality reference. Experimental path:
+        // RVLLM_QWEN35_MLP_CUTLASS_SM120=1 uses CUTLASS blockscale FP8
+        // GEMM for M>=RVLLM_QWEN35_MLP_CUTLASS_MIN_TOKENS (default 128).
+        // It is opt-in because it quantizes activations to FP8.
+        let cutlass_min_tokens = std::env::var("RVLLM_QWEN35_MLP_CUTLASS_MIN_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(128);
+        let cutlass_requested =
+            crate::gemma4_bring_up::parse_truthy_env("RVLLM_QWEN35_MLP_CUTLASS_SM120")
+                .unwrap_or(false)
+                && num_tokens >= cutlass_min_tokens;
+        let mut used_cutlass_mlp = false;
+        if cutlass_requested {
+            if let CutlassBackend::SoSm120(ref lib) = self.cutlass {
+                let gate_buf = arena.region("qwen35_bmlp_gate_cutlass", ni, 16)?.device_ptr();
+                let up_buf = arena.region("qwen35_bmlp_up_cutlass", ni, 16)?.device_ptr();
+                self.qwen35_fp8_cutlass_blockscale_sm120(
+                    ker,
+                    lib,
+                    gate_buf,
+                    layer.mlp.gate_proj.offset_bytes,
+                    layer.mlp.gate_proj.blockscale_ptr.unwrap_or(0),
+                    h_work_buf,
+                    num_tokens,
+                    intermediate as u32,
+                    hidden as u32,
+                    stream_raw,
+                    "qwen35_bmlp_gate_in_fp8",
+                )?;
+                self.qwen35_fp8_cutlass_blockscale_sm120(
+                    ker,
+                    lib,
+                    up_buf,
+                    layer.mlp.up_proj.offset_bytes,
+                    layer.mlp.up_proj.blockscale_ptr.unwrap_or(0),
+                    h_work_buf,
+                    num_tokens,
+                    intermediate as u32,
+                    hidden as u32,
+                    stream_raw,
+                    "qwen35_bmlp_up_in_fp8",
+                )?;
+                {
+                    use cudarc::driver::sys::*;
+                    let mut out_ptr = silu_mid_buf;
+                    let mut gate_ptr = gate_buf;
+                    let mut up_ptr = up_buf;
+                    let mut elem_n: i32 = (num_tokens as i32) * intermediate;
+                    let args = [
+                        (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut gate_ptr) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut up_ptr) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut elem_n) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let grid_x = ((elem_n as u32) + 255) / 256;
+                    let rc = cuLaunchKernel(
+                        ker.fn_silu_mul_f16.raw() as CUfunction,
+                        grid_x, 1, 1, 256, 1, 1, 0,
+                        stream_raw as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen35_bmlp CUTLASS silu_mul_f16 launch",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup()));
+                    }
+                }
+                used_cutlass_mlp = true;
+            }
+        }
+        if !used_cutlass_mlp {
             use cudarc::driver::sys::*;
             let mut out_ptr = silu_mid_buf;
             let mut wg_ptr = layer.mlp.gate_proj.offset_bytes;
@@ -5529,22 +5731,40 @@ impl Qwen35Bringup {
             trace_last = Some(std::time::Instant::now());
         }
 
-        // (3+4) down_proj at M=num_tokens — one launch via the
-        //       row-batched FP8 GEMV (kernel already supports
-        //       grid.y=M; see qwen36 fp8_proj_dispatch fix).
-        let fp8_gemv_fn = ker.fn_fp8_gemv_wpr_native_f16in.ok_or_else(|| corrupt(
-            self.paths.model_dir.clone(),
-            "apply_dense_mlp_layer_batched: fp8_gemv_wpr_native_f16in unavailable".into()))?;
-        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-            m: num_tokens, n: hidden as u32, k: intermediate as u32,
-        }.launch(
-            fp8_gemv_fn,
-            down_out_buf,
-            layer.mlp.down_proj.offset_bytes,
-            layer.mlp.down_proj.blockscale_ptr.unwrap_or(0),
-            silu_mid_buf,
-            stream_raw,
-        )?;
+        if used_cutlass_mlp {
+            if let CutlassBackend::SoSm120(ref lib) = self.cutlass {
+                self.qwen35_fp8_cutlass_blockscale_sm120(
+                    ker,
+                    lib,
+                    down_out_buf,
+                    layer.mlp.down_proj.offset_bytes,
+                    layer.mlp.down_proj.blockscale_ptr.unwrap_or(0),
+                    silu_mid_buf,
+                    num_tokens,
+                    hidden as u32,
+                    intermediate as u32,
+                    stream_raw,
+                    "qwen35_bmlp_down_in_fp8",
+                )?;
+            }
+        } else {
+            // (3+4) down_proj at M=num_tokens — one launch via the
+            //       row-batched FP8 GEMV (kernel already supports
+            //       grid.y=M; see qwen36 fp8_proj_dispatch fix).
+            let fp8_gemv_fn = ker.fn_fp8_gemv_wpr_native_f16in.ok_or_else(|| corrupt(
+                self.paths.model_dir.clone(),
+                "apply_dense_mlp_layer_batched: fp8_gemv_wpr_native_f16in unavailable".into()))?;
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m: num_tokens, n: hidden as u32, k: intermediate as u32,
+            }.launch(
+                fp8_gemv_fn,
+                down_out_buf,
+                layer.mlp.down_proj.offset_bytes,
+                layer.mlp.down_proj.blockscale_ptr.unwrap_or(0),
+                silu_mid_buf,
+                stream_raw,
+            )?;
+        }
         if mlp_trace {
             qwen35_sync_stream(stream_raw, "qwen35 mlp trace down")?;
             if let Some(t0) = trace_last {
@@ -5589,11 +5809,12 @@ impl Qwen35Bringup {
                 .map(|t0| t0.elapsed().as_secs_f64() * 1000.0)
                 .unwrap_or(0.0);
             eprintln!(
-                "[qwen35-mlp-perf] tokens={} layer={} total_ms={:.3} \
+                "[qwen35-mlp-perf] tokens={} layer={} path={} total_ms={:.3} \
                  copy_ms={:.3} norm_ms={:.3} gate_up_ms={:.3} \
                  down_ms={:.3} residual_ms={:.3}",
                 num_tokens,
                 layer_idx,
+                if used_cutlass_mlp { "cutlass-sm120" } else { "gemv-f16in" },
                 total_ms,
                 trace_copy_ms,
                 trace_norm_ms,
@@ -5602,6 +5823,7 @@ impl Qwen35Bringup {
                 trace_residual_ms,
             );
         }
+        arena.restore(mlp_ck);
         Ok(())
     }
 }
