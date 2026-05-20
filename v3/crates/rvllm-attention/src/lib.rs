@@ -392,6 +392,15 @@ pub struct Fa2PtxKernels {
     /// Owner PTX module for `fn_prefill_nvfp4kv_unified`.
     #[cfg(feature = "cuda")]
     pub unified_prefill_nvfp4kv_mod: Option<rvllm_kernels::LoadedModule>,
+    /// _nosvt variant: eliminates `s_v_f16_T` smem buffer + the
+    /// per-tile V-transpose pass by reading V row-major directly in
+    /// the P·V MMA via software re-pack. Opt-in via env knob
+    /// `RVLLM_PREFILL_NVFP4_NOSVT=1`. ABI-compatible launch; smem
+    /// footprint is `MMA_K * head_dim * 2` bytes smaller.
+    #[cfg(feature = "cuda")]
+    pub fn_prefill_nvfp4kv_unified_nosvt: Option<rvllm_kernels::KernelFn>,
+    #[cfg(feature = "cuda")]
+    pub unified_prefill_nvfp4kv_nosvt_mod: Option<rvllm_kernels::LoadedModule>,
     /// `fused_rope_partial_nvfp4kv_kernel` — RoPE + NVFP4 paged-KV
     /// cache write (layer-exec uses this in the decode/prefill hot
     /// path when `kv_dtype == Nvfp4`).
@@ -627,6 +636,25 @@ impl Fa2PtxKernels {
                     Err(_) => (None, None),
                 };
 
+            // _nosvt experimental variant. Best-effort load; missing
+            // PTX silently disables the env-gated selection.
+            let (
+                unified_prefill_nvfp4kv_nosvt_mod,
+                fn_prefill_nvfp4kv_unified_nosvt,
+            ) = match loader
+                .load_ptx("flash_attention_unified_prefill_nvfp4kv_nosvt")
+            {
+                Ok(m) => {
+                    let f = m
+                        .get_function(
+                            "flash_attention_2_prefill_nvfp4kv_unified_nosvt_kernel",
+                        )
+                        .ok();
+                    (Some(m), f)
+                }
+                Err(_) => (None, None),
+            };
+
             // Split-KV decode module — optional. Missing on PTX trees
             // predating the paged_attention_v2-style split kernel.
             let (
@@ -681,6 +709,8 @@ impl Fa2PtxKernels {
                 fn_prefill_nvfp4kv_bc16,
                 fn_prefill_nvfp4kv_unified,
                 unified_prefill_nvfp4kv_mod,
+                fn_prefill_nvfp4kv_unified_nosvt,
+                unified_prefill_nvfp4kv_nosvt_mod,
                 fn_rope_nvfp4kv,
                 fn_rope_nvfp4kv_bf16in,
                 fn_decode_nvfp4kv_bf16out,

@@ -1117,8 +1117,19 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
             // one. With output_bf16 plumb live, cycle 55 Stage 3
             // can flip a flag at the caller instead of touching the
             // launcher.
+            // _nosvt opt-in: eliminates s_v_f16_T (saves MMA_K * head_dim * 2
+            // bytes of smem AND skips the per-tile V-transpose pass).
+            // f16-out path only; bf16-out variant unchanged.
+            let use_nosvt = !output_bf16
+                && std::env::var("RVLLM_PREFILL_NVFP4_NOSVT")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                && fa2.fn_prefill_nvfp4kv_unified_nosvt.is_some();
             let kernel_handle = if output_bf16 {
                 fa2.fn_prefill_nvfp4kv_unified_bf16out
+            } else if use_nosvt {
+                fa2.fn_prefill_nvfp4kv_unified_nosvt
             } else {
                 fa2.fn_prefill_nvfp4kv_unified
             };
@@ -1148,11 +1159,13 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
             let hd = params.head_dim;
             let ts = unified.tile_size;
             let s_s_stride = ts.max(MMA_K);
+            // _nosvt drops s_v_f16_T from the layout (saves MMA_K * hd * 2 B).
+            let svt_bytes: u32 = if use_nosvt { 0 } else { MMA_K * hd * 2 };
             let smem_bytes: u32 = block_m * hd * 2        // s_q_f16
                 + block_m * 4                              // s_q_scale
                 + ts * hd * 2                              // s_k_f16
                 + ts * hd * 2                              // s_v_f16
-                + MMA_K * hd * 2                           // s_v_f16_T
+                + svt_bytes                                // s_v_f16_T (0 if nosvt)
                 + block_m * s_s_stride * 4                 // s_s
                 + block_m * 4 * 3                          // s_m + s_l + s_alpha
                 + block_m * MMA_K * 2                      // s_p_f16
