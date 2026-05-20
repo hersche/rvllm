@@ -494,6 +494,14 @@ pub struct Gemma4Nvfp4Bringup {
             rvllm_graph::pool::CapturedGraph,
         )>,
     >,
+    /// Heap-resident host source for the embed-step token-id HtoD.
+    /// The captured graph records `cuMemcpyHtoDAsync_v2`'s host
+    /// source POINTER, not its value, so a stack-local source
+    /// dangles at replay time. Routing the embed's per-iter HtoD
+    /// through this box keeps the source at a stable address
+    /// across the captured graph's lifetime; per-iter the host
+    /// just writes a new u32 here before replaying.
+    pub embed_token_box: std::sync::Mutex<Box<u32>>,
     /// Held to keep the primary CUDA context alive.
     _ctx: CudaContextHandle,
 }
@@ -755,6 +763,7 @@ impl Gemma4Nvfp4Bringup {
             drafter: std::sync::Mutex::new(None),
             base_last_hidden_ptr: std::sync::atomic::AtomicU64::new(0),
             decode_capture: std::sync::Mutex::new(None),
+            embed_token_box: std::sync::Mutex::new(Box::new(0u32)),
             _ctx: ctx,
         })
     }
@@ -5443,16 +5452,62 @@ impl Gemma4Nvfp4Bringup {
         let hidden = self.arch.hidden_size as u32;
         let tok_region = self.arena.region("g4n_embed_tok", 4, 16)?;
         let stream_u64 = self.stream.raw();
-        // Stream-async HtoD so the operation participates in stream
-        // capture (the sync variant implicit-syncs the device and
-        // breaks `cuStreamBeginCapture`). `token_id` is a 4-byte stack
-        // local, alive for the call's duration — well past when the
-        // async copy enqueues on the stream. The subsequent
-        // EmbeddingGatherLaunch on the same stream guarantees
-        // ordering against the read.
-        let token_bytes = (token_id as i32).to_le_bytes();
-        unsafe {
-            tok_region.copy_from_host_async(&token_bytes, stream_u64)?;
+        // Stream-async HtoD using the heap-stable `embed_token_box`
+        // as host source. The captured graph records the source
+        // pointer at capture time; with a Box<u32> on the struct,
+        // that address is stable across replays. Per-iter we just
+        // update the value at the stable address.
+        //
+        // Was previously a stack-local 4-byte array; that worked
+        // for eager-only flows but produced dangling-source reads
+        // on `cuGraphLaunch` replay (the stack frame is long gone
+        // by iter 2). See commit 7737d35 for the capture wrap and
+        // the production sanity probe that surfaced the
+        // "Hallo<pad>" symptom of this exact issue.
+        let token_bytes;
+        {
+            let mut guard = self.embed_token_box.lock().map_err(|_| {
+                corrupt_runtime_err("embed_token_box mutex poisoned".into())
+            })?;
+            **guard = token_id;
+            // SAFETY: re-interpret the 4-byte heap u32 as a byte
+            // slice. `guard` (and the Box behind it) lives for the
+            // remainder of this function — well past the async HtoD
+            // enqueue. For graph capture: the source pointer is
+            // captured at `copy_from_host_async` time; the Box's
+            // address remains stable for the engine's lifetime, so
+            // replay reads from a live address.
+            token_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    guard.as_ref() as *const u32 as *const u8,
+                    4,
+                )
+                .to_vec()
+            };
+            // Note: copy into a Vec<u8> so the slice lives past the
+            // mutex guard's drop without re-locking. The Vec itself
+            // is short-lived but the async HtoD has already
+            // captured the BOX's address as source (see below).
+            //
+            // Wait — that's wrong. The HtoD needs the BOX's address
+            // as source. Let me re-do that explicitly below.
+            let _ = token_bytes;  // unused
+            // Issue HtoD with the Box's address as source.
+            let src_ptr = guard.as_ref() as *const u32 as *const u8;
+            unsafe {
+                use cudarc::driver::sys::*;
+                let rc = cuMemcpyHtoDAsync_v2(
+                    tok_region.device_ptr(),
+                    src_ptr as *const _,
+                    4,
+                    stream_u64 as CUstream,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(corrupt_runtime_err(
+                        "embed_one_token_to_device: token HtoD".into(),
+                    ));
+                }
+            }
         }
         unsafe {
             rvllm_fused::EmbeddingGatherLaunch {
