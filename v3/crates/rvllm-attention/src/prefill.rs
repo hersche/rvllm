@@ -1117,8 +1117,20 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
             // one. With output_bf16 plumb live, cycle 55 Stage 3
             // can flip a flag at the caller instead of touching the
             // launcher.
+            // RVLLM_PREFILL_NVFP4_UNROLLED=1 opts into the experimental
+            // unrolled-MMA variant (f16-out path only; bf16-out unchanged).
+            // Falls back to the canonical kernel if the unrolled PTX is
+            // missing or its symbol didn't resolve.
+            let use_unrolled = !output_bf16
+                && std::env::var("RVLLM_PREFILL_NVFP4_UNROLLED")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                && fa2.fn_prefill_nvfp4kv_unified_unrolled.is_some();
             let kernel_handle = if output_bf16 {
                 fa2.fn_prefill_nvfp4kv_unified_bf16out
+            } else if use_unrolled {
+                fa2.fn_prefill_nvfp4kv_unified_unrolled
             } else {
                 fa2.fn_prefill_nvfp4kv_unified
             };

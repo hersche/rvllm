@@ -392,6 +392,15 @@ pub struct Fa2PtxKernels {
     /// Owner PTX module for `fn_prefill_nvfp4kv_unified`.
     #[cfg(feature = "cuda")]
     pub unified_prefill_nvfp4kv_mod: Option<rvllm_kernels::LoadedModule>,
+    /// Experimental variant of `fn_prefill_nvfp4kv_unified` with the
+    /// `#pragma unroll 1` directives lifted from the QK^T and P·V MMA
+    /// inner loops. Same launch ABI; opt-in via env knob
+    /// `RVLLM_PREFILL_NVFP4_UNROLLED=1`. Branch experiment for the
+    /// qwen35 prefill smem-bound bottleneck.
+    #[cfg(feature = "cuda")]
+    pub fn_prefill_nvfp4kv_unified_unrolled: Option<rvllm_kernels::KernelFn>,
+    #[cfg(feature = "cuda")]
+    pub unified_prefill_nvfp4kv_unrolled_mod: Option<rvllm_kernels::LoadedModule>,
     /// `fused_rope_partial_nvfp4kv_kernel` — RoPE + NVFP4 paged-KV
     /// cache write (layer-exec uses this in the decode/prefill hot
     /// path when `kv_dtype == Nvfp4`).
@@ -627,6 +636,27 @@ impl Fa2PtxKernels {
                     Err(_) => (None, None),
                 };
 
+            // Experimental: unrolled-MMA variant. Same kernel as above
+            // but with `#pragma unroll 1` lifted from the QK^T + P·V
+            // inner loops. Loaded best-effort; missing PTX silently
+            // disables the env-gated selection in `prefill.rs`.
+            let (
+                unified_prefill_nvfp4kv_unrolled_mod,
+                fn_prefill_nvfp4kv_unified_unrolled,
+            ) = match loader.load_ptx(
+                "flash_attention_unified_prefill_nvfp4kv_unrolled",
+            ) {
+                Ok(m) => {
+                    let f = m
+                        .get_function(
+                            "flash_attention_2_prefill_nvfp4kv_unified_unrolled_kernel",
+                        )
+                        .ok();
+                    (Some(m), f)
+                }
+                Err(_) => (None, None),
+            };
+
             // Split-KV decode module — optional. Missing on PTX trees
             // predating the paged_attention_v2-style split kernel.
             let (
@@ -681,6 +711,8 @@ impl Fa2PtxKernels {
                 fn_prefill_nvfp4kv_bc16,
                 fn_prefill_nvfp4kv_unified,
                 unified_prefill_nvfp4kv_mod,
+                fn_prefill_nvfp4kv_unified_unrolled,
+                unified_prefill_nvfp4kv_unrolled_mod,
                 fn_rope_nvfp4kv,
                 fn_rope_nvfp4kv_bf16in,
                 fn_decode_nvfp4kv_bf16out,
