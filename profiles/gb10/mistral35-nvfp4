@@ -1,0 +1,19 @@
+# Source with: source profiles/gb10/mistral35-nvfp4
+#
+# Mistral Medium 3.5 128B on GB10: NVFP4 compressed-tensors weights,
+# native Pixtral vision. Production-ready, multi-token greedy
+# generation, SSE streaming.
+
+export RVLLM_MODEL_DIR=/home/r00t/mistral-3.5
+export RVLLM_MODEL_ID=mistral-3.5-nvfp4
+export RVLLM_MODEL_FAMILY=mistral35
+export RVLLM_KERNELS_DIR=/home/r00t/workspace/upstream/rvllm-serve/kernels
+export RVLLM_CUTLASS_SM120_SO=/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121/libcutlass_sm120.so
+export RVLLM_ARENA_GB=100
+export RVLLM_BIND=127.0.0.1:8010
+export RVLLM_QUEUE_DEPTH=2
+export RVLLM_MAX_TOKENS_CAP=128
+export RVLLM_REQUEST_TIMEOUT_SECS=600
+
+# Vision (Pixtral) required for image_url requests.
+export RVLLM_LOAD_VISION=1

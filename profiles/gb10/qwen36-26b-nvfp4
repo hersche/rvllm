@@ -8,10 +8,14 @@ export RVLLM_MODEL_ID=qwen3-6-27b
 export RVLLM_MODEL_FAMILY=qwen35
 export RVLLM_KERNELS_DIR=/home/r00t/workspace/upstream/rvllm-serve/kernels
 export RVLLM_CUTLASS_SM120_SO=/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121/libcutlass_sm120.so
-export RVLLM_ARENA_GB=45
+export RVLLM_ARENA_GB=65
 export RVLLM_BIND=127.0.0.1:8010
 export RVLLM_QUEUE_DEPTH=8
-export RVLLM_MAX_TOKENS_CAP=4096
+export RVLLM_MAX_TOKENS_CAP=65536
+# qwen35 path uses a separate env for KV/RoPE allocation (default 8192).
+# Must match RVLLM_MAX_TOKENS_CAP or long prompts run off the RoPE table
+# and produce garbage output.
+export RVLLM_QWEN35_KV_MAX_POS=65536
 export RVLLM_REQUEST_TIMEOUT_SECS=600
 
 export RVLLM_QWEN35_FWD=generate
@@ -35,4 +39,4 @@ export RVLLM_QWEN35_SPEC_MIN_DRAFTS=6
 export RVLLM_QWEN35_SPEC_MIN_PROMPT_TOKENS=1024
 export RVLLM_QWEN35_SPEC_MIN_MAX_NEW_TOKENS=64
 export RVLLM_QWEN35_SPEC_ZERO_ACCEPT_BAILOUT_ITERS=1
-export RVLLM_QWEN35_SPEC_PERF_TRACE=0
+export RVLLM_QWEN35_SPEC_PERF_TRACE=1

@@ -12,7 +12,7 @@ export RVLLM_CUTLASS_SM120_SO=/home/r00t/workspace/upstream/rvllm-serve/kernels/
 export RVLLM_ARENA_GB=50
 export RVLLM_BIND=127.0.0.1:8010
 export RVLLM_QUEUE_DEPTH=8
-export RVLLM_MAX_TOKENS_CAP=4096
+export RVLLM_MAX_TOKENS_CAP=65536
 export RVLLM_REQUEST_TIMEOUT_SECS=600
 
 export RVLLM_BATCH_PREFILL=1

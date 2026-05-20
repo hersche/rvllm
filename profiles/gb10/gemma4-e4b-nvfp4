@@ -1,0 +1,44 @@
+# Source with: source profiles/gb10/gemma4-e4b-nvfp4
+#
+# Gemma 4 E4B-it on GB10: F16 weights, FP8 KV, native vision + audio,
+# spec-decode K=4 via the official E4B assistant drafter.
+#
+# Validated 2026-05-15:
+#   - text: factual prompts byte-identical to non-spec E4B
+#   - vision: ball.png → "orangefarbene kreisförmige Sonne …"
+#   - audio: real speech transcribed correctly via /v1/audio/transcriptions
+#   - spec K=4 with FP8 KV delivers ~2.46× speedup vs non-spec
+
+export RVLLM_MODEL_DIR=/home/r00t/gemma4-e4b
+export RVLLM_MODEL_ID=gemma-4-e4b-it
+export RVLLM_MODEL_FAMILY=gemma4
+export RVLLM_KERNELS_DIR=/home/r00t/workspace/upstream/rvllm-serve/kernels
+export RVLLM_CUTLASS_SM120_SO=/home/r00t/workspace/upstream/rvllm-serve/kernels/sm_121/libcutlass_sm120.so
+export RVLLM_ARENA_GB=30
+export RVLLM_BIND=127.0.0.1:8010
+export RVLLM_QUEUE_DEPTH=8
+export RVLLM_MAX_TOKENS_CAP=65536
+export RVLLM_REQUEST_TIMEOUT_SECS=600
+
+# F16 weights (E4B ships bf16 → cast to f16 at load).
+export RVLLM_F16_ONLY=1
+export RVLLM_F16_KV=0
+export RVLLM_FP8_KV=1
+
+# Vision + audio + PLE.
+export RVLLM_VISION_MAX_IMAGES=8
+export RVLLM_E4B_PLE=1
+export RVLLM_E4B_AUDIO=1
+export RVLLM_RESIDUAL_BF16=0
+
+# Batched unified prefill.
+export RVLLM_BATCH_PREFILL=1
+export RVLLM_UNIFIED_PREFILL=1
+export RVLLM_UNIFIED_PREFILL_MMA=1
+export RVLLM_PREFILL_CHUNK_SIZE=2048
+
+# Speculative decoding (E4B drafter, K=4 fixed).
+export RVLLM_GEMMA4_SPEC_DECODE=1
+export RVLLM_GEMMA4_DRAFTER_DIR=/home/r00t/gemma4-e4b-assistant
+export RVLLM_GEMMA4_SPEC_K=4
+export RVLLM_GEMMA4_SPEC_PERF_TRACE=0
