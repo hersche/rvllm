@@ -7098,6 +7098,77 @@ impl Gemma4Nvfp4Bringup {
         self.forward_final_to_token(&residual_host)
     }
 
+    /// Device-only variant of `forward_full_to_token`: runs the
+    /// same embed → 60-layer → final-norm → LM-head → argmax chain
+    /// fully on the engine's stream, returns the device pointer
+    /// holding the argmax int32. Caller is responsible for either
+    /// sync-fence + DtoH (via `argmax_dev_to_host_token`) or for
+    /// using the device pointer downstream on the same stream.
+    ///
+    /// Mirrors the production no-dump path of `forward_full_to_token`
+    /// but ELIMINATES the mid-forward sync `cuMemcpyDtoH_v2` that
+    /// reads the residual back to host between the layer loop and
+    /// the final norm. The host hop was needed for the legacy
+    /// `forward_final_to_token(&[u16])` signature; with the
+    /// device-only final helper (commit 4c83855) the residual can
+    /// stay on device end-to-end.
+    ///
+    /// Stream-capture-safe: every enqueued op uses async-only CUDA
+    /// API. Arena allocations are deterministic (same name + same
+    /// scratch_guard checkpoint produces the same device address
+    /// across calls), so a captured graph replays correctly when
+    /// the per-iter scalar slots (token_id-via-embed, position,
+    /// num_tokens) are updated between replays.
+    pub fn forward_full_to_token_device_argmax(
+        &self,
+        token_id: u32,
+        position: u32,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<u64> {
+        if position >= kv.max_pos {
+            return Err(corrupt_runtime_err(format!(
+                "forward_full_to_token_device_argmax: position={} \
+                 >= kv.max_pos={}",
+                position, kv.max_pos
+            )));
+        }
+        let _scratch_guard = self.forward_scratch_guard();
+        let hidden = self.arch.hidden_size as u32;
+        let max_n_q: usize = self
+            .model
+            .layers
+            .iter()
+            .map(|l| l.q_proj.shape[0])
+            .max()
+            .unwrap_or(0);
+        let residual_dev =
+            self.arena
+                .region("g4n_drv_residual_bf16", (hidden as usize) * 2, 256)?;
+        let attn_out_dev = self
+            .arena
+            .region("g4n_drv_attn_out_bf16", max_n_q * 2, 256)?;
+        self.embed_one_token_to_device(token_id, residual_dev.device_ptr())?;
+        for li in 0..self.arch.num_hidden_layers {
+            self.forward_layer_attn_from_residual_dev(
+                li,
+                residual_dev.device_ptr(),
+                position,
+                kv,
+                attn_out_dev.device_ptr(),
+            )?;
+            self.forward_layer_post_attn_dev(
+                li,
+                attn_out_dev.device_ptr(),
+                residual_dev.device_ptr(),
+            )?;
+            self.forward_layer_post_attn_mlp_dev(li, residual_dev.device_ptr())?;
+        }
+        self.forward_final_device_to_argmax_dev(
+            residual_dev.device_ptr(),
+            /*snapshot_base_hidden=*/ false,
+        )
+    }
+
     /// Commit #5f: multi-token prompt processing on Option B.
     /// Processes `prompt` token IDs sequentially through the 60
     /// decoder blocks, writing N consecutive KV cache slots at
@@ -7713,7 +7784,7 @@ impl Gemma4Nvfp4Bringup {
     /// (eager forward or `cuGraphLaunch` replay) on the stream, then
     /// calls this to extract the result. Bounded host work after this
     /// returns — no other syncs needed.
-    fn argmax_dev_to_host_token(&self, token_dev_ptr: u64) -> Result<u32> {
+    pub fn argmax_dev_to_host_token(&self, token_dev_ptr: u64) -> Result<u32> {
         let vocab = self.arch.vocab_size as u32;
         self.stream.fence()?;
         let mut tok = [0i32; 1];

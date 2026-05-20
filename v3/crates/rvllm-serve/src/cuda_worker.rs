@@ -1187,6 +1187,13 @@ pub async fn spawn_cuda_worker(
                     // lands a clear win.
                     let decode_via_unified = std::env::var("G4N_DECODE_VIA_UNIFIED")
                         .ok().as_deref() == Some("1");
+                    // Device-only argmax path: skips the mid-forward
+                    // sync DtoH of the residual back to host that
+                    // blocks `cuStreamBeginCapture` recording. The
+                    // host result extraction happens AFTER the
+                    // device pipeline via a single sync fence + DtoH.
+                    let decode_device_argmax = std::env::var("G4N_DECODE_DEVICE_ARGMAX")
+                        .ok().as_deref() == Some("1");
                     if stop_set.contains(&next_first) {
                         finish = FinishReason::Stop;
                     } else {
@@ -1201,7 +1208,22 @@ pub async fn spawn_cuda_worker(
                             }
                             let position = prompt_len + (step - 1);
                             let single = [last_token];
-                            let res = if decode_via_unified {
+                            let res = if decode_device_argmax {
+                                // Step 2/4 of the cuGraphLaunch wrap.
+                                // Run the per-token forward fully on
+                                // device, then extract argmax via a
+                                // single sync fence + DtoH at the end.
+                                // This is the body the captured graph
+                                // will eventually record (the
+                                // argmax_dev_to_host_token call lives
+                                // OUTSIDE the recorded region).
+                                match bringup.forward_full_to_token_device_argmax(
+                                    last_token, position, &kv,
+                                ) {
+                                    Ok(dev_ptr) => bringup.argmax_dev_to_host_token(dev_ptr),
+                                    Err(e) => Err(e),
+                                }
+                            } else if decode_via_unified {
                                 // Same path as the multi-token prefill,
                                 // exercised at N=1. Slower per-iter
                                 // today (unified kernel is tuned for
