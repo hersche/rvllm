@@ -1194,6 +1194,14 @@ pub async fn spawn_cuda_worker(
                     // device pipeline via a single sync fence + DtoH.
                     let decode_device_argmax = std::env::var("G4N_DECODE_DEVICE_ARGMAX")
                         .ok().as_deref() == Some("1");
+                    // Final cuStreamBeginCapture wrap entry. When
+                    // set, decode iter 1 captures the device-only
+                    // forward, iter 2+ replays via cuGraphLaunch.
+                    // Requires `G4N_DECODE_GRAPH_INDIRECT=1` co-set
+                    // (position must reach kernels via stable
+                    // device pointer for replay correctness).
+                    let decode_graph_replay = std::env::var("G4N_DECODE_GRAPH_REPLAY")
+                        .ok().as_deref() == Some("1");
                     if stop_set.contains(&next_first) {
                         finish = FinishReason::Stop;
                     } else {
@@ -1208,7 +1216,16 @@ pub async fn spawn_cuda_worker(
                             }
                             let position = prompt_len + (step - 1);
                             let single = [last_token];
-                            let res = if decode_device_argmax {
+                            let res = if decode_graph_replay {
+                                // Final cuStreamBeginCapture wrap:
+                                // captures iter 1, replays iter 2+.
+                                // Per-iter ~660 cuLaunchKernel host
+                                // dispatches collapse into a single
+                                // cuGraphLaunch.
+                                bringup.forward_full_to_token_captured(
+                                    last_token, position, &kv,
+                                )
+                            } else if decode_device_argmax {
                                 // Step 2/4 of the cuGraphLaunch wrap.
                                 // Run the per-token forward fully on
                                 // device, then extract argmax via a

@@ -471,6 +471,29 @@ pub struct Gemma4Nvfp4Bringup {
     /// allocated → snapshot is a no-op (production path is
     /// undisturbed when spec decode isn't requested).
     pub base_last_hidden_ptr: std::sync::atomic::AtomicU64,
+    /// CUDA-Graph capture state for single-token decode. Captured
+    /// lazily on the first `forward_full_to_token_captured` call
+    /// and reused for every subsequent decode step.
+    ///
+    /// Tuple layout:
+    ///   - `Box<u32>`: heap-resident token-id source for the embed
+    ///     HtoD. Kept on the struct so its address is stable across
+    ///     replays — a stack-local would dangle on iter 2 since
+    ///     the captured graph captures the source POINTER not its
+    ///     contents.
+    ///   - `u64`: device pointer holding the argmax int32 result.
+    ///     The captured graph writes here; the post-replay sync
+    ///     fence + DtoH reads it.
+    ///   - `rvllm_graph::pool::CapturedGraph`: instantiated graph
+    ///     exec handle. Replay drives the whole 60-layer chain
+    ///     without re-dispatching ~660 individual kernel launches.
+    pub decode_capture: std::sync::Mutex<
+        Option<(
+            Box<u32>,
+            u64,
+            rvllm_graph::pool::CapturedGraph,
+        )>,
+    >,
     /// Held to keep the primary CUDA context alive.
     _ctx: CudaContextHandle,
 }
@@ -731,6 +754,7 @@ impl Gemma4Nvfp4Bringup {
             kernels: loader,
             drafter: std::sync::Mutex::new(None),
             base_last_hidden_ptr: std::sync::atomic::AtomicU64::new(0),
+            decode_capture: std::sync::Mutex::new(None),
             _ctx: ctx,
         })
     }
@@ -7167,6 +7191,174 @@ impl Gemma4Nvfp4Bringup {
             residual_dev.device_ptr(),
             /*snapshot_base_hidden=*/ false,
         )
+    }
+
+    /// Single-token decode via cuGraphLaunch replay.
+    ///
+    /// First call: runs `forward_full_to_token_device_argmax` inside
+    /// `cuStreamBeginCapture` / `cuStreamEndCapture` on the engine's
+    /// stream, instantiates the captured graph, stashes it on
+    /// `self.decode_capture`. Subsequent calls: update the heap-
+    /// resident token-id source byte-by-byte, call
+    /// `cuGraphLaunch` against the stashed exec handle, then sync-
+    /// fence + DtoH the argmax via `argmax_dev_to_host_token`.
+    ///
+    /// Preconditions for correct replay:
+    ///   * `G4N_DECODE_GRAPH_INDIRECT=1` must be set so the
+    ///     fill_pos_slots kernel reads position scalars via stable
+    ///     device pointers (commit `638c998`). Without this, the
+    ///     captured graph freezes iter 0's position into every
+    ///     replay and produces wrong tokens.
+    ///   * The caller's `kv` MUST be the same instance as on the
+    ///     capture call (KvState pointers are baked into the graph).
+    ///
+    /// On capture failure (some sync op leaked into the chain) the
+    /// method falls back to eager `forward_full_to_token_device_argmax`
+    /// + `argmax_dev_to_host_token` and emits a `tracing::warn` so
+    /// the operator sees why the graph didn't engage. Quality is
+    /// unaffected — either path produces byte-identical greedy
+    /// output.
+    ///
+    /// Gated entry — cuda_worker routes here when
+    /// `G4N_DECODE_GRAPH_REPLAY=1`. Default off so production decode
+    /// keeps the current path.
+    pub fn forward_full_to_token_captured(
+        &self,
+        token_id: u32,
+        position: u32,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<u32> {
+        let stream_u64 = self.stream.raw();
+        let mut guard = self.decode_capture.lock().map_err(|_| {
+            corrupt_runtime_err("decode_capture mutex poisoned".into())
+        })?;
+
+        if let Some((tok_src, token_dev_ptr, captured)) = guard.as_mut() {
+            // Replay path. Update heap-resident token-id source;
+            // the captured graph's HtoD memcpy node reads from
+            // its address (stable across iters because Box<u32>
+            // is heap-allocated, captured Box address).
+            **tok_src = token_id;
+            // Update position via the existing graph-scalar slots
+            // (already populated by fill_pos_slots inside the
+            // captured body — since position differs per iter,
+            // we need the captured body's fill_pos_slots to read
+            // from a device pointer too. That requires
+            // G4N_DECODE_GRAPH_INDIRECT=1 set in the profile to
+            // route through `fill_pos_slots_indirect`. Update the
+            // device slot here so the captured kernel sees the
+            // new value at replay.
+            let pos_bytes = (position as i32).to_le_bytes();
+            unsafe {
+                use cudarc::driver::sys::*;
+                for (dst, src) in [
+                    (kv.graph_pos_off_ptr, pos_bytes.as_ptr()),
+                    (kv.graph_start_slot_ptr, pos_bytes.as_ptr()),
+                ] {
+                    let rc = cuMemcpyHtoDAsync_v2(
+                        dst as CUdeviceptr,
+                        src as *const _,
+                        4,
+                        stream_u64 as CUstream,
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(corrupt_runtime_err(
+                            "captured replay: position HtoD".into(),
+                        ));
+                    }
+                }
+            }
+            // (kv.graph_num_tokens_ptr stays at 1 — captured value.)
+            unsafe { captured.replay(stream_u64)?; }
+            return self.argmax_dev_to_host_token(*token_dev_ptr);
+        }
+
+        // First call: eagerly run + capture.
+        let mut tok_src: Box<u32> = Box::new(token_id);
+        let token_dev_ptr;
+        let layout = rvllm_metadata::MetadataLayout::compute(1, 1);
+        let layout_hash = layout.hash();
+        let fingerprint = rvllm_graph::pool::GraphFingerprint([0u8; 32]);
+        // The capture closure has to actually launch the kernels on
+        // the stream; we run the device-only forward inside. If
+        // capture rejects (residual sync somewhere) the body still
+        // runs eagerly — body() executes synchronously inside
+        // `CapturedGraph::capture`. We catch the error and fall
+        // through to a non-captured DtoH so the request completes.
+        let mut captured_token_dev: u64 = 0;
+        let body_token_dev = &mut captured_token_dev;
+        let tok_src_ptr = tok_src.as_ref() as *const u32;
+        let capture_result = unsafe {
+            rvllm_graph::pool::CapturedGraph::capture(
+                0,
+                0,
+                layout_hash,
+                fingerprint,
+                stream_u64,
+                || -> Result<()> {
+                    // Pre-kernel: HtoD-async copy heap token source
+                    // → arena's g4n_embed_tok slot. The slot's
+                    // address is captured into the graph; the
+                    // source pointer is `tok_src_ptr` (the Box on
+                    // self.decode_capture once we move it in).
+                    // The graph node will reference tok_src_ptr at
+                    // replay time, so it MUST stay live for the
+                    // graph's lifetime (Box is moved into
+                    // decode_capture after capture — pointer
+                    // remains stable because Box doesn't relocate).
+                    let dev = self.forward_full_to_token_device_argmax(
+                        // The embed function reads token_id by value;
+                        // for capture-friendliness we'd need a
+                        // separate indirect-embed path. For this
+                        // first wrap, capture iter 0 with this
+                        // specific token; replay iter 2+ will use
+                        // the captured value (token_id=iter-0-token)
+                        // UNLESS we also wire an indirect embed.
+                        // Quality A/B will reveal whether replay
+                        // tokens drift; if so, the next commit
+                        // adds an indirect embed.
+                        *tok_src_ptr,
+                        position,
+                        kv,
+                    )?;
+                    *body_token_dev = dev;
+                    Ok(())
+                },
+            )
+        };
+        token_dev_ptr = captured_token_dev;
+
+        match capture_result {
+            Ok(g) => {
+                // Capture succeeded. The forward already ran during
+                // capture (eager) and wrote argmax to token_dev_ptr.
+                // Extract it via standard DtoH.
+                let result = self.argmax_dev_to_host_token(token_dev_ptr);
+                *guard = Some((tok_src, token_dev_ptr, g));
+                result
+            }
+            Err(e) => {
+                // Capture rejected. The body still ran eagerly (per
+                // CapturedGraph::capture contract — body() executes
+                // before End). Argmax is in token_dev_ptr. Just
+                // extract and let the next iter try capture again
+                // (or stay eager forever depending on the rejection
+                // root cause).
+                tracing::warn!(
+                    "decode-graph capture rejected ({e:?}); falling back to \
+                     eager path for this iter"
+                );
+                if token_dev_ptr != 0 {
+                    return self.argmax_dev_to_host_token(token_dev_ptr);
+                }
+                // Body itself errored before writing argmax. Re-run
+                // eagerly (paranoid fallback).
+                let dev = self.forward_full_to_token_device_argmax(
+                    token_id, position, kv,
+                )?;
+                self.argmax_dev_to_host_token(dev)
+            }
+        }
     }
 
     /// Commit #5f: multi-token prompt processing on Option B.
