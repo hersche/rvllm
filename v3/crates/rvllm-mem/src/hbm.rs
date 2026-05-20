@@ -272,6 +272,51 @@ impl<'a> Region<'a> {
         }
         Ok(())
     }
+
+    /// Stream-async variant of `copy_from_host`. Identical contract on
+    /// the value side but issues `cuMemcpyHtoDAsync_v2` against
+    /// `stream` so the operation participates in stream-capture mode
+    /// (required for `cuStreamBeginCapture` + `cuGraphLaunch` replay,
+    /// since the sync variant implicit-syncs the device and fails
+    /// capture). Caller MUST keep `src` alive until the stream reaches
+    /// at least the next sync point (or invokes one) — typical use
+    /// is a small per-iter scalar (token_id, position) that lives on
+    /// the host stack for the duration of the launch chain.
+    ///
+    /// # Safety
+    /// Standard CUDA pointer/lifetime rules apply, plus the src-buffer
+    /// lifetime caveat above.
+    pub unsafe fn copy_from_host_async(&self, src: &[u8], stream: u64) -> Result<()> {
+        if src.len() > self.len {
+            return Err(RvllmError::cuda(
+                "Region::copy_from_host_async (len)",
+                CudaErrorKind::AllocFailed,
+                CudaCtx::setup(),
+            ));
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyHtoDAsync_v2(
+                self.device_ptr(),
+                src.as_ptr() as *const _,
+                src.len(),
+                stream as CUstream,
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "cuMemcpyHtoDAsync_v2",
+                    CudaErrorKind::AllocFailed,
+                    CudaCtx::setup(),
+                ));
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (src, stream);
+        }
+        Ok(())
+    }
 }
 
 // A `Region` is GraphSafe: it borrows the arena, the arena is fixed-size

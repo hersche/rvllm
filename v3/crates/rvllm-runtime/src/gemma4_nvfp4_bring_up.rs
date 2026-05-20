@@ -5282,10 +5282,18 @@ impl Gemma4Nvfp4Bringup {
     fn embed_one_token_to_device(&self, token_id: u32, dst_dev: u64) -> Result<()> {
         let hidden = self.arch.hidden_size as u32;
         let tok_region = self.arena.region("g4n_embed_tok", 4, 16)?;
-        unsafe {
-            tok_region.copy_from_host(&(token_id as i32).to_le_bytes())?;
-        }
         let stream_u64 = self.stream.raw();
+        // Stream-async HtoD so the operation participates in stream
+        // capture (the sync variant implicit-syncs the device and
+        // breaks `cuStreamBeginCapture`). `token_id` is a 4-byte stack
+        // local, alive for the call's duration — well past when the
+        // async copy enqueues on the stream. The subsequent
+        // EmbeddingGatherLaunch on the same stream guarantees
+        // ordering against the read.
+        let token_bytes = (token_id as i32).to_le_bytes();
+        unsafe {
+            tok_region.copy_from_host_async(&token_bytes, stream_u64)?;
+        }
         unsafe {
             rvllm_fused::EmbeddingGatherLaunch {
                 num_tokens: 1,
