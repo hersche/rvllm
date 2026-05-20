@@ -1172,6 +1172,21 @@ pub async fn spawn_cuda_worker(
 
                     let mut completion_tokens: u32 = 1;
                     let mut finish = FinishReason::Length;
+                    // CUDA-Graph foundation (step toward goal #2): the
+                    // unified-NVFP4-prefill path uses a device-pointer
+                    // positions buffer (`positions_dev` in
+                    // gemma4_nvfp4_bring_up.rs's batched-prefill body),
+                    // so routing single-token decode through
+                    // `forward_prompt_to_token([token], pos, kv)` is
+                    // graph-replay-friendly by design — the only
+                    // per-iter input that's NOT a stable device
+                    // pointer is the embedded token row, which we can
+                    // shadow into a stable buffer in a follow-up.
+                    // Enable for A/B with `G4N_DECODE_VIA_UNIFIED=1`.
+                    // Defaults OFF until the equivalence + perf A/B
+                    // lands a clear win.
+                    let decode_via_unified = std::env::var("G4N_DECODE_VIA_UNIFIED")
+                        .ok().as_deref() == Some("1");
                     if stop_set.contains(&next_first) {
                         finish = FinishReason::Stop;
                     } else {
@@ -1185,13 +1200,27 @@ pub async fn spawn_cuda_worker(
                                 break;
                             }
                             let position = prompt_len + (step - 1);
-                            let next = match bringup.forward_full_to_token(
-                                last_token, position, &kv,
-                            ) {
+                            let single = [last_token];
+                            let res = if decode_via_unified {
+                                // Same path as the multi-token prefill,
+                                // exercised at N=1. Slower per-iter
+                                // today (unified kernel is tuned for
+                                // batched N), but device-pointer
+                                // shape stability is the prerequisite
+                                // for cuGraphLaunch replay.
+                                bringup.forward_prompt_to_token(
+                                    &single, position, &kv,
+                                )
+                            } else {
+                                bringup.forward_full_to_token(
+                                    last_token, position, &kv,
+                                )
+                            };
+                            let next = match res {
                                 Ok(t) => t,
                                 Err(e) => {
                                     let _ = req.events_tx.send(GenerateEvent::Error(
-                                        format!("forward_full_to_token: {e:?}")));
+                                        format!("decode: {e:?}")));
                                     break;
                                 }
                             };
