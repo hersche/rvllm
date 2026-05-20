@@ -20,6 +20,14 @@ export RVLLM_QUEUE_DEPTH=8
 # 32k cumulative prompt+completion. Adjust further if memory
 # permits.
 export RVLLM_MAX_TOKENS_CAP=32768
+# Mistral 3.5's runtime KV cap is a SEPARATE env from MAX_TOKENS_CAP
+# (it sizes the per-layer KV arena + the YaRN RoPE table at boot).
+# Default = config's original_max_position_embeddings = 4096, which
+# rejected real zeroclaw prompts (~16k tokens). Raise to match
+# MAX_TOKENS_CAP. At 32k positions, RoPE tables are ~16 MB and KV
+# (BF16 + NVFP4 dual) is ~7.7 GB total — well inside the 100 GiB
+# arena after weights (~70 GiB NVFP4).
+export RVLLM_KV_CACHE_MAX_POS=32768
 export RVLLM_REQUEST_TIMEOUT_SECS=600
 
 # Vision (Pixtral) required for image_url requests.
