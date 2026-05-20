@@ -106,6 +106,17 @@ pub struct Gemma4Nvfp4KvState {
     /// the production NVFP4 profile). The RoPE+KV-write kernel
     /// uses this when per-token Q scale is off.
     pub q_scale_ptr: u64,
+    /// CUDA-Graph foundation: stable 4-byte device slots holding the
+    /// per-iter scalars consumed by `g4n_fill_pos_slots_i32_indirect`.
+    /// Caller updates these via `copy_from_host_async` on the
+    /// engine's stream right before each `cuGraphLaunch` replay;
+    /// the kernel inside the captured graph then reads the updated
+    /// values. Always allocated (4 bytes × 3 = 12 bytes overhead) so
+    /// the indirect kernel can be wired unconditionally without an
+    /// init-order branch.
+    pub graph_pos_off_ptr: u64,
+    pub graph_start_slot_ptr: u64,
+    pub graph_num_tokens_ptr: u64,
     /// Per-layer K-cache base pointers. Slot indexing inside
     /// each layer's region follows the kernel's
     /// `(slot * num_kv_heads + head_idx) * (head_dim/2)` byte
@@ -149,6 +160,12 @@ impl Gemma4Nvfp4KvState {
         let positions_region = arena.region("gemma4_nvfp4_kv_positions", meta_bytes, 16)?;
         let slot_mapping_region = arena.region("gemma4_nvfp4_kv_slot_mapping", meta_bytes, 16)?;
         let q_scale_region = arena.region("gemma4_nvfp4_kv_q_scale", 4, 16)?;
+        // CUDA-Graph foundation: stable 4-byte slots for the indirect
+        // fill_pos_slots kernel. Address is captured into the graph;
+        // value is updated per-iter via async HtoD before each replay.
+        let graph_pos_off_region = arena.region("g4n_graph_pos_off", 4, 16)?;
+        let graph_start_slot_region = arena.region("g4n_graph_start_slot", 4, 16)?;
+        let graph_num_tokens_region = arena.region("g4n_graph_num_tokens", 4, 16)?;
 
         // Initialize block_tables with identity mapping
         // (i32 0..max_pos). Single HtoD copy at allocate
@@ -215,6 +232,9 @@ impl Gemma4Nvfp4KvState {
             positions_ptr: positions_region.device_ptr(),
             slot_mapping_ptr: slot_mapping_region.device_ptr(),
             q_scale_ptr: q_scale_region.device_ptr(),
+            graph_pos_off_ptr: graph_pos_off_region.device_ptr(),
+            graph_start_slot_ptr: graph_start_slot_region.device_ptr(),
+            graph_num_tokens_ptr: graph_num_tokens_region.device_ptr(),
             k_packed_layer_ptrs,
             v_packed_layer_ptrs,
             k_scale_layer_ptrs,
