@@ -902,6 +902,20 @@ impl Gemma4Nvfp4Bringup {
         stop_token_ids: &[u32],
         kv: &Gemma4Nvfp4KvState,
     ) -> Result<SpecSessionStats> {
+        self.run_spec_session_nvfp4_greedy_k1_from(
+            prompt_ids, max_new, stop_token_ids, kv, 0)
+    }
+
+    /// Prefix-cache-aware K=1 variant. See `run_spec_session_nvfp4_greedy_k_from`
+    /// for the position_start contract.
+    pub fn run_spec_session_nvfp4_greedy_k1_from(
+        &mut self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        stop_token_ids: &[u32],
+        kv: &Gemma4Nvfp4KvState,
+        position_start: u32,
+    ) -> Result<SpecSessionStats> {
         if max_new == 0 {
             return Err(corrupt_runtime_err(
                 "run_spec_session_nvfp4_greedy_k1: max_new must be \
@@ -937,7 +951,13 @@ impl Gemma4Nvfp4Bringup {
         //    #6b-base-hidden hook in `forward_final_to_token`)
         //    snapshots base's post-final-norm hidden for the
         //    last prompt token into `base_last_hidden_ptr`.
-        let mut t_committed = self.forward_prompt_to_token(prompt_ids, 0, kv)?;
+        // Prefix-cache: skip prefill for the LCP prefix that the
+        // caller has already filled. ALWAYS feed >=1 token.
+        let effective_start =
+            (position_start as usize).min(prompt_ids.len().saturating_sub(1));
+        let suffix = &prompt_ids[effective_start..];
+        let mut t_committed = self.forward_prompt_to_token(
+            suffix, effective_start as u32, kv)?;
         let mut emitted: Vec<u32> = vec![t_committed];
         let mut ctx_len: u32 = prompt_ids.len() as u32;
 
@@ -1061,6 +1081,24 @@ impl Gemma4Nvfp4Bringup {
         stop_token_ids: &[u32],
         kv: &Gemma4Nvfp4KvState,
     ) -> Result<SpecSessionStats> {
+        // Default entrypoint: no prefix reuse (position_start = 0).
+        self.run_spec_session_nvfp4_greedy_k_from(
+            prompt_ids, max_new, spec_k, stop_token_ids, kv, 0)
+    }
+
+    /// Variant that accepts `position_start`: caller has verified KV
+    /// positions [0, position_start) already hold valid K/V for
+    /// `prompt_ids[0..position_start]` (the worker's prefix-cache
+    /// hit path). Only the suffix is prefilled.
+    pub fn run_spec_session_nvfp4_greedy_k_from(
+        &mut self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        spec_k: usize,
+        stop_token_ids: &[u32],
+        kv: &Gemma4Nvfp4KvState,
+        position_start: u32,
+    ) -> Result<SpecSessionStats> {
         if spec_k == 0 {
             return Err(corrupt_runtime_err(
                 "run_spec_session_nvfp4_greedy_k: spec_k must be >= 1".into(),
@@ -1127,9 +1165,18 @@ impl Gemma4Nvfp4Bringup {
         let mut adaptive_k_sum = 0usize;
 
         // Prefill prompt and snapshot the prompt-final base hidden for
-        // drafter step 0.
+        // drafter step 0. With `position_start > 0`, the caller has
+        // pre-populated KV[0..position_start] for prompt_ids[0..position_start]
+        // (prefix-cache hit) — we only feed the suffix. We ALWAYS feed
+        // at least 1 token so forward_prompt_to_token has work to do
+        // (it rejects empty slices) and so t_committed is the LM-head
+        // argmax at the LAST prompt position.
         let prefill_t0 = std::time::Instant::now();
-        let mut t_committed = self.forward_prompt_to_token(prompt_ids, 0, kv)?;
+        let effective_start =
+            (position_start as usize).min(prompt_ids.len().saturating_sub(1));
+        let suffix = &prompt_ids[effective_start..];
+        let mut t_committed = self.forward_prompt_to_token(
+            suffix, effective_start as u32, kv)?;
         prefill_elapsed += prefill_t0.elapsed();
         let mut emitted: Vec<u32> = vec![t_committed];
         let mut ctx_len: u32 = prompt_ids.len() as u32;

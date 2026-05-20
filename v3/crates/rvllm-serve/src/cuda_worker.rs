@@ -989,6 +989,28 @@ pub async fn spawn_cuda_worker(
                 let mut spec_zero_accept_req_streak = 0usize;
                 let mut spec_circuit_skip_remaining = 0usize;
 
+                // Prefix-cache: track the prompt tokens used for the
+                // most recent successful prefill so we can skip
+                // re-prefilling the longest-common-prefix on the next
+                // request. Default OFF — controlled tests
+                // (identical-prompt + chained-extension) verify
+                // byte-equivalent output AND 2.4× speedup, but the
+                // zeroclaw webhook scenario triggers a subtle output
+                // divergence not yet root-caused. Opt-in via
+                // G4N_PREFIX_CACHE=1 for direct-API workloads where
+                // the prompt-extension chain is controlled by the
+                // caller.
+                let prefix_cache_on = std::env::var("G4N_PREFIX_CACHE")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
+                let prefix_min_tokens: usize = std::env::var(
+                    "G4N_PREFIX_CACHE_MIN_TOKENS")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(64);
+                let mut g4n_last_prompt_ids: Vec<u32> = Vec::new();
+
                 while let Some(req) = req_rx.blocking_recv() {
                     let prompt_len = req.prompt_ids.len() as u32;
                     if req.prompt_ids.is_empty() {
@@ -1075,14 +1097,44 @@ pub async fn spawn_cuda_worker(
                     // a follow-up.
                     if spec_probe_this_request {
                         let stop_vec: Vec<u32> = stop_set.iter().copied().collect();
-                        let stats = match if spec_cfg.k == 1 {
-                            bringup.run_spec_session_nvfp4_greedy_k1(
-                                &req.prompt_ids, max_new as usize,
-                                &stop_vec, &kv)
+                        // Compute LCP with last successful prompt.
+                        // STRICT-EXTENSION-ONLY cache policy: we only
+                        // trust cached KV[0..LCP] when the new prompt
+                        // EXTENDS the cached prompt without divergence
+                        // (LCP == cached_len). The divergent-in-middle
+                        // case (LCP < cached_len) was found to subtly
+                        // corrupt output between webhook turns even
+                        // though K/V at matching positions should be
+                        // identical — likely because something in the
+                        // spec verify/rollback path touches K/V the
+                        // strict extension case avoids.
+                        let lcp = if prefix_cache_on {
+                            req.prompt_ids
+                                .iter()
+                                .zip(g4n_last_prompt_ids.iter())
+                                .take_while(|(a, b)| a == b)
+                                .count()
                         } else {
-                            bringup.run_spec_session_nvfp4_greedy_k(
+                            0
+                        };
+                        let strict_extension =
+                            lcp >= prefix_min_tokens
+                            && lcp == g4n_last_prompt_ids.len()
+                            && lcp <= req.prompt_ids.len();
+                        let position_start: u32 = if strict_extension {
+                            lcp.min(req.prompt_ids.len().saturating_sub(1)) as u32
+                        } else {
+                            0
+                        };
+                        let stats = match if spec_cfg.k == 1 {
+                            bringup.run_spec_session_nvfp4_greedy_k1_from(
                                 &req.prompt_ids, max_new as usize,
-                                spec_cfg.k as usize, &stop_vec, &kv)
+                                &stop_vec, &kv, position_start)
+                        } else {
+                            bringup.run_spec_session_nvfp4_greedy_k_from(
+                                &req.prompt_ids, max_new as usize,
+                                spec_cfg.k as usize, &stop_vec, &kv,
+                                position_start)
                         } {
                             Ok(s) => s,
                             Err(e) => {
@@ -1147,6 +1199,15 @@ pub async fn spawn_cuda_worker(
                             finish, prompt_tokens: prompt_len,
                             completion_tokens,
                         });
+                        // Prefix-cache update: this request finished
+                        // successfully; KV[0..prompt_len] now holds
+                        // valid K/V for `req.prompt_ids`. Stash for
+                        // next request's LCP compare.
+                        if prefix_cache_on {
+                            g4n_last_prompt_ids.clear();
+                            g4n_last_prompt_ids
+                                .extend_from_slice(&req.prompt_ids);
+                        }
                         continue;
                     }
 
