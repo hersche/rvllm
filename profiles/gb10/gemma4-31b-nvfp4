@@ -33,7 +33,7 @@ export RVLLM_LEGACY_ALLOWED=1
 
 export RVLLM_GEMMA4_SPEC_DECODE=1
 export RVLLM_GEMMA4_DRAFTER_DIR=/home/r00t/gemma-4-31B-it-assistant
-export RVLLM_GEMMA4_SPEC_K=7
+export RVLLM_GEMMA4_SPEC_K=8
 export RVLLM_GEMMA4_SPEC_PERF_TRACE=0
 # Gate spec OFF when prompt > N tokens. The default 900 was set when
 # spec only helped short prompts; with the K=7 verify-reuse path
