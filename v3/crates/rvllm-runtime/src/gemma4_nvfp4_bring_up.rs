@@ -7611,6 +7611,33 @@ impl Gemma4Nvfp4Bringup {
         h_residual_bf16_dev: u64,
         snapshot_base_hidden: bool,
     ) -> Result<u32> {
+        // Device-side pipeline (norm → lm_head → argmax) is stream-
+        // capture-safe. Pull the sync fence + DtoH OUT so a captured
+        // graph can include the device pipeline and the host-side
+        // result extraction happens AFTER replay returns.
+        let token_dev = self.forward_final_device_to_argmax_dev(
+            h_residual_bf16_dev,
+            snapshot_base_hidden,
+        )?;
+        self.argmax_dev_to_host_token(token_dev)
+    }
+
+    /// Device-only variant of `forward_final_device_to_token_impl`:
+    /// runs RMSNorm → LM-head GEMM → argmax on `self.stream`, writes
+    /// the argmax token id to a device int32 slot, and returns its
+    /// device pointer. NO sync fence, NO DtoH — caller is responsible
+    /// for either calling `argmax_dev_to_host_token(returned_ptr)`
+    /// after the appropriate synchronization, or for using the
+    /// returned pointer downstream on the same stream.
+    ///
+    /// Stream-capture-safe: every op enqueued here uses async-only
+    /// CUDA API. The arena.region calls produce deterministic
+    /// addresses inside a `forward_scratch_guard` frame.
+    fn forward_final_device_to_argmax_dev(
+        &self,
+        h_residual_bf16_dev: u64,
+        snapshot_base_hidden: bool,
+    ) -> Result<u64> {
         let hidden = self.arch.hidden_size as u32;
         let vocab = self.arch.vocab_size as u32;
         let stream_u64 = self.stream.raw();
@@ -7677,21 +7704,36 @@ impl Gemma4Nvfp4Bringup {
             )?;
         }
 
+        Ok(token_region.device_ptr())
+    }
+
+    /// Sync fence + DtoH read of a device int32 slot, with vocab-
+    /// range validation. The fence is the ONLY synchronization point
+    /// in the captured-graph decode flow: caller runs an enqueue chain
+    /// (eager forward or `cuGraphLaunch` replay) on the stream, then
+    /// calls this to extract the result. Bounded host work after this
+    /// returns — no other syncs needed.
+    fn argmax_dev_to_host_token(&self, token_dev_ptr: u64) -> Result<u32> {
+        let vocab = self.arch.vocab_size as u32;
         self.stream.fence()?;
         let mut tok = [0i32; 1];
         unsafe {
             use cudarc::driver::sys::*;
-            let rc = cuMemcpyDtoH_v2(tok.as_mut_ptr() as *mut _, token_region.device_ptr(), 4);
+            let rc = cuMemcpyDtoH_v2(
+                tok.as_mut_ptr() as *mut _,
+                token_dev_ptr,
+                4,
+            );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(corrupt_runtime_err(
-                    "forward_final_device_to_token: token DtoH".into(),
+                    "argmax_dev_to_host_token: token DtoH".into(),
                 ));
             }
         }
         let id = tok[0];
         if id < 0 || (id as u32) >= vocab {
             return Err(corrupt_runtime_err(format!(
-                "forward_final_device_to_token: argmax produced \
+                "argmax_dev_to_host_token: argmax produced \
                  out-of-range token id={id} vocab={vocab}"
             )));
         }
