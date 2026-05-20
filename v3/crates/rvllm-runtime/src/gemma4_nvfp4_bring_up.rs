@@ -6270,10 +6270,15 @@ impl Gemma4Nvfp4Bringup {
             num_tokens as i32,
         )?;
         // Sequence total context length for this prompt batch.
+        // Stream-async HtoD so this 4-byte per-layer copy participates
+        // in `cuStreamBeginCapture` recording (sync variant breaks
+        // capture). Pageable-source staging keeps the stack-local
+        // value safe for the call's duration.
         let seq_total_ctx: i32 = (position_start + num_tokens) as i32;
+        let seq_total_bytes = seq_total_ctx.to_le_bytes();
         let seq_total_region = self.arena.region("g4n_batch_ctx_override", 4, 16)?;
         unsafe {
-            seq_total_region.copy_from_host(&seq_total_ctx.to_le_bytes())?;
+            seq_total_region.copy_from_host_async(&seq_total_bytes, stream_u64)?;
             // Stream-ordered DtoD copy into context_lens[0].
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoDAsync_v2(
