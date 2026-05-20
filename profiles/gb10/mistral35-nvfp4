@@ -33,12 +33,20 @@ export RVLLM_REQUEST_TIMEOUT_SECS=600
 # Vision (Pixtral) required for image_url requests.
 export RVLLM_LOAD_VISION=1
 
-# NVFP4 KV cache (dual-write validation mode by default — KV is
-# allocated as BF16 authoritative + NVFP4 mirror; FA-decode reads BF16,
-# NVFP4 ride-along catches quantization regressions). Switch to
-# `nvfp4_only` once dual-mode validates clean to recover ~700 MB of
-# arena. Decoder kernels (FA decode + KV write) for NVFP4 are loaded
-# unconditionally; opting out costs nothing at boot.
+# NVFP4 KV cache mode. Three options:
+#   bf16        : BF16 KV only (legacy, smallest arena footprint at
+#                 longer contexts after NVFP4 mirror is dropped)
+#   nvfp4_dual  : BF16 authoritative + NVFP4 mirror. FA-decode reads
+#                 BF16 (fast path), NVFP4 ride-along catches quant
+#                 regressions. ~11.26 GiB KV at 32k context.
+#   nvfp4_only  : NVFP4 only. Saves ~700 MB arena but FA-decode reads
+#                 NVFP4 → 2-2.4× slower wallclock per request on the
+#                 GB10 hot path. Net negative for production; useful
+#                 only if KV arena is the binding constraint at >64k
+#                 context.
+# Hardware A/B (634-tok prompt + 30 decode, mistral 3.5):
+#   nvfp4_dual: ~33.9s | nvfp4_only: ~79.9s (+135%)
+# Stay on dual-write — the arena saving doesn't justify the perf hit.
 export RVLLM_MISTRAL35_KV_MODE=nvfp4_dual
 
 # FlashAttention-2 chunked prefill kernel. PTX is loaded
