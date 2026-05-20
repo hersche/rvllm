@@ -32,7 +32,15 @@ export RVLLM_NVFP4_KV=1
 export RVLLM_NVFP4_HADAMARD=1
 export RVLLM_NVFP4_HADAMARD_V=1
 
-export RVLLM_QWEN35_SPEC_DECODE=1
+# Prompt-lookup speculative decoding: DISABLED by default on this
+# family. End-to-end A/B at 16k zeroclaw-style prompts shows spec OFF
+# is 5-7% faster across (fresh code-gen, refused-echo, short-reply)
+# workloads with identical greedy output. Mechanism: prompt-lookup
+# drafts n-grams from the prompt; tool-heavy zeroclaw prompts almost
+# never produce generated tokens that match a recent prompt n-gram,
+# so accept_per_verify stays low and spec overhead (drafter + verify
+# preflight) costs more than it saves. Flip back to 1 to experiment.
+export RVLLM_QWEN35_SPEC_DECODE=0
 export RVLLM_QWEN35_SPEC_K=6
 export RVLLM_QWEN35_SPEC_NGRAM=2
 export RVLLM_QWEN35_SPEC_MIN_DRAFTS=6
