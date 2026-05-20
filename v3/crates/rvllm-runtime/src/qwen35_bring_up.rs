@@ -3467,6 +3467,16 @@ impl Qwen35Bringup {
         }
 
         // (5) Layer-major dispatch.
+        //
+        // Per-layer arena checkpoint+restore: each layer's
+        // apply_*_attn_layer_batched + apply_dense_mlp_layer_batched
+        // bump-allocate ~hundreds of MiB of f32 Q/K/V/MLP scratch via
+        // arena.region. Without rewinding between layers the 64 layers
+        // accumulate ~tens of GiB of dead scratch and OOM on long
+        // prompts. The buffers allocated BEFORE the loop
+        // (h_residual_buf / positions_dev / ctx_len_dev / token_ids_dev)
+        // sit BELOW the checkpoint and survive the per-layer restore.
+        let layer_ck = arena.checkpoint();
         for (li, ty) in arch.base.layer_types.iter().enumerate() {
             match ty {
                 rvllm_loader::LayerAttnType::Linear => {
@@ -3522,6 +3532,9 @@ impl Qwen35Bringup {
                 }
                 trace_last = Some(std::time::Instant::now());
             }
+            // Rewind this layer's bump-allocated scratch before the
+            // next layer claims the same arena region.
+            unsafe { arena.restore(layer_ck); }
         }
 
         // (6) Move last row of h_residual into the single-row

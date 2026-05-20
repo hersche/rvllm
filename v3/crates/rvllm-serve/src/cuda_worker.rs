@@ -907,14 +907,17 @@ pub async fn spawn_cuda_worker(
                 // Conservative max_pos cap for KV cache. The
                 // checkpoint advertises max_position_embeddings =
                 // 262144 but per-layer NVFP4 KV at that cap would
-                // be O(60 GiB). 4096 matches the production NVFP4
-                // smoke profile and fits comfortably alongside the
+                // be O(60 GiB). Default 4096 matches the production
+                // NVFP4 smoke profile and fits comfortably alongside
                 // ~22 GiB of model weights in a 40 GiB arena.
-                const G4N_KV_MAX_POS: u32 = 4096;
+                // Override via env G4N_KV_MAX_POS (e.g. 16384 for
+                // the full zeroclaw persona prompt).
+                let g4n_kv_max_pos: u32 = std::env::var("G4N_KV_MAX_POS")
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
                 // Stream-#5f-PRIME: prompt-path batched prefill needs
                 // max_query_tokens >= prompt length per call. Cap at
-                // G4N_KV_MAX_POS so the chunk equals the full context.
-                const G4N_KV_MAX_QUERY_TOKENS: u32 = G4N_KV_MAX_POS;
+                // g4n_kv_max_pos so the chunk equals the full context.
+                let g4n_kv_max_query_tokens: u32 = g4n_kv_max_pos;
                 let mut bringup = match Gemma4Nvfp4Bringup::load(
                     &paths.model_dir, arena_bytes, &paths.kernels_dir,
                 ) {
@@ -927,7 +930,7 @@ pub async fn spawn_cuda_worker(
                     }
                 };
                 let kv = match bringup.allocate_kv_state_with_chunk(
-                    G4N_KV_MAX_POS, G4N_KV_MAX_QUERY_TOKENS,
+                    g4n_kv_max_pos, g4n_kv_max_query_tokens,
                 ) {
                     Ok(k) => k,
                     Err(e) => {
@@ -965,7 +968,7 @@ pub async fn spawn_cuda_worker(
                 let _ = ready_tx.send(Ok(()));
                 tracing::info!(
                     "gemma4-nvfp4 worker ready (Option B native; \
-                     max_pos={G4N_KV_MAX_POS}, vocab={}, hidden={}, \
+                     max_pos={g4n_kv_max_pos}, vocab={}, hidden={}, \
                      layers={}, spec_decode={spec_decode}, spec_k={}).",
                     bringup.arch.vocab_size,
                     bringup.arch.hidden_size,
@@ -1031,12 +1034,12 @@ pub async fn spawn_cuda_worker(
                     // Conservative reject when the prompt+decode
                     // would exceed the KV cap.
                     let max_new = req.max_new_tokens.max(1);
-                    if (prompt_len as u32) + max_new > G4N_KV_MAX_POS {
+                    if (prompt_len as u32) + max_new > g4n_kv_max_pos {
                         let _ = req.events_tx.send(GenerateEvent::Error(
                             format!(
                                 "gemma4-nvfp4: prompt_len({prompt_len}) + \
                                  max_new_tokens({max_new}) exceeds \
-                                 max_pos({G4N_KV_MAX_POS}). Raise \
+                                 max_pos({g4n_kv_max_pos}). Raise \
                                  G4N_KV_MAX_POS or shorten the prompt."
                             )));
                         continue;

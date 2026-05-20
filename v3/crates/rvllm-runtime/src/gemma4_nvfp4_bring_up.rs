@@ -7168,6 +7168,8 @@ impl Gemma4Nvfp4Bringup {
             self.embed_one_token_to_device(tok, dst)?;
         }
 
+        // Per-layer arena checkpoint: see forward_prompt_to_all_tokens_impl.
+        let layer_ckpt = self.arena.checkpoint();
         for li in 0..self.arch.num_hidden_layers {
             self.forward_layer_attn_batched_prefill_dev(
                 li,
@@ -7184,6 +7186,7 @@ impl Gemma4Nvfp4Bringup {
                 residual_dev.device_ptr(),
             )?;
             self.forward_layer_post_attn_mlp_batched_dev(li, n_tokens, residual_dev.device_ptr())?;
+            unsafe { self.arena.restore(layer_ckpt); }
         }
 
         let logits_region =
@@ -7371,6 +7374,13 @@ impl Gemma4Nvfp4Bringup {
             self.embed_one_token_to_device(tok, dst)?;
         }
 
+        // Per-layer arena checkpoint: each layer's Q/K/V/MLP
+        // scratch regions accumulate via bump-alloc (no Drop
+        // rewind on Region). Without rewinding between layers,
+        // 60 × O(N*hidden) scratch overflows the arena at long
+        // prompts. Capture cursor after residual_dev/attn_out_dev
+        // (which MUST survive the loop) and restore each iter.
+        let layer_ckpt = self.arena.checkpoint();
         for li in 0..self.arch.num_hidden_layers {
             self.forward_layer_attn_batched_prefill_dev(
                 li,
@@ -7387,6 +7397,7 @@ impl Gemma4Nvfp4Bringup {
                 residual_dev.device_ptr(),
             )?;
             self.forward_layer_post_attn_mlp_batched_dev(li, n_tokens, residual_dev.device_ptr())?;
+            unsafe { self.arena.restore(layer_ckpt); }
         }
 
         // Common prefill path: `forward_prompt_to_token` only needs
