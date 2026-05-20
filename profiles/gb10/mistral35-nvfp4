@@ -47,3 +47,12 @@ export RVLLM_MISTRAL35_KV_MODE=nvfp4_dual
 # split qk_dot+softmax+v_dot legacy chain. Verified safe; turn off
 # only when bisecting prefill numerics.
 export RVLLM_MISTRAL35_FA_PREFILL=1
+
+# Fused W4A16 prefill GEMM variants (MMA v2..v8): all default OFF.
+# Hardware A/B (long-prompt prefill on 634-tok input, 30-tok decode):
+#   default (dequant → bf16_gemm_f32 → f32_to_bf16): 33.87s avg
+#   MMA v8 (persistent CTA, cp.async 2-stage):       40.43s avg (+19%)
+# Output byte-identical (md5 75d36e68) but the legacy bf16_gemm path
+# is faster for Mistral 3.5's projection shapes — keep the variants
+# off in production. Toggle V2..V8 explicitly when benching kernel-
+# level perf changes.
