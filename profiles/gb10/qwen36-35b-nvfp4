@@ -22,6 +22,16 @@ export RVLLM_QWEN36_NVFP4_BATCH_FULL_PREFILL=1
 export RVLLM_QWEN36_NVFP4_UNIFIED_BATCH_FULL_PREFILL=1
 export RVLLM_QWEN36_NVFP4_UNIFIED_BATCH_FULL_FROM=5
 
+# Prompt-lookup spec stays OFF on this family. Re-validated end-to-end
+# 2026-05-20 at 2k prompts:
+#   workload     spec=OFF   spec=ON   delta
+#   fresh-code   34.8s      34.8s     0%
+#   echo-quote   39.3s      38.8s    -1% (noise; spec accept_per_verify=3.97)
+#   short-reply  26.6s      26.6s     0%
+# qwen36 base decode is already fast (MoE → only ~3B active params per
+# token), so the drafter forward cancels out the saved base-verify
+# steps even when accept rate is 99%. Re-enable per-profile if a real
+# workload shows otherwise.
 export RVLLM_QWEN36_SPEC_DECODE=0
 export RVLLM_QWEN36_SPEC_K=4
 export RVLLM_QWEN36_SPEC_NGRAM=2
