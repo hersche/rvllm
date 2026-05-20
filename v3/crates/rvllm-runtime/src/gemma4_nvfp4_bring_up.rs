@@ -6292,11 +6292,18 @@ impl Gemma4Nvfp4Bringup {
         }
 
         // cu_seqlens_q for one sequence of length N: [0, N].
+        // Stream-async HtoD so this small (8-byte) copy participates
+        // in `cuStreamBeginCapture` (the sync variant implicit-syncs
+        // the device, breaking capture). For pageable host source
+        // CUDA stages the copy synchronously from the host's
+        // perspective via its internal pinned pool, so the stack
+        // array `cu` lifetime is safe even though it goes out of
+        // scope at the end of this unsafe block.
         let cu_seqlens_region = self.arena.region("g4n_batch_cu_seqlens", 2 * 4, 16)?;
         unsafe {
             let cu: [i32; 2] = [0, num_tokens as i32];
             let bytes: &[u8] = std::slice::from_raw_parts(cu.as_ptr() as *const u8, 8);
-            cu_seqlens_region.copy_from_host(bytes)?;
+            cu_seqlens_region.copy_from_host_async(bytes, stream_u64)?;
         }
 
         let k_packed = kv.k_packed_layer_ptrs[layer_idx];
