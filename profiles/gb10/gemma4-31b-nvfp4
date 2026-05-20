@@ -35,7 +35,12 @@ export RVLLM_GEMMA4_SPEC_DECODE=1
 export RVLLM_GEMMA4_DRAFTER_DIR=/home/r00t/gemma-4-31B-it-assistant
 export RVLLM_GEMMA4_SPEC_K=7
 export RVLLM_GEMMA4_SPEC_PERF_TRACE=0
-export G4N_SPEC_MAX_PROMPT_TOKENS=900
+# Gate spec OFF when prompt > N tokens. The default 900 was set when
+# spec only helped short prompts; with the K=7 verify-reuse path
+# accept rates stay high at long prompt sizes too, so push the gate
+# out far enough that zeroclaw's 15-17k persona prompts still get
+# spec'd. Empirically lifted 2026-05-20; re-tune if accept_rate drops.
+export G4N_SPEC_MAX_PROMPT_TOKENS=200000
 export G4N_SPEC_ADAPTIVE_WINDOW_ITERS=3
 export G4N_SPEC_ADAPTIVE_MIN_K=1
 export G4N_SPEC_ADAPTIVE_K=0
