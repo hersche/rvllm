@@ -270,6 +270,16 @@ struct ForwardKernels {
     /// race with kernels on `self.stream`.
     _fill_pos_slots_mod: LoadedModule,
     fn_fill_pos_slots_i32: KernelFn,
+    /// `g4n_fill_pos_slots_i32_indirect_kernel` — device-pointer
+    /// variant of `fn_fill_pos_slots_i32`. Same math; reads
+    /// `position_offset` / `start_slot` / `num_tokens` from stable
+    /// device int* slots instead of inlined kernel arg-buffer
+    /// scalars. Required so `cuStreamBeginCapture`-recorded forwards
+    /// can replay against changed per-iter inputs (the captured
+    /// graph freezes literal kernel arg values, but DOES re-read
+    /// device memory at replay time).
+    _fill_pos_slots_indirect_mod: LoadedModule,
+    fn_fill_pos_slots_i32_indirect: KernelFn,
     /// `f32_to_bf16_kernel` — device-side narrow of f32 → bf16.
     /// Replaces per-call DtoH + host RTNE-narrow + HtoD trios
     /// after every cublasLt GEMM output. Single launch per
@@ -525,6 +535,11 @@ impl Gemma4Nvfp4Bringup {
         let fill_pos_slots_mod = loader.load_ptx("g4n_fill_pos_slots_i32")?;
         let fn_fill_pos_slots_i32 =
             fill_pos_slots_mod.get_function("g4n_fill_pos_slots_i32_kernel")?;
+        // Indirect-args variant (CUDA Graph capture foundation).
+        let fill_pos_slots_indirect_mod =
+            loader.load_ptx("g4n_fill_pos_slots_i32_indirect")?;
+        let fn_fill_pos_slots_i32_indirect = fill_pos_slots_indirect_mod
+            .get_function("g4n_fill_pos_slots_i32_indirect_kernel")?;
 
         // Floor commit 4 / Stream 5a: load device-side narrow +
         // parameter-free V-RMSNorm so the per-layer attention
@@ -647,6 +662,8 @@ impl Gemma4Nvfp4Bringup {
             fn_attn_decode_gqa_bf16out,
             _fill_pos_slots_mod: fill_pos_slots_mod,
             fn_fill_pos_slots_i32,
+            _fill_pos_slots_indirect_mod: fill_pos_slots_indirect_mod,
+            fn_fill_pos_slots_i32_indirect,
             _f32_to_bf16_mod: f32_to_bf16_mod,
             fn_f32_to_bf16,
             _vnorm_bf16_mod: vnorm_bf16_mod,
@@ -1770,6 +1787,58 @@ impl Gemma4Nvfp4Bringup {
             rvllm_fused::launch_raw(
                 self.forward_kernels.fn_fill_pos_slots_i32,
                 (grid_x, 1, 1),
+                (BLOCK, 1, 1),
+                0,
+                self.stream.raw(),
+                &args,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Indirect-args variant of `fill_pos_slots`. All three scalar
+    /// inputs are read from stable device int* slots so a
+    /// `cuStreamBeginCapture`-recorded forward can replay against
+    /// updated per-iter values (caller updates the slots via
+    /// `copy_from_host_async` on the same stream before each replay).
+    ///
+    /// `grid_x_at_capture` MUST be sized for the LARGEST
+    /// `*num_tokens_ptr` the captured graph will ever see at
+    /// replay; the kernel silently no-ops threads with
+    /// `t >= *num_tokens_ptr`.
+    #[allow(dead_code)]
+    fn fill_pos_slots_indirect(
+        &self,
+        kv: &Gemma4Nvfp4KvState,
+        position_offset_dev: u64,
+        start_slot_dev: u64,
+        num_tokens_dev: u64,
+        grid_x_at_capture: u32,
+    ) -> Result<()> {
+        if grid_x_at_capture == 0 {
+            return Err(corrupt_runtime_err(
+                "fill_pos_slots_indirect: grid_x_at_capture must be > 0".into(),
+            ));
+        }
+        let mut positions: u64 = kv.positions_ptr;
+        let mut slot_mapping: u64 = kv.slot_mapping_ptr;
+        let mut context_lens: u64 = kv.context_lens_ptr;
+        let mut pos_off_ptr = position_offset_dev;
+        let mut sslot_ptr = start_slot_dev;
+        let mut nt_ptr = num_tokens_dev;
+        let args: [*mut core::ffi::c_void; 6] = [
+            (&mut positions) as *mut u64 as *mut _,
+            (&mut slot_mapping) as *mut u64 as *mut _,
+            (&mut context_lens) as *mut u64 as *mut _,
+            (&mut pos_off_ptr) as *mut u64 as *mut _,
+            (&mut sslot_ptr) as *mut u64 as *mut _,
+            (&mut nt_ptr) as *mut u64 as *mut _,
+        ];
+        const BLOCK: u32 = 256;
+        unsafe {
+            rvllm_fused::launch_raw(
+                self.forward_kernels.fn_fill_pos_slots_i32_indirect,
+                (grid_x_at_capture, 1, 1),
                 (BLOCK, 1, 1),
                 0,
                 self.stream.raw(),
