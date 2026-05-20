@@ -2877,7 +2877,9 @@ impl Qwen35Bringup {
                 let num_queries_per_kv = (n_q_heads / n_kv_heads) as u32;
                 let unified = rvllm_attention::UnifiedPrefillParams {
                     num_queries_per_kv,
-                    tile_size: if head_dim <= 256 { 32 } else { 16 },
+                    tile_size: std::env::var("RVLLM_QWEN35_UNIFIED_TILE_SIZE")
+                        .ok().and_then(|s| s.parse().ok())
+                        .unwrap_or(if head_dim <= 256 { 32 } else { 16 }),
                     block_q: (rvllm_attention::UNIFIED_PREFILL_BLOCK_M
                         / num_queries_per_kv.max(1)).max(1),
                     use_mma: true,
