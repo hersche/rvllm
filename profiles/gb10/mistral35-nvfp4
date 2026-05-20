@@ -49,6 +49,17 @@ export RVLLM_LOAD_VISION=1
 # Stay on dual-write — the arena saving doesn't justify the perf hit.
 export RVLLM_MISTRAL35_KV_MODE=nvfp4_dual
 
+# Decode device-pointer kernels: per-decode-step pos / past_len live
+# in device-resident i32 slots (updated once per step via a single
+# cuMemcpyHtoDAsync) instead of being baked into kernel arg-bufs at
+# every launch. This is the precursor wiring CUDA Graph capture
+# needs (host→device pointer stability across replays) but is a
+# real perf win on its own — saves one stream sync + arg-buf
+# marshal per decode step × 3 kernels (RoPE / KV write / FA decode).
+# devp PTX variants are loaded unconditionally; the env flips
+# dispatch.
+export RVLLM_MISTRAL35_DECODE_DEVP=1
+
 # FlashAttention-2 chunked prefill kernel. PTX is loaded
 # unconditionally at bring-up; setting this gates the runtime
 # dispatch so the chunk-prefill path uses the kernel rather than the
