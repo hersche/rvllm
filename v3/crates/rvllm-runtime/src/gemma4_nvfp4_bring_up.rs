@@ -1787,6 +1787,53 @@ impl Gemma4Nvfp4Bringup {
                 "fill_pos_slots: num_tokens={num_tokens} must be > 0"
             )));
         }
+
+        // CUDA-Graph foundation: when `G4N_DECODE_GRAPH_INDIRECT=1`,
+        // route through the indirect-args kernel so the captured
+        // graph can replay against per-iter scalar updates. The
+        // graph_* device slots live on the KvState (commit 1c4cb73)
+        // and are updated via async HtoD here on the engine's stream
+        // — same stream as the kernel that reads them, so the
+        // update is ordered before the read by construction.
+        let use_indirect = std::env::var("G4N_DECODE_GRAPH_INDIRECT")
+            .ok().as_deref() == Some("1");
+        if use_indirect {
+            let stream_raw = self.stream.raw();
+            let pos_off_bytes = position_offset.to_le_bytes();
+            let sslot_bytes = start_slot.to_le_bytes();
+            let n_bytes = num_tokens.to_le_bytes();
+            unsafe {
+                use cudarc::driver::sys::*;
+                // Async HtoD on the engine's stream. The graph_*
+                // device addresses are stable across the worker's
+                // lifetime; the values get updated per fill call.
+                for (dst, src) in [
+                    (kv.graph_pos_off_ptr, pos_off_bytes.as_ptr()),
+                    (kv.graph_start_slot_ptr, sslot_bytes.as_ptr()),
+                    (kv.graph_num_tokens_ptr, n_bytes.as_ptr()),
+                ] {
+                    let rc = cuMemcpyHtoDAsync_v2(
+                        dst as CUdeviceptr,
+                        src as *const _,
+                        4,
+                        stream_raw as CUstream,
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(corrupt_runtime_err(
+                            "fill_pos_slots(indirect): graph-scalar HtoD".into(),
+                        ));
+                    }
+                }
+            }
+            return self.fill_pos_slots_indirect(
+                kv,
+                kv.graph_pos_off_ptr,
+                kv.graph_start_slot_ptr,
+                kv.graph_num_tokens_ptr,
+                ((num_tokens as u32) + 256 - 1) / 256,
+            );
+        }
+
         let mut positions: u64 = kv.positions_ptr;
         let mut slot_mapping: u64 = kv.slot_mapping_ptr;
         let mut context_lens: u64 = kv.context_lens_ptr;
