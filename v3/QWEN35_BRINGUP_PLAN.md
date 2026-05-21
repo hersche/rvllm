@@ -247,12 +247,18 @@ Status (2026-05-22): substantially done. Concrete commits:
 
 * `a165a41` — CUTLASS FP8 blockwise GEMM now accepts M<128 via
   internal zero-pad to M_pad=128, DtoD-copy of first M rows back
-  to caller. Unblocks prefills with 32 ≤ M < 128 (previously stuck
-  on per-token gemv-f16in fallback). **4.3× speedup measured at
+  to caller. Unblocks prefills with M < 128 (previously stuck on
+  per-token gemv-f16in fallback). **4.3× speedup measured at
   M=89: 16.95s → 3.94s on the zeroclaw-shape 520-char Linux
   prompt + 40 decode, byte-equivalent output (md5 6f87a6f0).**
-  Profile defaults lowered: `RVLLM_QWEN35_{MLP,LINEAR,FULL}_CUTLASS_MIN_TOKENS`
-  128 → 32.
+* `df1f485` — Profile MIN_TOKENS sweep landed the final default:
+  `RVLLM_QWEN35_{MLP,LINEAR,FULL}_CUTLASS_MIN_TOKENS` 128 → 8.
+  Sweep showed byte-equivalent output across MIN ∈ {32, 16, 8, 2}
+  for all tested prompts and a **3.8× speedup at M=19** prefill
+  (3.36s → 0.88s for the short prompt). M=33 / M=89 unchanged
+  between MIN=8 vs MIN=32 (both already on padded-CUTLASS).
+  Crossover where GEMV beats padded-CUTLASS is only M=1, which
+  doesn't hit this helper (separate single-token decode path).
 * `68c6dbb` — NVFP4 batched-prefill cu_seqlens populator switched
   from sync `Region::copy_from_host` to stream-ordered
   `cuMemsetD32Async`. Eliminates 16 host-blocking HtoD per

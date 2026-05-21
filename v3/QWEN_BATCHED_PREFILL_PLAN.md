@@ -190,12 +190,14 @@ The qwen35 path (Qwen 3.5 / 3.6-27B dense, qwen35_bring_up.rs)
 shares Phase 1-4a's plumbing but has its own NVFP4-batched-prefill
 landing. Recent perf landings on `rusty_sm121_qwen36_26b`:
 
-* `a165a41` — CUTLASS FP8 blockwise GEMM helper accepts M<128
-  via internal zero-pad to M_pad=128 + first-M-rows-copy back.
-  Profile defaults dropped MIN_TOKENS 128→32 across MLP/LINEAR/
-  FULL. **4.3× speedup at M=89 prefill** (16.95s → 3.94s on the
-  520-char Linux prompt + 40 decode); md5 byte-equivalent
-  (6f87a6f0 both before/after).
+* `a165a41` + `df1f485` — CUTLASS FP8 blockwise GEMM helper
+  accepts M<128 via internal zero-pad to M_pad=128 + first-M-
+  rows-copy back. Profile defaults dropped MIN_TOKENS 128 → 8
+  across MLP/LINEAR/FULL after a byte-equivalence sweep.
+  **4.3× speedup at M=89 prefill** (16.95s → 3.94s on the
+  520-char Linux prompt + 40 decode) and **3.8× at M=19**
+  (3.36s → 0.88s on the short prompt); md5 byte-equivalent
+  across all tested prompts.
 * `68c6dbb` — NVFP4 batched-prefill cu_seqlens populator switched
   to stream-ordered `cuMemsetD32Async`. 16 sync HtoDs/request
   eliminated.
