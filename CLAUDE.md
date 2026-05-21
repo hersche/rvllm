@@ -370,6 +370,63 @@ and dump T1..T11 in PyTorch. Compare against rvllm's
 layer-trace probes. Where they FIRST diverge identifies the
 bug. Avoids loading 70 GB HF base.
 
+### Round 7 (2026-05-22) — root cause + fix landed (commit `c29cd81`)
+
+Same dump→diff pipeline as Round 6 but with
+`RVLLM_NVFP4_HADAMARD=0` + `RVLLM_NVFP4_HADAMARD_V=0` on the
+31B spec profile:
+
+|       Tensor       | cos Round 6 | cos Round 7 |
+|--------------------|-------------|-------------|
+| K sliding (L58)    |    ~0.00    |  **0.912**  |
+| V sliding (L58)    |    0.017    |  **0.886**  |
+| K global  (L59)    |   -0.002    |  **0.877**  |
+| V global  (L59)    |    0.007    |  **0.876**  |
+| base_hidden_last   |    0.885    |    0.885    |
+
+Cosines went from uncorrelated to HF-faithful. Residual ~12% is
+NVFP4 quantization noise (matches the base hidden state's 0.885
+which never changed — confirms the same quant-noise floor).
+
+**Spec accept rates now non-zero on every prompt:**
+
+  * Capital of France:  7 / 8 drafted accepted (87.5%)
+  * 5 Europ. capitals: 10 / 24 drafted (42%), 2.0/verify
+  * Explain Linux:     33 / 72 drafted (46%), 1.94/verify
+
+All outputs correct German. Wall is ~5% slower than eager on
+80-tok decode (compute-bound 31B dense, verify-cost amortisation
+still fails — same shape as mistral35 spec). Per user direction
+this is acceptable as long as quality is verified against HF,
+which the cosine table above establishes.
+
+**Why Hadamard + spec was breaking accept_rate to 0**: base
+attention's Hadamard rotation puts K/V in an orthogonally-
+rotated frame so QK contracts correctly via H^T·H=I. The
+drafter cross-attends to shadow K/V using a separately-trained
+drafter Q projection that expects HF-NATIVE (unrotated) K/V.
+The companions `apply_hadamard_to_drafter_q` +
+`apply_hadamard_unrotate_drafter_attn_out` cancel only the
+attention output's rotation — the cross-attn dot product
+itself contracts in rotated K-space against an unrotated
+drafter Q, collapsing the score distribution to near-uniform.
+
+**Proper code-level fix (deferred)**: un-rotate K (and V if
+V-rotated) inside `populate_shadow_kv_range_from_base`'s dequant
+kernel, so the shadow KV lands in HF-native frame regardless of
+the base's rotation. That's a separate, larger lift (kernel +
+integration + dump re-validation). Operator workaround: run
+spec with HADAMARD=HADAMARD_V=0, accepting the documented base-
+quality tradeoff on long contexts.
+
+**Guard (this round)**: `ensure_drafter()` refuses to load the
+drafter when `(RVLLM_NVFP4_HADAMARD=1 || RVLLM_NVFP4_HADAMARD_V=1)`
+and `RVLLM_GEMMA4_SPEC_DECODE=1` are simultaneously true. Error
+message references this round's diagnosis + CLAUDE.md + the
+bypass knob `RVLLM_GEMMA4_SPEC_ALLOW_HADAMARD=1` for the future
+un-rotate-in-populate fix to develop against without tripping
+the guard.
+
 ### Round 6 (2026-05-22) — first end-to-end diff run, content-uncorrelated
 
 The full dump→dump→diff pipeline ran end-to-end for the first
