@@ -1,6 +1,50 @@
 # Speculative-decoding next-session plan — Gemma 4 E4B
 
-## State at end of this session
+## Status (2026-05-22 session update — head `9845395`)
+
+* **#28 — Persistent identity block table — DONE** (`9845395`).
+  The per-call `gen_bt` arena region + sync HtoD of
+  `(0..num_blocks_total).collect()` now lives once, in
+  `init_prefix_cache`. Exposed through new fields
+  `PrefixCacheState::identity_block_tables_ptr` +
+  `identity_block_tables_len`. `run_generate` reads the ptr
+  through the prefix-cache tuple and skips the per-call HtoD
+  whenever the cache is initialised. Three internal usages
+  (`gemma4_forward` meta-ptrs, `gemma4_forward_phase` meta-ptrs,
+  and the `RVLLM_BOUNDARY_DUMP` DtoH staging) now read from the
+  persistent ptr. Smoke on production qwen3-6-27b unchanged.
+
+* **#26 — `verify_batched_suffix_k_only` (no run_generate) —
+  NOT STARTED.** ~400-600 LOC extraction of the chunked-prefill
+  body (lines ~11240-11700 in `gemma4_bring_up.rs`) into a new
+  method that calls `gemma4_layer_exec::gemma4_forward_phase`
+  directly with `Gemma4Phase::Prefill` for K tokens at
+  `start_pos`. The extraction needs to faithfully replicate
+  ~150 LOC of per-layer scratch + meta setup. Risk class is
+  "correctness regression vs the in-place chunked-prefill" —
+  byte-equivalence against the existing
+  `verify_batched_from_state` path on the three regression
+  prompts before any production flip.
+
+* **#27 — `commit_base_tokens_from_state` (K=1 case) — NOT
+  STARTED.** Per codex's note ("treat `prefill_one_from_state`
+  as `verify_batched_suffix(K=1)`"), this is a ~50 LOC wrapper
+  on top of #26 that skips the K-row argmax buffer (commit
+  doesn't need per-row argmaxes).
+
+What changed in the perf model since the plan was first
+written: the new persistent identity block table (#28) removes
+one of the per-call HtoDs but the dominant cost in
+`verify_avg_ms ≈ 183 ms` is GPU compute on the chunked-prefill
+kernels at K=4. run_generate's host overhead (25 env reads + 38
+arena.region calls per call) adds <1 ms total. The per-token
+cost amortises poorly on E4B's compute-bound dense path. Even a
+perfect #26 extraction is unlikely to drop `verify_avg_ms`
+below ~100 ms — the layer-loop kernels at K=4 themselves
+dominate. Kernel-level work (decode-tuned K≤4 variants) is the
+next-after step beyond the extraction.
+
+## State at end of e4b spec session
 
 Branch: `rusty_sm121_qwen36_26b` (not pushed). HEAD = `6eeefb5`.
 
