@@ -1071,18 +1071,80 @@ impl Qwen35Bringup {
         stream: u64,
         scratch_prefix: &'static str,
     ) -> Result<()> {
-        if m < 128 || weight_blockscale == 0 {
+        if weight_blockscale == 0 {
             return Err(rvllm_core::RvllmError::cuda(
-                "qwen35 CUTLASS FP8 path requires m>=128 and blockscale weights",
+                "qwen35 CUTLASS FP8 path requires blockscale weights",
                 rvllm_core::CudaErrorKind::Other,
                 rvllm_core::CudaCtx::setup(),
             ));
         }
+        // CUTLASS SM120 blockscale FP8 requires M >= 128 (MmaTileShape_M
+        // hard-coded to 128). For M < 128 we PAD: allocate a 128-row
+        // intermediate, zero-fill the padding rows, run the kernel at
+        // M_padded = 128, then DtoD-copy the first `m` rows of the
+        // output back to the caller's buffer. The wasted compute is
+        // `(128 - m) / 128` of the GEMM (max 99% at m=1, 30% at m=89,
+        // 0% at m=128) — but the per-row cost on the CUTLASS path is
+        // dramatically lower than the per-token GEMV fallback, so the
+        // crossover is well below m=128 in practice.
+        //
+        // M=128 minimum is the only constraint relaxed here. K=128
+        // tile + scale-block alignment + cooperative-kernel schedule
+        // limits stay untouched.
+        const M_TILE: u32 = 128;
+        let m_pad = m.div_ceil(M_TILE).max(1) * M_TILE;
+        let need_pad = m_pad != m;
         let arena = self.arena.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
             "qwen35_fp8_cutlass_blockscale_sm120: arena absent".into()))?;
-        let fp8_bytes = (m as usize) * (k as usize);
-        let amax_bytes = (m as usize) * 4;
+
+        // Padded input buffer (zero rows for [m..m_pad)). When m==m_pad
+        // we use the caller's input_f16 directly — no extra copy.
+        let input_used_ptr: u64 = if need_pad {
+            let pad_bytes = (m_pad as usize) * (k as usize) * 2;
+            let real_bytes = (m as usize) * (k as usize) * 2;
+            let pad_in = arena.region(
+                "qwen35_cutlass_pad_in_f16", pad_bytes, 16)?;
+            use cudarc::driver::sys::*;
+            // Zero entire padded region first (including padding tail).
+            let rc = cuMemsetD8Async(
+                pad_in.device_ptr(), 0, pad_bytes, stream as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 CUTLASS FP8 path: pad input zero",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+            // Copy real rows on top of the zeros.
+            let rc = cuMemcpyDtoDAsync_v2(
+                pad_in.device_ptr(),
+                input_f16,
+                real_bytes,
+                stream as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 CUTLASS FP8 path: pad input copy",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+            pad_in.device_ptr()
+        } else {
+            input_f16
+        };
+
+        // Padded output buffer — same pattern. CUTLASS writes m_pad rows;
+        // we copy the first m back to the caller's out_f16.
+        let out_used_ptr: u64 = if need_pad {
+            let pad_out_bytes = (m_pad as usize) * (n as usize) * 2;
+            let pad_out = arena.region(
+                "qwen35_cutlass_pad_out_f16", pad_out_bytes, 16)?;
+            pad_out.device_ptr()
+        } else {
+            out_f16
+        };
+
+        let fp8_bytes = (m_pad as usize) * (k as usize);
+        let amax_bytes = (m_pad as usize) * 4;
         let in_fp8 = arena.region(scratch_prefix, fp8_bytes, 16)?;
         let in_amax = arena.region("qwen35_cutlass_in_amax", amax_bytes, 16)?;
         {
@@ -1090,7 +1152,7 @@ impl Qwen35Bringup {
             let block_dim: u32 = k.min(1024);
             let mut o_fp8 = in_fp8.device_ptr();
             let mut o_amax = in_amax.device_ptr();
-            let mut i_ptr = input_f16;
+            let mut i_ptr = input_used_ptr;
             let mut k_i: i32 = k as i32;
             let args = [
                 (&mut o_fp8) as *mut u64 as *mut core::ffi::c_void,
@@ -1100,7 +1162,7 @@ impl Qwen35Bringup {
             ];
             let rc = cuLaunchKernel(
                 ker.fn_fp8_quantize_per_token_amax_f16.raw() as CUfunction,
-                m, 1, 1, block_dim, 1, 1, 0,
+                m_pad, 1, 1, block_dim, 1, 1, 0,
                 stream as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
@@ -1113,9 +1175,9 @@ impl Qwen35Bringup {
                 ));
             }
         }
-        let sfa_n = lib.sfa_bytes(m as i32, k as i32);
+        let sfa_n = lib.sfa_bytes(m_pad as i32, k as i32);
         let sfb_n = lib.sfb_bytes(n as i32, k as i32);
-        let ws_n = lib.workspace_size(m as i32, n as i32, k as i32);
+        let ws_n = lib.workspace_size(m_pad as i32, n as i32, k as i32);
         if sfa_n == 0 || sfb_n == 0 {
             return Err(rvllm_core::RvllmError::cuda(
                 "qwen35 CUTLASS FP8 path: SM120 prep helpers unavailable",
@@ -1129,7 +1191,7 @@ impl Qwen35Bringup {
         lib.launch_prep_sfa(
             in_amax.device_ptr(),
             sfa.device_ptr(),
-            m as i32,
+            m_pad as i32,
             k as i32,
             stream,
         )?;
@@ -1141,18 +1203,36 @@ impl Qwen35Bringup {
             stream,
         )?;
         lib.launch_fp8_gemm_blockscale(
-            out_f16,
+            out_used_ptr,
             in_fp8.device_ptr(),
             weight_fp8,
             sfa.device_ptr(),
             sfb.device_ptr(),
-            m as i32,
+            m_pad as i32,
             n as i32,
             k as i32,
             ws.device_ptr(),
             ws_n,
             stream,
-        )
+        )?;
+
+        // Copy first `m` rows of padded output back to caller's buffer.
+        if need_pad {
+            let real_out_bytes = (m as usize) * (n as usize) * 2;
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoDAsync_v2(
+                out_f16,
+                out_used_ptr,
+                real_out_bytes,
+                stream as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 CUTLASS FP8 path: pad output copy back",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        Ok(())
     }
 
     /// Phase 2c-A: outside-only smoke forward. Drives the
