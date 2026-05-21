@@ -142,7 +142,39 @@ Key e4b commits (top → bottom):
   in `run_generate` + worker disarms all spec hook atomics on
   non-spec branch.
 
-### 31B-it spec — wired, drafter accept_rate=0, root cause LIKELY V-cache on `attention_k_eq_v=true` global layers
+### 31B-it spec — accept_rate>0 SHIPPED (commit `c29cd81`, 2026-05-22)
+
+**Resolved 2026-05-22 via Round 7 dump→diff.** The drafter
+accept_rate=0 was caused by `RVLLM_NVFP4_HADAMARD=1` +
+`RVLLM_NVFP4_HADAMARD_V=1` on the 31B spec profile. With these
+flags the shadow K/V the drafter cross-attends to are in an
+orthogonally-rotated frame the drafter Q-projection can't dot-
+product into (drafter weights were trained against HF-native
+unrotated K/V). Cosines vs HF base K/V went from ~0.0 (uncorrelated)
+to ~0.88 (NVFP4-quant-noise floor) when both flags are turned off,
+and accept rates landed at 87.5% / 42% / 46% on three test prompts.
+
+`ensure_drafter()` now refuses to load the drafter when
+HADAMARD/HADAMARD_V is on with spec enabled, with a clear error
+pointing at the diagnosis. Bypass knob
+`RVLLM_GEMMA4_SPEC_ALLOW_HADAMARD=1` exists for the future
+un-rotate-in-populate kernel fix to develop against.
+
+The proper code-level fix (un-rotate K/V inside
+`populate_shadow_kv_range_from_base`'s dequant kernel, so the
+shadow KV lands in HF-native frame regardless of base's rotation)
+is deferred — separate, larger lift. Operator workaround until
+then: spec profile sets HADAMARD=HADAMARD_V=0, accepting the
+documented base-quality tradeoff on long contexts.
+
+Spec wall is ~5% slower than eager on the 80-tok decode
+(compute-bound 31B dense, verify-cost amortisation fails on this
+shape — same fundamental cap as mistral35 spec). Output quality
+verified against HF (cosine 0.88 on K/V + 0.885 on base hidden
+state). Per-prompt accept rates above. Full Rounds 1-7 diagnosis
++ measurements live in the dedicated section below.
+
+### 31B-it spec — historical investigation (Rounds 1-6, pre-fix)
 
 Profile: `mobile-31b-rvllm-spec.env` (drafter dir
 `/home/r00t/gemma-4-31B-it-assistant`, K=4, perf trace ON).
