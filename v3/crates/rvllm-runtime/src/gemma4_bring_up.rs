@@ -1060,6 +1060,18 @@ pub struct PrefixCacheState {
     /// not generally reusable. Cheap to check; protects against
     /// silent miscompare across env-var flips between requests.
     pub provenance: PrefixProvenance,
+    /// Task #28 — persistent identity block table at `[0, 1, 2,
+    /// …, num_blocks_total - 1]`. Built once at `init_prefix_cache`
+    /// + populated once via a single async HtoD. Single-seq spec
+    /// requests (num_seqs == 1) read from here instead of allocating
+    /// a per-call `gen_bt` arena region and doing a sync HtoD on
+    /// every `run_generate` invocation. Multi-seq requests still
+    /// pre-allocate per-call because the per-seq layout differs.
+    /// Device pointer is 0 only on the impossibly-tight-arena
+    /// init path; otherwise non-zero for the service lifetime.
+    pub identity_block_tables_ptr: u64,
+    /// Length of the identity table in u32 entries (= num_blocks_total).
+    pub identity_block_tables_len: u32,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -2732,6 +2744,23 @@ impl Gemma4Bringup {
                 "init_prefix_cache_kv_scale_zero", 0u64);
         }
 
+        // Task #28 — persistent identity block table. Allocated once
+        // in the same arena that owns the persistent KV cache so its
+        // lifetime matches. For single-seq requests the table is just
+        // [0, 1, ..., num_blocks_total - 1] and never changes, so we
+        // populate it with one async HtoD here and reuse the device
+        // pointer across every run_generate / verify call.
+        let identity_bytes = (num_blocks_total as usize) * 4;
+        let identity_region = self.arena.region(
+            "persistent_identity_block_tables", identity_bytes, 16)?;
+        let identity_ptr = identity_region.device_ptr();
+        {
+            let bt: Vec<i32> = (0..num_blocks_total as i32).collect();
+            unsafe {
+                identity_region.copy_from_host(bytemuck_cast_i32(&bt))?;
+            }
+        }
+
         *guard = Some(PrefixCacheState {
             last_tokens: Vec::new(),
             kv_cache_ptr,
@@ -2745,6 +2774,8 @@ impl Gemma4Bringup {
             block_size,
             committed_prefix_len: 0,
             provenance: PrefixProvenance::from_env(),
+            identity_block_tables_ptr: identity_ptr,
+            identity_block_tables_len: num_blocks_total,
         });
         Ok(())
     }
@@ -10217,7 +10248,8 @@ impl Gemma4Bringup {
         // loop + chunk_size cap) is bypassed and the forced value is
         // used directly as common_prefix_len.
         let (kv_cache_ptr, kv_scale_ptr, kv_layer_offsets, kv_scale_layer_offsets,
-             kv_total_bytes, kv_scale_total_bytes, common_prefix_len_raw) = {
+             kv_total_bytes, kv_scale_total_bytes, common_prefix_len_raw,
+             persistent_identity_bt_ptr, persistent_identity_bt_len) = {
             let guard = self.prefix_cache.lock().unwrap();
             match &*guard {
                 Some(pc) => {
@@ -10305,9 +10337,17 @@ impl Gemma4Bringup {
                         pc.kv_cache_bytes,
                         pc.kv_scale_bytes,
                         prefix as u32,
+                        // Task #28: pull the persistent identity-block-table
+                        // ptr through here. Single-seq run_generate (always
+                        // num_seqs=1) uses identity [0..num_blocks_total)
+                        // and can share this once-built table across every
+                        // call instead of re-uploading 4*num_blocks_total
+                        // bytes per request.
+                        pc.identity_block_tables_ptr,
+                        pc.identity_block_tables_len,
                     )
                 }
-                None => (0, 0, Vec::new(), Vec::new(), 0, 0, 0),
+                None => (0, 0, Vec::new(), Vec::new(), 0, 0, 0, 0, 0),
             }
         };
 
@@ -10463,10 +10503,26 @@ impl Gemma4Bringup {
             ((max_tokens.max(1) + 1) * 4) as usize,
             16,
         )?;
-        let block_tables = arena.region("gen_bt", (max_blocks_per_seq * 4) as usize, 16)?;
+        // Task #28: persistent identity block table. The single-seq
+        // run_generate path uses identity [0..max_blocks_per_seq) which
+        // never changes across calls. Reuse the pre-uploaded persistent
+        // region from init_prefix_cache (one HtoD at startup, zero per-
+        // call HtoDs). Falls back to a per-call build only when the
+        // prefix cache wasn't initialized or the count mismatches.
+        let _block_tables_owned: Option<rvllm_mem::Region>;
+        let block_tables_ptr: u64;
+        if persistent_identity_bt_ptr != 0
+            && persistent_identity_bt_len == max_blocks_per_seq
         {
+            block_tables_ptr = persistent_identity_bt_ptr;
+            _block_tables_owned = None;
+        } else {
+            let r = arena.region(
+                "gen_bt", (max_blocks_per_seq * 4) as usize, 16)?;
             let bt: Vec<i32> = (0..max_blocks_per_seq as i32).collect();
-            block_tables.copy_from_host(bytemuck_cast_i32(&bt))?;
+            r.copy_from_host(bytemuck_cast_i32(&bt))?;
+            block_tables_ptr = r.device_ptr();
+            _block_tables_owned = Some(r);
         }
 
         let residual = arena.region("gen_residual", (max_tokens * hidden * 2) as usize, 16)?;
@@ -10943,7 +10999,7 @@ impl Gemma4Bringup {
                 let meta = crate::gemma4_layer_exec::Gemma4MetadataPtrs {
                     positions: positions.device_ptr(), slot_mapping: slot_mapping.device_ptr(),
                     cos, sin,
-                    block_tables: block_tables.device_ptr(), context_lens: context_lens.device_ptr(),
+                    block_tables: block_tables_ptr, context_lens: context_lens.device_ptr(),
                 };
                 crate::gemma4_layer_exec::gemma4_forward(
                     dims, &kernels, &w, &scratch, &meta,
@@ -11602,7 +11658,7 @@ impl Gemma4Bringup {
                 let meta = crate::gemma4_layer_exec::Gemma4MetadataPtrs {
                     positions: positions.device_ptr(), slot_mapping: slot_mapping.device_ptr(),
                     cos, sin,
-                    block_tables: block_tables.device_ptr(), context_lens: context_lens.device_ptr(),
+                    block_tables: block_tables_ptr, context_lens: context_lens.device_ptr(),
                 };
                 crate::gemma4_layer_exec::gemma4_forward_phase(
                     dims, &kernels, &w, &scratch, &meta,
@@ -12272,7 +12328,7 @@ impl Gemma4Bringup {
                 let mut bt_host = vec![0i32; bt_entries];
                 cudarc::driver::sys::cuMemcpyDtoH_v2(
                     bt_host.as_mut_ptr() as *mut _,
-                    block_tables.device_ptr(),
+                    block_tables_ptr,
                     (bt_entries * 4) as usize,
                 );
                 let mut ctx_host = [0i32; 1];
