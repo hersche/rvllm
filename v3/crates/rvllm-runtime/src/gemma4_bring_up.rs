@@ -2326,6 +2326,52 @@ impl Gemma4Bringup {
         if self.drafter.lock().unwrap().is_some() {
             return Ok(());
         }
+        // Codex Round 6 + Round 7 (2026-05-22): the Hadamard rotation
+        // applied to base K/V (RVLLM_NVFP4_HADAMARD=1 +/-
+        // RVLLM_NVFP4_HADAMARD_V=1) puts the shadow K/V in a rotated
+        // frame that the drafter cannot cross-attend to correctly even
+        // with the Q-rotate / attn-out-unrotate companions: the drafter
+        // weights were trained against the unrotated base K/V. End-to-
+        // end run with both flags on produced accept_rate=0 on every
+        // prompt (rvllm shadow K/V vs HF base K/V cosine ≈ 0).
+        //
+        // Until populate_shadow_kv_range_from_base un-rotates K/V
+        // post-dequant (or the drafter is retrained against rotated
+        // K/V), refuse to enable spec when either Hadamard flag is on.
+        // Operators can either set RVLLM_NVFP4_HADAMARD{,_V}=0 to
+        // unblock spec (with the documented base-quality tradeoff on
+        // long contexts) or unset RVLLM_GEMMA4_SPEC_DECODE.
+        let had = crate::gemma4_bring_up::parse_truthy_env(
+            "RVLLM_NVFP4_HADAMARD").unwrap_or(false);
+        let had_v = crate::gemma4_bring_up::parse_truthy_env(
+            "RVLLM_NVFP4_HADAMARD_V").unwrap_or(false);
+        let allow_bypass = crate::gemma4_bring_up::parse_truthy_env(
+            "RVLLM_GEMMA4_SPEC_ALLOW_HADAMARD").unwrap_or(false);
+        if (had || had_v) && !allow_bypass &&
+            crate::gemma4_bring_up::parse_truthy_env(
+                "RVLLM_GEMMA4_SPEC_DECODE").unwrap_or(false)
+        {
+            return Err(RvllmError::Loader {
+                err: LoaderError::Corrupt {
+                    detail: format!(
+                        "ensure_drafter: RVLLM_NVFP4_HADAMARD={} \
+                         RVLLM_NVFP4_HADAMARD_V={} is incompatible with \
+                         RVLLM_GEMMA4_SPEC_DECODE=1 — Hadamard rotation \
+                         puts the shadow K/V in a frame the drafter \
+                         cannot read (validated via HF-vs-rvllm K/V \
+                         dump diff, cos ≈ 0 vs cos ≈ 0.88 once Hadamard \
+                         is disabled). Either set HADAMARD=HADAMARD_V=0 \
+                         on the spec profile or disable SPEC_DECODE. \
+                         See CLAUDE.md 'Round 7 (2026-05-22)' for the \
+                         full diagnosis. Set RVLLM_GEMMA4_SPEC_ALLOW_HADAMARD=1 \
+                         to bypass this guard (e.g. for tracing or \
+                         after the un-rotate-in-populate fix lands).",
+                        had as u32, had_v as u32),
+                },
+                ctx: LoaderCtx { path: drafter_dir.to_path_buf(), tensor: None },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
         if self.assistant_kv_sources.is_none() {
             return Err(RvllmError::Loader {
                 err: LoaderError::Corrupt {
