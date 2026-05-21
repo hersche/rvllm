@@ -505,31 +505,64 @@ size_t cutlass_nvfp4_gemm_sm120_sfb_natural_bytes(int n, int k) {
 ///   `sfa_cutlass_out`         `cutlass_nvfp4_gemm_sm120_sfa_bytes(m, k)` bytes
 ///
 /// Returns 0 on success; forwards the underlying error rc on failure.
-/// Stub today (-100) until `prep_act` is wired in via the build
-/// SOURCES list — the symbol is defined in a sibling .cu so chaining
-/// here would require `extern "C"` decl, but the linker resolution
-/// is what closes the loop. Operators rebuilding the .so with both
-/// sources flip this from -100 to a real chain.
+///
+/// Two-step pipeline (chained 2026-05-21 against CUTLASS v4.5.1):
+///   1. `cutlass_nvfp4_gemm_sm120_prep_act` (defined in
+///      cutlass_nvfp4_prep_act_sm120.cu, same .so) — converts the
+///      BF16/F16 input to NVFP4 packed bytes + writes a natural-
+///      layout SFA into a temporary device buffer.
+///   2. `cutlass_nvfp4_gemm_sm120_sfa_natural_to_interleaved` —
+///      transforms the natural SFA into CUTLASS's interleaved
+///      swizzle layout that the SM120 BlockScaledTensorOp expects.
+///
+/// The intermediate natural-SFA buffer is allocated per call via
+/// `cudaMallocAsync` on the caller's stream and freed before
+/// return. Buffer size = m * (k/16) bytes (small — a few KB for
+/// typical decode shapes).
+extern "C" int cutlass_nvfp4_gemm_sm120_prep_act(
+    const void* a_input,
+    void* a_packed_out,
+    void* sfa_natural_out,
+    int m,
+    int k,
+    int a_input_dtype,
+    cudaStream_t stream);
+
 int cutlass_nvfp4_gemm_sm120_prep_sfa(
-    const void* /*a_input*/,
-    void*       /*a_packed_out*/,
-    void*       /*sfa_cutlass_out*/,
-    int         /*m*/,
-    int         /*k*/,
-    int         /*a_input_dtype*/,
-    cudaStream_t /*stream*/)
+    const void* a_input,
+    void*       a_packed_out,
+    void*       sfa_cutlass_out,
+    int         m,
+    int         k,
+    int         a_input_dtype,
+    cudaStream_t stream)
 {
-    // Wiring helper:
-    //   1. cutlass_nvfp4_gemm_sm120_prep_act(...)  -> a_packed +
-    //      a temporary natural SFA buffer.
-    //   2. cutlass_nvfp4_gemm_sm120_sfa_natural_to_interleaved(...)
-    //      -> CUTLASS SFA.
-    // Today the public Rust wrapper (`launch_nvfp4_prep_sfa`) does
-    // NOT supply a scratch buffer for the natural-layout SFA; that's
-    // the missing piece. Until the runtime provides it, return -100
-    // so callers fall back to the kernel-side error path rather than
-    // get incorrect SFA bytes.
-    return -100;
+    if (a_input == nullptr || a_packed_out == nullptr
+        || sfa_cutlass_out == nullptr || m <= 0 || k <= 0
+        || (k % 16) != 0) {
+        return -1;
+    }
+    const size_t nat_bytes =
+        static_cast<size_t>(m) * static_cast<size_t>(k / 16);
+
+    void* sfa_natural = nullptr;
+    cudaError_t e = cudaMallocAsync(&sfa_natural, nat_bytes, stream);
+    if (e != cudaSuccess || sfa_natural == nullptr) {
+        return -2;
+    }
+
+    int rc = cutlass_nvfp4_gemm_sm120_prep_act(
+        a_input, a_packed_out, sfa_natural,
+        m, k, a_input_dtype, stream);
+    if (rc != 0) {
+        cudaFreeAsync(sfa_natural, stream);
+        return rc;
+    }
+
+    rc = cutlass_nvfp4_gemm_sm120_sfa_natural_to_interleaved(
+        sfa_natural, sfa_cutlass_out, m, k, stream);
+    cudaFreeAsync(sfa_natural, stream);
+    return rc;
 }
 
 } // extern "C"

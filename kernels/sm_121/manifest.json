@@ -452,9 +452,9 @@
       "sha256": "cd2ac37a4ec5b691346fdfd6b0fdefc1b98a4c25c6cb84d7556b2392406496a7"
     },
     "libcutlass_sm120": {
-      "bytes": 434544,
+      "bytes": 434688,
       "path": "libcutlass_sm120.so",
-      "sha256": "4d889e63fc7866907c96ba69f5909f8e34d20d0e07c221c6fd4aa7485051c175"
+      "sha256": "219dd6a537c20b511e54bbe9ca5ce480cc6010aacb254499f28e52c85d296bda"
     },
     "logit_softcap": {
       "bytes": 3637,
