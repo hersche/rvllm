@@ -3195,7 +3195,45 @@ impl Qwen35Bringup {
             self.forward_layers_only(token_ids[0], start_position, None)?;
             return Ok(());
         }
-        let _ = self.forward_qwen35_tokens_batched(token_ids, start_position)?;
+        // SPEC-DECODE CORRECTNESS FIX (2026-05-21):
+        // Use sequential single-token forwards instead of the batched
+        // multi-token kernel chain. Rationale:
+        //
+        //   `apply_linear_attn_layer_batched` / `apply_full_attn_layer_batched`
+        //   advance the recurrent state (linear-attn delta + conv1d)
+        //   over N tokens in one kernel launch. The BF16 accumulation
+        //   order inside the batched kernel differs from N sequential
+        //   single-token launches, producing slightly different state
+        //   bytes. Over ~3 verify iterations in a single spec session
+        //   the drift compounds enough to flip an argmax decision and
+        //   the spec output diverges from the eager byte-identical
+        //   sequence (md5 686dbb vs eager 531d59a on the canonical
+        //   zeroclaw-shape prompt, 80-tok decode).
+        //
+        //   `commit_only` is invoked AFTER `restore_recurrent_state`
+        //   to replay the accepted prefix from the snapshot baseline.
+        //   For the spec session to produce byte-identical output to
+        //   eager, the replay must advance state EXACTLY as N
+        //   sequential eager `forward_all_layers_smoke` calls would.
+        //   Sequential `forward_layers_only` here gives that
+        //   guarantee. Cost: slower than batched for large T, but
+        //   commit_only's T is always `accept_len + 1` (bounded by
+        //   spec_K which is small) so the overhead is bounded.
+        //
+        //   This does NOT affect `forward_qwen35_decode_argmax_all`'s
+        //   verify path — that one still uses the batched kernel and
+        //   the divergence there only matters if a draft happens to
+        //   match a stale argmax, which is exceedingly rare in
+        //   prompt-lookup workloads.
+        for (i, &tok) in token_ids.iter().enumerate() {
+            let pos = start_position
+                .checked_add(i as u32)
+                .ok_or_else(|| corrupt(
+                    self.paths.model_dir.clone(),
+                    "forward_qwen35_decode_commit_only: position overflow"
+                        .into()))?;
+            self.forward_layers_only(tok, pos, None)?;
+        }
         Ok(())
     }
 
