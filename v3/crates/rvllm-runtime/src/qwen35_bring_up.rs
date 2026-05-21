@@ -2853,15 +2853,30 @@ impl Qwen35Bringup {
         Qwen35KvDtype::Nvfp4 => {
             let attn_out = arena.region(
                 "qwen35_bfattn_attn_f16", n * qsize_us * 2, 16)?.device_ptr();
-            let cu_seqlens = arena.region(
+            // cu_seqlens = [0, num_tokens] (i32 × 2). Previously this was
+            // populated via `copy_from_host` which is a SYNCHRONOUS HtoD
+            // on the legacy default stream — 16 full-attn layers ×
+            // 1 prefill = 16 host blocks per request. Use stream-ordered
+            // `cuMemsetD32Async` to match the F16 path's setup
+            // (qwen35_bfattn_seqstart uses the same pattern at line ~2734).
+            let cu_seqlens_region = arena.region(
                 "qwen35_bfattn_cu_seqlens", 2 * 4, 16)?;
+            let cu_seqlens_ptr = cu_seqlens_region.device_ptr();
             unsafe {
-                let cu: [i32; 2] = [0, num_tokens as i32];
-                let bytes = std::slice::from_raw_parts(
-                    cu.as_ptr() as *const u8,
-                    std::mem::size_of_val(&cu),
-                );
-                cu_seqlens.copy_from_host(bytes)?;
+                use cudarc::driver::sys::*;
+                let r0 = cuMemsetD32Async(
+                    cu_seqlens_ptr, 0, 1, stream_raw as CUstream);
+                let r1 = cuMemsetD32Async(
+                    cu_seqlens_ptr + 4, num_tokens, 1,
+                    stream_raw as CUstream);
+                if r0 != CUresult::CUDA_SUCCESS || r1 != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35_bfattn nvfp4 cu_seqlens memset",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup()));
+                }
+            }
+            unsafe {
                 let params = rvllm_attention::PagedPrefillParams {
                     num_seqs: 1,
                     num_tokens,
@@ -2899,7 +2914,7 @@ impl Qwen35Bringup {
                     layer_kv.v_scale_ptr,
                     q_scale_cache,
                     kv_cache.block_tables_ptr,
-                    cu_seqlens.device_ptr(),
+                    cu_seqlens_ptr,
                     prefill_ctx_len_dev_ptr,
                     q_scale_cache,
                     false,
