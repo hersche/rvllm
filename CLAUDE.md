@@ -370,6 +370,71 @@ and dump T1..T11 in PyTorch. Compare against rvllm's
 layer-trace probes. Where they FIRST diverge identifies the
 bug. Avoids loading 70 GB HF base.
 
+### Round 6 (2026-05-22) — first end-to-end diff run, content-uncorrelated
+
+The full dump→dump→diff pipeline ran end-to-end for the first
+time on `mobile-31b-rvllm-spec.env` (fp8-block weights, NVFP4 KV,
+20-token prompt "Was ist die Hauptstadt von Frankreich?"). Diff
+result on the four layer-58/59 shadow K/V tensors:
+
+|       Tensor       | rms(rvllm) | rms(hf) | rms(diff) | cosine(flat) | max diff |
+|--------------------|------------|---------|-----------|--------------|----------|
+| K sliding (L58)    |    0.123   |  0.122  |   0.085   |   ~0.00      |   1.55   |
+| V sliding (L58)    |    1.004   |  1.000  |   1.405   |   0.017      |  17.13   |
+| K global  (L59)    |    0.060   |  0.060  |   0.085   |  -0.002      |   1.38   |
+| V global  (L59)    |    1.000   |  1.000  |   1.409   |   0.007      |  22.94   |
+| base_hidden_last   |    3.890   |  4.205  |   1.964   |   0.885      |  33.75   |
+
+**Magnitudes match (RMS within 1%) but content is entirely
+uncorrelated (cos ≈ 0).** rvllm's shadow K/V at the spec source
+layers carry the right statistical distribution but the wrong
+values, slot-for-slot, head-for-head. First divergence is slot
+t=0 (BOS) for every tensor.
+
+Distribution analysis of the rvllm dump:
+* shadow_V_sliding has only **130 unique values** across 81920
+  elements, clustered at ±[1.03125, 2.0625, 3.75, …].
+* shadow_K_sliding has **132 unique values** clustered at
+  ±[0.04, 0.47] (smaller range).
+* HF reference values are full-precision continuous floats,
+  thousands of unique values, normally-distributed.
+
+The unique-value count strongly suggests rvllm is dumping
+**NVFP4-grid quantized values × E4M3 microscale** with very
+uniform scales, not the dequantized continuous f16. Either:
+1. The dump tool is reading from a buffer where the content has
+   been re-quantized but not properly dequantized for V
+   specifically;
+2. Or the NVFP4 KV path stores K + V with different scales than
+   the base attention reads from, so the shadow population
+   produces uncorrelated content.
+
+base_hidden_last has cosine 0.885 — the base model's last-layer
+hidden state is only 12% off vs HF, consistent with NVFP4
+quantization noise. The base forward is approximately correct,
+but the K/V cache that feeds the spec drafter is materially
+wrong.
+
+Diff tool got one fix this round (commit `c37431e` — pending):
+the rvllm dumps are flat 1-D npy (the in-process saver only
+emits 1-D headers). The diff tool now reads `meta.json` and
+reshapes to logical `[T, nkvh, head_dim]` before comparing
+against HF's already-3-D dump.
+
+Codex round 7 (next) needs:
+* Inspect the NVFP4 dequant path in
+  `gemma4_drafter.rs::populate_one_source_layer` Nvfp4 branch
+  — specifically whether the SAME microscale arena is used for
+  K + V (they should have separate scale pointers).
+* If yes → check if the `k_v_half_bytes` split in
+  `gemma4_bring_up.rs::compute_view` accounts for NVFP4's 4×
+  density (currently `layer_elems / 4` for NVFP4 element
+  count) AND its scale arena split (`layer_elems / 32` for
+  combined K+V scales).
+* Hypothesis: V's scale-arena offset is computed against the
+  K side, so the V dequant reads K's scales (or wrong scales)
+  → produces magnitude-right-but-content-random output.
+
 ### Round 5 (2026-05-22) — debug harness completed
 
 The full dump→dump→diff pipeline that Round 4 sketched is now

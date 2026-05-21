@@ -40,6 +40,7 @@ Output:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -114,14 +115,27 @@ def main() -> int:
                     help="abs |diff| tolerance for first-divergence")
     args = ap.parse_args()
 
+    # rvllm dumps as flat 1-D arrays (the in-process NPY saver only
+    # emits 1-D headers). Reshape to logical [T, nkvh, head_dim] using
+    # meta.json so downstream slot/head/channel breakdown works.
+    meta_path = args.rvllm_dump / "meta.json"
+    if not meta_path.exists():
+        print(f"meta.json missing at {meta_path} — cannot reshape rvllm dumps")
+        return 2
+    meta = json.loads(meta_path.read_text())
+    T = int(meta["committed_len"])
     pairs = [
-        ("shadow_k_sliding_src", "K sliding (layer 58)"),
-        ("shadow_v_sliding_src", "V sliding (layer 58)"),
-        ("shadow_k_global_src",  "K global  (layer 59)"),
-        ("shadow_v_global_src",  "V global  (layer 59)"),
+        ("shadow_k_sliding_src", "K sliding (layer 58)",
+         (T, int(meta["sliding_num_kv_heads"]), int(meta["sliding_head_dim"]))),
+        ("shadow_v_sliding_src", "V sliding (layer 58)",
+         (T, int(meta["sliding_num_kv_heads"]), int(meta["sliding_head_dim"]))),
+        ("shadow_k_global_src",  "K global  (layer 59)",
+         (T, int(meta["full_num_kv_heads"]), int(meta["full_head_dim"]))),
+        ("shadow_v_global_src",  "V global  (layer 59)",
+         (T, int(meta["full_num_kv_heads"]), int(meta["full_head_dim"]))),
     ]
     missing = []
-    for stem, _label in pairs:
+    for stem, _label, _shape in pairs:
         rvllm_p = args.rvllm_dump / f"{stem}.npy"
         hf_p = args.hf_dump / f"{stem}_hf.npy"
         if not rvllm_p.exists():
@@ -139,8 +153,10 @@ def main() -> int:
     print(f"hf dump:    {args.hf_dump}")
     print(f"tol:        {args.tol}")
 
-    for stem, label in pairs:
+    for stem, label, shape in pairs:
         rvllm_arr = load_npy(args.rvllm_dump / f"{stem}.npy")
+        if rvllm_arr.ndim == 1 and rvllm_arr.size == int(np.prod(shape)):
+            rvllm_arr = rvllm_arr.reshape(shape)
         hf_arr = load_npy(args.hf_dump / f"{stem}_hf.npy")
         summarise(label, rvllm_arr, hf_arr, args.tol)
 
