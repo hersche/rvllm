@@ -242,11 +242,53 @@ Breaking down into measurable sub-phases:
   real engine.
 
 ### Phase 5 — Perf
-* FA-decode + batched prefill + fused QKV/gate_up gemv (port
-  from Mistral 3.5; identical shapes for the GEMV side).
-* W4A16-equivalent for FP8 (mistral35 V7 with cp.async is
-  reusable since the block-scale layout matches).
-* Codex round on the new arch.
+
+Status (2026-05-22): substantially done. Concrete commits:
+
+* `a165a41` — CUTLASS FP8 blockwise GEMM now accepts M<128 via
+  internal zero-pad to M_pad=128, DtoD-copy of first M rows back
+  to caller. Unblocks prefills with 32 ≤ M < 128 (previously stuck
+  on per-token gemv-f16in fallback). **4.3× speedup measured at
+  M=89: 16.95s → 3.94s on the zeroclaw-shape 520-char Linux
+  prompt + 40 decode, byte-equivalent output (md5 6f87a6f0).**
+  Profile defaults lowered: `RVLLM_QWEN35_{MLP,LINEAR,FULL}_CUTLASS_MIN_TOKENS`
+  128 → 32.
+* `68c6dbb` — NVFP4 batched-prefill cu_seqlens populator switched
+  from sync `Region::copy_from_host` to stream-ordered
+  `cuMemsetD32Async`. Eliminates 16 host-blocking HtoD per
+  request (one per full-attn layer).
+* `c8c72cb` — spec-decode `forward_qwen35_decode_commit_only`
+  swapped batched-multi-token path for sequential
+  `forward_layers_only` per token. Required because the batched
+  recurrent-state advance produces BF16 accumulation drift
+  vs N sequential forwards; over ~3 verify iterations the drift
+  flipped an argmax. With the fix the spec session is
+  byte-equivalent to eager on the canonical workloads (Linux
+  80-tok md5 531d59a3; 2+2 50-tok md5 239ecf39). Spec is
+  perf-neutral at default knobs — verify-cost amortisation
+  requires high accept rate (>~30%) which n-gram prompt-lookup
+  doesn't reach on free-form generation; tuning + harness in
+  `v3/tools/spec_decode_bench.sh`.
+* `c2a5e9d` — `v3/tools/spec_decode_bench.sh` A/B + byte-equiv
+  harness. Drives any rvllm-serve family through fixed
+  zeroclaw-shape prompts with spec OFF and spec ON, captures
+  wall + md5, hard-fails on any md5 divergence. Exit 0 iff every
+  workload byte-equivalent. Suitable for CI / pre-merge
+  verification.
+
+Open (not yet started in this Phase-5 pass):
+
+* `Qwen35Bringup` doesn't yet snapshot KV cache around verify
+  (only linear + conv recurrent state). KV slots written by
+  rejected drafts persist until the next iter overwrites — works
+  correctly today only because attention reads stop at
+  `context_lens`, not `max_pos`. A more aggressive partial-accept
+  strategy that re-reads the rejected slot range would need KV
+  snapshot too.
+* Decode-step CUDA Graph capture (parallel to qwen36 Phase 8).
+  Blocked by per-call arena allocations in the layer helpers,
+  same workspace-refactor prerequisite as qwen36 (see
+  `v3/QWEN_BATCHED_PREFILL_PLAN.md` Phase 8).
 
 ## Markers + invariants
 

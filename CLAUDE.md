@@ -370,6 +370,31 @@ and dump T1..T11 in PyTorch. Compare against rvllm's
 layer-trace probes. Where they FIRST diverge identifies the
 bug. Avoids loading 70 GB HF base.
 
+### Round 5 (2026-05-22) — debug harness completed
+
+The full dump→dump→diff pipeline that Round 4 sketched is now
+buildable end-to-end (commit `92ae8fe`):
+
+  1. rvllm side (existing): run gemma-4-31b-nvfp4 with
+     `RVLLM_SPEC_DUMP_DIR` set → shadow_{k,v}_{sliding,global}_src.npy
+     in the dump dir.
+  2. HF base side (existing `dump_hf_base_kv_31b.py`): stop rvllm,
+     load Gemma 4 31B base in bf16, run one forward over the same
+     prompt → shadow_{k,v}_{sliding,global}_src_hf.npy.
+  3. `diff_hf_vs_rvllm_kv.py` (NEW): element-compares each pair.
+     Per-tensor rms, cosine(flat), max|diff|, top-10 worst slots
+     by per-slot max|diff|, and a first-divergence detector
+     (smallest slot index where |diff| > tol).
+
+This closes the missing piece in the debug chain — operator can
+now drive the comparison and the diff output points at the
+exact (slot, head, channel) where rvllm's shadow-KV-population
+diverges from HF's `past_key_values` for layers 58 (sliding) /
+59 (global). The analytical work of running the chain + reading
+the diff remains operator-driven (requires the 120 GB unified
+memory for HF base load, which means stopping rvllm and
+restarting it on a different profile).
+
 Active env knobs (all default OFF, env-gated):
 * `RVLLM_GEMMA4_SPEC_SOURCE_PAIR=<s>,<f>`
 * `RVLLM_GEMMA4_SPEC_DRAFT_TRACE=1`

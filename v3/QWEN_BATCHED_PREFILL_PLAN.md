@@ -184,6 +184,30 @@ Bench (`RVLLM_QWEN36_TIMING=1`):
 Default for all 5 gates is OFF until the prod-flip is taken explicitly;
 single-line change.
 
+## qwen35 27B-dense parallel track (2026-05-22)
+
+The qwen35 path (Qwen 3.5 / 3.6-27B dense, qwen35_bring_up.rs)
+shares Phase 1-4a's plumbing but has its own NVFP4-batched-prefill
+landing. Recent perf landings on `rusty_sm121_qwen36_26b`:
+
+* `a165a41` — CUTLASS FP8 blockwise GEMM helper accepts M<128
+  via internal zero-pad to M_pad=128 + first-M-rows-copy back.
+  Profile defaults dropped MIN_TOKENS 128→32 across MLP/LINEAR/
+  FULL. **4.3× speedup at M=89 prefill** (16.95s → 3.94s on the
+  520-char Linux prompt + 40 decode); md5 byte-equivalent
+  (6f87a6f0 both before/after).
+* `68c6dbb` — NVFP4 batched-prefill cu_seqlens populator switched
+  to stream-ordered `cuMemsetD32Async`. 16 sync HtoDs/request
+  eliminated.
+* `c8c72cb` — qwen35 spec-decode `commit_only` uses sequential
+  `forward_layers_only` per token (not the batched recurrent-
+  state path which had BF16 accumulation drift). Spec output now
+  byte-equivalent to eager on 2 canonical workloads.
+
+These changes mean qwen35 sm_121 prefill at M ∈ [32, 127] now
+runs through CUTLASS SM120 instead of the slow per-token GEMV
+fallback — closing the perf cliff that lived at M=128.
+
 ## TODO — Phase 8: Decode-step CUDA Graph capture
 
 Codex Round-28 reviewed the path:
