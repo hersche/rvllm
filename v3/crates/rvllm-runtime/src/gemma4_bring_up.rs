@@ -15707,25 +15707,37 @@ impl Gemma4Bringup {
         // Both this fp8-block path and Option B's `Gemma4Nvfp4Bringup`
         // construct an identical borrow-view and delegate; no behaviour
         // change for the production fp8-block path.
-        let rt = crate::gemma4_vision::Gemma4VisionRuntime {
-            arch: &self.arch,
-            arena: &self.arena,
-            stream: &self.stream,
-            cublaslt: &self.cublaslt,
-            fused: &self.vit,
-            model: crate::gemma4_vision::Gemma4VisionModelView {
-                vision: self.model.vision.as_ref(),
-            },
-            fused_bf16: self.vit_bf16.as_ref(),
-        };
         if crate::gemma4_vision::gemma4_vit_use_bf16_enabled() {
             // Lazy-populate the bf16 weight cache once on first call.
-            // The conversion runs once per process lifetime; reuses
-            // arena scratch above the per-request checkpoint so it
-            // survives arena.restore() between requests.
             self.ensure_vit_bf16_weights()?;
+            let bf16w_guard = self.vit_bf16_weights.lock().unwrap();
+            let bf16w_ref = bf16w_guard.as_ref();
+            let rt = crate::gemma4_vision::Gemma4VisionRuntime {
+                arch: &self.arch,
+                arena: &self.arena,
+                stream: &self.stream,
+                cublaslt: &self.cublaslt,
+                fused: &self.vit,
+                model: crate::gemma4_vision::Gemma4VisionModelView {
+                    vision: self.model.vision.as_ref(),
+                },
+                fused_bf16: self.vit_bf16.as_ref(),
+                bf16_weights: bf16w_ref,
+            };
             rt.forward_bf16(image_bytes)
         } else {
+            let rt = crate::gemma4_vision::Gemma4VisionRuntime {
+                arch: &self.arch,
+                arena: &self.arena,
+                stream: &self.stream,
+                cublaslt: &self.cublaslt,
+                fused: &self.vit,
+                model: crate::gemma4_vision::Gemma4VisionModelView {
+                    vision: self.model.vision.as_ref(),
+                },
+                fused_bf16: self.vit_bf16.as_ref(),
+                bf16_weights: None,
+            };
             rt.forward(image_bytes)
         }
     }

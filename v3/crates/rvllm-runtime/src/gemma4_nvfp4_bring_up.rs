@@ -2981,21 +2981,36 @@ impl Gemma4Nvfp4Bringup {
         &self,
         image_bytes: &[u8],
     ) -> Result<crate::qwen36_bring_up::VisionForwardOutput> {
-        let rt = crate::gemma4_vision::Gemma4VisionRuntime {
-            arch: &self.arch,
-            arena: &self.arena,
-            stream: &self.stream,
-            cublaslt: &self.cublaslt,
-            fused: &self.vit,
-            model: crate::gemma4_vision::Gemma4VisionModelView {
-                vision: self.model.vision.as_ref(),
-            },
-            fused_bf16: self.vit_bf16.as_ref(),
-        };
         if crate::gemma4_vision::gemma4_vit_use_bf16_enabled() {
             self.ensure_vit_bf16_weights()?;
+            let bf16w_guard = self.vit_bf16_weights.lock().unwrap();
+            let bf16w_ref = bf16w_guard.as_ref();
+            let rt = crate::gemma4_vision::Gemma4VisionRuntime {
+                arch: &self.arch,
+                arena: &self.arena,
+                stream: &self.stream,
+                cublaslt: &self.cublaslt,
+                fused: &self.vit,
+                model: crate::gemma4_vision::Gemma4VisionModelView {
+                    vision: self.model.vision.as_ref(),
+                },
+                fused_bf16: self.vit_bf16.as_ref(),
+                bf16_weights: bf16w_ref,
+            };
             rt.forward_bf16(image_bytes)
         } else {
+            let rt = crate::gemma4_vision::Gemma4VisionRuntime {
+                arch: &self.arch,
+                arena: &self.arena,
+                stream: &self.stream,
+                cublaslt: &self.cublaslt,
+                fused: &self.vit,
+                model: crate::gemma4_vision::Gemma4VisionModelView {
+                    vision: self.model.vision.as_ref(),
+                },
+                fused_bf16: self.vit_bf16.as_ref(),
+                bf16_weights: None,
+            };
             rt.forward(image_bytes)
         }
     }
