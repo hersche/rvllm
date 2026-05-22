@@ -249,6 +249,12 @@ pub struct Qwen36OutsideKernels {
     /// Kernel: kernels/qwen_fill_pos_slots_i32.cu.
     pub qwen_fill_pos_slots_i32_mod: LoadedModule,
     pub fn_qwen_fill_pos_slots_i32: KernelFn,
+    /// Phase 8 deeper (multi-step capture): step-linker kernel that
+    /// runs BETWEEN consecutive decode-step forwards inside a
+    /// macro-captured graph. Copies argmax → next-token and
+    /// increments pos/ctx by 1, fully device-side.
+    pub qwen36_step_link_i32_mod: LoadedModule,
+    pub fn_qwen36_step_link_i32: KernelFn,
     /// Phase 6a / Round-27: batched router GEMV. Per-token grid.y
     /// dimension over the existing single-token kernel; one launch
     /// per layer instead of N. Kernel:
@@ -490,6 +496,16 @@ pub struct Qwen36Bringup {
     /// handled at the call site).
     pub decode_capture:
         std::sync::Mutex<Option<rvllm_graph::pool::CapturedGraph>>,
+    /// Phase 8 deeper-optimization slot: separate captured graph
+    /// for the N-step macro-replay path. Distinct from
+    /// `decode_capture` (single-step) because the macro-graph
+    /// records N iterations of forward + N-1 step_link kernels.
+    /// Bucket=N tags the graph with its macro-step count;
+    /// re-capture is needed if the operator changes
+    /// `RVLLM_QWEN36_DECODE_MULTI_STEP` mid-process (just restart
+    /// the worker for that).
+    pub decode_capture_multi_step:
+        std::sync::Mutex<Option<rvllm_graph::pool::CapturedGraph>>,
 }
 
 /// Output of `Qwen36Bringup::forward_qwen_vision`.
@@ -687,6 +703,298 @@ impl Qwen36Bringup {
             }
         }
         Ok(())
+    }
+
+    /// Phase 8 deeper: launch the step-linker kernel device-side
+    /// between two consecutive decode-step iterations inside the
+    /// macro-captured graph. Reads `argmax_token_src`, writes to
+    /// `workspace.token_dev`, and increments `workspace.pos_dev` +
+    /// `workspace.ctx_dev` by 1 — all in one tiny kernel.
+    #[cfg(feature = "cuda")]
+    fn launch_step_link_i32(
+        &self,
+        argmax_token_src: u64,
+        workspace:
+            &crate::qwen36_decode_workspace::Qwen36DecodeWorkspace,
+    ) -> Result<()> {
+        use cudarc::driver::sys::*;
+        unsafe {
+            let mut a_src = argmax_token_src;
+            let mut a_tok = workspace.token_dev;
+            let mut a_pos = workspace.pos_dev;
+            let mut a_ctx = workspace.ctx_dev;
+            let args: [*mut core::ffi::c_void; 4] = [
+                (&mut a_src) as *mut _ as *mut _,
+                (&mut a_tok) as *mut _ as *mut _,
+                (&mut a_pos) as *mut _ as *mut _,
+                (&mut a_ctx) as *mut _ as *mut _,
+            ];
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_qwen36_step_link_i32.raw() as CUfunction,
+                1, 1, 1,
+                32, 1, 1,
+                0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 step_link_i32 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase 8 deeper: capture N consecutive decode steps as ONE
+    /// macro-graph. Caller has already populated `workspace.token_dev`
+    /// (first token), `workspace.pos_dev` (start position), and
+    /// `workspace.ctx_dev` (start_position+1). The captured body:
+    ///
+    ///   * iter 0: forward step → writes argmax to
+    ///     `argmax_tokens_dev_base[0]`. (Single-step path's
+    ///     `workspace.argmax_token_dev` aliases this slot.)
+    ///   * step_link kernel: `workspace.token_dev = argmax_tokens
+    ///     [0]; workspace.pos_dev += 1; workspace.ctx_dev += 1`.
+    ///   * iter 1: forward step → writes argmax to
+    ///     `argmax_tokens_dev_base[1]`. (For this iteration the
+    ///     forward kernel sequence is captured with a SHIFTED sub-
+    ///     workspace whose `argmax_token_dev = base + 1*4`.)
+    ///   * ... and so on for iter 2..N-1.
+    ///
+    /// On capture failure (residual sync somewhere), the body still
+    /// ran eagerly under capture rules — replay would have failed
+    /// to instantiate, so the caller falls back to per-step replay.
+    /// Stores the macro-graph on `self.decode_capture_multi_step`
+    /// (separate slot from the single-step `decode_capture`).
+    #[cfg(feature = "cuda")]
+    pub fn try_capture_decode_steps_n(
+        &self,
+        workspace:
+            &crate::qwen36_decode_workspace::Qwen36DecodeWorkspace,
+        position: u32,
+        n_steps: u32,
+    ) -> Result<()> {
+        if n_steps < 2 {
+            // n=1 reduces to single-step capture; reuse the existing
+            // entry. Sanity: callers should gate on multi_step > 1
+            // before calling this.
+            return self.try_capture_decode_step(workspace, position);
+        }
+        if n_steps > workspace.max_steps {
+            return Err(rvllm_core::RvllmError::cuda(
+                "try_capture_decode_steps_n: n_steps exceeds workspace.max_steps",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        let stream_u64 = self.stream.raw() as u64;
+        let layout = rvllm_metadata::MetadataLayout::compute(1, 1);
+        let layout_hash = layout.hash();
+        let fingerprint = rvllm_graph::pool::GraphFingerprint([0u8; 32]);
+        let base_argmax = workspace.argmax_tokens_dev_base;
+        let capture_result = unsafe {
+            rvllm_graph::pool::CapturedGraph::capture(
+                /* bucket */ n_steps,
+                /* max_blocks */ 0,
+                layout_hash,
+                fingerprint,
+                stream_u64,
+                || -> Result<()> {
+                    for i in 0..n_steps {
+                        // Each iteration's forward writes argmax to
+                        // a DIFFERENT slot. Construct a sub-
+                        // workspace whose `argmax_token_dev` = base
+                        // + i*4. All OTHER workspace pointers stay
+                        // unchanged (scratch is reused per step;
+                        // token/pos/ctx are advanced by the linker).
+                        let mut sub = *workspace;
+                        sub.argmax_token_dev = base_argmax + (i as u64) * 4;
+                        self.forward_qwen36_decode_step_to_workspace(
+                            &sub, position + i)?;
+                        if i + 1 < n_steps {
+                            // Stitch: argmax[i] → token_dev,
+                            // pos_dev++, ctx_dev++. Next iteration's
+                            // forward reads the updated values.
+                            self.launch_step_link_i32(
+                                base_argmax + (i as u64) * 4,
+                                workspace)?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+        };
+        match capture_result {
+            Ok(g) => {
+                // Per the explicit-replay-after-capture invariant
+                // (commit bb9a3cf): CUDA stream capture in
+                // THREAD_LOCAL mode records but doesn't execute
+                // kernels. Replay once to actually run the macro-
+                // graph for THIS first call's result.
+                unsafe { g.replay(stream_u64)?; }
+                let mut guard = self.decode_capture_multi_step.lock().unwrap();
+                *guard = Some(g);
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "qwen36 multi-step capture rejected ({n_steps} steps): {e:?}. \
+                     Falling back to per-step replay path."
+                );
+                // Body kernels weren't executed under capture; re-
+                // run eagerly so the host has correct argmax tokens
+                // in `argmax_tokens_dev_base[0..n_steps]`.
+                for i in 0..n_steps {
+                    let mut sub = *workspace;
+                    sub.argmax_token_dev = base_argmax + (i as u64) * 4;
+                    self.forward_qwen36_decode_step_to_workspace(
+                        &sub, position + i)?;
+                    if i + 1 < n_steps {
+                        self.launch_step_link_i32(
+                            base_argmax + (i as u64) * 4,
+                            workspace)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Phase 8 deeper: replay a previously-captured N-step
+    /// macro-graph. Worker has already populated the first
+    /// iteration's token/pos/ctx into the workspace's shared
+    /// slots; the captured graph re-runs the whole N-step chain.
+    /// Returns immediately — caller does the DtoH of
+    /// `argmax_tokens_dev_base[0..n_steps]` to harvest the N tokens.
+    #[cfg(feature = "cuda")]
+    pub fn replay_decode_steps_n(
+        &self,
+        _workspace:
+            &crate::qwen36_decode_workspace::Qwen36DecodeWorkspace,
+    ) -> Result<()> {
+        let guard = self.decode_capture_multi_step.lock().unwrap();
+        let g = match guard.as_ref() {
+            Some(g) => g,
+            None => return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 replay_decode_steps_n: no captured macro-graph; \
+                 call try_capture_decode_steps_n first",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )),
+        };
+        unsafe { g.replay(self.stream.raw() as u64)?; }
+        Ok(())
+    }
+
+    /// Phase 8 deeper: DtoH harvest of N argmax tokens from the
+    /// macro-replay's per-iteration argmax slots. Fences the stream
+    /// first so all captured kernels are observed.
+    #[cfg(feature = "cuda")]
+    pub fn argmax_tokens_dev_to_host(
+        &self,
+        workspace:
+            &crate::qwen36_decode_workspace::Qwen36DecodeWorkspace,
+        n_steps: u32,
+    ) -> Result<Vec<i32>> {
+        if n_steps == 0 { return Ok(Vec::new()); }
+        if n_steps > workspace.max_steps {
+            return Err(rvllm_core::RvllmError::cuda(
+                "argmax_tokens_dev_to_host: n_steps > max_steps",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        self.stream.fence()?;
+        let mut buf = vec![0i32; n_steps as usize];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut _,
+                workspace.argmax_tokens_dev_base,
+                (n_steps as usize) * 4,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 argmax_tokens_dev_to_host DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(buf)
+    }
+
+    /// Phase 8 deeper: high-level macro-decode entry. Worker calls
+    /// once per `n_steps`-token chunk. Mirrors
+    /// `decode_step_via_graph_or_eager` but for the N-step macro
+    /// path. Capture-on-first-use, replay subsequent calls — the
+    /// macro-graph is keyed by `n_steps` (one cached graph per
+    /// distinct macro-step count).
+    ///
+    /// Caller contract:
+    ///   1. Write the first token to `workspace.token_dev` (the
+    ///      worker already does this via
+    ///      `write_token_to_workspace`).
+    ///   2. Write the starting position to `workspace.pos_dev` +
+    ///      pos+1 to `workspace.ctx_dev` (via
+    ///      `write_position_to_workspace`).
+    ///   3. Call this method.
+    ///   4. Receive `Vec<i32>` of N argmax tokens.
+    #[cfg(feature = "cuda")]
+    pub fn decode_steps_n_via_graph_or_eager(
+        &self,
+        workspace:
+            &crate::qwen36_decode_workspace::Qwen36DecodeWorkspace,
+        first_token: i32,
+        position: u32,
+        n_steps: u32,
+    ) -> Result<Vec<i32>> {
+        self.write_token_to_workspace(workspace, first_token)?;
+        self.write_position_to_workspace(workspace, position)?;
+        let graph_enabled =
+            crate::qwen36_decode_workspace::qwen36_decode_graph_enabled();
+        let replay_enabled = std::env::var("RVLLM_QWEN36_DECODE_GRAPH_REPLAY")
+            .ok()
+            .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+            .unwrap_or(false);
+        let have_capture = {
+            let guard = self.decode_capture_multi_step.lock().unwrap();
+            guard.is_some()
+        };
+        if graph_enabled && replay_enabled && have_capture {
+            self.replay_decode_steps_n(workspace)?;
+            return self.argmax_tokens_dev_to_host(workspace, n_steps);
+        }
+        if graph_enabled && !have_capture {
+            self.try_capture_decode_steps_n(workspace, position, n_steps)?;
+        } else {
+            // Pure eager path: just re-run the macro-body without
+            // capture machinery.
+            let base_argmax = workspace.argmax_tokens_dev_base;
+            for i in 0..n_steps {
+                let mut sub = *workspace;
+                sub.argmax_token_dev = base_argmax + (i as u64) * 4;
+                self.forward_qwen36_decode_step_to_workspace(&sub, position + i)?;
+                if i + 1 < n_steps {
+                    self.launch_step_link_i32(
+                        base_argmax + (i as u64) * 4, workspace)?;
+                }
+            }
+        }
+        self.argmax_tokens_dev_to_host(workspace, n_steps)
+    }
+
+    /// Phase 8 deeper: clear the cached multi-step macro-graph.
+    /// Called by the worker before re-capture when the per-request
+    /// arena layout changes (mirrors the single-step
+    /// `clear_decode_capture`).
+    pub fn clear_decode_capture_multi_step(&self) {
+        let mut guard = self.decode_capture_multi_step.lock().unwrap();
+        *guard = None;
     }
 
     /// Phase 8: clear any cached captured graph. The captured graph
@@ -1130,6 +1438,9 @@ impl Qwen36Bringup {
             kernels.load_ptx("conv_state_advance_batched_f16")?;
         let fn_conv_state_advance_batched_f16 = conv_state_advance_batched_f16_mod
             .get_function("conv_state_advance_batched_f16_kernel")?;
+        let qwen36_step_link_i32_mod = kernels.load_ptx("qwen36_step_link_i32")?;
+        let fn_qwen36_step_link_i32 =
+            qwen36_step_link_i32_mod.get_function("qwen36_step_link_i32_kernel")?;
         let qwen_fill_pos_slots_i32_mod = kernels.load_ptx("qwen_fill_pos_slots_i32")?;
         let fn_qwen_fill_pos_slots_i32 =
             qwen_fill_pos_slots_i32_mod.get_function("qwen_fill_pos_slots_i32_kernel")?;
@@ -1281,6 +1592,8 @@ impl Qwen36Bringup {
             fn_conv_state_advance_batched_f16,
             qwen_fill_pos_slots_i32_mod,
             fn_qwen_fill_pos_slots_i32,
+            qwen36_step_link_i32_mod,
+            fn_qwen36_step_link_i32,
             router_gemv_batched_f16_to_f32_mod,
             fn_router_gemv_batched_f16_to_f32,
             topk_softmax_batched_f32_mod,
@@ -1664,6 +1977,7 @@ impl Qwen36Bringup {
             conv_state_bytes,
             conv_state_layer_bytes,
             decode_capture: std::sync::Mutex::new(None),
+            decode_capture_multi_step: std::sync::Mutex::new(None),
         };
         // Phase 4b-prep iter25: upload the constant identity block
         // table once. The paged-attention layer used to rebuild it

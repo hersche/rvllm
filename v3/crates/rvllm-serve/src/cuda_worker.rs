@@ -1826,6 +1826,20 @@ pub async fn spawn_cuda_worker(
                                 .unwrap_or(false);
                         let need_workspace =
                             decode_graph_on || decode_workspace_only;
+                        // Phase 8 deeper: when multi-step env value
+                        // changes mid-process OR the workspace's
+                        // arena layout shifts, the cached multi-step
+                        // macro-graph could go stale. Since we now
+                        // keep workspace persistent + decode_inner
+                        // takes an inner checkpoint, addresses are
+                        // stable across requests — so we DON'T need
+                        // to clear per request. But keep the clear
+                        // method available for ops that change
+                        // multi-step N at runtime (no current
+                        // caller). The single-step
+                        // `decode_capture` already enjoys
+                        // cross-request reuse (commit bcdce94).
+
                         // Phase 8 follow-on: reuse the
                         // worker-persistent workspace (allocated
                         // above scratch_ck at worker bring-up).
@@ -1869,6 +1883,21 @@ pub async fn spawn_cuda_worker(
                         let mut finish = FinishReason::Length;
                         let max_new = req.max_new_tokens.max(1);
                         let mut emitted_ids: Vec<u32> = Vec::with_capacity(max_new as usize);
+                        // Phase 8 deeper-optimization: multi-step
+                        // macro-replay. When
+                        // `RVLLM_QWEN36_DECODE_MULTI_STEP=<N>` is
+                        // set (and N>1) AND the workspace is live,
+                        // each macro-replay returns N tokens at
+                        // once. `multi_step_buf` is the FIFO of
+                        // pre-fetched tokens (reversed so we pop
+                        // from the back in O(1)). When empty, we
+                        // top it up with the next macro-block.
+                        let multi_step_n = rvllm_runtime::qwen36_decode_workspace
+                            ::qwen36_decode_multi_step_n();
+                        let multi_step_active = multi_step_n > 1
+                            && decode_workspace.is_some()
+                            && decode_graph_on;
+                        let mut multi_step_buf: Vec<i32> = Vec::new();
                         for step in 0..max_new {
                             let id = if next_token < 0 { 0u32 } else { next_token as u32 };
                             // Round-20 finding #2: stop-token check BEFORE
@@ -1912,7 +1941,34 @@ pub async fn spawn_cuda_worker(
                             // Decode step: feed just this token at
                             // start_position = prompt_len + step.
                             let pos = prompt_len + step;
-                            let step_res = if let Some(ws) = decode_workspace.as_ref() {
+                            let step_res = if multi_step_active {
+                                // Pop from the pre-fetched batch;
+                                // when empty, top up with the next
+                                // macro-block of N tokens.
+                                let ws = decode_workspace.as_ref().unwrap();
+                                if multi_step_buf.is_empty() {
+                                    let remaining = max_new - step;
+                                    let n = multi_step_n.min(remaining);
+                                    match qwen.decode_steps_n_via_graph_or_eager(
+                                        ws, next_token as i32, pos, n)
+                                    {
+                                        Ok(mut toks) => {
+                                            // Reverse so we pop from
+                                            // the back in O(1).
+                                            toks.reverse();
+                                            multi_step_buf = toks;
+                                        }
+                                        Err(e) => {
+                                            let _ = req.events_tx.send(
+                                                GenerateEvent::Error(format!(
+                                                    "qwen36 multi-step replay: {e:?}"
+                                                )));
+                                            break;
+                                        }
+                                    }
+                                }
+                                Ok(multi_step_buf.pop().unwrap_or(0))
+                            } else if let Some(ws) = decode_workspace.as_ref() {
                                 if decode_graph_on {
                                     qwen.decode_step_via_graph_or_eager(
                                         ws, next_token as i32, pos)

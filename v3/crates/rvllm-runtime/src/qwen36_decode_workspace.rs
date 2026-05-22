@@ -124,7 +124,30 @@ pub struct Qwen36DecodeWorkspace {
     /// Output argmax token id: i32 `[1]`. The captured graph writes
     /// here; the outer loop does a single 4-byte DtoH AFTER replay
     /// (so the captured body never holds a DtoH).
+    ///
+    /// For SINGLE-STEP captures this is the only argmax slot. For
+    /// MULTI-STEP captures (`max_steps > 1`), it aliases the FIRST
+    /// slot of `argmax_tokens_dev_base` so single-step paths keep
+    /// working unchanged.
     pub argmax_token_dev: u64,
+
+    // ──────────────────────────── Multi-step (Phase 8 deeper) ─────────────
+    /// Base of an `i32 [max_steps]` device array holding per-iteration
+    /// argmax tokens for the multi-step captured macro-graph. The
+    /// captured graph for iteration `i` writes to
+    /// `argmax_tokens_dev_base + i*4`; after macro-replay the host
+    /// DtoHs all `max_steps` entries in one go.
+    ///
+    /// `argmax_tokens_dev_base == argmax_token_dev` by construction
+    /// — slot 0 IS the single-step argmax slot, so single-step
+    /// paths (and the cross-request graph cache) keep working
+    /// without any change.
+    pub argmax_tokens_dev_base: u64,
+    /// Capacity of the per-step argmax-tokens array. `1` reduces to
+    /// the single-step workspace; `>1` enables multi-step macro-
+    /// capture via `try_capture_decode_steps_n`. Operator-tuned via
+    /// `RVLLM_QWEN36_DECODE_MULTI_STEP=<N>` (default 1).
+    pub max_steps: u32,
 
     // ──────────────────────────── Frozen geometry ──────────────────────────
     pub hidden: u32,
@@ -181,8 +204,19 @@ impl Qwen36DecodeWorkspace {
         let token_dev = arena.region("qwen36_ws_token", 4, 4)?.device_ptr();
         let pos_dev = arena.region("qwen36_ws_pos", 4, 4)?.device_ptr();
         let ctx_dev = arena.region("qwen36_ws_ctx", 4, 4)?.device_ptr();
-        let argmax_token_dev =
-            arena.region("qwen36_ws_argmax_tok", 4, 4)?.device_ptr();
+        // Phase 8 deeper: allocate `max_steps * 4` bytes so the
+        // multi-step macro-replay has per-iteration argmax slots.
+        // For `max_steps == 1` this reduces to a single i32 slot
+        // (the legacy single-step path). The first slot IS the
+        // single-step `argmax_token_dev` — they alias by design so
+        // existing code paths (cross-request graph cache, eager
+        // workspace path) keep working unchanged.
+        let max_steps_capacity = qwen36_decode_multi_step_n().max(1);
+        let argmax_tokens_dev_base = arena
+            .region("qwen36_ws_argmax_tokens",
+                4 * (max_steps_capacity as usize), 4)?
+            .device_ptr();
+        let argmax_token_dev = argmax_tokens_dev_base;
 
         // ── Hidden flow ─────────────────────────────────────────
         let hidden_dev = arena.region("qwen36_ws_hidden", hb, 16)?.device_ptr();
@@ -249,6 +283,8 @@ impl Qwen36DecodeWorkspace {
             final_norm_dev,
             logits_dev,
             argmax_token_dev,
+            argmax_tokens_dev_base,
+            max_steps: max_steps_capacity,
             hidden,
             intermediate,
             vocab,
@@ -304,4 +340,24 @@ pub fn qwen36_decode_graph_enabled() -> bool {
         .ok()
         .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
         .unwrap_or(false)
+}
+
+/// Phase 8 deeper-optimization knob: capture a chain of N decode
+/// steps as one macro-graph. Default `1` (single-step replay,
+/// behavioral parity with the original Phase 8 path). Operator
+/// opts in via `RVLLM_QWEN36_DECODE_MULTI_STEP=<N>` to enable the
+/// macro-replay; valid range is `[1, 32]` — values outside are
+/// clamped to keep the workspace's argmax-tokens array bounded.
+///
+/// The workspace allocator reads this once at construction time so
+/// the per-step argmax-tokens array is sized correctly for the
+/// configured macro-step count. Changing the env mid-process won't
+/// resize an already-allocated workspace; restart the worker to
+/// pick up a new value.
+pub fn qwen36_decode_multi_step_n() -> u32 {
+    let raw = std::env::var("RVLLM_QWEN36_DECODE_MULTI_STEP")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
+    raw.clamp(1, 32)
 }
