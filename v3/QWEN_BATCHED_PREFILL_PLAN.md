@@ -317,6 +317,20 @@ launches + 320 f16 round-trips per decode token on Qwen 3.6
 photosynthesis decode (≈20-25% speedup). The CLAUDE.md
 "Phase 8 MoE-fusion — SHIPPED" section has the full A/B table.
 
+**Other-models fusion (commit `39f7c1a`)** — same pattern
+ported to Qwen 3.5/3.6 27B DENSE decode via new kernel
+`fp8_gemv_blockwise_wpr_native_f16in_residual_add_kernel`.
+Three per-layer M=1 sites in qwen35_bring_up.rs (full-attn
+o_proj, linear-attn out_proj, dense MLP ffn_down) fuse with
+the subsequent vector_add_f16 residual. 120 launches saved per
+decode token. Hardware-validated correct on qwen3-6-27b but
+latency win is below noise (~14.68s for 150-token decode) —
+the 27B dense path is kernel-work-bound, not launch-overhead-
+bound; the fusion's value is architectural. The fused kernel
+infrastructure is now available for Mistral 3.5 / Gemma 4 31B
+dense paths but the latency win on those would also be below
+noise.
+
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
 desired.
