@@ -93,6 +93,35 @@ text-recognition tasks degrade.
 deferred indefinitely. Re-open only if a real quality regression
 appears that the f16 path can't service.
 
+### Scaffold landed 2026-05-22 (commit `257945d`)
+
+The bf16 path now has a callable seam ready for the next debug
+session, but the forward body itself is still stubbed:
+
+- `Gemma4VisionKernelsBf16` struct in
+  `v3/crates/rvllm-runtime/src/gemma4_vision.rs` holds the 13
+  bf16-typed vision KernelFns + the existing `f32_to_bf16_kernel`.
+  `try_load(loader) → Result<Option<Self>>` returns Ok(None) on
+  older kernel trees so the bringup still constructs.
+- Loaded on BOTH `Gemma4Bringup.vit_bf16` (fp8-block) and
+  `Gemma4Nvfp4Bringup.vit_bf16` (Option B) at startup.
+- `Gemma4VisionRuntime.fused_bf16: Option<&...>` borrow-view
+  extension carries the kernel set into the runtime; production
+  `forward` (f16) ignores this field entirely.
+- `RVLLM_GEMMA4_VIT_USE_BF16=1` env gate (helper
+  `gemma4_vit_use_bf16_enabled()`); each
+  `forward_gemma_vision` shim now checks the gate and routes to
+  `forward_bf16` when set.
+- `Gemma4VisionRuntime::forward_bf16` currently STUBBED: errors
+  out with a clear "PTX missing" / "body staged for follow-up"
+  message. The actual ~1200-LOC body — mechanical kernel-by-kernel
+  substitution of `forward` using `fused_bf16` + `cublaslt.
+  bf16_gemm_f32_batched_strided` — is the next commit's content.
+  The substep dump harness
+  (`RVLLM_GEMMA4_VIT_SUBSTEP_BLK` + `cmp_g4v_substep.py`) is
+  already in place to localise the prior blk0_out cos=0.76
+  failure within block 0's first sub-step that drifts.
+
 ### Justification
 - f16 path delivers correct vision output on real images for both
   Qwen 3.6 and Gemma 4 31B (NYT-1969 photo headline + date,

@@ -853,7 +853,7 @@ overhead dominates for the legacy path.
   between two valid German jokes. Post-fix the same canary is
   byte-stable.
 
-### Phase 8 — TODO
+### Phase 8 — IN PROGRESS (foundations landed 2026-05-22)
 Decode-step CUDA Graph capture is parked as Phase 8 in
 `v3/QWEN_BATCHED_PREFILL_PLAN.md`. Codex round-28 picked a
 workspace-based factoring (`decode_step_launch_only` reading
@@ -861,6 +861,43 @@ device pointers, no per-call arena allocation, no sync DtoH inside
 the captured body) over capturing the current allocation-heavy
 forward. Realistic scope 500–1000 LOC, separate session. Not
 blocking the prefill rollout above.
+
+**Foundations shipped 2026-05-22**:
+
+* `793ddf0` — `Qwen36DecodeWorkspace` struct in
+  `v3/crates/rvllm-runtime/src/qwen36_decode_workspace.rs`. Stable
+  per-step device-pointer slots for token/pos/ctx scalars, the
+  hidden-flow buffers (hidden, residual_save, normed), attention
+  scratch (qkv/q/k/v/attn_out), linear-attn scratch, MoE scratch
+  (router_logits, topk_idx, topk_w, gate, up, silu_mul, down),
+  closer scratch (final_norm, logits, argmax_token).
+  `Qwen36Bringup::alloc_decode_workspace()` constructs from the
+  arena. Env gate `RVLLM_QWEN36_DECODE_GRAPH=1` (default off).
+* `be98a01` — `forward_qwen36_outside_closer_device_argmax(...,
+  argmax_token_dev)` writes the argmax to a caller-provided
+  device pointer, NO `stream.fence()`, NO `cuMemcpyDtoH_v2`
+  inside the body. Pairs with `argmax_dev_to_host_token` which
+  fences + DtoHs OUTSIDE the captured region. Mirrors Gemma 4
+  NVFP4's `forward_full_to_token_device_argmax` pattern.
+
+**Remaining**:
+
+* Phase 8 commit 2b — refactor the per-layer chain inside
+  `forward_qwen36_decode_inner` so it reads/writes workspace
+  device pointers instead of per-call `arena.region(...)`. The
+  embed-gather must read from `workspace.token_dev` (instead of
+  the current host→device `tok_region.copy_from_host`). This is
+  the deeper plumbing piece.
+* Phase 8 commit 3 — wire `rvllm_graph::CapturedGraph::capture(...)`
+  around the workspace-based decode step inside `cuda_worker.rs`'s
+  qwen36 dispatch, mirroring Gemma 4 NVFP4's `decode_capture`
+  state. Update token/pos/ctx via `cuMemsetD32Async` before
+  `graph.replay()`, extract via `argmax_dev_to_host_token`
+  outside the captured region.
+
+Eager decode path remains the production default. The captured
+path stays opt-in (`RVLLM_QWEN36_DECODE_GRAPH=1`) until commits
+2b + 3 land and accept-rate / latency A/B validates.
 
 ## Other docs in this tree
 
