@@ -493,6 +493,63 @@ pub struct VisionForwardOutput {
 }
 
 impl Qwen36Bringup {
+    /// Phase 8 commit 2b: workspace-driven single-step decode.
+    /// Combines the two overrides on
+    /// `forward_qwen36_decode_inner_with_workspace_overrides` so a
+    /// single call from the cuda-worker drives one decode step
+    /// using the workspace's stable device pointers throughout
+    /// (token in, argmax out). NO sync HtoD and NO sync DtoH inside.
+    ///
+    /// Caller contract:
+    ///   1. Write the current token id (i32) to `workspace.token_dev`
+    ///      via `cuMemcpyHtoDAsync_v2` (4 bytes) or
+    ///      `cuMemsetD32Async` BEFORE calling this method.
+    ///   2. Call this method.
+    ///   3. Call `argmax_dev_to_host_token(workspace.argmax_token_dev)`
+    ///      to fence + extract the resulting token.
+    ///
+    /// The captured-graph wrapping in cuda_worker (commit 3) records
+    /// step 2 into a CUDA graph; replay re-runs the same kernel
+    /// sequence with whatever token_id was just written to
+    /// `workspace.token_dev` in step 1. Token IDs change per
+    /// replay; the rest of the kernel arg vector is captured-stable.
+    ///
+    /// Position is currently still passed as a host-side scalar
+    /// kernel arg (RoPE, KV slot indexing). For the captured-graph
+    /// path to support a moving position, the RoPE + KV-slot kernel
+    /// variants need "indirect" siblings that read position from a
+    /// device i32 pointer (same pattern as Gemma 4 NVFP4's
+    /// `G4N_DECODE_GRAPH_INDIRECT=1`). Until those land, the
+    /// captured path is single-position only — useful for
+    /// validating the capture/replay infrastructure, but production
+    /// decode loops need the indirect kernels for multi-step
+    /// replay.
+    #[cfg(feature = "cuda")]
+    pub fn forward_qwen36_decode_step_to_workspace(
+        &self,
+        workspace:
+            &crate::qwen36_decode_workspace::Qwen36DecodeWorkspace,
+        position: u32,
+    ) -> Result<()> {
+        // The single-token slice is unused on the override path —
+        // the embed_gather reads token_dev directly. Passing an
+        // arbitrary i32 so the inner function's debug paths still
+        // see a non-empty slice when something downstream needs it.
+        let dummy_tok = [0i32; 1];
+        self.forward_qwen36_decode_inner_with_workspace_overrides(
+            &dummy_tok,
+            position,
+            /* vision_splice */ &[],
+            /* cancel */ None,
+            /* all_argmaxes */ None,
+            /* skip_closer */ false,
+            /* mtp_shadow_out */ None,
+            Some(workspace.token_dev),
+            Some(workspace.argmax_token_dev),
+        )?;
+        Ok(())
+    }
+
     /// Phase 8 scaffold: allocate the stable per-step decode workspace
     /// for one request. Must be called BEFORE the per-request scratch
     /// checkpoint so subsequent `arena.restore(ck)` doesn't reclaim
@@ -4476,9 +4533,50 @@ impl Qwen36Bringup {
         start_position: u32,
         vision_splice: &[(usize, &[u8])],
         cancel: Option<&std::sync::atomic::AtomicBool>,
+        all_argmaxes: Option<&mut Vec<i32>>,
+        skip_closer: bool,
+        mtp_shadow_out: Option<&mut Option<i32>>,
+    ) -> Result<i32> {
+        self.forward_qwen36_decode_inner_with_workspace_overrides(
+            token_ids, start_position, vision_splice, cancel,
+            all_argmaxes, skip_closer, mtp_shadow_out,
+            /* tok_device_override */ None,
+            /* closer_argmax_dev    */ None,
+        )
+    }
+
+    /// Phase 8 commit 2b — decode_inner with workspace overrides for
+    /// graph-capture-friendly dispatch.
+    ///
+    /// * `tok_device_override`: when `Some(ptr)`, the per-call
+    ///   host-side `tok_bytes` + `tok_region.copy_from_host` step is
+    ///   skipped and the embed_gather reads token indices directly
+    ///   from `ptr` (caller-stable device i32 pointer, e.g.
+    ///   `workspace.token_dev`). The legacy default-stream sync
+    ///   HtoD vanishes — required for capture.
+    /// * `closer_argmax_dev`: when `Some(ptr)`, the closer writes
+    ///   the argmax token id to `ptr` via
+    ///   `forward_qwen36_outside_closer_device_argmax` and returns
+    ///   `0` as a sentinel (caller must read the result via
+    ///   `argmax_dev_to_host_token(ptr)` AFTER fencing). The
+    ///   capture-breaking `cuMemcpyDtoH_v2` at the tail of the
+    ///   eager closer vanishes.
+    ///
+    /// Both overrides default-None preserve byte-identical behavior
+    /// to the pre-Phase-8 eager path. Passing one without the other
+    /// is supported (operator can validate the embed-side rewrite
+    /// without the closer-side rewrite, and vice versa).
+    fn forward_qwen36_decode_inner_with_workspace_overrides(
+        &self,
+        token_ids: &[i32],
+        start_position: u32,
+        vision_splice: &[(usize, &[u8])],
+        cancel: Option<&std::sync::atomic::AtomicBool>,
         mut all_argmaxes: Option<&mut Vec<i32>>,
         skip_closer: bool,
         mtp_shadow_out: Option<&mut Option<i32>>,
+        tok_device_override: Option<u64>,
+        closer_argmax_dev: Option<u64>,
     ) -> Result<i32> {
         if token_ids.is_empty() {
             return Err(rvllm_core::RvllmError::cuda(
@@ -4495,12 +4593,34 @@ impl Qwen36Bringup {
         let last_hidden_bytes = (hidden as usize) * 2;
 
         // 1. Token IDs + embed_gather → hidden_region [num_tokens, hidden] f16.
-        let mut tok_bytes = Vec::with_capacity(token_ids.len() * 4);
-        for t in token_ids {
-            tok_bytes.extend_from_slice(&t.to_le_bytes());
-        }
-        let tok_region = self.arena.region("qwen36_pl_tok", tok_bytes.len(), 16)?;
-        unsafe { tok_region.copy_from_host(&tok_bytes)? };
+        // Phase 8 commit 2b: when `tok_device_override` is Some, the
+        // caller already populated the token index buffer on-device
+        // (workspace.token_dev). Skip the per-call host-side
+        // `copy_from_host` (legacy default-stream sync HtoD) so the
+        // captured graph body contains zero sync HtoD.
+        let token_dev_ptr: u64 = if let Some(p) = tok_device_override {
+            // Override mode: caller-provided device i32 pointer.
+            // Sanity: only single-token decode is supported via the
+            // override today; multi-token prefill keeps using the
+            // legacy host-side path.
+            if num_tokens != 1 {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "forward_qwen36_decode: tok_device_override only \
+                     supports num_tokens=1 (Phase 8 single-step decode)",
+                    rvllm_core::CudaErrorKind::Other,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+            p
+        } else {
+            let mut tok_bytes = Vec::with_capacity(token_ids.len() * 4);
+            for t in token_ids {
+                tok_bytes.extend_from_slice(&t.to_le_bytes());
+            }
+            let tok_region = self.arena.region("qwen36_pl_tok", tok_bytes.len(), 16)?;
+            unsafe { tok_region.copy_from_host(&tok_bytes)? };
+            tok_region.device_ptr()
+        };
         let hidden_bytes = (num_tokens as usize) * (hidden as usize) * 2;
         let hidden_region = self.arena.region("qwen36_pl_hidden", hidden_bytes, 16)?;
         unsafe {
@@ -4513,7 +4633,7 @@ impl Qwen36Bringup {
                 self.outside_kernels.fn_embedding_gather_f16,
                 hidden_region.device_ptr(),
                 self.model.outside.embed_tokens.offset_bytes,
-                tok_region.device_ptr(),
+                token_dev_ptr,
                 stream_raw,
             )?;
         }
@@ -5262,17 +5382,43 @@ impl Qwen36Bringup {
             }
             Ok(*out.last().unwrap_or(&0))
         } else {
-            let base =
-                self.forward_qwen36_outside_closer(&hidden_region, num_tokens, hidden, vocab, last_idx)?;
-            if let Some(out) = mtp_shadow_out {
-                let last_hidden_row_ptr =
-                    hidden_region.device_ptr() + (last_idx as u64) * (hidden as u64) * 2;
-                *out = Some(self.forward_qwen36_mtp_from_hidden_ptr(
-                    last_hidden_row_ptr,
-                    base,
-                    start_position + last_idx as u32,
-                )?);
-            }
+            // Phase 8 commit 2b: when `closer_argmax_dev` is Some,
+            // run the device-argmax closer instead of the eager
+            // DtoH-tailed closer. Returns 0 as a sentinel — the
+            // caller is expected to call `argmax_dev_to_host_token`
+            // OUTSIDE any captured-graph body to extract the real
+            // token id after fencing the stream.
+            //
+            // MTP shadow is skipped in this override path (Phase 8
+            // captured decode is single-token, no spec).
+            let base = if let Some(argmax_dev) = closer_argmax_dev {
+                if mtp_shadow_out.is_some() {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "forward_qwen36_decode: closer_argmax_dev + \
+                         mtp_shadow_out is unsupported (Phase 8 + \
+                         MTP-spec are mutually exclusive)",
+                        rvllm_core::CudaErrorKind::Other,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+                self.forward_qwen36_outside_closer_device_argmax(
+                    &hidden_region, num_tokens, hidden, vocab,
+                    last_idx, argmax_dev)?;
+                0i32
+            } else {
+                let base = self.forward_qwen36_outside_closer(
+                    &hidden_region, num_tokens, hidden, vocab, last_idx)?;
+                if let Some(out) = mtp_shadow_out {
+                    let last_hidden_row_ptr =
+                        hidden_region.device_ptr() + (last_idx as u64) * (hidden as u64) * 2;
+                    *out = Some(self.forward_qwen36_mtp_from_hidden_ptr(
+                        last_hidden_row_ptr,
+                        base,
+                        start_position + last_idx as u32,
+                    )?);
+                }
+                base
+            };
             Ok(base)
         }
     }
