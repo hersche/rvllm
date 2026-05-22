@@ -863,8 +863,18 @@ When modifying a shared file for ONE model's perf/quality:
    default for everyone. Pattern: kernels compile multiple
    `extern "C" __global__` symbols via a templated `__device__`
    helper (one register-array size per variant), host dispatches
-   by actual model parameter. See e.g. NVFP4 GQA decode's
-   `_gqa_kernel` vs `_gqa_max16_kernel` pattern (when it lands).
+   by actual model parameter. **Canonical example shipped 2026-05-22**
+   (task #1): NVFP4 GQA decode's `_gqa_kernel` (MAX_GQA=4) vs
+   `_gqa_max16_kernel` (MAX_GQA=16), with BC=32 + BC=16 + bf16-out +
+   split-decode + FP8-KV siblings (commits 6828eeb / 24715f8 /
+   cd04286 / 823bfe4 / 7d9e21b). Host dispatch in
+   `v3/crates/rvllm-attention/src/decode.rs` picks the smallest
+   fitting variant per actual GQA; low-GQA models (Gemma 4
+   sliding GQA=2, Qwen 27B GQA=4) stay on the minimal-register
+   default. Runtime-validated on Qwen 27B (GQA=4 default path
+   unchanged), Gemma 4 31B (global GQA=8 → _max16), Qwen 3.6
+   35B-A3B (GQA=8 → _max16), Mistral 3.5 (GQA=12 → _max16) —
+   all coherent German output on three smoke prompts each.
 4. **Document the cross-model impact in commit + register.**
    Commit message must list every model family whose forward
    path passes through the touched file, and confirm the
@@ -876,10 +886,10 @@ When modifying a shared file for ONE model's perf/quality:
 
 These rules apply to ALL shared code paths, not just attention.
 The mistral perf work (raising `MAX_GQA_DECODE`/`MAX_GQA_SPLIT`
-in `flash_attention*kv*.cu`) is the canonical example of where
-naive single-default bumping created a Gemma 4 / Qwen
-register-pressure risk; the correct fix is adaptive kernel-
-variant dispatch.
+in `flash_attention*kv*.cu`) was the canonical example: naive
+single-default bumping would have created a Gemma 4 / Qwen
+register-pressure risk. Resolved 2026-05-22 (task #1) via the
+adaptive `_max16` variant pattern documented in rule (3) above.
 
 ## Known pitfalls
 
