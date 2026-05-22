@@ -334,16 +334,24 @@ impl Gemma4Bringup {
         let hidden = arch.hidden_size as u32;
         let vocab = arch.vocab_size as u32;
         let inter = arch.intermediate_size as u32;
-        let block_size: u32 = std::env::var("RVLLM_BLOCK_SIZE")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+        // The persistent KV cache slot indexing is
+        // `slot = block * block_size + slot_in_block`; the spec
+        // verify path MUST use the SAME block_size the cache was
+        // allocated with or attention reads wrong slots → garbage.
+        // Read the canonical value from PrefixCacheState.block_size
+        // (set inside init_prefix_cache where the persistent KV is
+        // allocated). Falls back to 32 only if the cache wasn't
+        // initialised — which also fails the persistent-cache-ptr
+        // guard below, so the fallback is unreachable in production.
         let max_layers: usize = self.model.layers.len();
 
         // Prefix-cache must be initialised — verify-from-state is a
         // spec-only path that runs against the persistent KV cache.
         let (kv_cache_ptr, kv_scale_cache_ptr,
              kv_layer_offsets, kv_scale_layer_offsets,
-             num_blocks_total, identity_bt_ptr, identity_bt_len): (u64, u64,
-             Vec<u64>, Vec<u64>, u32, u64, u32) = {
+             num_blocks_total, identity_bt_ptr, identity_bt_len,
+             block_size): (u64, u64,
+             Vec<u64>, Vec<u64>, u32, u64, u32, u32) = {
             let guard = self.prefix_cache.lock().unwrap();
             match guard.as_ref() {
                 Some(pc) => (
@@ -354,6 +362,7 @@ impl Gemma4Bringup {
                     pc.num_blocks_total,
                     pc.identity_block_tables_ptr,
                     pc.identity_block_tables_len,
+                    pc.block_size,
                 ),
                 None => {
                     return Err(rvllm_core::RvllmError::Config {
@@ -731,6 +740,34 @@ impl Gemma4Bringup {
                 &self.sliding_attention, &self.global_attention,
                 s.residual, stream, phase,
             )?;
+            // Phase 4 debug: per-layer residual hash for OLD-vs-NEW
+            // bisection. Gated on RVLLM_GEMMA4_SPEC_LAYER_DUMP=1.
+            if std::env::var("RVLLM_GEMMA4_SPEC_LAYER_DUMP").as_deref() == Ok("1") {
+                use cudarc::driver::sys::*;
+                self.stream.fence()?;
+                let mut buf = vec![0u16; (k as usize) * (hidden as usize)];
+                let rc = cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut _,
+                    s.residual,
+                    (k as usize) * (hidden as usize) * 2);
+                if rc == CUresult::CUDA_SUCCESS {
+                    // RMS + max + first 4 values of row 0.
+                    let mut sum_sq = 0.0f64;
+                    let mut amax = 0.0f32;
+                    for &b in &buf[..hidden as usize] {
+                        let v = half::f16::from_bits(b).to_f32();
+                        sum_sq += (v * v) as f64;
+                        if v.abs() > amax { amax = v.abs(); }
+                    }
+                    let rms = (sum_sq / hidden as f64).sqrt();
+                    let first4: Vec<f32> = buf[..4].iter()
+                        .map(|&b| half::f16::from_bits(b).to_f32()).collect();
+                    eprintln!(
+                        "[spec-new-layer-dump] layer={} k={} hidden={} \
+                         row0_rms={:.4} row0_max={:.3} row0_first4={:?}",
+                        layer_idx, k, hidden, rms, amax, first4);
+                }
+            }
         }
 
         // Capture K post-layer-loop residual rows into caller's buffer.
