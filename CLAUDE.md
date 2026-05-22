@@ -905,21 +905,43 @@ blocking the prefill rollout above.
   eager, returns the token via `argmax_dev_to_host_token`).
   `RVLLM_QWEN36_DECODE_GRAPH=1` opts in (default off).
 
+* `3c30fea` — Phase 8 follow-up: worker integration +
+  two-gate capture/replay design. `cuda_worker.rs`'s qwen36
+  decode loop allocates the workspace once per request when
+  `RVLLM_QWEN36_DECODE_GRAPH=1` and routes per-step decode
+  through `decode_step_via_graph_or_eager`. The method now
+  honors TWO gates: `DECODE_GRAPH=1` enables ATTEMPTING
+  capture (step 0 runs eagerly inside `cuStreamBeginCapture`
+  — validates the workspace body is capture-clean);
+  `DECODE_GRAPH_REPLAY=1` enables actual REPLAY in steps 1+.
+  Split exists because position-frozen kernels make replay
+  incorrect at moving positions. Hardware-validated:
+  default-off path byte-identical to pre-commit; capture-on
+  path log reads "[graph] captured 1856 nodes" — workspace
+  body captures cleanly.
+
+**Known regression (`DECODE_GRAPH=1` only, default-off
+unaffected)**: when capture is opted in via env, multi-step
+decode produces incorrect output ("Die." instead of "Die
+Hauptstadt von Frankreich ist Paris."). Reproducible. Needs a
+focused debug session to narrow whether the workspace body's
+per-call arena-bump pattern, the device-argmax closer's
+interaction with multi-step KV state, or a capture-body side
+effect is breaking the per-step decode chain.
+**`RVLLM_QWEN36_DECODE_GRAPH` is documented unsafe to flip
+until that's resolved** — the gate exists for infrastructure
+validation and follow-up debugging only.
+
 **Remaining**:
 
-The per-layer chain inside `forward_qwen36_decode_inner` still
-allocates per-call `arena.region(...)` scratch and reads scalar
-position kernel args. Capture currently succeeds when the arena
-bumps land at deterministic addresses (which holds inside one
-request), AND when the captured kernel scalars are valid for the
-replay step. Because **position** is a kernel scalar (not yet a
-device pointer), captured replay is correct only at the SAME
-position as capture. Multi-step replay across moving positions
-needs "indirect" RoPE + KV-slot kernel variants (Qwen's
-equivalent of Gemma 4 NVFP4's
-`G4N_DECODE_GRAPH_INDIRECT=1`). That's the next chunk of work;
-the capture/replay scaffold landed here unblocks it without
-disturbing the eager production path.
+1. Debug the `DECODE_GRAPH=1` multi-step regression above
+   (capture-on, replay-off still corrupts output — must precede
+   any further capture/replay work).
+2. Author position-indirect Qwen RoPE + KV-slot kernel variants
+   so replay can flip on without position-frozen failures
+   (Qwen's analog of Gemma 4 NVFP4's
+   `G4N_DECODE_GRAPH_INDIRECT=1`).
+3. Latency / accept-rate A/B once 1 + 2 land.
 
 Eager decode path remains the production default
 (`RVLLM_QWEN36_DECODE_GRAPH` unset). Captured path opt-in only.

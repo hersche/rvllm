@@ -87,17 +87,69 @@ For now the f16-everywhere path is acceptable: model reads text
 correctly, residual cosine drift is well below the threshold where
 text-recognition tasks degrade.
 
-## Phase 3 status — bf16 vision path (FORMALLY DEFERRED, 2026-05-05)
+## Phase 3 status — bf16 vision path (SHIPPED 2026-05-22)
 
-**Decision**: production runs on the f16 + f32-pooler path. bf16 is
-deferred indefinitely. Re-open only if a real quality regression
-appears that the f16 path can't service.
+**Decision**: production runs on the f16 + f32-pooler path. bf16
+opt-in via `RVLLM_GEMMA4_VIT_USE_BF16=1` since `797a019` —
+hardware-validated working on first try (prior `blk0_out
+cos=0.76` failure is resolved). Production default unchanged.
 
-### Scaffold landed 2026-05-22 (commits `257945d`, `b2cfdbc`)
+### `797a019` — forward_bf16 body landed
 
-The bf16 path now has a callable seam + weight conversion infra
-ready for the next debug session, but the forward body itself is
-still stubbed:
+Mechanical 1216-LOC kernel-by-kernel substitution of the f16
+`forward` (gemma4_vision.rs:572) via a deterministic script:
+
+- 15 f16 kernel function pointers → bf16 siblings on `bf16k`
+  (fn_rmsnorm → fn_rmsnorm_bf16_gbf16, fn_vnorm → fn_vnorm_bf16,
+  fn_vector_add → fn_vector_add_bf16, fn_cast_f32_to_f16 →
+  fn_cast_f32_to_bf16, fn_{extract,scatter}_head{,_s}_f16 → _bf16,
+  fn_transpose_heads_v_f16 → _bf16, fn_softmax_row_f32_to_f16 →
+  _f32_to_bf16, fn_gelu_tanh_mul_f16 → _bf16,
+  fn_vit_avgpool_f16_to_f32 → _bf16_to_f32,
+  fn_vit_pos_emb_lookup_2d_f16 → _bf16,
+  fn_vit_rotary_gemma4_2d_f16 → _bf16,
+  fn_vit_standardize_f32_to_f16 → _f32_to_bf16;
+  fn_scale_inplace_f32 stays).
+- 2 cuBLASLt entries:
+  `f16_gemm_f32{,_batched_strided}` → `bf16_gemm_f32{,_batched_strided}`.
+- All vision weight pointers: `vision.X.offset_bytes` →
+  `bf16w.X_ptr` (top-level); `blk.X.offset_bytes` →
+  `bf16_blk.X_ptr` (13 per-block) via parallel
+  `vision.blocks.iter().zip(bf16w.blocks.iter()).enumerate()`.
+- Host-side narrows: `half::f16::from_f32` → `half::bf16::from_f32`
+  (patches + cos/sin tables).
+- Arena region names: `g4v_X` → `g4vbf16_X` for clear hybrid-debug
+  isolation.
+
+`Gemma4VisionRuntime` gained a `bf16_weights: Option<&Gemma4VisionBf16>`
+borrow-view field; both bringups now build the runtime with the
+bf16 weights borrow when `RVLLM_GEMMA4_VIT_USE_BF16=1` (the
+mutex guard outlives the borrow via stack-bound let-binding).
+
+**Hardware validation** (2026-05-22):
+- f16 baseline (`RVLLM_GEMMA4_VIT_USE_BF16` unset):
+  gemma-4-31b-it-nvfp4 on /tmp/ball.png → "Das Bild zeigt einen
+  orangefarbenen Kreis auf einem hellblauen Hintergrund. Es sieht
+  aus wie eine **minimalistische** Darstellung der Sonne am Himmel."
+- bf16 (`RVLLM_GEMMA4_VIT_USE_BF16=1`): same image → "Das Bild
+  zeigt einen orangefarbenen Kreis auf einem hellblauen
+  Hintergrund. Es sieht aus wie eine **vereinfachte** Darstellung
+  einer Sonne am Himmel." Semantically identical; minor wording
+  variation expected at the precision boundary (~0.003 cos delta
+  per the original audit). Clean traversal through all 27 blocks
+  via "vision: Gemma4Nvfp4 ViT forward done idx=0 tokens=256
+  hidden=5376".
+
+Path stays opt-in; the audit doc's "f16-everywhere path is
+acceptable" verdict means the bf16 gain doesn't motivate flipping
+the default. Value of the bf16 path is as a tested seam for any
+future image-quality investigation where the ~0.003 mean-cos
+delta matters.
+
+### Earlier scaffold (foundational commits)
+
+Landed before the body in `257945d` (kernel set + env gate) and
+`b2cfdbc` (weight conversion infrastructure):
 
 **`257945d` — kernel set + env gate**:
 
@@ -136,15 +188,8 @@ still stubbed:
   regions live ABOVE the per-request scratch checkpoint so they
   survive `arena.restore(ck)` between requests.
 
-**Still stubbed**: `Gemma4VisionRuntime::forward_bf16` body. The
-~1200-LOC mechanical kernel-by-kernel substitution of `forward`
-using `fused_bf16` + `bf16_gemm_f32` + the now-available
-`Gemma4VisionBf16` weight pointers is the next commit. With the
-weights + kernels both ready, the body can land as a focused
-diff and be debugged via the per-substep dump harness
-(`RVLLM_GEMMA4_VIT_SUBSTEP_BLK` + `cmp_g4v_substep.py`) to
-localise the prior blk0_out cos=0.76 failure within block 0's
-first sub-step that drifts.
+**Body landed in `797a019`** — see the "SHIPPED 2026-05-22"
+section at the top of this status block.
 
 ### Justification
 - f16 path delivers correct vision output on real images for both
