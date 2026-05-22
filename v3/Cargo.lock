@@ -2041,6 +2041,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
+ "half",
  "http-body-util",
  "image",
  "minijinja",
