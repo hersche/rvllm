@@ -1068,6 +1068,33 @@ prefill / MTP / shared-expert chains. The fusion targets ONLY
 the per-k-round routed-expert pair in the per-token decode
 hot-path.
 
+### Phase 8 other-models fusion (qwen27b dense) — SHIPPED 2026-05-23
+
+Commit `39f7c1a` ports the same fusion pattern to the Qwen 3.5/3.6
+27B DENSE decode path. New kernel
+`fp8_gemv_blockwise_wpr_native_f16in_residual_add_kernel` fuses
+the single-output FP8 GEMV with the subsequent vector_add_f16
+residual add. Three per-layer M=1 sites in qwen35_bring_up.rs
+are rewired: full-attn o_proj+residual (#10-11), linear-attn
+out_proj+residual (#9-10), dense MLP ffn_down+residual (#4-5).
+40 layers × 3 sites = 120 launches saved per decode token.
+
+Hardware-validated on qwen3-6-27b: short / 1-10 counting / 80-
+token photosynthesis all coherent. Latency ~14.68s for 150-token
+photosynthesis decode (no pre-fusion baseline within this session
+since qwen27b was unaffected by the MoE-fusion work). The dense
+27B decode is kernel-work-bound (all 27B params activate per
+token), so the ~0.5-1 ms/token saved is below noise. The fusion's
+value is architectural: fewer graph nodes, no temp-buffer f16
+round-trips, cleaner kernel chain.
+
+PREFILL (M > 1) sites kept on the unfused path — CUTLASS SM120
+GEMM is preferred there. The fusion targets ONLY M=1 decode
+hot-path sites. Mistral 3.5 (dense) and Gemma 4 31B (dense) could
+pick up the same fusion via their own bring-up files, but their
+paths are similarly kernel-work-bound; latency win would also be
+below noise.
+
 ### Phase 8 follow-on (graph-cache reuse) — SHIPPED 2026-05-22
 
 Commit `bcdce94` lands cross-request graph cache reuse:
