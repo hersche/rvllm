@@ -2462,7 +2462,37 @@ impl Gemma4Nvfp4Bringup {
         // gemma4_bring_up.rs:2939 / 3522 / 10615 / 11292).
         let scale: f32 = 1.0;
         let stream = self.stream.raw();
+        // Stream-6b: when the base rotated K/V by Hadamard
+        // R = H · diag(D) (`RVLLM_NVFP4_HADAMARD=1`), the
+        // drafter cross-attends to the rotated K/V; for the
+        // dot product (Q · K^T) to land in the same frame, Q
+        // must also be rotated by R BEFORE the cross-attn
+        // launch. After attention, attn_out lives in R-rotated
+        // V-space when V was also rotated
+        // (`RVLLM_NVFP4_HADAMARD_V=1`); un-rotate by R^T to
+        // recover P·V before the o-projection. Mirrors the
+        // fp8-block call sites at gemma4_bring_up.rs:5057+.
+        //
+        // Source layer (sliding vs global) determines which
+        // per-layer signs vector to use. Both helpers are
+        // no-ops when `nvfp4_hadamard_enabled()` is false or
+        // the signs alloc is None, so this code is a no-op on
+        // HADAMARD=0 deployments.
+        let (sliding_src, full_src) = self.arch.assistant_shared_kv_sources()
+            .ok_or_else(|| corrupt_runtime_err(
+                "forward_drafter_layer_cross_attn: assistant_shared_kv_sources \
+                 returned None — drafter shouldn't have loaded".into()))?;
+        let source_layer_idx = if is_global { full_src } else { sliding_src };
+        let num_heads = drafter.arch.num_attention_heads as u32;
+        let eff_hd = layer.effective_head_dim as u32;
         unsafe {
+            self.apply_hadamard_to_drafter_q(
+                workspace.q,
+                source_layer_idx as u32,
+                num_heads,
+                eff_hd,
+                stream as u64,
+            )?;
             if is_global {
                 drafter.launch_cross_attn_global(
                     workspace.attn_out,
@@ -2471,7 +2501,7 @@ impl Gemma4Nvfp4Bringup {
                     kv.context_lens_ptr,
                     scale,
                     stream,
-                )
+                )?;
             } else {
                 // Sliding window from the BASE arch — drafter's
                 // sliding source layer mirrors the base's
@@ -2487,9 +2517,17 @@ impl Gemma4Nvfp4Bringup {
                     scale,
                     window_size_left,
                     stream,
-                )
+                )?;
             }
+            self.apply_hadamard_unrotate_drafter_attn_out(
+                workspace.attn_out,
+                source_layer_idx as u32,
+                num_heads,
+                eff_hd,
+                stream as u64,
+            )?;
         }
+        Ok(())
     }
 
     /// Stream-6a (drafter forward primitive #3): attention
@@ -3310,6 +3348,29 @@ impl Gemma4Nvfp4Bringup {
         let dq_fp8 = dq_mod.get_function("gemma4_drafter_dequant_fp8_to_f16_kernel")?;
         let dq_nvfp4 = dq_mod.get_function("gemma4_drafter_dequant_nvfp4_to_f16_kernel")?;
         rt.attach_drafter_dequant_kernels(dq_mod, dq_fp8, dq_nvfp4);
+
+        // Stream-6b: lazy-upload per-(base layer, channel) Hadamard
+        // signs the first time the drafter is loaded. The drafter
+        // cross-attn rotation (`apply_hadamard_to_drafter_q`) and
+        // post-attn un-rotation (`apply_hadamard_unrotate_drafter
+        // _attn_out`) read from this alloc; both are env-gated
+        // (`RVLLM_NVFP4_HADAMARD=1`) inside the launch helpers, so
+        // the allocation is wasted memory on HADAMARD=0 deployments
+        // but trivial (~few hundred KB). Mirrors the fp8-block
+        // path's `nvfp4_hadamard` lazy-upload pattern
+        // (gemma4_bring_up.rs:10936). The signs alloc lives ABOVE
+        // any per-request scratch checkpoint — `build_nvfp4_hadamard
+        // _signs` calls `arena.region(...)` which bumps the arena
+        // permanently for the bringup's lifetime.
+        {
+            let mut guard = self.nvfp4_hadamard.lock().unwrap();
+            if guard.is_none() {
+                let max_hd = self.arch.max_head_dim() as u32;
+                let nl = self.arch.num_hidden_layers as u32;
+                *guard = crate::gemma4_bring_up::build_nvfp4_hadamard_signs(
+                    nl, max_hd, &self.arena)?;
+            }
+        }
 
         // Allocate f16 shadow KV. Codex Stream-6a fix:
         // block_size = kv.block_size (= 1 on Option B), NOT the
