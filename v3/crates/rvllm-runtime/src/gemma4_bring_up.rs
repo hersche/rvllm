@@ -370,7 +370,7 @@ mod decode_graph_eligibility_tests {
 /// table into the runtime's flat-pointer struct. Returns the all-zero
 /// default when no AWQ tensors were uploaded for this layer (every
 /// non-AWQ checkpoint), so the existing FP8 dispatch cascade runs.
-fn awq_layer_ptrs(
+pub(crate) fn awq_layer_ptrs(
     awq: Option<&rvllm_loader::AwqLayerWeights>,
 ) -> crate::gemma4_layer_exec::Gemma4AwqLayerPtrs {
     let Some(a) = awq else {
@@ -425,8 +425,8 @@ pub use crate::bring_up::HbmArenaCheckpoint;
 /// old defaults (PPL 10.2 → 2.3). Both overridable per-run via
 /// `RVLLM_Q_SCALE` / `RVLLM_KV_SCALE` env vars for further tuning or
 /// per-model calibration.
-const DEFAULT_Q_SCALE: f32 = 0.1;
-const DEFAULT_KV_SCALE: f32 = 0.08;
+pub(crate) const DEFAULT_Q_SCALE: f32 = 0.1;
+pub(crate) const DEFAULT_KV_SCALE: f32 = 0.08;
 
 /// Cycle 56 step 2: parse a `f32` env var with explicit logging on
 /// malformed values. The earlier `.parse().ok().unwrap_or(default)`
@@ -16651,7 +16651,7 @@ impl Gemma4Bringup {
     }
 }
 
-fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
+pub(crate) fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
 
