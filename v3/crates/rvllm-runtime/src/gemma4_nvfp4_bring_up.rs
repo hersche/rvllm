@@ -458,6 +458,9 @@ pub struct Gemma4Nvfp4Bringup {
     /// so `forward_gemma_vision` can splice ViT output rows into the
     /// device-resident residual between embed and the layer loop.
     pub vit: crate::gemma4_vision::Gemma4VisionKernels,
+    /// Optional bf16 sibling vision kernel set — Option B mirror of
+    /// `Gemma4Bringup::vit_bf16`. `None` on older kernel trees.
+    pub vit_bf16: Option<crate::gemma4_vision::Gemma4VisionKernelsBf16>,
     /// Stream-6b: per-(base layer, channel) ±1 Hadamard signs used by
     /// drafter Q rotation. Allocated lazily by `ensure_drafter_nvfp4`
     /// (mirrors `Gemma4Bringup::nvfp4_hadamard`); zero-bytes overhead
@@ -762,6 +765,9 @@ impl Gemma4Nvfp4Bringup {
         };
         // Stream-7: ViT kernel subset for native vision splice.
         let vit = crate::gemma4_vision::Gemma4VisionKernels::load(&loader)?;
+        // 2026-05-22: bf16 sibling kernel set for the deferred Phase-3
+        // bf16-vision investigation (see v3/GEMMA_VISION_AUDIT.md).
+        let vit_bf16 = crate::gemma4_vision::Gemma4VisionKernelsBf16::try_load(&loader)?;
 
         // Stream-6b: Hadamard rotate/unrotate kernels — optional on
         // older PTX trees, .ok() lets the bringup still construct.
@@ -798,6 +804,7 @@ impl Gemma4Nvfp4Bringup {
             kv_state_allocated: false,
             kernels: loader,
             vit,
+            vit_bf16,
             nvfp4_hadamard: std::sync::Mutex::new(None),
             fn_hadamard_rotate_f16,
             fn_hadamard_unrotate_f16,
@@ -2977,8 +2984,13 @@ impl Gemma4Nvfp4Bringup {
             model: crate::gemma4_vision::Gemma4VisionModelView {
                 vision: self.model.vision.as_ref(),
             },
+            fused_bf16: self.vit_bf16.as_ref(),
         };
-        rt.forward(image_bytes)
+        if crate::gemma4_vision::gemma4_vit_use_bf16_enabled() {
+            rt.forward_bf16(image_bytes)
+        } else {
+            rt.forward(image_bytes)
+        }
     }
 
     /// Stream-6b: rotate drafter Q by per-base-layer R = H·diag(D)

@@ -125,6 +125,180 @@ impl Gemma4VisionKernels {
     }
 }
 
+/// bf16 sibling of [`Gemma4VisionKernels`]. Every f16-typed entry in
+/// the f16 path has a 1:1 bf16 sibling kernel that takes/returns the
+/// same shapes with `__nv_bfloat16` instead of `__half`. Loaded
+/// alongside the f16 set; the bf16 forward variant
+/// ([`Gemma4VisionRuntime::forward_bf16`]) reads from this struct
+/// instead of `fused`. `Optional` so older PTX trees that don't carry
+/// the bf16 modules still load — the forward variant errors out at
+/// the first launch with a clear message in that case.
+///
+/// Per the GEMMA_VISION_AUDIT.md "Phase 3 status" note (2026-05-05),
+/// the f16 path stays the production default. bf16 is opt-in via
+/// `RVLLM_GEMMA4_VIT_USE_BF16=1` and ships as a debug seam for the
+/// follow-up "Phase-3 blk0_out cos=0.76" investigation, which now has
+/// per-sub-step dump tooling (`RVLLM_GEMMA4_VIT_SUBSTEP_BLK`) ready
+/// to localise the offending kernel inside block 0.
+pub struct Gemma4VisionKernelsBf16 {
+    /// `rmsnorm_inplace_bf16_gbf16_kernel` — bf16-input, bf16-gamma
+    /// in-place RMSNorm. Vision-specific variant (the text path's
+    /// `rmsnorm_inplace_bf16` keeps gamma in f16; vision's bf16 path
+    /// stores gamma natively in bf16 so the dtype matches the
+    /// residual buffer end-to-end).
+    pub fn_rmsnorm_bf16_gbf16: KernelFn,
+    pub fn_vnorm_bf16: KernelFn,
+    pub fn_vector_add_bf16: KernelFn,
+    /// Reuses the existing text-path `f32_to_bf16` PTX module (no
+    /// vision-specific sibling needed — same f32 → bf16 RTNE narrow
+    /// the text decode path already uses after every cuBLASLt GEMM).
+    pub fn_cast_f32_to_bf16: KernelFn,
+    pub fn_extract_head_bf16: KernelFn,
+    pub fn_scatter_head_bf16: KernelFn,
+    pub fn_scatter_heads_bf16: KernelFn,
+    pub fn_transpose_heads_v_bf16: KernelFn,
+    pub fn_softmax_row_f32_to_bf16: KernelFn,
+    pub fn_gelu_tanh_mul_bf16: KernelFn,
+    pub fn_vit_avgpool_bf16_to_f32: KernelFn,
+    pub fn_vit_pos_emb_lookup_2d_bf16: KernelFn,
+    pub fn_vit_rotary_gemma4_2d_bf16: KernelFn,
+    pub fn_vit_standardize_f32_to_bf16: KernelFn,
+    _modules: Vec<LoadedModule>,
+}
+
+impl Gemma4VisionKernelsBf16 {
+    /// Try to load the bf16 vision kernel set. Returns `Ok(None)` if
+    /// ANY of the bf16 PTX modules is missing (older kernel trees);
+    /// returns `Ok(Some(kernels))` only when the full set is
+    /// resolvable so the forward never trips on a half-loaded set.
+    pub fn try_load(loader: &KernelLoader) -> Result<Option<Self>> {
+        // Each `load_ptx` returns Err on missing module; map to None
+        // here so we can early-bail without polluting the call site.
+        let rmsnorm_bf16_gbf16_mod = match loader.load_ptx("rmsnorm_inplace_bf16_gbf16") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let vnorm_bf16_mod = match loader.load_ptx("vnorm_bf16") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let vector_add_bf16_mod = match loader.load_ptx("vector_add_bf16") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let f32_to_bf16_mod = match loader.load_ptx("f32_to_bf16") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let extract_head_bf16_mod = match loader.load_ptx("extract_head_bf16") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let scatter_heads_bf16_mod = match loader.load_ptx("scatter_heads_bf16") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let transpose_heads_v_bf16_mod = match loader.load_ptx("transpose_heads_v_bf16") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let softmax_row_f32_to_bf16_mod = match loader.load_ptx("softmax_row_f32_to_bf16") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let gelu_tanh_mul_bf16_mod = match loader.load_ptx("gelu_tanh_mul_bf16") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let vit_avgpool_bf16_to_f32_mod = match loader.load_ptx("vit_avgpool_bf16_to_f32") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let vit_pos_emb_lookup_2d_bf16_mod = match loader.load_ptx("vit_pos_emb_lookup_2d_bf16") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let vit_rotary_gemma4_2d_bf16_mod = match loader.load_ptx("vit_rotary_gemma4_2d_bf16") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let vit_standardize_f32_to_bf16_mod = match loader.load_ptx("vit_standardize_f32_to_bf16") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+
+        // Resolve symbols; a missing entry is a real PTX/kernel
+        // mismatch, not a back-compat case, so propagate the error.
+        let fn_rmsnorm_bf16_gbf16 =
+            rmsnorm_bf16_gbf16_mod.get_function("rmsnorm_inplace_bf16_gbf16_kernel")?;
+        let fn_vnorm_bf16 = vnorm_bf16_mod.get_function("vnorm_bf16_kernel")?;
+        let fn_vector_add_bf16 = vector_add_bf16_mod.get_function("vector_add_bf16_kernel")?;
+        let fn_cast_f32_to_bf16 = f32_to_bf16_mod.get_function("f32_to_bf16_kernel")?;
+        let fn_extract_head_bf16 =
+            extract_head_bf16_mod.get_function("extract_head_bf16_kernel")?;
+        let fn_scatter_head_bf16 =
+            extract_head_bf16_mod.get_function("scatter_head_bf16_kernel")?;
+        let fn_scatter_heads_bf16 =
+            scatter_heads_bf16_mod.get_function("scatter_heads_bf16_kernel")?;
+        let fn_transpose_heads_v_bf16 = transpose_heads_v_bf16_mod
+            .get_function("transpose_heads_v_bf16_kernel")?;
+        let fn_softmax_row_f32_to_bf16 = softmax_row_f32_to_bf16_mod
+            .get_function("softmax_row_f32_to_bf16_kernel")?;
+        let fn_gelu_tanh_mul_bf16 =
+            gelu_tanh_mul_bf16_mod.get_function("gelu_tanh_mul_bf16_kernel")?;
+        let fn_vit_avgpool_bf16_to_f32 = vit_avgpool_bf16_to_f32_mod
+            .get_function("vit_avgpool_bf16_to_f32_kernel")?;
+        let fn_vit_pos_emb_lookup_2d_bf16 = vit_pos_emb_lookup_2d_bf16_mod
+            .get_function("vit_pos_emb_lookup_2d_bf16_kernel")?;
+        let fn_vit_rotary_gemma4_2d_bf16 = vit_rotary_gemma4_2d_bf16_mod
+            .get_function("vit_rotary_gemma4_2d_bf16_kernel")?;
+        let fn_vit_standardize_f32_to_bf16 = vit_standardize_f32_to_bf16_mod
+            .get_function("vit_standardize_f32_to_bf16_kernel")?;
+
+        Ok(Some(Self {
+            fn_rmsnorm_bf16_gbf16,
+            fn_vnorm_bf16,
+            fn_vector_add_bf16,
+            fn_cast_f32_to_bf16,
+            fn_extract_head_bf16,
+            fn_scatter_head_bf16,
+            fn_scatter_heads_bf16,
+            fn_transpose_heads_v_bf16,
+            fn_softmax_row_f32_to_bf16,
+            fn_gelu_tanh_mul_bf16,
+            fn_vit_avgpool_bf16_to_f32,
+            fn_vit_pos_emb_lookup_2d_bf16,
+            fn_vit_rotary_gemma4_2d_bf16,
+            fn_vit_standardize_f32_to_bf16,
+            _modules: vec![
+                rmsnorm_bf16_gbf16_mod,
+                vnorm_bf16_mod,
+                vector_add_bf16_mod,
+                f32_to_bf16_mod,
+                extract_head_bf16_mod,
+                scatter_heads_bf16_mod,
+                transpose_heads_v_bf16_mod,
+                softmax_row_f32_to_bf16_mod,
+                gelu_tanh_mul_bf16_mod,
+                vit_avgpool_bf16_to_f32_mod,
+                vit_pos_emb_lookup_2d_bf16_mod,
+                vit_rotary_gemma4_2d_bf16_mod,
+                vit_standardize_f32_to_bf16_mod,
+            ],
+        }))
+    }
+}
+
+/// Convenience: env gate for the bf16 vision forward. Returns true
+/// when `RVLLM_GEMMA4_VIT_USE_BF16` parses as a truthy value.
+/// Default-off so the production f16 path is the everyday default.
+pub fn gemma4_vit_use_bf16_enabled() -> bool {
+    std::env::var("RVLLM_GEMMA4_VIT_USE_BF16")
+        .ok()
+        .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 /// Tiny adapter exposing the body's `self.model.vision` reference
 /// pattern. Holds an `Option<&Gemma4Vision>` so callers can splice in
 /// whichever weights container they own.
@@ -145,6 +319,10 @@ pub struct Gemma4VisionRuntime<'a> {
     pub cublaslt: &'a CublasLt,
     pub fused: &'a Gemma4VisionKernels,
     pub model: Gemma4VisionModelView<'a>,
+    /// Optional bf16 kernel set for the deferred Phase-3 bf16 vision
+    /// path. `None` reduces `forward_bf16` to a clear error. Production
+    /// `forward` (f16) never touches this field.
+    pub fused_bf16: Option<&'a Gemma4VisionKernelsBf16>,
 }
 
 impl<'a> Gemma4VisionRuntime<'a> {
@@ -1381,6 +1559,43 @@ impl<'a> Gemma4VisionRuntime<'a> {
     pub fn forward(&self, _image_bytes: &[u8]) -> Result<VisionForwardOutput> {
         Err(RvllmError::cuda(
             "vision: forward_gemma_vision is CUDA-only",
+            rvllm_core::CudaErrorKind::Other,
+            rvllm_core::CudaCtx::setup(),
+        ))
+    }
+
+    /// Phase-3 bf16 vision forward — deferred since 2026-05-05. The
+    /// real body lands in a follow-up commit (kernel-by-kernel
+    /// substitution of `forward` above using `fused_bf16` + bf16
+    /// cuBLASLt). For now: if the env gate
+    /// `RVLLM_GEMMA4_VIT_USE_BF16=1` flips on, route here and emit a
+    /// clear NotImplemented error so the request fails fast and the
+    /// operator can see the gate is honoured. The f16 path remains
+    /// production-default and is fully untouched by this seam.
+    ///
+    /// Gates that must hold before this stub becomes a real forward:
+    ///   * `fused_bf16` is `Some` (else clear "PTX missing" error),
+    ///   * vision weights have a bf16 sibling on `Gemma4Vision`
+    ///     (loader follow-up — currently weights are f16 only).
+    pub fn forward_bf16(
+        &self,
+        _image_bytes: &[u8],
+    ) -> Result<VisionForwardOutput> {
+        if self.fused_bf16.is_none() {
+            return Err(RvllmError::cuda(
+                "vision: bf16 kernel set not loaded (older PTX tree). \
+                 Rebuild kernels via `bash kernels/build.sh sm_121`.",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        Err(RvllmError::cuda(
+            "vision: bf16 forward body is staged for the Phase-3 \
+             follow-up — see v3/GEMMA_VISION_AUDIT.md. The kernel \
+             set + cuBLASLt bf16 entries are loaded and ready; the \
+             forward body lands in the next commit. Unset \
+             RVLLM_GEMMA4_VIT_USE_BF16 to use the production f16 \
+             path.",
             rvllm_core::CudaErrorKind::Other,
             rvllm_core::CudaCtx::setup(),
         ))

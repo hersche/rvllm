@@ -1213,6 +1213,13 @@ pub struct Gemma4Bringup {
     /// fp8-block path's `forward_gemma_vision` shim borrows
     /// from this instead of `fused` so Option B can mirror.
     pub vit: crate::gemma4_vision::Gemma4VisionKernels,
+    /// Optional bf16 sibling vision kernel set — shipped 2026-05-22
+    /// as the opt-in seam for the deferred Phase-3 bf16-vision
+    /// follow-up (see `v3/GEMMA_VISION_AUDIT.md`). `None` when any
+    /// of the bf16 PTX modules failed to load (older kernel tree),
+    /// in which case `forward_bf16` errors out with a clear message
+    /// and the production f16 path stays unaffected.
+    pub vit_bf16: Option<crate::gemma4_vision::Gemma4VisionKernelsBf16>,
     pub sliding_attention: AttentionBackend,
     pub global_attention: AttentionBackend,
     pub cutlass: CutlassBackend,
@@ -2221,6 +2228,11 @@ impl Gemma4Bringup {
         // Stream-7: ViT kernel subset, shared with Option B's
         // `Gemma4Nvfp4Bringup` via `Gemma4VisionRuntime`.
         let vit = crate::gemma4_vision::Gemma4VisionKernels::load(&kernels)?;
+        // 2026-05-22: bf16 sibling set for the deferred Phase-3
+        // bf16-vision investigation. `try_load` returns Ok(None) when
+        // any bf16 PTX module is absent (graceful older-tree
+        // compatibility).
+        let vit_bf16 = crate::gemma4_vision::Gemma4VisionKernelsBf16::try_load(&kernels)?;
 
         // Spec-decode commit 3: pre-compute the source-layer indices
         // the Gemma 4 assistant-drafter will consume at draft time.
@@ -2304,6 +2316,7 @@ impl Gemma4Bringup {
             policy,
             fused,
             vit,
+            vit_bf16,
             assistant_kv_sources,
             drafter: std::sync::Mutex::new(None),
             base_last_hidden_ptr: std::sync::atomic::AtomicU64::new(0),
@@ -15692,8 +15705,13 @@ impl Gemma4Bringup {
             model: crate::gemma4_vision::Gemma4VisionModelView {
                 vision: self.model.vision.as_ref(),
             },
+            fused_bf16: self.vit_bf16.as_ref(),
         };
-        rt.forward(image_bytes)
+        if crate::gemma4_vision::gemma4_vit_use_bf16_enabled() {
+            rt.forward_bf16(image_bytes)
+        } else {
+            rt.forward(image_bytes)
+        }
     }
 
     /// Task #34 Phase 2 — convenience wrapper that runs un-rotate on
