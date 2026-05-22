@@ -975,6 +975,48 @@ kernel-launch overhead; eager is already fast on GB10, so the
 captured path's primary value is as the foundation for further
 graph-level optimizations.
 
+### Phase 8 deeper-optimizations — SHIPPED 2026-05-23
+
+Commit `a14af12` lands the multi-step graph capture + device-side
+step-linker that subsumes BOTH "multi-step graph capture" and
+"pipeline argmax-DtoH with next-step HtoD" deeper-optimization
+items:
+
+- New kernel `qwen36_step_link_i32` (single-thread) copies
+  argmax → token_dev and increments pos_dev / ctx_dev by 1.
+  Sits BETWEEN consecutive decode-step forwards inside the
+  macro-graph; eliminates the host-side write_token +
+  write_position round-trip the per-step path needs.
+- Workspace gains `argmax_tokens_dev_base: u64` (i32[max_steps]
+  array) + `max_steps: u32` sized from
+  `RVLLM_QWEN36_DECODE_MULTI_STEP` (default 1, clamped to
+  [1, 32]). `argmax_token_dev` aliases slot 0 so single-step
+  paths + the cross-request graph cache keep working unchanged.
+- `Qwen36Bringup` gains `try_capture_decode_steps_n` /
+  `replay_decode_steps_n` / `decode_steps_n_via_graph_or_eager` +
+  `decode_capture_multi_step` slot (separate from the
+  single-step `decode_capture`). The macro-graph captures N
+  forwards (each writing argmax to slot i via a SHIFTED sub-
+  workspace) + N-1 linker launches.
+- Worker per-decode-step loop gains a `multi_step_buf` FIFO that
+  pre-fetches N tokens via macro-replay when
+  `multi_step_active`. Single-step path (default) untouched.
+
+Hardware validation (`MULTI_STEP=8 + DECODE_GRAPH=1 + REPLAY=1`,
+qwen3-6-35b-a3b): coherent multi-token output across short /
+multi-step counting / 80-token reasoning prompts. Journal:
+`[graph] captured 14847 nodes (bucket=8)` — ≈1856 nodes/step × 8
++ 7 linker stitches.
+
+**Honest latency assessment**: macro-replay at N=8 doesn't
+outperform single-step replay (2.188s vs 2.140s at max_tokens=150;
+within noise). The per-step host overhead it eliminates is small
+(~5-10 µs/token) relative to the kernel work (~14 ms/token). The
+infrastructure is in place for future kernel-fusion work where
+larger graphs DO matter, or for continuous-batch decoding where
+macro-graphs could share sequences across requests. Production
+default (`MULTI_STEP` unset) remains the single-step path.
+
 ### Phase 8 follow-on (graph-cache reuse) — SHIPPED 2026-05-22
 
 Commit `bcdce94` lands cross-request graph cache reuse:
