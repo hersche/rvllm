@@ -878,12 +878,19 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             let use_gqa_default = gqa_env_on
                 && gqa_ratio > 1
                 && gqa_ratio <= MAX_GQA_DECODE_DEFAULT;
+            // _max16 variant availability differs per BC tile size:
+            // BC=32 (hd≤256) has `_gqa_max16_kernel`; BC=16 (hd>256)
+            // has `_gqa_bc16_max16_kernel`. Both `None` on older PTX
+            // trees → host falls back to per-head when GQA > 4.
+            let max16_kernel_available = if hd > 256 {
+                fa2.fn_decode_nvfp4kv_gqa_bc16_max16.is_some()
+            } else {
+                fa2.fn_decode_nvfp4kv_gqa_max16.is_some()
+            };
             let use_gqa_max16 = gqa_env_on
                 && gqa_ratio > MAX_GQA_DECODE_DEFAULT
                 && gqa_ratio <= MAX_GQA_DECODE_MAX16
-                && fa2.fn_decode_nvfp4kv_gqa_max16.is_some()
-                // bc16 path doesn't yet have the _max16 variant.
-                && hd <= 256;
+                && max16_kernel_available;
             let effective_max_gqa = if use_gqa_max16 {
                 MAX_GQA_DECODE_MAX16 as i32
             } else if use_gqa_default {
@@ -892,7 +899,9 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                 1
             };
             let (kernel_opt, fa2_bc) = if hd > 256 {
-                let k = if use_gqa_default {
+                let k = if use_gqa_max16 {
+                    fa2.fn_decode_nvfp4kv_gqa_bc16_max16.or(fa2.fn_decode_nvfp4kv_bc16)
+                } else if use_gqa_default {
                     fa2.fn_decode_nvfp4kv_gqa_bc16.or(fa2.fn_decode_nvfp4kv_bc16)
                 } else {
                     fa2.fn_decode_nvfp4kv_bc16
@@ -910,7 +919,11 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             };
             let gqa_dispatched = (use_gqa_default || use_gqa_max16)
                 && if hd > 256 {
-                    fa2.fn_decode_nvfp4kv_gqa_bc16.is_some()
+                    if use_gqa_max16 {
+                        fa2.fn_decode_nvfp4kv_gqa_bc16_max16.is_some()
+                    } else {
+                        fa2.fn_decode_nvfp4kv_gqa_bc16.is_some()
+                    }
                 } else if use_gqa_max16 {
                     fa2.fn_decode_nvfp4kv_gqa_max16.is_some()
                 } else {

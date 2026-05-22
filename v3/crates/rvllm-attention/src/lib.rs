@@ -382,6 +382,11 @@ pub struct Fa2PtxKernels {
     /// kernel trees that pre-date the variant.
     #[cfg(feature = "cuda")]
     pub fn_decode_nvfp4kv_gqa_max16: Option<rvllm_kernels::KernelFn>,
+    /// BC=16 sibling of `_gqa_max16` — head_dim>256 path (Gemma 4 31B
+    /// global has head_dim=512). Same MAX_GQA=16 cap, tile size 16
+    /// instead of 32 to fit smem at the larger head_dim.
+    #[cfg(feature = "cuda")]
+    pub fn_decode_nvfp4kv_gqa_bc16_max16: Option<rvllm_kernels::KernelFn>,
     /// `flash_attention_2_prefill_nvfp4kv_kernel` — NVFP4 KV prefill,
     /// BC=32 variant.
     #[cfg(feature = "cuda")]
@@ -536,6 +541,7 @@ impl Fa2PtxKernels {
                 fn_decode_nvfp4kv_gqa,
                 fn_decode_nvfp4kv_gqa_bc16,
                 fn_decode_nvfp4kv_gqa_max16,
+                fn_decode_nvfp4kv_gqa_bc16_max16,
             ) = match loader.load_ptx("flash_attention_nvfp4kv") {
                 Ok(m) => {
                     let d    = m.get_function("flash_attention_2_decode_nvfp4kv_kernel").ok();
@@ -544,14 +550,15 @@ impl Fa2PtxKernels {
                     let p16  = m.get_function("flash_attention_2_prefill_nvfp4kv_bc16_kernel").ok();
                     let dg   = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_kernel").ok();
                     let dg16 = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_bc16_kernel").ok();
-                    // MAX_GQA=16 variant for Mistral 3.5 + Gemma 4 31B
+                    // MAX_GQA=16 variants for Mistral 3.5 + Gemma 4 31B
                     // global + Qwen 3.6 35B-A3B. `None` on older kernel
                     // trees → host falls back to the per-head kernel
                     // for actual GQA > 4 (existing behavior).
-                    let dgm  = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_max16_kernel").ok();
-                    (Some(m), d, d16, p, p16, dg, dg16, dgm)
+                    let dgm   = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_max16_kernel").ok();
+                    let dgm16 = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_bc16_max16_kernel").ok();
+                    (Some(m), d, d16, p, p16, dg, dg16, dgm, dgm16)
                 }
-                Err(_) => (None, None, None, None, None, None, None, None),
+                Err(_) => (None, None, None, None, None, None, None, None, None),
             };
             let (fused_rope_nvfp4kv_mod, fn_rope_nvfp4kv) =
                 match loader.load_ptx("fused_rope_partial_nvfp4kv") {
@@ -694,6 +701,7 @@ impl Fa2PtxKernels {
                 fn_decode_nvfp4kv_gqa,
                 fn_decode_nvfp4kv_gqa_bc16,
                 fn_decode_nvfp4kv_gqa_max16,
+                fn_decode_nvfp4kv_gqa_bc16_max16,
                 fn_prefill_nvfp4kv,
                 fn_prefill_nvfp4kv_bc16,
                 fn_prefill_nvfp4kv_unified,
