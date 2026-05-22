@@ -9756,6 +9756,131 @@ impl Qwen36Bringup {
     /// Phase-4v experimental path. Takes a `hidden_region` already
     /// populated with f16 hidden state and returns the argmax token
     /// id over the last token's lm_head logits.
+    /// Phase 8 commit 2: graph-capture-friendly closer variant.
+    /// Mirrors `forward_qwen36_outside_closer` but writes the argmax
+    /// token id to a CALLER-PROVIDED device pointer instead of doing
+    /// a sync `cuMemcpyDtoH_v2` at the end. Outside the captured
+    /// region, the operator calls
+    /// [`Self::argmax_dev_to_host_token`] to extract the 4-byte
+    /// result.
+    ///
+    /// Only the fp8 lm_head path is supported (the production
+    /// default); the f16 lm_head debug knob
+    /// `RVLLM_QWEN36_LM_HEAD_F16=1` continues to route through the
+    /// eager closer because graph capture is opt-in via
+    /// `RVLLM_QWEN36_DECODE_GRAPH=1` and the two are mutually
+    /// exclusive operator gates.
+    ///
+    /// This path is the closer half of the Phase 8 captured forward.
+    /// The corresponding workspace-based decode-step launch body
+    /// (the per-layer chain that produces `hidden_region`) is the
+    /// follow-up sub-commit; until it lands, this closer is
+    /// callable for partial validation (eager prefill + eager
+    /// per-layer chain + device-argmax closer + post-fence DtoH).
+    #[cfg(feature = "cuda")]
+    fn forward_qwen36_outside_closer_device_argmax(
+        &self,
+        hidden_region: &rvllm_mem::Region<'_>,
+        num_tokens: u32,
+        hidden: u32,
+        vocab: u32,
+        last_idx: usize,
+        argmax_token_dev: u64,
+    ) -> Result<()> {
+        let _ = num_tokens; // kept for parity with the eager closer
+        let eps = self.arch.base.rms_norm_eps;
+        let hidden_fp8_bytes = hidden as usize;
+        let hidden_scale_bytes = 4usize;
+        let logits_bytes = (vocab as usize) * 2;
+        let hidden_fp8_region =
+            self.arena.region("qwen36_pl_h_fp8_devarg", hidden_fp8_bytes, 16)?;
+        let hidden_scale_region =
+            self.arena.region("qwen36_pl_h_scale_devarg", hidden_scale_bytes, 16)?;
+        let logits_region =
+            self.arena.region("qwen36_pl_logits_devarg", logits_bytes, 16)?;
+        let stream_raw = self.stream.raw() as u64;
+        let last_hidden_row_ptr =
+            hidden_region.device_ptr() + (last_idx as u64) * (hidden as u64) * 2;
+        unsafe {
+            rvllm_fused::FusedRmsnormFp8QuantLaunch {
+                num_tokens: 1,
+                hidden,
+                eps,
+            }
+            .launch(
+                self.outside_kernels.fn_fused_rmsnorm_fp8_quant,
+                hidden_fp8_region.device_ptr(),
+                hidden_scale_region.device_ptr(),
+                last_hidden_row_ptr,
+                self.model.outside.final_norm.offset_bytes,
+                stream_raw,
+            )?;
+            self.cublaslt.fp8_gemm(
+                hidden_fp8_region.device_ptr(),
+                self.model.outside.lm_head_fp8.offset_bytes,
+                logits_region.device_ptr(),
+                1,
+                vocab as i32,
+                hidden as i32,
+                hidden_scale_region.device_ptr(),
+                self.model.outside.lm_head_fp8.scale_ptr,
+                stream_raw,
+            )?;
+            use cudarc::driver::sys::*;
+            let mut logits_ptr = logits_region.device_ptr();
+            let mut out_ptr = argmax_token_dev;
+            let mut vs = vocab as i32;
+            let args = [
+                (&mut logits_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vs) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_argmax_f16.raw() as CUfunction,
+                1, 1, 1,
+                512, 1, 1,
+                0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 device-argmax_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        // NO stream.fence() here, NO DtoH — the captured graph must
+        // contain only kernels. Caller does the fence + DtoH OUTSIDE
+        // the captured body via `argmax_dev_to_host_token`.
+        Ok(())
+    }
+
+    /// Phase 8 commit 2: outside-the-captured-body argmax extractor.
+    /// Fences the stream then DtoHs a single 4-byte token id from
+    /// `argmax_token_dev`. Called AFTER `graph.replay()` (or eager
+    /// `forward_qwen36_outside_closer_device_argmax`) returns.
+    #[cfg(feature = "cuda")]
+    pub fn argmax_dev_to_host_token(&self, argmax_token_dev: u64) -> Result<i32> {
+        self.stream.fence()?;
+        let mut tok_buf = [0i32; 1];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                tok_buf.as_mut_ptr() as *mut _, argmax_token_dev, 4);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 argmax_dev_to_host_token DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(tok_buf[0])
+    }
+
     fn forward_qwen36_outside_closer(
         &self,
         hidden_region: &rvllm_mem::Region<'_>,
