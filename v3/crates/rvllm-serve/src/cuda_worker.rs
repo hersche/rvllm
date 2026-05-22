@@ -1771,31 +1771,31 @@ pub async fn spawn_cuda_worker(
                             }
                         };
 
-                        // Phase 8 follow-up wiring: when
-                        // `RVLLM_QWEN36_DECODE_GRAPH=1`, alloc the
-                        // workspace ONCE per request and route the
-                        // per-step decode loop through
-                        // `decode_step_via_graph_or_eager`. The
-                        // method internally picks capture / replay /
-                        // eager based on the env gate + the
-                        // captured-state mutex on `qwen`. Default-off
-                        // path stays on the legacy per-step
-                        // `forward_qwen36_decode` call below.
-                        //
-                        // KNOWN LIMITATION (documented in CLAUDE.md
-                        // "Phase 8 — IN PROGRESS"): position is still
-                        // a kernel scalar arg inside the per-layer
-                        // chain, so captured-replay is only correct
-                        // at the SAME position as capture. Multi-step
-                        // replay needs the position-indirect RoPE +
-                        // KV-slot kernel variants — that's the
-                        // next chunk of work. Until those land, the
-                        // captured path is single-position only;
-                        // operator-validated infrastructure only.
+                        // Phase 8 follow-up wiring: workspace alloc
+                        // + dispatch. Two operator gates:
+                        //   * `RVLLM_QWEN36_DECODE_GRAPH=1` — full
+                        //     graph-capture path via
+                        //     `decode_step_via_graph_or_eager`.
+                        //   * `RVLLM_QWEN36_DECODE_WORKSPACE=1` —
+                        //     workspace-eager ONLY (no capture
+                        //     attempted). Isolates whether the
+                        //     workspace path itself is correct across
+                        //     multi-step decode, independent of the
+                        //     capture machinery. Set automatically when
+                        //     DECODE_GRAPH is on; can be set
+                        //     standalone for debug.
                         let decode_graph_on =
                             rvllm_runtime::qwen36_decode_workspace
                                 ::qwen36_decode_graph_enabled();
-                        let decode_workspace = if decode_graph_on {
+                        let decode_workspace_only =
+                            std::env::var("RVLLM_QWEN36_DECODE_WORKSPACE")
+                                .ok()
+                                .map(|s| matches!(s.as_str(),
+                                    "1"|"true"|"TRUE"|"yes"|"on"))
+                                .unwrap_or(false);
+                        let need_workspace =
+                            decode_graph_on || decode_workspace_only;
+                        let decode_workspace = if need_workspace {
                             match qwen.alloc_decode_workspace() {
                                 Ok(w) => Some(w),
                                 Err(e) => {
@@ -1881,9 +1881,22 @@ pub async fn spawn_cuda_worker(
                             // start_position = prompt_len + step.
                             let pos = prompt_len + step;
                             let step_res = if let Some(ws) = decode_workspace.as_ref() {
-                                qwen.decode_step_via_graph_or_eager(
-                                    ws, next_token as i32, pos)
-                                    .map(|t| t as i32)
+                                if decode_graph_on {
+                                    qwen.decode_step_via_graph_or_eager(
+                                        ws, next_token as i32, pos)
+                                        .map(|t| t as i32)
+                                } else {
+                                    // Workspace-eager isolation mode:
+                                    // write token to workspace.token_dev,
+                                    // run the workspace-driven step,
+                                    // extract via argmax_dev_to_host_token.
+                                    // NO capture, NO replay.
+                                    qwen.write_token_to_workspace(ws, next_token as i32)
+                                        .and_then(|()|
+                                            qwen.forward_qwen36_decode_step_to_workspace(ws, pos))
+                                        .and_then(|()| qwen.argmax_dev_to_host_token(
+                                            ws.argmax_token_dev))
+                                }
                             } else {
                                 qwen.forward_qwen36_decode(
                                     &[next_token], pos, &[])

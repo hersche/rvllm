@@ -549,24 +549,41 @@ impl Qwen36Bringup {
         };
         match capture_result {
             Ok(g) => {
+                // Phase 8 debug 2026-05-22: CUDA stream capture in
+                // THREAD_LOCAL mode RECORDS kernel launches but does
+                // NOT execute them eagerly (despite earlier
+                // assumptions in our comments). The `body()` closure
+                // submits kernels which are routed to the graph,
+                // leaving the KV cache + argmax slot unmodified.
+                // Without an explicit replay here, step 0 returns a
+                // stale `workspace.argmax_token_dev`, the KV slot at
+                // step 0's position stays empty, and step 1+ runs
+                // forward from a broken KV state — manifesting as
+                // truncated output like "Die.".
+                //
+                // Fix: replay the freshly-captured graph
+                // immediately. The graph contains exactly the body's
+                // kernel sequence; replaying it executes those
+                // kernels on `stream` for real, producing the
+                // correct argmax + advancing KV state. The graph is
+                // then stored on `self.decode_capture` for any
+                // subsequent replay opt-in.
+                unsafe { g.replay(self.stream.raw() as u64)?; }
                 let mut guard = self.decode_capture.lock().unwrap();
                 *guard = Some(g);
                 Ok(())
             }
             Err(e) => {
-                // Body still ran eagerly; result is in
-                // workspace.argmax_token_dev. Logging the capture
-                // reject is informational — production decode just
-                // stays eager for this request.
+                // Capture FAILED. Per the CUDA semantics above the
+                // body's launches did NOT execute either. The
+                // workspace's argmax_token_dev is stale and KV state
+                // wasn't advanced. Re-run the body eagerly to
+                // produce a correct result + advance KV state.
                 tracing::warn!(
                     "qwen36: decode-step graph capture rejected: {e:?}. \
-                     Falling back to eager. (Likely a residual sync \
-                     HtoD/DtoH inside the per-layer body — Phase 8 \
-                     commit 2b only rewrote the embed-side and closer; \
-                     the per-layer chain still has internal \
-                     arena.region/copy_from_host that defeat capture.)"
+                     Falling back to eager (workspace path) for this iter."
                 );
-                Ok(())
+                self.forward_qwen36_decode_step_to_workspace(workspace, position)
             }
         }
     }
@@ -601,6 +618,41 @@ impl Qwen36Bringup {
             )),
         };
         unsafe { g.replay(self.stream.raw() as u64)?; }
+        Ok(())
+    }
+
+    /// Phase 8 helper: write `token_id` to `workspace.token_dev`
+    /// via cuMemcpyHtoDAsync. Stand-alone entry for the
+    /// workspace-eager isolation path that the worker uses to
+    /// validate the workspace forward without going through
+    /// `decode_step_via_graph_or_eager` (which always touches the
+    /// capture machinery). 4-byte async HtoD on
+    /// `self.stream`; same-stream ordering covers the subsequent
+    /// embed_gather read.
+    #[cfg(feature = "cuda")]
+    pub fn write_token_to_workspace(
+        &self,
+        workspace:
+            &crate::qwen36_decode_workspace::Qwen36DecodeWorkspace,
+        token_id: i32,
+    ) -> Result<()> {
+        use cudarc::driver::sys::*;
+        let tok_host = token_id;
+        unsafe {
+            let rc = cuMemcpyHtoDAsync_v2(
+                workspace.token_dev as CUdeviceptr,
+                (&tok_host) as *const i32 as *const _,
+                4,
+                self.stream.raw() as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 write_token_to_workspace HtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
         Ok(())
     }
 
