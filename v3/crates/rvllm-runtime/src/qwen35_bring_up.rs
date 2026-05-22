@@ -314,6 +314,16 @@ pub struct Qwen35OutsideKernels {
     pub fn_f16_plus_f32_inplace_f16: KernelFn,
     pub vector_add_f16_mod: LoadedModule,
     pub fn_vector_add_f16: KernelFn,
+    /// Phase 8 other-models fusion (2026-05-23): fused FP8 GEMV
+    /// (f16 input/output) + in-place residual add. Single-launch
+    /// replacement for the back-to-back pair
+    /// (`fp8_gemv_blockwise_wpr_native_f16in_kernel` →
+    /// `vector_add_f16_kernel`) used per layer × 2 sites
+    /// (post-attn residual after o_proj, post-FFN residual after
+    /// ffn_down). 80 launches/token saved on 40-layer Qwen 3.5/3.6
+    /// 27B dense.
+    pub fp8_gemv_f16in_residual_add_mod: LoadedModule,
+    pub fn_fp8_gemv_f16in_residual_add: KernelFn,
     // ── Vision (Qwen3-VL ViT, Phase 3-a-v) ─────────────────
     // 11 modules + 12 kernel handles. cast_fp_mod carries both
     // cast_f32_to_f16 (used here) and cast_f16_to_f32 (unused,
@@ -848,6 +858,11 @@ impl Qwen35Bringup {
             let vector_add_f16_mod = kernels.load_ptx("vector_add_f16")?;
             let fn_vector_add_f16 = vector_add_f16_mod
                 .get_function("vector_add_f16_kernel")?;
+            let fp8_gemv_f16in_residual_add_mod =
+                kernels.load_ptx("fp8_gemv_f16in_residual_add")?;
+            let fn_fp8_gemv_f16in_residual_add =
+                fp8_gemv_f16in_residual_add_mod.get_function(
+                    "fp8_gemv_blockwise_wpr_native_f16in_residual_add_kernel")?;
 
             // ── Vision kernels (Phase 3-a-v) ────────────────────
             let layernorm_inplace_f16_mod =
@@ -955,6 +970,8 @@ impl Qwen35Bringup {
                 fn_f16_plus_f32_inplace_f16,
                 vector_add_f16_mod,
                 fn_vector_add_f16,
+                fp8_gemv_f16in_residual_add_mod,
+                fn_fp8_gemv_f16in_residual_add,
                 layernorm_inplace_f16_mod,
                 fn_layernorm_inplace_f16,
                 gelu_tanh_f16_mod,
@@ -2323,46 +2340,50 @@ impl Qwen35Bringup {
             }
         }
 
-        // (10) o_proj: FP8 GEMV [hidden, n_q_heads*head_dim] —
-        // reuses the Fp8GemvF16InLaunch path. Output goes to
-        // scr.o_out_ptr.
+        // (10-11) Fused o_proj + post-attn residual add (Phase 8
+        // other-models fusion, 2026-05-23). Single-kernel
+        // replacement for the back-to-back Fp8GemvF16In →
+        // vector_add_f16 pair: computes the FP8 GEMV exactly as
+        // before, then in the same launch on lane 0 reads
+        // h_residual[n] f16 → f32, adds the GEMV's f32 acc,
+        // narrows back to f16, writes back. Per-element accumulator
+        // touched by exactly one thread → no atomic. Eliminates 1
+        // launch + 1 f16 round-trip per layer per token (post-attn
+        // residual).
         let o_n = hidden as u32;
         let o_k = (n_q_heads * head_dim) as u32;
         unsafe {
-            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                m: 1, n: o_n, k: o_k,
-            }.launch(
-                fp8_gemv_fn,
-                scr.o_out_ptr,
-                full.o_proj.offset_bytes,
-                full.o_proj.blockscale_ptr.unwrap_or(0),
-                scr.attn_out_ptr,
-                stream_raw,
-            )?;
-        }
-
-        // (11) h_residual += o_out (F16 + F16 → F16).
-        unsafe {
             use cudarc::driver::sys::*;
-            let mut dst = scr.h_residual_ptr;
-            let mut src = scr.o_out_ptr;
-            let mut n_arg: i32 = hidden;
+            let mut h_resid = scr.h_residual_ptr;
+            let mut w_ptr = full.o_proj.offset_bytes;
+            let mut s_ptr = full.o_proj.blockscale_ptr.unwrap_or(0);
+            let mut x_ptr = scr.attn_out_ptr;
+            let mut m_i: i32 = 1;
+            let mut n_i: i32 = o_n as i32;
+            let mut k_i: i32 = o_k as i32;
+            let mut ncb: i32 = ((o_k as i32) + 127) / 128;
             let args = [
-                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
-                (&mut src) as *mut u64 as *mut core::ffi::c_void,
-                (&mut n_arg) as *mut i32 as *mut core::ffi::c_void,
+                (&mut h_resid) as *mut u64 as *mut core::ffi::c_void,
+                (&mut w_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut s_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut x_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
             ];
-            let grid_x: u32 = ((hidden as u32) + 255) / 256;
+            let grid = ((o_n + 7) / 8, 1u32, 1u32);
             let rc = cuLaunchKernel(
-                ker.fn_vector_add_f16.raw() as CUfunction,
-                grid_x, 1, 1, 256, 1, 1, 0,
+                ker.fn_fp8_gemv_f16in_residual_add.raw() as CUfunction,
+                grid.0, grid.1, grid.2,
+                256, 1, 1, 0,
                 stream_raw as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "qwen35 attn vector_add_f16 (residual) launch",
+                    "qwen35 fp8_gemv_f16in_residual_add (o_proj+resid) launch",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup()));
             }
@@ -4185,47 +4206,49 @@ impl Qwen35Bringup {
             }
         }
 
-        // (9) out_proj FP8 GEMV → o_out [hidden].
+        // (9-10) Fused out_proj + residual add (Phase 8
+        // other-models fusion, 2026-05-23). Single-kernel
+        // replacement for the back-to-back FP8 GEMV →
+        // vector_add_f16 pair: writes directly into
+        // `scr.h_residual_ptr` instead of materializing a temp
+        // `out_region`.
         let out_n = la.out_proj.shape[0] as u32;
         let out_k = la.out_proj.shape[1] as u32;
         let out_bs = la.out_proj.blockscale_ptr.ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
             "apply_linear_attn_layer: out_proj blockscale missing".into()))?;
-        let out_region = arena.region("qwen35_la_out", (out_n as usize) * 2, 16)?;
-        rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-            m: 1, n: out_n, k: out_k,
-        }.launch(
-            fp8_gemv_fn,
-            out_region.device_ptr(),
-            la.out_proj.offset_bytes,
-            out_bs,
-            gated_region.device_ptr(),
-            stream_raw,
-        )?;
-
-        // (10) h_residual += out (residual sum).
-        {
+        unsafe {
             use cudarc::driver::sys::*;
-            let mut dst = scr.h_residual_ptr;
-            let mut src = out_region.device_ptr();
-            let mut nn: i32 = hidden;
+            let mut h_resid = scr.h_residual_ptr;
+            let mut w_ptr = la.out_proj.offset_bytes;
+            let mut s_ptr = out_bs;
+            let mut x_ptr = gated_region.device_ptr();
+            let mut m_i: i32 = 1;
+            let mut n_i: i32 = out_n as i32;
+            let mut k_i: i32 = out_k as i32;
+            let mut ncb: i32 = ((out_k as i32) + 127) / 128;
             let args = [
-                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
-                (&mut src) as *mut u64 as *mut core::ffi::c_void,
-                (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                (&mut h_resid) as *mut u64 as *mut core::ffi::c_void,
+                (&mut w_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut s_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut x_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
             ];
-            let block: u32 = 256;
-            let grid: u32 = ((hidden_u + block - 1) / block).max(1);
+            let grid = ((out_n + 7) / 8, 1u32, 1u32);
             let rc = cuLaunchKernel(
-                ker.fn_vector_add_f16.raw() as CUfunction,
-                grid, 1, 1, block, 1, 1, 0,
+                ker.fn_fp8_gemv_f16in_residual_add.raw() as CUfunction,
+                grid.0, grid.1, grid.2,
+                256, 1, 1, 0,
                 stream_raw as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "qwen35 la residual vector_add_f16",
+                    "qwen35 fp8_gemv_f16in_residual_add (la out_proj+resid) launch",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup()));
             }
@@ -5850,51 +5873,52 @@ impl Qwen35Bringup {
             "apply_dense_mlp_layer: fp8_gemv_wpr_native_f16in unavailable \
              (need sm_100+; GB10/sm_121 should have it)".into(),
         ))?;
-        unsafe {
-            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                m: 1,
-                n: hidden as u32,
-                k: intermediate as u32,
-            }.launch(
-                fp8_gemv_fn,
-                scr.down_out_ptr,
-                layer.mlp.down_proj.offset_bytes,
-                layer.mlp.down_proj.blockscale_ptr.unwrap_or(0),
-                scr.silu_mid_ptr,
-                stream_raw,
-            )?;
-        }
-        // (cublaslt only used for outside lm_head now; the
-        // blockwise path is the looped m=1 GEMV above.)
+        // (4-5) Fused dense FFN-down + post-FFN residual add
+        // (Phase 8 other-models fusion, 2026-05-23). Single-launch
+        // replacement for the back-to-back FP8 GEMV →
+        // vector_add_f16 pair. Writes directly into
+        // `scr.h_residual_ptr`; the per-call `scr.down_out_ptr`
+        // temp buffer is no longer consumed by anyone after this
+        // fusion (kept allocated for arena address stability).
         let _ = cublaslt;
-
-        // (5) h_residual += down_out (F16 + F16 → F16).
         unsafe {
             use cudarc::driver::sys::*;
-            let mut dst = scr.h_residual_ptr;
-            let mut src = scr.down_out_ptr;
-            let mut n_arg: i32 = hidden;
+            let mut h_resid = scr.h_residual_ptr;
+            let mut w_ptr = layer.mlp.down_proj.offset_bytes;
+            let mut s_ptr = layer.mlp.down_proj.blockscale_ptr.unwrap_or(0);
+            let mut x_ptr = scr.silu_mid_ptr;
+            let mut m_i: i32 = 1;
+            let mut n_i: i32 = hidden;
+            let mut k_i: i32 = intermediate as i32;
+            let mut ncb: i32 = (intermediate as i32 + 127) / 128;
             let args = [
-                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
-                (&mut src) as *mut u64 as *mut core::ffi::c_void,
-                (&mut n_arg) as *mut i32 as *mut core::ffi::c_void,
+                (&mut h_resid) as *mut u64 as *mut core::ffi::c_void,
+                (&mut w_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut s_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut x_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
             ];
-            let grid_x: u32 = ((hidden as u32) + 255) / 256;
+            let grid = (((hidden as u32) + 7) / 8, 1u32, 1u32);
             let rc = cuLaunchKernel(
-                ker.fn_vector_add_f16.raw() as CUfunction,
-                grid_x, 1, 1, 256, 1, 1, 0,
+                ker.fn_fp8_gemv_f16in_residual_add.raw() as CUfunction,
+                grid.0, grid.1, grid.2,
+                256, 1, 1, 0,
                 stream_raw as CUstream,
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "qwen35 vector_add_f16 launch",
+                    "qwen35 fp8_gemv_f16in_residual_add (dense FFN down+resid) launch",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
             }
         }
+        let _ = fp8_gemv_fn;
         Ok(())
     }
 

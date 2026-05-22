@@ -236,6 +236,11 @@
       "path": "fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add.ptx",
       "sha256": "5cd456e4a291d34e99cbda960abf09ab49ca59a010704301c03f55d83eb83c86"
     },
+    "fp8_gemv_f16in_residual_add": {
+      "bytes": 23476,
+      "path": "fp8_gemv_f16in_residual_add.ptx",
+      "sha256": "9c1f99f167164ccd2118e9cf2539007f658254cd9b336a3947095f3bd1d38e2c"
+    },
     "fp8_mma_smem_probe": {
       "bytes": 2967,
       "path": "fp8_mma_smem_probe.ptx",
@@ -1032,5 +1037,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "113ef57"
+  "revision": "390718a"
 }
