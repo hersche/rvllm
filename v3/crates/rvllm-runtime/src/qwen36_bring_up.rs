@@ -481,6 +481,15 @@ pub struct Qwen36Bringup {
     pub conv_state_ptr: u64,
     pub conv_state_bytes: usize,
     pub conv_state_layer_bytes: usize,
+    /// Phase 8 commit 3: lazily-populated single-token-decode CUDA
+    /// graph. Populated by `try_capture_decode_step` on the first
+    /// captured step; replayed by `replay_decode_step` thereafter.
+    /// `None` when capture has not run yet OR when capture was
+    /// attempted and rejected (eager path stays in use). Reset by
+    /// the operator via dropping the bringup (per-request reset is
+    /// handled at the call site).
+    pub decode_capture:
+        std::sync::Mutex<Option<rvllm_graph::pool::CapturedGraph>>,
 }
 
 /// Output of `Qwen36Bringup::forward_qwen_vision`.
@@ -493,6 +502,183 @@ pub struct VisionForwardOutput {
 }
 
 impl Qwen36Bringup {
+    /// Phase 8 commit 3: try to capture a single decode step into a
+    /// CUDA graph. The eager body runs once during capture (so this
+    /// call still returns the real argmax token via the workspace);
+    /// the captured `CapturedGraph` exec handle is stored on
+    /// `self.decode_capture` for subsequent
+    /// [`Self::replay_decode_step`] calls.
+    ///
+    /// On capture failure (residual host-sync inside the body, PTX
+    /// quirk, etc.) the body still ran eagerly, the workspace's
+    /// `argmax_token_dev` holds the result, and the
+    /// `decode_capture` slot stays None — caller falls back to
+    /// eager mode for the remainder of the request.
+    ///
+    /// Caller contract: write `workspace.token_dev` BEFORE calling
+    /// (via cuMemcpyHtoDAsync or cuMemsetD32Async); read the
+    /// result via `argmax_dev_to_host_token(workspace.argmax_token_dev)`
+    /// AFTER.
+    #[cfg(feature = "cuda")]
+    pub fn try_capture_decode_step(
+        &self,
+        workspace:
+            &crate::qwen36_decode_workspace::Qwen36DecodeWorkspace,
+        position: u32,
+    ) -> Result<()> {
+        let stream_u64 = self.stream.raw() as u64;
+        let layout = rvllm_metadata::MetadataLayout::compute(1, 1);
+        let layout_hash = layout.hash();
+        let fingerprint = rvllm_graph::pool::GraphFingerprint([0u8; 32]);
+        // Capture closure: just the workspace-driven step. The
+        // closure RUNS the body eagerly during `cuStreamEndCapture`
+        // — `argmax_token_dev` holds the result regardless of
+        // whether the graph instantiation succeeds.
+        let capture_result = unsafe {
+            rvllm_graph::pool::CapturedGraph::capture(
+                /* bucket */ 0,
+                /* max_blocks */ 0,
+                layout_hash,
+                fingerprint,
+                stream_u64,
+                || -> Result<()> {
+                    self.forward_qwen36_decode_step_to_workspace(
+                        workspace, position)
+                },
+            )
+        };
+        match capture_result {
+            Ok(g) => {
+                let mut guard = self.decode_capture.lock().unwrap();
+                *guard = Some(g);
+                Ok(())
+            }
+            Err(e) => {
+                // Body still ran eagerly; result is in
+                // workspace.argmax_token_dev. Logging the capture
+                // reject is informational — production decode just
+                // stays eager for this request.
+                tracing::warn!(
+                    "qwen36: decode-step graph capture rejected: {e:?}. \
+                     Falling back to eager. (Likely a residual sync \
+                     HtoD/DtoH inside the per-layer body — Phase 8 \
+                     commit 2b only rewrote the embed-side and closer; \
+                     the per-layer chain still has internal \
+                     arena.region/copy_from_host that defeat capture.)"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Phase 8 commit 3: replay a previously-captured decode step.
+    /// Caller must have already populated `workspace.token_dev`
+    /// with the current step's token id (via cuMemcpyHtoDAsync or
+    /// cuMemsetD32Async) BEFORE calling. Result lands in
+    /// `workspace.argmax_token_dev`; extract via
+    /// `argmax_dev_to_host_token` after.
+    ///
+    /// **Position-indirect limitation**: the captured graph holds
+    /// RoPE / KV-slot kernel scalar args from capture time. Until
+    /// position-indirect kernel variants land (Qwen's equivalent of
+    /// Gemma 4 NVFP4's `G4N_DECODE_GRAPH_INDIRECT=1`), replay is
+    /// only correct at the SAME `position` value as capture.
+    /// `Err(NotCaptured)` when nothing was captured yet.
+    #[cfg(feature = "cuda")]
+    pub fn replay_decode_step(
+        &self,
+        _workspace:
+            &crate::qwen36_decode_workspace::Qwen36DecodeWorkspace,
+    ) -> Result<()> {
+        let guard = self.decode_capture.lock().unwrap();
+        let g = match guard.as_ref() {
+            Some(g) => g,
+            None => return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 replay_decode_step: no captured graph; \
+                 call try_capture_decode_step first",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )),
+        };
+        unsafe { g.replay(self.stream.raw() as u64)?; }
+        Ok(())
+    }
+
+    /// Phase 8 commit 3: high-level decode-step entry that picks
+    /// capture vs eager vs replay based on the operator gate
+    /// (`RVLLM_QWEN36_DECODE_GRAPH=1`) and the current capture
+    /// state. Production cuda_worker can call this once per
+    /// decode iteration:
+    ///
+    ///   1. Eager (capture disabled or NOT yet captured): runs
+    ///      `forward_qwen36_decode_step_to_workspace` eagerly,
+    ///      optionally attempts capture for next time.
+    ///   2. Replay (capture present): writes the new token to
+    ///      `workspace.token_dev` via HtoD-async, replays the
+    ///      captured graph.
+    ///   3. Either way: returns the resulting token after
+    ///      `argmax_dev_to_host_token`.
+    ///
+    /// `position` is the absolute position for this decode step
+    /// (start_position + step_index). With current kernels, replay
+    /// requires position == capture-position; multi-step replay
+    /// across positions is the remaining position-indirect work.
+    #[cfg(feature = "cuda")]
+    pub fn decode_step_via_graph_or_eager(
+        &self,
+        workspace:
+            &crate::qwen36_decode_workspace::Qwen36DecodeWorkspace,
+        token_id: i32,
+        position: u32,
+    ) -> Result<i32> {
+        let stream_u64 = self.stream.raw() as u64;
+        // Write the current token to workspace.token_dev — both
+        // capture and replay paths read from this stable pointer.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let tok_host = token_id;
+            let rc = cuMemcpyHtoDAsync_v2(
+                workspace.token_dev as CUdeviceptr,
+                (&tok_host) as *const i32 as *const _,
+                4,
+                stream_u64 as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 decode_step: workspace.token_dev HtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        let graph_enabled =
+            crate::qwen36_decode_workspace::qwen36_decode_graph_enabled();
+        let have_capture = {
+            let guard = self.decode_capture.lock().unwrap();
+            guard.is_some()
+        };
+
+        if graph_enabled && have_capture {
+            // Replay path.
+            self.replay_decode_step(workspace)?;
+            return self.argmax_dev_to_host_token(workspace.argmax_token_dev);
+        }
+
+        // Eager path. When graph_enabled but no capture yet, the
+        // first call eagerly runs AND attempts to capture for the
+        // next call (capture body re-runs the eager step under
+        // cuStreamBeginCapture). When graph_disabled, just runs
+        // eager and never attempts capture.
+        if graph_enabled {
+            self.try_capture_decode_step(workspace, position)?;
+        } else {
+            self.forward_qwen36_decode_step_to_workspace(
+                workspace, position)?;
+        }
+        self.argmax_dev_to_host_token(workspace.argmax_token_dev)
+    }
+
     /// Phase 8 commit 2b: workspace-driven single-step decode.
     /// Combines the two overrides on
     /// `forward_qwen36_decode_inner_with_workspace_overrides` so a
@@ -1323,6 +1509,7 @@ impl Qwen36Bringup {
             conv_state_ptr,
             conv_state_bytes,
             conv_state_layer_bytes,
+            decode_capture: std::sync::Mutex::new(None),
         };
         // Phase 4b-prep iter25: upload the constant identity block
         // table once. The paged-attention layer used to rebuild it
