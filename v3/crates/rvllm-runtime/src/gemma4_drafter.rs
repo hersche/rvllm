@@ -313,6 +313,14 @@ pub struct Gemma4DrafterRuntime {
     pub drafter_dequant_mod: Option<rvllm_kernels::LoadedModule>,
     pub fn_drafter_dequant_fp8_to_f16: Option<rvllm_kernels::KernelFn>,
     pub fn_drafter_dequant_nvfp4_to_f16: Option<rvllm_kernels::KernelFn>,
+    /// Task #34 deferred fix: fused dequant + Hadamard un-rotate.
+    /// Same arguments as the plain `_to_f16` siblings plus a `signs`
+    /// pointer (per-channel ±1 from `Gemma4LayerScratch.hadamard
+    /// _signs_k`). One launch instead of dequant + separate
+    /// `hadamard_unrotate_f16_kernel` pass. `None` on PTX trees that
+    /// pre-date the kernel.
+    pub fn_drafter_dequant_fp8_to_f16_unrotate: Option<rvllm_kernels::KernelFn>,
+    pub fn_drafter_dequant_nvfp4_to_f16_unrotate: Option<rvllm_kernels::KernelFn>,
 }
 
 /// F16 shadow KV regions used by the assistant cross-attention. One
@@ -650,6 +658,8 @@ impl Gemma4DrafterRuntime {
             drafter_dequant_mod: None,
             fn_drafter_dequant_fp8_to_f16: None,
             fn_drafter_dequant_nvfp4_to_f16: None,
+            fn_drafter_dequant_fp8_to_f16_unrotate: None,
+            fn_drafter_dequant_nvfp4_to_f16_unrotate: None,
         })
     }
 
@@ -716,6 +726,15 @@ impl Gemma4DrafterRuntime {
         fp8_entry: rvllm_kernels::KernelFn,
         nvfp4_entry: rvllm_kernels::KernelFn,
     ) {
+        // Task #34 fused-unrotate variants. `.get_function().ok()`
+        // keeps older PTX trees loadable; consumers gate on
+        // `is_some()` before dispatching the fused path.
+        self.fn_drafter_dequant_fp8_to_f16_unrotate = module
+            .get_function("gemma4_drafter_dequant_fp8_to_f16_unrotate_kernel")
+            .ok();
+        self.fn_drafter_dequant_nvfp4_to_f16_unrotate = module
+            .get_function("gemma4_drafter_dequant_nvfp4_to_f16_unrotate_kernel")
+            .ok();
         self.drafter_dequant_mod = Some(module);
         self.fn_drafter_dequant_fp8_to_f16 = Some(fp8_entry);
         self.fn_drafter_dequant_nvfp4_to_f16 = Some(nvfp4_entry);
@@ -1216,6 +1235,137 @@ impl Gemma4DrafterRuntime {
         Ok(())
     }
 
+    /// Task #34 deferred fix — fused NVFP4 dequant + Hadamard
+    /// un-rotate launch. One launch instead of (plain dequant +
+    /// `hadamard_unrotate_f16_kernel`) for the same logical output.
+    /// Grid = (num_tokens, nkvh), block = head_dim, smem =
+    /// head_dim * 4 bytes for the f32 FWHT staging.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4_dequant_unrotate_to_shadow(
+        &self,
+        kernel: rvllm_kernels::KernelFn,
+        packed: u64,
+        scales: u64,
+        signs: u64,
+        dst: u64,
+        num_tokens: i32,
+        nkvh: i32,
+        head_dim: i32,
+        stream: u64,
+    ) -> Result<()> {
+        if num_tokens <= 0 || nkvh <= 0 || head_dim <= 0 {
+            return Ok(());
+        }
+        use cudarc::driver::sys::*;
+        let block: u32 = head_dim as u32;
+        let smem_bytes: u32 = (head_dim as u32).saturating_mul(4);
+        let mut a_packed = packed;
+        let mut a_scales = scales;
+        let mut a_signs = signs;
+        let mut a_dst = dst;
+        let mut a_nt = num_tokens;
+        let mut a_nkvh = nkvh;
+        let mut a_hd = head_dim;
+        let args: [*mut core::ffi::c_void; 7] = [
+            &mut a_packed as *mut _ as *mut _,
+            &mut a_scales as *mut _ as *mut _,
+            &mut a_signs  as *mut _ as *mut _,
+            &mut a_dst    as *mut _ as *mut _,
+            &mut a_nt     as *mut _ as *mut _,
+            &mut a_nkvh   as *mut _ as *mut _,
+            &mut a_hd     as *mut _ as *mut _,
+        ];
+        let rc = cuLaunchKernel(
+            kernel.raw() as CUfunction,
+            num_tokens as u32, nkvh as u32, 1,
+            block, 1, 1,
+            smem_bytes,
+            stream as CUstream,
+            args.as_ptr() as *mut *mut core::ffi::c_void,
+            core::ptr::null_mut(),
+        );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(RvllmError::Cuda {
+                kind: rvllm_core::CudaErrorKind::LaunchFailed,
+                op: "gemma4_drafter_dequant_nvfp4_to_f16_unrotate",
+                ctx: rvllm_core::CudaCtx {
+                    stream,
+                    kernel: "gemma4_drafter_dequant_nvfp4_to_f16_unrotate_kernel",
+                    launch: None,
+                    device: 0,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Task #34 deferred fix — fused FP8 dequant + Hadamard
+    /// un-rotate launch. Mirrors `launch_fp8_dequant_to_shadow`
+    /// but applies the diag(D)·H rotation on the head_dim vector
+    /// before writeback.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_fp8_dequant_unrotate_to_shadow(
+        &self,
+        kernel: rvllm_kernels::KernelFn,
+        src: u64,
+        scales: u64,
+        signs: u64,
+        dst: u64,
+        num_tokens: i32,
+        nkvh: i32,
+        head_dim: i32,
+        stream: u64,
+    ) -> Result<()> {
+        if num_tokens <= 0 || nkvh <= 0 || head_dim <= 0 {
+            return Ok(());
+        }
+        use cudarc::driver::sys::*;
+        let block: u32 = head_dim as u32;
+        let smem_bytes: u32 = (head_dim as u32).saturating_mul(4);
+        let mut a_src = src;
+        let mut a_scales = scales;
+        let mut a_signs = signs;
+        let mut a_dst = dst;
+        let mut a_nt = num_tokens;
+        let mut a_nkvh = nkvh;
+        let mut a_hd = head_dim;
+        let args: [*mut core::ffi::c_void; 7] = [
+            &mut a_src    as *mut _ as *mut _,
+            &mut a_scales as *mut _ as *mut _,
+            &mut a_signs  as *mut _ as *mut _,
+            &mut a_dst    as *mut _ as *mut _,
+            &mut a_nt     as *mut _ as *mut _,
+            &mut a_nkvh   as *mut _ as *mut _,
+            &mut a_hd     as *mut _ as *mut _,
+        ];
+        let rc = cuLaunchKernel(
+            kernel.raw() as CUfunction,
+            num_tokens as u32, nkvh as u32, 1,
+            block, 1, 1,
+            smem_bytes,
+            stream as CUstream,
+            args.as_ptr() as *mut *mut core::ffi::c_void,
+            core::ptr::null_mut(),
+        );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(RvllmError::Cuda {
+                kind: rvllm_core::CudaErrorKind::LaunchFailed,
+                op: "gemma4_drafter_dequant_fp8_to_f16_unrotate",
+                ctx: rvllm_core::CudaCtx {
+                    stream,
+                    kernel: "gemma4_drafter_dequant_fp8_to_f16_unrotate_kernel",
+                    launch: None,
+                    device: 0,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        Ok(())
+    }
+
     /// Spec-decode commit 14: cross-attention for a global-source
     /// drafter layer (layer 3 on E4B). Mirrors
     /// `launch_cross_attn_sliding` but reads from
@@ -1528,6 +1678,8 @@ impl Gemma4DrafterRuntime {
             drafter_dequant_mod: None,
             fn_drafter_dequant_fp8_to_f16: None,
             fn_drafter_dequant_nvfp4_to_f16: None,
+            fn_drafter_dequant_fp8_to_f16_unrotate: None,
+            fn_drafter_dequant_nvfp4_to_f16_unrotate: None,
         })
     }
 
