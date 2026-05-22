@@ -838,6 +838,49 @@ blocking the prefill rollout above.
   unavailability)
 - `CONTRIBUTING.md` — upstream workflow
 
+## Cross-model invariants (READ BEFORE TOUCHING SHARED FILES)
+
+Files in `v3/crates/rvllm-attention/`, `v3/crates/rvllm-fused/`,
+`v3/crates/rvllm-cutlass/`, and `kernels/flash_attention*.cu` /
+`kernels/fused_*.cu` are **shared across model families** (Gemma 4
+fp8-block, Gemma 4 NVFP4, Qwen 3.5/3.6, Mistral 3.5, E4B). Changes
+to these files affect EVERY model that loads them.
+
+When modifying a shared file for ONE model's perf/quality:
+
+1. **Identify all consumers first.** `grep -rn` for the symbol/cap
+   across all `*_bring_up.rs` and `*_load.rs` files. The cross-
+   model dispatcher `v3/crates/rvllm-attention/src/decode.rs` is
+   the central hotspot — changes here touch ALL decode paths.
+2. **Verify byte-identity for every affected model.** Don't ship
+   a "Mistral-only" optimization without running the regression
+   smoke for Gemma 4 31B + E4B + Qwen 3.5/3.6 + spec-decode paths.
+   The byte-equivalence gate from tasks #26/#27/#34 (md5 captures
+   of fixed test prompts) is the existing infrastructure.
+3. **Prefer adaptive dispatch over one-size-fits-all.** When a
+   model needs a larger cap/buffer/kernel variant, ADD a new
+   variant + dispatch logic rather than bumping the shared
+   default for everyone. Pattern: kernels compile multiple
+   `extern "C" __global__` symbols via a templated `__device__`
+   helper (one register-array size per variant), host dispatches
+   by actual model parameter. See e.g. NVFP4 GQA decode's
+   `_gqa_kernel` vs `_gqa_max16_kernel` pattern (when it lands).
+4. **Document the cross-model impact in commit + register.**
+   Commit message must list every model family whose forward
+   path passes through the touched file, and confirm the
+   regression check on each. The deferred-work registers (Option
+   B + mistral + qwen) get a cross-reference back to the commit.
+5. **Off-by-default env knobs** when introducing experimental
+   kernel variants — flip the default only after broader hardware
+   coverage validates no regression across families.
+
+These rules apply to ALL shared code paths, not just attention.
+The mistral perf work (raising `MAX_GQA_DECODE`/`MAX_GQA_SPLIT`
+in `flash_attention*kv*.cu`) is the canonical example of where
+naive single-default bumping created a Gemma 4 / Qwen
+register-pressure risk; the correct fix is adaptive kernel-
+variant dispatch.
+
 ## Known pitfalls
 
 - **`cargo` cwd**: every cargo invocation must be from `v3/`, not
