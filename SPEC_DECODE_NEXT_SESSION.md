@@ -1,6 +1,27 @@
 # Speculative-decoding next-session plan — Gemma 4 E4B
 
-## Status (2026-05-22 session update — head `3a40819`)
+## Status (2026-05-22 session update — head `2334dbc`)
+
+* **#26 — `verify_batched_suffix_k_only` — DONE** (`3f9febd`,
+  `4449903`, `4a43405`, `2334dbc`). Byte-equivalent to the existing
+  `verify_batched_from_state` path on three regression prompts:
+
+      Prompt                                   | OLD md5  | NEW md5
+      Was ist die Hauptstadt von Frankreich?    | d0451f05 | d0451f05 ✓
+      Sag mir 5 Hauptstädte Europas in einem... | 58649bba | 58649bba ✓
+      Erkläre kurz was Linux ist.               | 08b20f16 | 08b20f16 ✓
+
+  Wall times equal within measurement noise (compute-bound cap on
+  dense 31B). Root cause of the earlier regression: my new path
+  defaulted block_size to 16 via env (RVLLM_BLOCK_SIZE), but the
+  persistent KV cache was allocated at block_size = 32 inside
+  init_prefix_cache. Slot indexing `block * block_size +
+  slot_in_block` was off-by-2x → wrong KV slots → garbage. Fix:
+  read PrefixCacheState.block_size and pass it through.
+
+* **#27 — `commit_base_tokens_from_state` — DONE** (`4449903`,
+  `4a43405`, `2334dbc`). K=1 wrapper around #26; same byte-equivalence
+  + production-safety story.
 
 * **#28 — Persistent identity block table — DONE** (`9845395`).
 
