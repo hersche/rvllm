@@ -853,7 +853,7 @@ overhead dominates for the legacy path.
   between two valid German jokes. Post-fix the same canary is
   byte-stable.
 
-### Phase 8 — IN PROGRESS (foundations landed 2026-05-22)
+### Phase 8 — SHIPPED 2026-05-22
 Decode-step CUDA Graph capture is parked as Phase 8 in
 `v3/QWEN_BATCHED_PREFILL_PLAN.md`. Codex round-28 picked a
 workspace-based factoring (`decode_step_launch_only` reading
@@ -920,28 +920,60 @@ blocking the prefill rollout above.
   path log reads "[graph] captured 1856 nodes" — workspace
   body captures cleanly.
 
-**Known regression (`DECODE_GRAPH=1` only, default-off
-unaffected)**: when capture is opted in via env, multi-step
-decode produces incorrect output ("Die." instead of "Die
-Hauptstadt von Frankreich ist Paris."). Reproducible. Needs a
-focused debug session to narrow whether the workspace body's
-per-call arena-bump pattern, the device-argmax closer's
-interaction with multi-step KV state, or a capture-body side
-effect is breaking the per-step decode chain.
-**`RVLLM_QWEN36_DECODE_GRAPH` is documented unsafe to flip
-until that's resolved** — the gate exists for infrastructure
-validation and follow-up debugging only.
+**Final commits (`bb9a3cf`, `4f083f8`)** closed out Phase 8:
 
-**Remaining**:
+* `bb9a3cf` — debug fix: CUDA stream capture in THREAD_LOCAL
+  mode RECORDS kernel launches but does NOT execute them
+  eagerly (despite earlier optimistic comments in our Gemma 4
+  NVFP4 captured-decode code). `try_capture_decode_step` now
+  explicitly `graph.replay()`s immediately after
+  `CapturedGraph::capture` returns Ok, so step 0's kernels
+  actually land on the GPU. Without this the captured body's
+  KV writes never happened, `workspace.argmax_token_dev` stayed
+  stale, and step 1+ ran from a broken KV state (the "Die."
+  symptom). Capture-failure fallback also re-runs the body
+  eagerly. New env knob `RVLLM_QWEN36_DECODE_WORKSPACE=1`
+  isolates the workspace-eager path from the capture machinery.
+* `4f083f8` — position-indirect overrides + cross-request reset.
+  Two pieces that close out replay correctness across moving
+  positions and across requests:
+  - `pos_dev_override` / `ctx_dev_override` on
+    `forward_qwen36_decode_inner_with_workspace_overrides_v2`:
+    when both `Some`, the per-call `positions_region` /
+    `context_lens_region` allocations + the
+    `qwen_fill_pos_slots_i32` fill kernel are SKIPPED.
+    `tok_pos_dev_ptr` / `tok_cl_dev_ptr` bind directly to the
+    workspace's stable slots. Worker writes per-step values via
+    `Qwen36Bringup::write_position_to_workspace`
+    (`cuMemsetD32Async`) before each replay; the kernels pick
+    up updated values automatically.
+  - `Qwen36Bringup::clear_decode_capture()` called by the
+    worker at the start of every new request, BEFORE
+    `alloc_decode_workspace`. The captured graph holds device-
+    pointer references to per-call arena regions that get
+    released by `arena.restore(scratch_ck)` at end-of-request;
+    a stale graph from request N would replay against
+    reclaimed memory and hang request N+1.
 
-1. Debug the `DECODE_GRAPH=1` multi-step regression above
-   (capture-on, replay-off still corrupts output — must precede
-   any further capture/replay work).
-2. Author position-indirect Qwen RoPE + KV-slot kernel variants
-   so replay can flip on without position-frozen failures
-   (Qwen's analog of Gemma 4 NVFP4's
-   `G4N_DECODE_GRAPH_INDIRECT=1`).
-3. Latency / accept-rate A/B once 1 + 2 land.
+Hardware validation (`RVLLM_QWEN36_DECODE_GRAPH=1` +
+`_REPLAY=1`, qwen3-6-35b-a3b, three requests in sequence):
+
+- Req 1 (short):  "Die Hauptstadt von Frankreich ist Paris."
+- Req 2 (1-10):   "Eins / Zwei / Drei / ... / Zehn" (10 tokens,
+                   all correct via captured-replay).
+- Req 3 (long):   80-token photosynthesis explanation,
+                   byte-identical to eager.
+
+Latency A/B (Photosynthesis, max_tokens=150):
+- Eager  : 2.315s
+- Replay : 2.158s  (≈7% faster)
+
+Production default remains `RVLLM_QWEN36_DECODE_GRAPH` unset
+(legacy eager); captured path is opt-in. Replay path is now
+correct + slightly faster. Most gain comes from amortizing
+kernel-launch overhead; eager is already fast on GB10, so the
+captured path's primary value is as the foundation for further
+graph-level optimizations.
 
 Eager decode path remains the production default
 (`RVLLM_QWEN36_DECODE_GRAPH` unset). Captured path opt-in only.
