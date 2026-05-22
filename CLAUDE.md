@@ -475,13 +475,51 @@ attention output's rotation — the cross-attn dot product
 itself contracts in rotated K-space against an unrotated
 drafter Q, collapsing the score distribution to near-uniform.
 
-**Proper code-level fix (deferred)**: un-rotate K (and V if
-V-rotated) inside `populate_shadow_kv_range_from_base`'s dequant
-kernel, so the shadow KV lands in HF-native frame regardless of
-the base's rotation. That's a separate, larger lift (kernel +
-integration + dump re-validation). Operator workaround: run
-spec with HADAMARD=HADAMARD_V=0, accepting the documented base-
-quality tradeoff on long contexts.
+**Proper code-level fix — SHIPPED 2026-05-22**: un-rotate K (and
+V if V-rotated) inside `populate_shadow_kv_range_from_base`'s
+dequant kernel, so the shadow KV lands in HF-native frame
+regardless of the base's rotation. Landed in two commits:
+
+  * `bf6af65` — kernels:
+    `gemma4_drafter_dequant_{nvfp4,fp8}_to_f16_unrotate_kernel`
+    in `kernels/gemma4_drafter_dequant.cu`. Grid =
+    `(num_tokens, num_kv_heads)`, block = `head_dim`, smem =
+    `head_dim * 4` bytes. Each thread dequants one nibble (NVFP4)
+    or E4M3 byte (FP8) → f32 in smem, then participates in the
+    cooperative FWHT + `apply_signs_f32` from `hadamard.cuh`,
+    then writes back as f16. One launch replaces dequant + the
+    separate `hadamard_unrotate_f16_kernel` post-pass.
+    Launch helpers `launch_{nvfp4,fp8}_dequant_unrotate_to_shadow`
+    added on `Gemma4DrafterRuntime`.
+  * `eae6202` — consumer wiring:
+    `populate_shadow_kv_range_from_base_with_signs` threads per-
+    source signs ptrs to the with-signs `populate_one_source
+    _layer_with_signs`, which dispatches the fused launchers when
+    signs are non-zero. All four call sites in `gemma4_bring_up.rs`
+    (initial prompt populate + accept-batch + bonus + deferred-bonus)
+    extract signs via the new helper
+    `Gemma4Bringup::fused_unrotate_signs(sources)` which reads
+    `RVLLM_GEMMA4_SPEC_FUSED_UNROTATE` (default off) and the
+    `self.nvfp4_hadamard` alloc. `unrotate_shadow_kv_after_populate`
+    gains an early-return guard on the same env so the separate
+    post-pass doesn't double-rotate.
+
+Default behavior unchanged: with `RVLLM_GEMMA4_SPEC_FUSED_UNROTATE`
+unset, the helper returns `None`, signs ptrs are zero, the with-
+signs populate falls to the legacy dequant path, and the
+separate unrotate runs as before. Validated bit-coherent on the
+default 31B spec profile (HADAMARD=0). Fused path validated under
+HADAMARD=1 + FUSED_UNROTATE=1 + UNROTATE_SHADOW=1 on 31B spec:
+capital-of-France + photosynthesis prompts both coherent, no
+panics. Drops per-populate launch count from 4 → 2.
+
+Operator workaround for HADAMARD=1 quality still available: run
+spec with HADAMARD=HADAMARD_V=0 (default), OR enable the fused
+path via `RVLLM_GEMMA4_SPEC_FUSED_UNROTATE=1` +
+`RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1`, OR use the Phase 3 F16-
+shadow recipe (`RVLLM_NVFP4_SHADOW_F16=1` +
+`RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1`) which is still the highest
+accept-rate path.
 
 **Guard (this round)**: `ensure_drafter()` refuses to load the
 drafter when `(RVLLM_NVFP4_HADAMARD=1 || RVLLM_NVFP4_HADAMARD_V=1)`
