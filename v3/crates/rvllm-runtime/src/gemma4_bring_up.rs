@@ -6081,17 +6081,36 @@ impl Gemma4Bringup {
             total_drafted = total_drafted.saturating_add(k_actual as u32);
 
             // Step 2: batched verify -> K base argmaxes + K hiddens.
+            //
+            // Task #26 (commit 4449903): when
+            // `RVLLM_GEMMA4_SPEC_NEW_PRIMITIVES=1` is set, route to
+            // `verify_batched_suffix_k_only` which drives the chunked
+            // -prefill layer loop directly without `run_generate`'s
+            // host-side setup. Default off — the existing
+            // `verify_batched_from_state` path remains the fallback
+            // until byte-identity + perf are both validated on
+            // hardware.
             base_argmax_k.clear();
             base_argmax_k.resize(k_actual, 0u32);
             let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
-            self.verify_batched_from_state(
-                fn_embed,
-                &drafts.tokens,
-                session.committed_len,
-                &session,
-                k_hidden_buf,
-                &mut base_argmax_k,
-            )?;
+            if Self::spec_new_primitives_enabled() {
+                self.verify_batched_suffix_k_only(
+                    fn_embed,
+                    &drafts.tokens,
+                    session.committed_len,
+                    k_hidden_buf,
+                    &mut base_argmax_k,
+                )?;
+            } else {
+                self.verify_batched_from_state(
+                    fn_embed,
+                    &drafts.tokens,
+                    session.committed_len,
+                    &session,
+                    k_hidden_buf,
+                    &mut base_argmax_k,
+                )?;
+            }
             if perf_trace {
                 self.stream.fence()?;
                 sum_verify_us += t0.unwrap().elapsed().as_micros() as u64;
@@ -6224,9 +6243,32 @@ impl Gemma4Bringup {
 
                 // Commit the bonus's base K/V + capture its
                 // POST-final-norm hidden for the next iter's drafter.
+                //
+                // Task #27 (commit 4449903): when
+                // RVLLM_GEMMA4_SPEC_NEW_PRIMITIVES=1, route to
+                // `commit_base_tokens_from_state` which calls into
+                // `verify_batched_suffix_k_only` with K=1. The new
+                // path writes the bonus's post-final-norm hidden to
+                // row 0 of `k_hidden_buf` directly + returns the
+                // next argmax, matching prefill_one_from_state's
+                // contract.
                 let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
-                let new_next = self.prefill_one_from_state(
-                    fn_embed, &mut session, bonus)?;
+                let new_next = if Self::spec_new_primitives_enabled() {
+                    let r = self.commit_base_tokens_from_state(
+                        fn_embed, bonus, session.committed_len,
+                        k_hidden_buf)?;
+                    session.tokens.push(bonus);
+                    session.committed_len =
+                        session.committed_len.saturating_add(1);
+                    // Row 0 of k_hidden_buf IS the bonus's post-
+                    // final-norm hidden (K=1 verify path runs
+                    // final_norm in place over the captured residual).
+                    session.last_base_hidden_ptr = k_hidden_buf;
+                    r
+                } else {
+                    self.prefill_one_from_state(
+                        fn_embed, &mut session, bonus)?
+                };
                 if perf_trace {
                     self.stream.fence()?;
                     sum_prefill_one_us += t0.unwrap().elapsed().as_micros() as u64;
@@ -6290,8 +6332,19 @@ impl Gemma4Bringup {
                 if emitted.len() >= max_new { break; }
 
                 let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
-                let new_next = self.prefill_one_from_state(
-                    fn_embed, &mut session, bonus)?;
+                let new_next = if Self::spec_new_primitives_enabled() {
+                    let r = self.commit_base_tokens_from_state(
+                        fn_embed, bonus, session.committed_len,
+                        k_hidden_buf)?;
+                    session.tokens.push(bonus);
+                    session.committed_len =
+                        session.committed_len.saturating_add(1);
+                    session.last_base_hidden_ptr = k_hidden_buf;
+                    r
+                } else {
+                    self.prefill_one_from_state(
+                        fn_embed, &mut session, bonus)?
+                };
                 if perf_trace {
                     self.stream.fence()?;
                     sum_prefill_one_us += t0.unwrap().elapsed().as_micros() as u64;

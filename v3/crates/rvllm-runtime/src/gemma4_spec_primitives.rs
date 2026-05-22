@@ -831,33 +831,27 @@ impl Gemma4Bringup {
     /// Task #27 — commit a single base token to the persistent KV
     /// cache. K=1 special case of `verify_batched_suffix_k_only`:
     /// runs one chunked prefill step at `start_pos` for `new_token`,
-    /// advancing the persistent KV cache by one slot. Returns
-    /// nothing — callers consume the committed-base-token from the
-    /// persistent KV state, not a host-side argmax.
-    ///
-    /// The `_unused_argmax` parameter is present so the spec session's
-    /// call site can be source-equivalent to the verify primitive's
-    /// (the per-iter call dispatch sees one signature). The argmax
-    /// is computed and DtoH'd anyway (the K-row argmax kernel covers
-    /// K=1 without a special path) and the value is discarded; this
-    /// matches the existing `prefill_one_from_state` cost shape so the
-    /// switch behind `RVLLM_GEMMA4_SPEC_NEW_PRIMITIVES` is a fair
-    /// A/B against the existing path.
+    /// advancing the persistent KV cache by one slot. Returns the
+    /// next base argmax (the model's prediction for the next position
+    /// after `start_pos + 1`) so callers can use it as the
+    /// `session.next_base_argmax` seed for the following iter — same
+    /// return contract as the existing `prefill_one_from_state`.
     pub unsafe fn commit_base_tokens_from_state(
         &self,
         fn_embed: rvllm_kernels::KernelFn,
         new_token: u32,
         start_pos: u32,
         k_hidden_out: u64,
-    ) -> Result<()> {
-        let mut unused_argmax = [0u32; 1];
+    ) -> Result<u32> {
+        let mut argmax_buf = [0u32; 1];
         self.verify_batched_suffix_k_only(
             fn_embed,
             &[new_token],
             start_pos,
             k_hidden_out,
-            &mut unused_argmax,
-        )
+            &mut argmax_buf,
+        )?;
+        Ok(argmax_buf[0])
     }
 }
 
