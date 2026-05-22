@@ -210,20 +210,49 @@ These changes mean qwen35 sm_121 prefill at M ∈ [32, 127] now
 runs through CUTLASS SM120 instead of the slow per-token GEMV
 fallback — closing the perf cliff that lived at M=128.
 
-## TODO — Phase 8: Decode-step CUDA Graph capture
+## Phase 8: Decode-step CUDA Graph capture — SHIPPED 2026-05-22
 
-Codex Round-28 reviewed the path:
+The captured-graph decode path landed across a chain of commits
+from `793ddf0` through `4f083f8`. The replay path is now
+hardware-validated producing byte-correct multi-step output and
+runs ≈7% faster than eager at 150-token decode. Production
+default remains `RVLLM_QWEN36_DECODE_GRAPH` unset (legacy
+eager); captured path is opt-in.
+
+Final commit chain (see `CLAUDE.md` "Phase 8" section for the
+detailed catalog):
+
+- `793ddf0` `Qwen36DecodeWorkspace` struct + allocator.
+- `be98a01` device-argmax closer + `argmax_dev_to_host_token`.
+- `81a487f` workspace-driven decode-step entry
+  (`forward_qwen36_decode_step_to_workspace`).
+- `8505f90` `CapturedGraph::capture` + replay infrastructure
+  (`try_capture_decode_step`, `replay_decode_step`,
+  `decode_step_via_graph_or_eager`).
+- `3c30fea` cuda_worker wire-up; two-gate
+  capture/replay design.
+- `bb9a3cf` debug fix: explicit `graph.replay()` after capture
+  (CUDA stream capture in THREAD_LOCAL mode records but doesn't
+  execute eagerly — the unfortunate root cause of the
+  documented "Die." regression).
+- `4f083f8` position-indirect overrides
+  (`pos_dev_override` / `ctx_dev_override` skip the
+  per-call positions_region + fill kernel; workspace stable
+  pos/ctx device slots feed RoPE + KV-slot via
+  `cuMemsetD32Async`) + cross-request `clear_decode_capture`
+  reset.
+
+Codex Round-28 originally reviewed the path:
 
 > The minimal-risk first green graph is therefore not "capture
 > forward_qwen36_decode", but "factor a fixed-workspace
 > qwen36_decode_step_launch_only and capture that."
 
-Today's `forward_qwen36_decode_cancellable` allocates new arena
-regions per call, does sync `Region::copy_from_host` on the legacy
-default stream, and runs a sync `cuMemcpyDtoH` inside the closer.
-None of these are graph-friendly.
-
-Concrete plan when picked up:
+The pre-Phase-8 `forward_qwen36_decode_cancellable` allocated
+new arena regions per call, did sync `Region::copy_from_host` on
+the legacy default stream, and ran a sync `cuMemcpyDtoH` inside
+the closer — none of these were graph-friendly. The shipped plan
+(below) addressed each:
 
 1. **Workspace** — `Qwen36DecodeWorkspace` struct holding the ~30
    per-step scratch regions preallocated once (normed, qkv, q/k/v,
@@ -259,6 +288,12 @@ device-side before each replay, decoded tokens must be byte-identical
 to eager-mode for the same input. Any divergence points at captured
 stale metadata, hidden scratch aliasing, or accidental double-advance
 of state on the capture step.
+
+The shipped path satisfies this contract (validated on three
+sequential qwen3-6-35b-a3b requests, full 1-10 counting + 80-token
+photosynthesis output byte-identical to eager). Latency A/B at
+max_tokens=150: eager 2.315s vs replay 2.158s — replay ≈7%
+faster.
 
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
