@@ -11735,6 +11735,35 @@ impl Gemma4Bringup {
                     &self.cublaslt, &self.cutlass, &self.sliding_attention, &self.global_attention,
                     residual_ptr, stream, phase,
                 )?;
+                // Phase 4 debug: per-layer residual hash for OLD-vs-NEW
+                // bisection. Gated on RVLLM_GEMMA4_SPEC_LAYER_DUMP=1.
+                if std::env::var("RVLLM_GEMMA4_SPEC_LAYER_DUMP").as_deref() == Ok("1")
+                    && chunk_idx == 0
+                {
+                    use cudarc::driver::sys::*;
+                    self.stream.fence()?;
+                    let mut buf = vec![0u16; (chunk_q as usize) * (hidden as usize)];
+                    let rc = cuMemcpyDtoH_v2(
+                        buf.as_mut_ptr() as *mut _,
+                        residual_ptr,
+                        (chunk_q as usize) * (hidden as usize) * 2);
+                    if rc == CUresult::CUDA_SUCCESS {
+                        let mut sum_sq = 0.0f64;
+                        let mut amax = 0.0f32;
+                        for &b in &buf[..hidden as usize] {
+                            let v = half::f16::from_bits(b).to_f32();
+                            sum_sq += (v * v) as f64;
+                            if v.abs() > amax { amax = v.abs(); }
+                        }
+                        let rms = (sum_sq / hidden as f64).sqrt();
+                        let first4: Vec<f32> = buf[..4].iter()
+                            .map(|&b| half::f16::from_bits(b).to_f32()).collect();
+                        eprintln!(
+                            "[spec-old-layer-dump] layer={} k={} hidden={} \
+                             row0_rms={:.4} row0_max={:.3} row0_first4={:?}",
+                            layer_idx, chunk_q, hidden, rms, amax, first4);
+                    }
+                }
                 // Cycle 53 step 4: per-layer residual L2-norm dump for the
                 // last chunk's last few rows. Gated by
                 // RVLLM_DUMP_RESIDUAL_NORMS=1. Only dumps for the final
@@ -16718,6 +16747,110 @@ impl Gemma4Bringup {
             hidden_dim: OUT_HIDDEN,
             grid_thw: [1, pooled_rows as u32, pooled_cols as u32],
         })
+    }
+
+    /// Task #34 proper fix (Phase 1) — un-rotate Hadamard from a shadow
+    /// KV slot range, so the drafter cross-attends to HF-native K/V
+    /// regardless of whether the base writes K/V rotated by R = H · diag(D)
+    /// or not. Without this, RVLLM_NVFP4_HADAMARD=1 collapses the
+    /// drafter's attention score distribution → accept_rate ≈ 0 on 31B
+    /// (Round 7 diagnosis, commit `c29cd81`'s ensure_drafter guard).
+    ///
+    /// Layout of `shadow_*_base` is `[num_slots, nkvh, head_dim]` f16
+    /// flat (the same layout `hadamard_unrotate_f16_kernel` expects).
+    /// `signs_layer_idx` selects which per-layer sign vector to apply
+    /// (sliding source layer for K_sliding/V_sliding; full source
+    /// layer for K_global/V_global). `unrotate_v` should follow
+    /// `RVLLM_NVFP4_HADAMARD_V` — V is rotated only when that flag is
+    /// also set.
+    ///
+    /// No-op when (a) the global Hadamard flag is OFF, (b) the
+    /// per-layer signs allocation isn't present, or (c) the
+    /// `fn_hadamard_unrotate_f16` kernel isn't loaded (older kernel
+    /// tree). Caller side is responsible for wrapping a populate
+    /// call + this un-rotate call so the shadow buffer ends up in
+    /// the un-rotated (drafter-native) frame.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn apply_hadamard_unrotate_to_shadow_kv_range(
+        &self,
+        shadow_k_base: u64,
+        shadow_v_base: u64,
+        signs_layer_idx: u32,
+        slot_start: u32,
+        slot_count: u32,
+        nkvh: u32,
+        head_dim: u32,
+        unrotate_v: bool,
+        stream: u64,
+    ) -> Result<()> {
+        if slot_count == 0 { return Ok(()); }
+        if !nvfp4_hadamard_enabled() { return Ok(()); }
+        let alloc = match self.nvfp4_hadamard.lock().unwrap().as_ref() {
+            Some(a) => *a,
+            None => return Ok(()),
+        };
+        let kernel = match self.fused.fn_hadamard_unrotate_f16 {
+            Some(k) => k,
+            None => {
+                static WARN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                WARN.get_or_init(|| {
+                    eprintln!(
+                        "[spec-shadow] WARNING: nvfp4_hadamard alloc present but \
+                         hadamard_unrotate_f16.ptx not loaded; shadow KV stays \
+                         rotated — drafter cross-attn will see wrong K/V values."
+                    );
+                });
+                return Ok(());
+            }
+        };
+        let signs_ptr = alloc.base_ptr
+            + (signs_layer_idx as u64) * (alloc.head_dim as u64);
+
+        // Offset into shadow at the requested slot range.
+        let slot_bytes = (nkvh as u64) * (head_dim as u64) * 2;
+        let k_ptr = shadow_k_base + (slot_start as u64) * slot_bytes;
+        let v_ptr = shadow_v_base + (slot_start as u64) * slot_bytes;
+
+        // Helper to launch the kernel against one (K or V) buffer.
+        let launch = |buf_ptr: u64| -> Result<()> {
+            let mut x_ptr: u64 = buf_ptr;
+            let mut signs: u64 = signs_ptr;
+            let mut nt: i32 = slot_count as i32;
+            let mut nh: i32 = nkvh as i32;
+            let mut hd: i32 = head_dim as i32;
+            let args: [*mut core::ffi::c_void; 5] = [
+                &mut x_ptr as *mut _ as *mut _,
+                &mut signs as *mut _ as *mut _,
+                &mut nt    as *mut _ as *mut _,
+                &mut nh    as *mut _ as *mut _,
+                &mut hd    as *mut _ as *mut _,
+            ];
+            use cudarc::driver::sys::*;
+            let rc = cuLaunchKernel(
+                kernel.raw() as CUfunction,
+                slot_count, nkvh, 1,
+                head_dim, 1, 1,
+                0, stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "shadow_kv hadamard_unrotate_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+            Ok(())
+        };
+
+        // K is always rotated when HADAMARD=1 (base writes K_rotated to
+        // the KV cache; populate dequants that → shadow_k holds rotated).
+        launch(k_ptr)?;
+        if unrotate_v {
+            launch(v_ptr)?;
+        }
+        Ok(())
     }
 }
 
