@@ -6115,6 +6115,20 @@ impl Gemma4Bringup {
                 self.stream.fence()?;
                 sum_verify_us += t0.unwrap().elapsed().as_micros() as u64;
             }
+            // Phase 4 debug: dump per-iter base argmaxes when
+            // RVLLM_GEMMA4_SPEC_VERIFY_DUMP=1. Enabled side-by-side
+            // on the OLD + NEW paths to localize the first divergence.
+            if std::env::var("RVLLM_GEMMA4_SPEC_VERIFY_DUMP").as_deref() == Ok("1") {
+                eprintln!(
+                    "[spec-verify-dump] new_primitives={} \
+                     start_pos={} k={} \
+                     drafts={:?} base_argmax={:?}",
+                    Self::spec_new_primitives_enabled() as u32,
+                    session.committed_len, k_actual,
+                    &drafts.tokens[..k_actual.min(8)],
+                    &base_argmax_k[..k_actual.min(8)],
+                );
+            }
 
             // Step 3: greedy accept_len.
             // (Typical-acceptance: parked — falls back to greedy here.
