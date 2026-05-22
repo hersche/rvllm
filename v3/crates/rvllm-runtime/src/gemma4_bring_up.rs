@@ -5991,106 +5991,83 @@ impl Gemma4Bringup {
         let sliding_li = sources.sliding_source_layer as usize;
         let full_li = sources.full_source_layer as usize;
 
-        // Task #34 — when RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1, route
-        // the drafter to read POST-RoPE-PRE-HADAMARD-PRE-NVFP4-QUANT
-        // F16 K/V from the nvfp4-shadow region instead of dequanting
-        // the rotated-quantized NVFP4 base KV cache. With this on,
-        // drafter sees zero-quant-noise K/V → accept rate matches the
-        // HADAMARD=0 baseline even when HADAMARD=1 (preserving base
-        // long-context quality benefit).
+        // Stream-6a deeper unification (2026-05-22): the inline
+        // `shadow_view_for_layer` / `compute_view` /
+        // `effective_kv_dtype` closures are retired here. Their
+        // logic is now encapsulated in:
+        //   * `Fp8BlockBaseKvSource` — turns the per-(spec session)
+        //     locals (kv_base_ptr + offsets + dtype table + block
+        //     geometry) into a `BaseKvSource` impl.
+        //   * `ShadowOverrideBaseKvSource` — decorator that swaps in
+        //     the F16-shadow K/V pointers + `KvDtype::F16` for the
+        //     two designated source layers when
+        //     `RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1` is on and the
+        //     shadow alloc covers the layer.
+        // The four populate sites below pull pointers + dtype out of
+        // the `DrafterBaseKvView` returned by
+        // `base_kv.drafter_base_kv_view(layer_idx)?` instead of
+        // calling the closure tuple destructure + parallel
+        // `effective_kv_dtype` lookup.
         let spec_f16_shadow =
             crate::gemma4_bring_up::parse_truthy_env(
                 "RVLLM_GEMMA4_SPEC_USE_F16_SHADOW").unwrap_or(false);
-        let (shadow_alloc_ptr, shadow_layer_offsets_clone): (u64, Vec<u64>) = {
+        let (shadow_alloc_ptr, shadow_layer_offsets_vec): (u64, Vec<u64>) = {
             let g = self.nvfp4_shadow.lock().unwrap();
             match g.as_ref() {
                 Some(a) => (a.shadow_ptr, a.layer_offsets.clone()),
                 None => (0u64, Vec::new()),
             }
         };
-        // For per-source-layer override, precompute the shadow F16
-        // ptr and the per-layer bytes (= K-region size; V follows
-        // immediately after). When the shadow alloc is missing the
-        // layer (offset == u64::MAX), the override is skipped and
-        // populate falls back to the NVFP4 dequant path.
-        let shadow_view_for_layer = |layer_idx: u32| -> Option<(u64, u64)> {
-            if !spec_f16_shadow { return None; }
-            if shadow_alloc_ptr == 0 { return None; }
-            let li = layer_idx as usize;
-            if li >= shadow_layer_offsets_clone.len() { return None; }
-            let off = shadow_layer_offsets_clone[li];
-            if off == u64::MAX { return None; }
-            // Compute per-layer K-region bytes (matches
-            // build_nvfp4_shadow_alloc's layer_bytes / 2 for K).
-            let is_global = arch.layer_types[li]
+        // Per-layer K-region size (V follows in the same layer slot)
+        // for the override decorator. Computed once for each of the
+        // two source layers; matches `build_nvfp4_shadow_alloc`'s
+        // layout (`layer_bytes / 2` for K).
+        let compute_k_layer_bytes = |layer_idx: usize| -> u64 {
+            let is_global = arch.layer_types[layer_idx]
                 == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
             let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
-            let nkvh = arch.num_kv_heads_for_layer(li) as u32;
-            let hd = arch.head_dim_for_layer(li) as u32;
-            let k_layer_bytes = (layer_blocks as u64) * (block_size as u64)
-                * (nkvh as u64) * (hd as u64) * 2;
-            let base = shadow_alloc_ptr + off;
-            Some((base, base + k_layer_bytes))
+            let nkvh = arch.num_kv_heads_for_layer(layer_idx) as u32;
+            let hd = arch.head_dim_for_layer(layer_idx) as u32;
+            (layer_blocks as u64) * (block_size as u64)
+                * (nkvh as u64) * (hd as u64) * 2
         };
+        let sliding_k_layer_bytes = compute_k_layer_bytes(sliding_li);
+        let full_k_layer_bytes = compute_k_layer_bytes(full_li);
 
-        // Compute per-layer K/V pointers + scale pointers for the
-        // sliding + full source layers (used by populate_shadow_kv_range).
-        // When the F16-shadow override applies, returns the shadow ptr
-        // + zero scales (drafter will use the KvDtype::F16 path → no
-        // scale needed; caller MUST pass KvDtype::F16 for the populate).
-        let compute_view = |layer_idx: u32| -> (u64, u64, u64, u64) {
-            if let Some((sk, sv)) = shadow_view_for_layer(layer_idx) {
-                return (sk, sv, 0u64, 0u64);
-            }
-            let li = layer_idx as usize;
-            let off = kv_layer_offsets[li];
-            let scale_off = kv_scale_layer_offsets[li];
-            let is_global = arch.layer_types[li]
-                == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
-            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
-            let nkvh = arch.num_kv_heads_for_layer(li) as u32;
-            let hd = arch.head_dim_for_layer(li) as u32;
-            let layer_elems = 2u64 * layer_blocks as u64
-                * block_size as u64 * nkvh as u64 * hd as u64;
-            let dtype = kv_dtype_per_layer[li];
-            let k_v_half_bytes = match dtype {
-                crate::gemma4_layer_exec::KvDtype::F16 => layer_elems,
-                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems / 2,
-                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 4,
-            };
-            let scale_half_slots =
-                layer_blocks as u64 * block_size as u64 * nkvh as u64;
-            let scale_half_bytes = match dtype {
-                crate::gemma4_layer_exec::KvDtype::F16 => 0,
-                crate::gemma4_layer_exec::KvDtype::Fp8 => scale_half_slots * 4,
-                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 32,
-            };
-            let k_cache = kv_base_ptr + off;
-            let v_cache = k_cache + k_v_half_bytes;
-            let (k_scale, v_scale) = if dtype
-                == crate::gemma4_layer_exec::KvDtype::F16
-            {
-                (0u64, 0u64)
-            } else {
-                let k_s = kv_scale_base_ptr + scale_off;
-                (k_s, k_s + scale_half_bytes)
-            };
-            (k_cache, v_cache, k_scale, v_scale)
+        let fp8_block_base = crate::gemma4_bring_up::Fp8BlockBaseKvSource::new(
+            self,
+            kv_base_ptr,
+            kv_scale_base_ptr,
+            &kv_layer_offsets,
+            &kv_scale_layer_offsets,
+            &kv_dtype_per_layer,
+            num_blocks_total,
+            sliding_blocks,
+            block_size,
+        );
+        let base_kv = crate::gemma4_bring_up::ShadowOverrideBaseKvSource {
+            inner: fp8_block_base,
+            active: spec_f16_shadow,
+            shadow_alloc_ptr,
+            shadow_layer_offsets: &shadow_layer_offsets_vec,
+            sliding_source_layer: sliding_li,
+            full_source_layer: full_li,
+            sliding_k_layer_bytes,
+            full_k_layer_bytes,
         };
-        // Effective dtype for the populate dispatch — F16 when the
-        // override engaged (shadow source is f16), original NVFP4/FP8
-        // otherwise.
-        let effective_kv_dtype = |layer_idx: u32| -> crate::gemma4_layer_exec::KvDtype {
-            if shadow_view_for_layer(layer_idx).is_some() {
-                crate::gemma4_layer_exec::KvDtype::F16
-            } else {
-                kv_dtype_per_layer[layer_idx as usize]
-            }
-        };
-        let (sliding_k, sliding_v, sliding_ks, sliding_vs) =
-            compute_view(sources.sliding_source_layer);
-        let (full_k, full_v, full_ks, full_vs) =
-            compute_view(sources.full_source_layer);
+        use crate::gemma4_drafter::BaseKvSource as _;
+        let sliding_view = base_kv.drafter_base_kv_view(sliding_li)?;
+        let full_view = base_kv.drafter_base_kv_view(full_li)?;
+        let sliding_k = sliding_view.k_cache;
+        let sliding_v = sliding_view.v_cache;
+        let sliding_ks = sliding_view.k_scale_cache;
+        let sliding_vs = sliding_view.v_scale_cache;
+        let full_k = full_view.k_cache;
+        let full_v = full_view.v_cache;
+        let full_ks = full_view.k_scale_cache;
+        let full_vs = full_view.v_scale_cache;
+        let sliding_effective_dtype = sliding_view.kv_dtype;
+        let full_effective_dtype = full_view.kv_dtype;
 
         let (shadow_sliding_bytes, shadow_full_bytes) = {
             let guard = self.drafter.lock().unwrap();
@@ -6114,8 +6091,8 @@ impl Gemma4Bringup {
                 full_k, full_v,
                 sliding_ks, sliding_vs,
                 full_ks, full_vs,
-                effective_kv_dtype(sources.sliding_source_layer),
-                effective_kv_dtype(sources.full_source_layer),
+                sliding_effective_dtype,
+                full_effective_dtype,
                 shadow_sliding_bytes,
                 shadow_full_bytes,
                 /* slot_start */ 0,
@@ -6158,8 +6135,8 @@ impl Gemma4Bringup {
                 sources.full_source_layer,
                 sliding_k, sliding_v, full_k, full_v,
                 shadow_sliding_bytes, shadow_full_bytes,
-                effective_kv_dtype(sources.sliding_source_layer),
-                effective_kv_dtype(sources.full_source_layer),
+                sliding_effective_dtype,
+                full_effective_dtype,
             )?;
         }
 
@@ -6374,8 +6351,8 @@ impl Gemma4Bringup {
                         full_k, full_v,
                         sliding_ks, sliding_vs,
                         full_ks, full_vs,
-                        effective_kv_dtype(sources.sliding_source_layer),
-                        effective_kv_dtype(sources.full_source_layer),
+                        sliding_effective_dtype,
+                        full_effective_dtype,
                         shadow_sliding_bytes,
                         shadow_full_bytes,
                         /* slot_start */ old_committed,
@@ -6454,8 +6431,8 @@ impl Gemma4Bringup {
                         full_k, full_v,
                         sliding_ks, sliding_vs,
                         full_ks, full_vs,
-                        effective_kv_dtype(sources.sliding_source_layer),
-                        effective_kv_dtype(sources.full_source_layer),
+                        sliding_effective_dtype,
+                        full_effective_dtype,
                         shadow_sliding_bytes,
                         shadow_full_bytes,
                         /* slot_start */ bonus_slot,
@@ -6538,8 +6515,8 @@ impl Gemma4Bringup {
                         full_k, full_v,
                         sliding_ks, sliding_vs,
                         full_ks, full_vs,
-                        effective_kv_dtype(sources.sliding_source_layer),
-                        effective_kv_dtype(sources.full_source_layer),
+                        sliding_effective_dtype,
+                        full_effective_dtype,
                         shadow_sliding_bytes,
                         shadow_full_bytes,
                         /* slot_start */ old_committed,
@@ -16892,5 +16869,97 @@ impl<'a> crate::gemma4_drafter::BaseKvSource for Fp8BlockBaseKvSource<'a> {
 
     fn assistant_shared_kv_sources(&self) -> Option<(usize, usize)> {
         self.bringup.arch.assistant_shared_kv_sources()
+    }
+}
+
+// =====================================================================
+// Stream-6a deeper unification (2026-05-22): decorator that wraps any
+// `BaseKvSource` and overrides specific source layers with F16-shadow
+// pointers when `RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1` is on and the
+// shadow allocation covers the layer.
+//
+// Replaces the inline `compute_view` / `shadow_view_for_layer` /
+// `effective_kv_dtype` closures that previously lived at the top of
+// `run_generate_speculative_batched`. The decorator pattern keeps the
+// trait surface clean: `BaseKvSource::drafter_base_kv_view` for both
+// the rotated NVFP4/FP8 base path AND the un-rotated F16 shadow
+// path. Callers go through ONE method, get a `DrafterBaseKvView`
+// with the right pointers + dtype + scale pair, no per-call tuple
+// destructuring + parallel dtype lookup.
+// =====================================================================
+
+/// Decorator over a `BaseKvSource` that swaps in the F16-shadow K/V
+/// pointers + `KvDtype::F16` + zero scale ptrs for two designated
+/// source layers when active. Used for Gemma 4 31B spec-decode's
+/// `RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1` path: the drafter sees the
+/// post-RoPE / pre-Hadamard F16 K/V instead of de-quanting the
+/// rotated NVFP4 base cache (`bf6af65` un-rotate-in-populate is the
+/// alternative path).
+///
+/// When `active = false` or the layer is NOT one of
+/// `(sliding_src, full_src)` or the shadow alloc doesn't cover the
+/// layer (sentinel `u64::MAX`), the decorator just delegates to the
+/// inner `BaseKvSource` unchanged. So this is safe to ALWAYS layer
+/// on top of `Fp8BlockBaseKvSource` — the override only kicks in
+/// when the operator opts in.
+pub struct ShadowOverrideBaseKvSource<'a, B: crate::gemma4_drafter::BaseKvSource> {
+    pub inner: B,
+    pub active: bool,
+    pub shadow_alloc_ptr: u64,
+    pub shadow_layer_offsets: &'a [u64],
+    /// Source layer pair the override targets. Only these two layer
+    /// indices get the F16-shadow swap; all other layers pass
+    /// through `inner`.
+    pub sliding_source_layer: usize,
+    pub full_source_layer: usize,
+    /// `(layer_idx) → k_layer_bytes` for the layer's K region in
+    /// the shadow buffer (V follows immediately after K). Computed
+    /// once per source layer and stored as a small lookup so the
+    /// trait method stays cheap.
+    pub sliding_k_layer_bytes: u64,
+    pub full_k_layer_bytes: u64,
+}
+
+impl<'a, B: crate::gemma4_drafter::BaseKvSource>
+    crate::gemma4_drafter::BaseKvSource for ShadowOverrideBaseKvSource<'a, B>
+{
+    fn drafter_base_kv_view(
+        &self, layer_idx: usize,
+    ) -> Result<crate::gemma4_drafter::DrafterBaseKvView> {
+        if !self.active || self.shadow_alloc_ptr == 0 {
+            return self.inner.drafter_base_kv_view(layer_idx);
+        }
+        if layer_idx != self.sliding_source_layer
+            && layer_idx != self.full_source_layer
+        {
+            return self.inner.drafter_base_kv_view(layer_idx);
+        }
+        if layer_idx >= self.shadow_layer_offsets.len() {
+            return self.inner.drafter_base_kv_view(layer_idx);
+        }
+        let off = self.shadow_layer_offsets[layer_idx];
+        if off == u64::MAX {
+            return self.inner.drafter_base_kv_view(layer_idx);
+        }
+        let k_layer_bytes = if layer_idx == self.sliding_source_layer {
+            self.sliding_k_layer_bytes
+        } else {
+            self.full_k_layer_bytes
+        };
+        let base_ptr = self.shadow_alloc_ptr + off;
+        // Start from the inner view so block_size / max_blocks_per_seq
+        // / num_blocks_total / block_tables / context_lens carry
+        // through; only swap the data pointers + dtype + scale ptrs.
+        let mut view = self.inner.drafter_base_kv_view(layer_idx)?;
+        view.k_cache = base_ptr;
+        view.v_cache = base_ptr + k_layer_bytes;
+        view.k_scale_cache = 0;
+        view.v_scale_cache = 0;
+        view.kv_dtype = crate::gemma4_layer_exec::KvDtype::F16;
+        Ok(view)
+    }
+
+    fn assistant_shared_kv_sources(&self) -> Option<(usize, usize)> {
+        self.inner.assistant_shared_kv_sources()
     }
 }
