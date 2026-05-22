@@ -2359,7 +2359,13 @@ impl Gemma4Bringup {
             "RVLLM_NVFP4_HADAMARD_V").unwrap_or(false);
         let allow_bypass = crate::gemma4_bring_up::parse_truthy_env(
             "RVLLM_GEMMA4_SPEC_ALLOW_HADAMARD").unwrap_or(false);
-        if (had || had_v) && !allow_bypass &&
+        // Task #34 Phase 2 (commits f6d0b5d + this commit): when the
+        // shadow-KV un-rotate path is wired, HADAMARD=1 + SPEC=1 is
+        // safe — the shadow ends up in HF-native frame after each
+        // populate. Treat the un-rotate gate as an implicit bypass.
+        let unrotate_active = crate::gemma4_bring_up::parse_truthy_env(
+            "RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW").unwrap_or(false);
+        if (had || had_v) && !allow_bypass && !unrotate_active &&
             crate::gemma4_bring_up::parse_truthy_env(
                 "RVLLM_GEMMA4_SPEC_DECODE").unwrap_or(false)
         {
@@ -5991,6 +5997,11 @@ impl Gemma4Bringup {
                 stream,
             )?;
         }
+        // Task #34 Phase 2: un-rotate Hadamard from the freshly-populated
+        // shadow slots so the drafter cross-attends in HF-native frame.
+        // No-op unless RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1.
+        self.unrotate_shadow_kv_after_populate(
+            sources, 0, prompt_ids.len() as u32, stream)?;
 
         // === RVLLM_SPEC_DUMP_DIR ONE-SHOT DUMP =====================
         // Codex Round 4 Q5: dump the inputs the drafter receives at
@@ -6239,6 +6250,11 @@ impl Gemma4Bringup {
                         stream,
                     )?;
                 }
+                // Task #34 Phase 2: un-rotate Hadamard from freshly-
+                // populated shadow slots. No-op unless
+                // RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1.
+                self.unrotate_shadow_kv_after_populate(
+                    sources, old_committed, accept_len as u32, stream)?;
 
                 // Codex Round 9 #2: commit-before-emit invariant.
                 // Bonus's base K/V and shadow K/V must be committed
@@ -6310,6 +6326,9 @@ impl Gemma4Bringup {
                         stream,
                     )?;
                 }
+                // Task #34 Phase 2: un-rotate the bonus's shadow slot.
+                self.unrotate_shadow_kv_after_populate(
+                    sources, bonus_slot, 1, stream)?;
                 if perf_trace {
                     self.stream.fence()?;
                     sum_shadow_us += t0.unwrap().elapsed().as_micros() as u64;
@@ -6370,21 +6389,26 @@ impl Gemma4Bringup {
 
                 // Shadow KV update for the single new committed slot
                 let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
-                let guard = self.drafter.lock().unwrap();
-                let d = guard.as_ref().expect("drafter resident");
-                d.populate_shadow_kv_range_from_base(
-                    sliding_k, sliding_v,
-                    full_k, full_v,
-                    sliding_ks, sliding_vs,
-                    full_ks, full_vs,
-                    kv_dtype_per_layer[sliding_li],
-                    kv_dtype_per_layer[full_li],
-                    shadow_sliding_bytes,
-                    shadow_full_bytes,
-                    /* slot_start */ old_committed,
-                    /* slot_count */ 1,
-                    stream,
-                )?;
+                {
+                    let guard = self.drafter.lock().unwrap();
+                    let d = guard.as_ref().expect("drafter resident");
+                    d.populate_shadow_kv_range_from_base(
+                        sliding_k, sliding_v,
+                        full_k, full_v,
+                        sliding_ks, sliding_vs,
+                        full_ks, full_vs,
+                        kv_dtype_per_layer[sliding_li],
+                        kv_dtype_per_layer[full_li],
+                        shadow_sliding_bytes,
+                        shadow_full_bytes,
+                        /* slot_start */ old_committed,
+                        /* slot_count */ 1,
+                        stream,
+                    )?;
+                }
+                // Task #34 Phase 2: un-rotate the deferred-bonus slot.
+                self.unrotate_shadow_kv_after_populate(
+                    sources, old_committed, 1, stream)?;
                 if perf_trace {
                     self.stream.fence()?;
                     sum_shadow_us += t0.unwrap().elapsed().as_micros() as u64;
@@ -16747,6 +16771,74 @@ impl Gemma4Bringup {
             hidden_dim: OUT_HIDDEN,
             grid_thw: [1, pooled_rows as u32, pooled_cols as u32],
         })
+    }
+
+    /// Task #34 Phase 2 — convenience wrapper that runs un-rotate on
+    /// both source layers' shadow K/V slot range. Called immediately
+    /// after `populate_shadow_kv_range_from_base` so the shadow ends
+    /// up in HF-native (un-rotated) frame, which is what the drafter
+    /// expects.
+    ///
+    /// `sources` provides the (sliding, full) base layer indices —
+    /// these select which per-layer Hadamard sign vector to apply.
+    /// Slot range `[slot_start, slot_start + slot_count)` is the same
+    /// range the caller passed to populate.
+    ///
+    /// No-op when `RVLLM_NVFP4_HADAMARD=0` (or alloc absent / kernel
+    /// missing). V is un-rotated only when `RVLLM_NVFP4_HADAMARD_V=1`.
+    /// Gated behind `RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1` for safety
+    /// during Phase 2 bring-up — flipping the default ON moves with
+    /// the `ensure_drafter` HADAMARD-vs-spec guard relaxation.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn unrotate_shadow_kv_after_populate(
+        &self,
+        sources: Gemma4AssistantKvSources,
+        slot_start: u32,
+        slot_count: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if slot_count == 0 { return Ok(()); }
+        if !parse_truthy_env("RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW").unwrap_or(false) {
+            return Ok(());
+        }
+        let unrotate_v = parse_truthy_env("RVLLM_NVFP4_HADAMARD_V").unwrap_or(false);
+        // Pull shadow ptrs + dims from the resident drafter.
+        let (s_k, s_v, s_nkvh, s_hd, f_k, f_v, f_nkvh, f_hd) = {
+            let guard = self.drafter.lock().unwrap();
+            let d = match guard.as_ref() {
+                Some(d) => d,
+                None => return Ok(()),
+            };
+            let s = match d.shadow_kv {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            (
+                s.sliding_k_ptr, s.sliding_v_ptr,
+                s.sliding_num_kv_heads, s.sliding_head_dim,
+                s.full_k_ptr, s.full_v_ptr,
+                s.full_num_kv_heads, s.full_head_dim,
+            )
+        };
+        // Sliding source layer — sliding-K shadow + (optionally) V.
+        self.apply_hadamard_unrotate_to_shadow_kv_range(
+            s_k, s_v,
+            sources.sliding_source_layer,
+            slot_start, slot_count,
+            s_nkvh, s_hd,
+            unrotate_v,
+            stream,
+        )?;
+        // Full source layer — global-K shadow + (optionally) V.
+        self.apply_hadamard_unrotate_to_shadow_kv_range(
+            f_k, f_v,
+            sources.full_source_layer,
+            slot_start, slot_count,
+            f_nkvh, f_hd,
+            unrotate_v,
+            stream,
+        )?;
+        Ok(())
     }
 
     /// Task #34 proper fix (Phase 1) — un-rotate Hadamard from a shadow
