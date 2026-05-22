@@ -467,6 +467,12 @@ pub struct Fa2PtxKernels {
     /// to fall back to the per-Q split kernel for A/B comparisons.
     #[cfg(feature = "cuda")]
     pub fn_decode_nvfp4kv_split_gqa: Option<rvllm_kernels::KernelFn>,
+    /// MAX_GQA_SPLIT=16 sibling — adaptive dispatch picks this when
+    /// actual GQA ratio exceeds the default cap of 8 (Mistral 3.5
+    /// GQA=12, Gemma 4 31B global GQA=8 on long-context split path,
+    /// Qwen 3.6 35B-A3B GQA=8). Falls back to per-Q split when None.
+    #[cfg(feature = "cuda")]
+    pub fn_decode_nvfp4kv_split_gqa_max16: Option<rvllm_kernels::KernelFn>,
     /// Codex41-2: pre-fills sentinel slots [0, partition_offset) so
     /// the main split kernel can launch only the in-window CTAs.
     /// Lives in the same `flash_attention_split_decode_nvfp4kv` PTX
@@ -668,6 +674,7 @@ impl Fa2PtxKernels {
                 fn_decode_nvfp4kv_split_bc16,
                 fn_paged_attn_reduce_f16,
                 fn_decode_nvfp4kv_split_gqa,
+                fn_decode_nvfp4kv_split_gqa_max16,
                 fn_init_split_scratch_sentinels,
             ) = match loader.load_ptx("flash_attention_split_decode_nvfp4kv") {
                 Ok(m) => {
@@ -679,14 +686,16 @@ impl Fa2PtxKernels {
                         "paged_attention_reduce_f16_kernel").ok();
                     let gqa = m.get_function(
                         "flash_attention_2_decode_nvfp4kv_split_gqa_kernel").ok();
+                    let gqa16 = m.get_function(
+                        "flash_attention_2_decode_nvfp4kv_split_gqa_max16_kernel").ok();
                     // Codex41-2: sentinel-init kernel. `.ok()` keeps
                     // older PTX trees loadable; the launcher detects
                     // None and falls back to launching all partitions.
                     let init = m.get_function(
                         "init_split_scratch_sentinels_kernel").ok();
-                    (Some(m), s32, s16, r, gqa, init)
+                    (Some(m), s32, s16, r, gqa, gqa16, init)
                 }
-                Err(_) => (None, None, None, None, None, None),
+                Err(_) => (None, None, None, None, None, None, None),
             };
 
             Ok(Self {
@@ -735,6 +744,7 @@ impl Fa2PtxKernels {
                 fn_decode_nvfp4kv_split_bc16,
                 fn_paged_attn_reduce_f16,
                 fn_decode_nvfp4kv_split_gqa,
+                fn_decode_nvfp4kv_split_gqa_max16,
                 fn_init_split_scratch_sentinels,
             })
         }

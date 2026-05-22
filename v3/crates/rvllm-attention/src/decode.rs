@@ -1251,20 +1251,40 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             // larger than that, so the reduce phase would read
             // uninitialised scratch. Gemma 4 ratio = 4, well within
             // the cap, but the gate is generic.
-            const MAX_GQA_SPLIT: u32 = 8;
+            // Adaptive cap: default MAX_GQA_SPLIT=8 covers the majority
+            // (Gemma 4 sliding GQA=2, Qwen 27B GQA=4, Mistral 3.5 GQA=12
+            // → no, that overflows 8 — picks _max16 path). _max16 sibling
+            // raises the cap to 16 for Mistral 3.5 GQA=12 + Gemma 4 31B
+            // global GQA=8 + Qwen 3.6 35B-A3B GQA=8 on long-context
+            // split-decode. Host picks the smallest fitting variant to
+            // minimise register pressure per-thread.
+            const MAX_GQA_SPLIT_DEFAULT: u32 = 8;
+            const MAX_GQA_SPLIT_MAX16: u32 = 16;
             let gqa_ratio = if params.num_kv_heads > 0 {
                 params.num_heads / params.num_kv_heads
             } else {
                 0
             };
-            let want_gqa_shared = !output_bf16
+            let gqa_env_on = std::env::var_os("RVLLM_NVFP4_SPLIT_GQA")
+                .map(|v| v == "1" || v == "true" || v == "TRUE")
+                .unwrap_or(true);
+            let max16_kernel_available =
+                fa2.fn_decode_nvfp4kv_split_gqa_max16.is_some();
+            let want_gqa_default = !output_bf16
                 && hd <= 256
                 && gqa_ratio >= 2
-                && gqa_ratio <= MAX_GQA_SPLIT
-                && std::env::var_os("RVLLM_NVFP4_SPLIT_GQA")
-                    .map(|v| v == "1" || v == "true" || v == "TRUE")
-                    .unwrap_or(true);
-            let split_fn = if want_gqa_shared && fa2.fn_decode_nvfp4kv_split_gqa.is_some() {
+                && gqa_ratio <= MAX_GQA_SPLIT_DEFAULT
+                && gqa_env_on;
+            let want_gqa_max16 = !output_bf16
+                && hd <= 256
+                && gqa_ratio > MAX_GQA_SPLIT_DEFAULT
+                && gqa_ratio <= MAX_GQA_SPLIT_MAX16
+                && gqa_env_on
+                && max16_kernel_available;
+            let want_gqa_shared = want_gqa_default || want_gqa_max16;
+            let split_fn = if want_gqa_max16 && fa2.fn_decode_nvfp4kv_split_gqa_max16.is_some() {
+                fa2.fn_decode_nvfp4kv_split_gqa_max16
+            } else if want_gqa_default && fa2.fn_decode_nvfp4kv_split_gqa.is_some() {
                 fa2.fn_decode_nvfp4kv_split_gqa
             } else if output_bf16 {
                 if hd > 256 {
@@ -1323,7 +1343,7 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             // Codex36-3: GQA-shared variant carries one score row per
             // q-head in the kv-group, so the score region scales with
             // GQA. K/V tiles + reduce scratch unchanged.
-            let gqa_factor = if want_gqa_shared && fa2.fn_decode_nvfp4kv_split_gqa.is_some() {
+            let gqa_factor = if want_gqa_shared {
                 (params.num_heads / params.num_kv_heads.max(1)) as i32
             } else {
                 1
@@ -1479,7 +1499,7 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             let launch_z = total_parts.saturating_sub(part_off_i as u32).max(1);
             // Codex36-3: GQA-shared variant collapses gridDim.y from
             // num_heads to num_kv_heads.
-            let launch_y = if want_gqa_shared && fa2.fn_decode_nvfp4kv_split_gqa.is_some() {
+            let launch_y = if want_gqa_shared {
                 params.num_kv_heads as u32
             } else {
                 params.num_heads as u32
@@ -1688,6 +1708,7 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                 } else {
                     fa2.fn_decode_nvfp4kv_split.is_some()
                         || (gqa_env_on && fa2.fn_decode_nvfp4kv_split_gqa.is_some())
+                        || (gqa_env_on && fa2.fn_decode_nvfp4kv_split_gqa_max16.is_some())
                 };
                 split_for_hd && fa2.fn_paged_attn_reduce_f16.is_some()
             }
