@@ -3297,11 +3297,11 @@ impl Gemma4Nvfp4Bringup {
     /// has num_q_heads=32, num_kv_heads=16, head_dim=256.
     ///
     /// The Q/K outputs from `gemma4_nvfp4_attn_proj` are f32
-    /// [1, N], so we first narrow to bf16 with the existing
-    /// `f32_to_bf16` cast (TODO: this commit uses a host-side
-    /// narrow via a tiny scratch CPU path because the cast
-    /// kernel handle isn't yet on ForwardKernels; a follow-up
-    /// micro-commit adds the GPU cast).
+    /// [1, N]; we narrow to bf16 via the device-side
+    /// `f32_to_bf16_kernel` (commit 47fd34c+ replaces the prior
+    /// host-side narrow). Production decode path uses the same
+    /// kernel via `launch_f32_to_bf16` so this smoke is now in
+    /// lock-step with prod.
     pub fn forward_layer0_qk_norm(&self, token_id: u32) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let _scratch_guard = self.forward_scratch_guard();
         let (q_f32, k_f32, v_f32) = self.forward_layer0_qkv_only(token_id)?;
@@ -3312,46 +3312,49 @@ impl Gemma4Nvfp4Bringup {
         debug_assert_eq!(q_f32.len(), (num_q_heads * head_dim) as usize);
         debug_assert_eq!(k_f32.len(), (num_kv_heads * head_dim) as usize);
 
-        // f32 → bf16 narrow on host (one-time small buffer for
-        // the smoke; a GPU `f32_to_bf16_kernel` cast is the
-        // production path).
-        let q_bf16_host: Vec<u16> = q_f32
-            .iter()
-            .map(|&x| {
-                let bits = x.to_bits();
-                // Round-to-nearest-even bf16 narrow.
-                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-                (rounded >> 16) as u16
-            })
-            .collect();
-        let k_bf16_host: Vec<u16> = k_f32
-            .iter()
-            .map(|&x| {
-                let bits = x.to_bits();
-                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-                (rounded >> 16) as u16
-            })
-            .collect();
-
-        // Upload to device, run per-head RMSNorm in place.
-        let q_region = self
+        // Upload f32 to device, then GPU-narrow to bf16 in place
+        // via launch_f32_to_bf16 (production kernel). The narrowed
+        // bf16 lands in a separate region so the f32 source stays
+        // available if a future regression probe needs it.
+        let q_f32_bytes = q_f32.len() * 4;
+        let k_f32_bytes = k_f32.len() * 4;
+        let q_f32_region = self
             .arena
-            .region("gemma4_nvfp4_qk_q", q_bf16_host.len() * 2, 256)?;
-        let k_region = self
+            .region("gemma4_nvfp4_qk_q_f32", q_f32_bytes, 256)?;
+        let k_f32_region = self
             .arena
-            .region("gemma4_nvfp4_qk_k", k_bf16_host.len() * 2, 256)?;
+            .region("gemma4_nvfp4_qk_k_f32", k_f32_bytes, 256)?;
         unsafe {
             let q_bytes: &[u8] = std::slice::from_raw_parts(
-                q_bf16_host.as_ptr() as *const u8,
-                q_bf16_host.len() * 2,
+                q_f32.as_ptr() as *const u8,
+                q_f32_bytes,
             );
             let k_bytes: &[u8] = std::slice::from_raw_parts(
-                k_bf16_host.as_ptr() as *const u8,
-                k_bf16_host.len() * 2,
+                k_f32.as_ptr() as *const u8,
+                k_f32_bytes,
             );
-            q_region.copy_from_host(q_bytes)?;
-            k_region.copy_from_host(k_bytes)?;
+            q_f32_region.copy_from_host(q_bytes)?;
+            k_f32_region.copy_from_host(k_bytes)?;
         }
+        let q_region = self
+            .arena
+            .region("gemma4_nvfp4_qk_q", q_f32.len() * 2, 256)?;
+        let k_region = self
+            .arena
+            .region("gemma4_nvfp4_qk_k", k_f32.len() * 2, 256)?;
+        // GPU narrow: f32 → bf16 via the production f32_to_bf16_kernel.
+        // Replaces the prior host-side round-to-nearest-even loop
+        // (TODO from commit 5xxx — closed).
+        self.launch_f32_to_bf16(
+            q_region.device_ptr(),
+            q_f32_region.device_ptr(),
+            q_f32.len() as u32,
+        )?;
+        self.launch_f32_to_bf16(
+            k_region.device_ptr(),
+            k_f32_region.device_ptr(),
+            k_f32.len() as u32,
+        )?;
         let stream_u64 = self.stream.raw();
         unsafe {
             // Q-norm: num_tokens=num_q_heads, hidden=head_dim,
@@ -3384,8 +3387,8 @@ impl Gemma4Nvfp4Bringup {
         self.stream.fence()?;
 
         // Read back and convert to f32 for caller inspection.
-        let mut q_bf16_out = vec![0u16; q_bf16_host.len()];
-        let mut k_bf16_out = vec![0u16; k_bf16_host.len()];
+        let mut q_bf16_out = vec![0u16; q_f32.len()];
+        let mut k_bf16_out = vec![0u16; k_f32.len()];
         unsafe {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoH_v2(
