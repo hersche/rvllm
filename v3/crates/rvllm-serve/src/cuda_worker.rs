@@ -1795,6 +1795,21 @@ pub async fn spawn_cuda_worker(
                                 .unwrap_or(false);
                         let need_workspace =
                             decode_graph_on || decode_workspace_only;
+                        // Phase 8: clear any stale captured graph
+                        // from a prior request. The graph holds
+                        // device-pointer references to per-call
+                        // arena allocations released by
+                        // `arena.restore(scratch_ck)` at the end of
+                        // each request; replaying a stale graph
+                        // against reclaimed memory hangs or
+                        // produces garbage. Must precede
+                        // `alloc_decode_workspace` so the workspace
+                        // allocations land at the same addresses
+                        // every request (deterministic arena bumps
+                        // after the checkpoint restore).
+                        if decode_graph_on {
+                            qwen.clear_decode_capture();
+                        }
                         let decode_workspace = if need_workspace {
                             match qwen.alloc_decode_workspace() {
                                 Ok(w) => Some(w),
@@ -1887,11 +1902,14 @@ pub async fn spawn_cuda_worker(
                                         .map(|t| t as i32)
                                 } else {
                                     // Workspace-eager isolation mode:
-                                    // write token to workspace.token_dev,
-                                    // run the workspace-driven step,
-                                    // extract via argmax_dev_to_host_token.
-                                    // NO capture, NO replay.
+                                    // write token + position to workspace
+                                    // device slots, run the workspace-driven
+                                    // step, extract via
+                                    // argmax_dev_to_host_token. NO capture,
+                                    // NO replay.
                                     qwen.write_token_to_workspace(ws, next_token as i32)
+                                        .and_then(|()|
+                                            qwen.write_position_to_workspace(ws, pos))
                                         .and_then(|()|
                                             qwen.forward_qwen36_decode_step_to_workspace(ws, pos))
                                         .and_then(|()| qwen.argmax_dev_to_host_token(
@@ -1902,7 +1920,16 @@ pub async fn spawn_cuda_worker(
                                     &[next_token], pos, &[])
                             };
                             match step_res {
-                                Ok(t) => next_token = t,
+                                Ok(t) => {
+                                    if std::env::var("RVLLM_QWEN36_DECODE_DEBUG_TOKENS").as_deref()
+                                        == Ok("1")
+                                    {
+                                        tracing::info!(
+                                            step, pos, token = t, "qwen36 decode step token"
+                                        );
+                                    }
+                                    next_token = t;
+                                }
                                 Err(e) => {
                                     let _ = req.events_tx.send(GenerateEvent::Error(
                                         format!("qwen36 decode step {step}: {e:?}"),

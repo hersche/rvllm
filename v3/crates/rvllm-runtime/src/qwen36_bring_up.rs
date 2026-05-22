@@ -656,6 +656,20 @@ impl Qwen36Bringup {
         Ok(())
     }
 
+    /// Phase 8: clear any cached captured graph. The captured graph
+    /// holds device-pointer references to per-call arena
+    /// allocations (positions_region, hidden_region, q_split_region,
+    /// etc.) which are released by `arena.restore(scratch_ck)` at
+    /// the END of each request. The worker MUST call this BEFORE
+    /// the next request's `alloc_decode_workspace` so a stale
+    /// captured graph from request N doesn't replay against
+    /// reclaimed memory in request N+1 (which manifests as a hang
+    /// or wrong output).
+    pub fn clear_decode_capture(&self) {
+        let mut guard = self.decode_capture.lock().unwrap();
+        *guard = None;
+    }
+
     /// Phase 8 commit 3: high-level decode-step entry that picks
     /// capture vs eager vs replay based on the operator gate
     /// (`RVLLM_QWEN36_DECODE_GRAPH=1`) and the current capture
@@ -686,23 +700,12 @@ impl Qwen36Bringup {
         let stream_u64 = self.stream.raw() as u64;
         // Write the current token to workspace.token_dev — both
         // capture and replay paths read from this stable pointer.
-        unsafe {
-            use cudarc::driver::sys::*;
-            let tok_host = token_id;
-            let rc = cuMemcpyHtoDAsync_v2(
-                workspace.token_dev as CUdeviceptr,
-                (&tok_host) as *const i32 as *const _,
-                4,
-                stream_u64 as CUstream,
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 decode_step: workspace.token_dev HtoD",
-                    rvllm_core::CudaErrorKind::MemcpyFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
-        }
+        self.write_token_to_workspace(workspace, token_id)?;
+        // Phase 8 position-indirect: write the current position to
+        // workspace.pos_dev / ctx_dev so captured-replay reads the
+        // updated values (not step-0's frozen scalar).
+        self.write_position_to_workspace(workspace, position)?;
+        let _ = stream_u64;
 
         let graph_enabled =
             crate::qwen36_decode_workspace::qwen36_decode_graph_enabled();
@@ -793,7 +796,7 @@ impl Qwen36Bringup {
         // arbitrary i32 so the inner function's debug paths still
         // see a non-empty slice when something downstream needs it.
         let dummy_tok = [0i32; 1];
-        self.forward_qwen36_decode_inner_with_workspace_overrides(
+        self.forward_qwen36_decode_inner_with_workspace_overrides_v2(
             &dummy_tok,
             position,
             /* vision_splice */ &[],
@@ -803,7 +806,54 @@ impl Qwen36Bringup {
             /* mtp_shadow_out */ None,
             Some(workspace.token_dev),
             Some(workspace.argmax_token_dev),
+            // Phase 8 position-indirect: stable workspace pos/ctx
+            // slots. Worker writes both BEFORE calling this method
+            // (see Qwen36Bringup::write_position_to_workspace).
+            // Captured graph reads from these stable pointers, so
+            // replay picks up per-step values without freezing
+            // step-0's scalar.
+            Some(workspace.pos_dev),
+            Some(workspace.ctx_dev),
         )?;
+        Ok(())
+    }
+
+    /// Phase 8 helper: write the per-step `position` to
+    /// `workspace.pos_dev` and `position + 1` to `workspace.ctx_dev`
+    /// (the qwen36 context-length convention is `position + 1` for
+    /// a causal decode step). Both via cuMemsetD32Async on the
+    /// stream. Companion to `write_token_to_workspace` — the worker
+    /// calls both before each decode step.
+    #[cfg(feature = "cuda")]
+    pub fn write_position_to_workspace(
+        &self,
+        workspace:
+            &crate::qwen36_decode_workspace::Qwen36DecodeWorkspace,
+        position: u32,
+    ) -> Result<()> {
+        use cudarc::driver::sys::*;
+        unsafe {
+            let stream = self.stream.raw() as CUstream;
+            let rc1 = cuMemsetD32Async(
+                workspace.pos_dev as CUdeviceptr,
+                position,
+                1,
+                stream,
+            );
+            let rc2 = cuMemsetD32Async(
+                workspace.ctx_dev as CUdeviceptr,
+                position + 1,
+                1,
+                stream,
+            );
+            if rc1 != CUresult::CUDA_SUCCESS || rc2 != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 write_position_to_workspace cuMemsetD32Async",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -4830,11 +4880,46 @@ impl Qwen36Bringup {
         start_position: u32,
         vision_splice: &[(usize, &[u8])],
         cancel: Option<&std::sync::atomic::AtomicBool>,
+        all_argmaxes: Option<&mut Vec<i32>>,
+        skip_closer: bool,
+        mtp_shadow_out: Option<&mut Option<i32>>,
+        tok_device_override: Option<u64>,
+        closer_argmax_dev: Option<u64>,
+    ) -> Result<i32> {
+        self.forward_qwen36_decode_inner_with_workspace_overrides_v2(
+            token_ids, start_position, vision_splice, cancel,
+            all_argmaxes, skip_closer, mtp_shadow_out,
+            tok_device_override, closer_argmax_dev,
+            /* pos_dev_override */ None,
+            /* ctx_dev_override */ None,
+        )
+    }
+
+    /// Phase 8 position-indirect overrides: `pos_dev_override` and
+    /// `ctx_dev_override` point at caller-managed STABLE i32 device
+    /// slots holding the current decode step's absolute position
+    /// and context-length. When both `Some` (and num_tokens=1), the
+    /// per-call `positions_region` + `context_lens_region` arena
+    /// allocations + the `qwen_fill_pos_slots_i32` fill kernel are
+    /// SKIPPED — `tok_pos_dev_ptr` / `tok_cl_dev_ptr` bind directly
+    /// to the overrides. This is the missing piece that makes
+    /// captured-graph REPLAY produce correct output across moving
+    /// positions: the captured graph reads from the stable
+    /// `workspace.pos_dev` / `workspace.ctx_dev` slots, and the
+    /// worker writes those slots per step BEFORE replay.
+    fn forward_qwen36_decode_inner_with_workspace_overrides_v2(
+        &self,
+        token_ids: &[i32],
+        start_position: u32,
+        vision_splice: &[(usize, &[u8])],
+        cancel: Option<&std::sync::atomic::AtomicBool>,
         mut all_argmaxes: Option<&mut Vec<i32>>,
         skip_closer: bool,
         mtp_shadow_out: Option<&mut Option<i32>>,
         tok_device_override: Option<u64>,
         closer_argmax_dev: Option<u64>,
+        pos_dev_override: Option<u64>,
+        ctx_dev_override: Option<u64>,
     ) -> Result<i32> {
         if token_ids.is_empty() {
             return Err(rvllm_core::RvllmError::cuda(
@@ -5035,40 +5120,51 @@ impl Qwen36Bringup {
                 ));
             }
         }
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let mut pos_ptr = positions_region.device_ptr();
-            let mut cl_ptr = context_lens_region.device_ptr();
-            let mut start = start_position as i32;
-            let mut nt = num_tokens as i32;
-            let args = [
-                (&mut pos_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut cl_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut start) as *mut i32 as *mut core::ffi::c_void,
-                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let block: u32 = 256;
-            let grid: u32 = ((num_tokens + block - 1) / block).max(1);
-            let rc = cuLaunchKernel(
-                self.outside_kernels.fn_qwen_fill_pos_slots_i32.raw() as CUfunction,
-                grid,
-                1,
-                1,
-                block,
-                1,
-                1,
-                0,
-                self.stream.raw() as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 prefill: qwen_fill_pos_slots_i32 launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
+        // Phase 8 position-indirect: skip the fill kernel when the
+        // caller provided stable pos/ctx device slots. Worker is
+        // responsible for writing the per-step values to those
+        // slots BEFORE invoking the decode-step entry. Without the
+        // skip, the captured graph would record the scalar `start`
+        // arg at capture time and re-apply step-0's position on
+        // every replay — the position-frozen failure mode.
+        let pos_ctx_overridden =
+            pos_dev_override.is_some() && ctx_dev_override.is_some();
+        if !pos_ctx_overridden {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut pos_ptr = positions_region.device_ptr();
+                let mut cl_ptr = context_lens_region.device_ptr();
+                let mut start = start_position as i32;
+                let mut nt = num_tokens as i32;
+                let args = [
+                    (&mut pos_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut cl_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut start) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid: u32 = ((num_tokens + block - 1) / block).max(1);
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_qwen_fill_pos_slots_i32.raw() as CUfunction,
+                    grid,
+                    1,
+                    1,
+                    block,
+                    1,
+                    1,
+                    0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 prefill: qwen_fill_pos_slots_i32 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
         }
         // Per-token scratch checkpoint — bounds arena growth to ONE
@@ -5423,8 +5519,21 @@ impl Qwen36Bringup {
             // device-filled arrays from the single launch above; no
             // per-token HtoD anymore. Per-token full-attn calls below
             // pass `positions + t*4` / `context_lens + t*4`.
-            let tok_pos_dev_ptr = positions_region.device_ptr() + (tok_local as u64) * 4;
-            let tok_cl_dev_ptr = context_lens_region.device_ptr() + (tok_local as u64) * 4;
+            // Phase 8 position-indirect: when both pos+ctx overrides
+            // are present, bind directly to the stable workspace
+            // slots. For tok_local > 0 this would be wrong (single-
+            // token override only), but pos_ctx_overridden is only
+            // set when num_tokens=1 → tok_local always 0.
+            let tok_pos_dev_ptr = if pos_ctx_overridden {
+                pos_dev_override.unwrap()
+            } else {
+                positions_region.device_ptr() + (tok_local as u64) * 4
+            };
+            let tok_cl_dev_ptr = if pos_ctx_overridden {
+                ctx_dev_override.unwrap()
+            } else {
+                context_lens_region.device_ptr() + (tok_local as u64) * 4
+            };
             // Phase 1 of the Qwen batched-prefill plan: the layer
             // functions now accept a raw device pointer to the
             // per-token slot in `hidden_region`. The previous
