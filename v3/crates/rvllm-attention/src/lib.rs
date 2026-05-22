@@ -427,6 +427,12 @@ pub struct Fa2PtxKernels {
     pub fn_decode_nvfp4kv_bc16_bf16out: Option<rvllm_kernels::KernelFn>,
     pub fn_decode_nvfp4kv_gqa_bf16out: Option<rvllm_kernels::KernelFn>,
     pub fn_decode_nvfp4kv_gqa_bc16_bf16out: Option<rvllm_kernels::KernelFn>,
+    /// MAX_GQA=16 bf16-output variants of the GQA decode kernels —
+    /// bf16-residual siblings of `_gqa_max16_kernel` /
+    /// `_gqa_bc16_max16_kernel`. Same dispatch rules (host picks by
+    /// actual GQA + head_dim). `None` on older PTX trees.
+    pub fn_decode_nvfp4kv_gqa_max16_bf16out: Option<rvllm_kernels::KernelFn>,
+    pub fn_decode_nvfp4kv_gqa_bc16_max16_bf16out: Option<rvllm_kernels::KernelFn>,
     pub fn_prefill_nvfp4kv_bf16out: Option<rvllm_kernels::KernelFn>,
     pub fn_prefill_nvfp4kv_bc16_bf16out: Option<rvllm_kernels::KernelFn>,
     /// Cycle 55 step 10: bf16-output unified-prefill kernel handle.
@@ -593,6 +599,8 @@ impl Fa2PtxKernels {
                 fn_prefill_nvfp4kv_bc16_bf16out,
                 fn_decode_nvfp4kv_gqa_bf16out,
                 fn_decode_nvfp4kv_gqa_bc16_bf16out,
+                fn_decode_nvfp4kv_gqa_max16_bf16out,
+                fn_decode_nvfp4kv_gqa_bc16_max16_bf16out,
             ) = match loader.load_ptx("flash_attention_nvfp4kv_bf16out") {
                 Ok(m) => {
                     let d    = m.get_function("flash_attention_2_decode_nvfp4kv_bf16out_kernel").ok();
@@ -601,9 +609,11 @@ impl Fa2PtxKernels {
                     let p16  = m.get_function("flash_attention_2_prefill_nvfp4kv_bc16_bf16out_kernel").ok();
                     let dg   = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_bf16out_kernel").ok();
                     let dg16 = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_bc16_bf16out_kernel").ok();
-                    (Some(m), d, d16, p, p16, dg, dg16)
+                    let dgm    = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_max16_bf16out_kernel").ok();
+                    let dgm16  = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_bc16_max16_bf16out_kernel").ok();
+                    (Some(m), d, d16, p, p16, dg, dg16, dgm, dgm16)
                 }
-                Err(_) => (None, None, None, None, None, None, None),
+                Err(_) => (None, None, None, None, None, None, None, None, None),
             };
             // Cycle 55 step 10: split-decode + unified-prefill
             // bf16-output siblings. Phase-1 split kernels write f32
@@ -712,6 +722,8 @@ impl Fa2PtxKernels {
                 fn_decode_nvfp4kv_bc16_bf16out,
                 fn_decode_nvfp4kv_gqa_bf16out,
                 fn_decode_nvfp4kv_gqa_bc16_bf16out,
+                fn_decode_nvfp4kv_gqa_max16_bf16out,
+                fn_decode_nvfp4kv_gqa_bc16_max16_bf16out,
                 fn_prefill_nvfp4kv_bf16out,
                 fn_prefill_nvfp4kv_bc16_bf16out,
                 fn_prefill_nvfp4kv_unified_bf16out,
@@ -749,6 +761,8 @@ impl Fa2PtxKernels {
                 fn_decode_nvfp4kv_bc16_bf16out: None,
                 fn_decode_nvfp4kv_gqa_bf16out: None,
                 fn_decode_nvfp4kv_gqa_bc16_bf16out: None,
+                fn_decode_nvfp4kv_gqa_max16_bf16out: None,
+                fn_decode_nvfp4kv_gqa_bc16_max16_bf16out: None,
                 fn_prefill_nvfp4kv_bf16out: None,
                 fn_prefill_nvfp4kv_bc16_bf16out: None,
                 fn_prefill_nvfp4kv_unified_bf16out: None,
