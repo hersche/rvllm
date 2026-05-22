@@ -122,9 +122,9 @@
       "sha256": "7df0802916762bcf3a0ca983afee15414f4a5c25b98ee3d92bdd1c7b832ca400"
     },
     "flash_attention": {
-      "bytes": 396249,
+      "bytes": 467401,
       "path": "flash_attention.ptx",
-      "sha256": "cb8927b779bd2a04386ce5206c6e3495254d27920f9050a870e7d8bdb780bf6d"
+      "sha256": "ff64392fe9499d30848b59713362d42c998c9f48aad0ac8f8c4a718199ad38a0"
     },
     "flash_attention_3": {
       "bytes": 290878,
@@ -142,9 +142,9 @@
       "sha256": "84eeb1e52112fda81b9190569b483dff6f0618bda68015d7ead1f6958ebb20e6"
     },
     "flash_attention_decode_f16io_bc16": {
-      "bytes": 391759,
+      "bytes": 462911,
       "path": "flash_attention_decode_f16io_bc16.ptx",
-      "sha256": "015e90dbaa80802d7a38d17284d27623b0ddec5d3826be1a856ff8af823d05c0"
+      "sha256": "2e1d8a33bff8beb7588bfaf0b3d58b692c39c678afe500520cf179f15f9c11d7"
     },
     "flash_attention_nvfp4kv": {
       "bytes": 813070,
@@ -1017,5 +1017,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "cd04286"
+  "revision": "823bfe4"
 }

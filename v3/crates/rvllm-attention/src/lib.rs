@@ -305,6 +305,12 @@ pub struct Fa2PtxKernels {
     /// `num_heads > num_kv_heads` and GQA ≤ MAX_GQA_DECODE (=4).
     #[cfg(feature = "cuda")]
     pub fn_decode_fp8kv_gqa: Option<rvllm_kernels::KernelFn>,
+    /// MAX_GQA_DECODE=16 sibling — adaptive dispatch picks this when
+    /// actual GQA ratio exceeds the default cap of 4 (Mistral 3.5
+    /// GQA=12, Gemma 4 31B global GQA=8, Qwen 3.6 35B-A3B GQA=8).
+    /// Falls back to per-head FP8 kernel when None.
+    #[cfg(feature = "cuda")]
+    pub fn_decode_fp8kv_gqa_max16: Option<rvllm_kernels::KernelFn>,
     /// `flash_attention_2_prefill_fp8kv_unified_kernel` — multi-query
     /// FP8-KV prefill. Port of vLLM's
     /// `kernel_unified_attention_2d`; see
@@ -522,6 +528,9 @@ impl Fa2PtxKernels {
             let fn_decode_fp8kv_gqa = flash_attention_mod
                 .get_function("flash_attention_2_decode_fp8kv_gqa_kernel")
                 .ok();
+            let fn_decode_fp8kv_gqa_max16 = flash_attention_mod
+                .get_function("flash_attention_2_decode_fp8kv_gqa_max16_kernel")
+                .ok();
 
             // Optional: the unified prefill PTX module is added in
             // Phase A of `UNIFIED_PREFILL_SPEC.md` and its body lands
@@ -707,6 +716,7 @@ impl Fa2PtxKernels {
                 fn_prefill_f16kv,
                 fn_decode_fp8kv,
                 fn_decode_fp8kv_gqa,
+                fn_decode_fp8kv_gqa_max16,
                 fn_prefill_fp8kv_unified,
                 unified_prefill_mod,
                 flash_attention_nvfp4kv_mod,

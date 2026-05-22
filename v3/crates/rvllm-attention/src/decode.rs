@@ -575,7 +575,14 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                     use cudarc::driver::sys::*;
                     const FA2_THREADS: i32 = 128;
                     const FA2_BC: i32 = 16;
-                    const MAX_GQA_DECODE: i32 = 4;
+                    // Adaptive cap: default _gqa kernel handles GQA ≤ 4
+                    // (Gemma 4 sliding GQA=2, Qwen 27B GQA=4). _max16
+                    // sibling raises the cap to 16 for Mistral 3.5
+                    // GQA=12 + Gemma 4 31B global GQA=8 + Qwen 3.6
+                    // 35B-A3B GQA=8 on the FP8-KV decode path. Host
+                    // picks the smallest fitting variant.
+                    const MAX_GQA_DECODE_DEFAULT: i32 = 4;
+                    const MAX_GQA_DECODE_MAX16: i32 = 16;
                     let hd = params.head_dim as i32;
                     // GQA-grouped dispatch: one CTA per (seq, kv_head)
                     // amortizes KV dequant across the GQA query group.
@@ -594,16 +601,30 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                     let gqa_env_on = std::env::var("RVLLM_FP8_DECODE_GQA")
                         .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
                         .unwrap_or(false);
-                    let use_gqa = gqa_env_on
+                    let max16_avail = fa2.fn_decode_fp8kv_gqa_max16.is_some();
+                    let use_gqa_default = gqa_env_on
                         && gqa_ratio > 1
-                        && gqa_ratio <= MAX_GQA_DECODE as u32
+                        && gqa_ratio <= MAX_GQA_DECODE_DEFAULT as u32
                         && fa2.fn_decode_fp8kv_gqa.is_some();
-                    let kernel_fn = if use_gqa {
+                    let use_gqa_max16 = gqa_env_on
+                        && gqa_ratio > MAX_GQA_DECODE_DEFAULT as u32
+                        && gqa_ratio <= MAX_GQA_DECODE_MAX16 as u32
+                        && max16_avail;
+                    let use_gqa = use_gqa_default || use_gqa_max16;
+                    let kernel_fn = if use_gqa_max16 {
+                        fa2.fn_decode_fp8kv_gqa_max16.unwrap()
+                    } else if use_gqa_default {
                         fa2.fn_decode_fp8kv_gqa.unwrap()
                     } else {
                         fa2.fn_decode_fp8kv
                     };
-                    let score_rows = if use_gqa { MAX_GQA_DECODE } else { 1 };
+                    let score_rows = if use_gqa_max16 {
+                        MAX_GQA_DECODE_MAX16
+                    } else if use_gqa_default {
+                        MAX_GQA_DECODE_DEFAULT
+                    } else {
+                        1
+                    };
                     let smem_bytes =
                         2 * FA2_BC * hd * 4 + score_rows * FA2_BC * 4 + (FA2_THREADS / 32) * 4;
                     if smem_bytes as u32 >= 48 * 1024 {
