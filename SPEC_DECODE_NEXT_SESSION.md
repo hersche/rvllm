@@ -1,8 +1,41 @@
 # Speculative-decoding next-session plan — Gemma 4 E4B
 
-## Status (2026-05-22 session update — head `9845395`)
+## Status (2026-05-22 session update — head `3a40819`)
 
 * **#28 — Persistent identity block table — DONE** (`9845395`).
+
+* **#26 — `verify_batched_suffix_k_only` — LANDED, BYTE-EQUIV PENDING**
+  (`3f9febd` Phase 1 scratch + scaffold, `4449903` Phase 2 body,
+  `4a43405` Phase 4 wire-in, `3a40819` debug). The new method exists
+  on `Gemma4Bringup`, allocates K-sized scratch via
+  `prepare_spec_prefill_scratch(MAX_SPEC_K=16)`, runs one chunk of
+  prefill through `gemma4_forward_phase` directly (no run_generate),
+  captures K post-layer-loop residual rows + K argmaxes. Wired
+  through `RVLLM_GEMMA4_SPEC_NEW_PRIMITIVES=1` env knob, default
+  OFF. **Known regression on NEW path** — accept_rate drops from
+  87.5% (OLD) to 15.8% (NEW verify + OLD commit) to 0.9% (NEW
+  verify + NEW commit). Bisect knob `RVLLM_GEMMA4_SPEC_NEW_COMMIT=1`
+  added in `3a40819` to isolate verify vs commit contribution. The
+  GPU output diverges from the run_generate-driven path despite a
+  faithful per-layer setup mirror; root cause not yet identified.
+  Plausible candidates: missing PLE precompute (E4B only), per-
+  layer scratch field bind mismatch (38 fields), `q_scale_cache`
+  init shape (memset already added in `3a40819`). Next step: dump
+  K-row hidden + K argmax from BOTH paths on the SAME prompt and
+  diff to localize the divergence.
+
+* **#27 — `commit_base_tokens_from_state` — LANDED, BYTE-EQUIV PENDING**
+  (`4449903` Phase 2 body, `4a43405` Phase 4 wire-in). K=1 wrapper
+  around `verify_batched_suffix_k_only` that returns the next
+  argmax (matches `prefill_one_from_state`'s contract). Same env
+  knob + same regression status as #26.
+
+Production safety: both env knobs default to OFF.
+`verify_batched_from_state` + `prefill_one_from_state` remain the
+production path. Persistent identity block table (#28) is in use
+on the production path through `PrefixCacheState`.
+
+## Previous status (head `9845395`)
   The per-call `gen_bt` arena region + sync HtoD of
   `(0..num_blocks_total).collect()` now lives once, in
   `init_prefix_cache`. Exposed through new fields
