@@ -1034,6 +1034,40 @@ and 7 fewer launches per macro-block). The unfused
 parked infrastructure for future non-fused captured paths
 (continuous-batch, multi-sequence macro-graphs).
 
+### Phase 8 MoE-fusion — SHIPPED 2026-05-23
+
+Commit `f0f79d5` lands the first Phase 8 kernel fusion with a
+**real measurable speedup**: ≈20-25% decode latency reduction
+on Qwen 3.6 35B-A3B.
+
+New kernel
+`fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_kernel`
+fuses the per-token MoE down-projection FP8 GEMV with the
+scaled-add accumulator step that previously ran as a separate
+`scaled_add_f16_to_f32_devw_kernel` launch right after. The
+inner GEMV reduction is byte-identical; the epilogue replaces
+the f16 store with `routed_sum[n] += devw[0] * acc` directly in
+f32 (lane 0 of each warp owns exactly one output element → no
+atomic needed).
+
+Eliminates per decode token:
+- **320 kernel launches** (8 routed k-rounds × 40 MoE layers).
+- **320 f16 round-trips** (acc f32 → f16 down_region → f32 acc).
+
+Latency A/B (qwen3-6-35b-a3b, 150-token "explain photosynthesis"):
+- Pre-fusion: 2.140s eager / 2.16s single-step replay / 2.19s
+  N=8 macro-replay.
+- **Post-fusion: 1.717s deterministically across 3 runs**.
+- Per-token: 3.3 ms saved out of ~14 ms = predicted
+  launch-overhead × 320 launches/token.
+
+Production qwen27b (dense, no MoE) — unaffected (regression-clean).
+The unfused `fp8_gemv_blockwise_wpr_native_f16in_indirect_kernel`
++ `scaled_add_f16_to_f32_devw_kernel` stay loaded; still used by
+prefill / MTP / shared-expert chains. The fusion targets ONLY
+the per-k-round routed-expert pair in the per-token decode
+hot-path.
+
 ### Phase 8 follow-on (graph-cache reuse) — SHIPPED 2026-05-22
 
 Commit `bcdce94` lands cross-request graph cache reuse:
