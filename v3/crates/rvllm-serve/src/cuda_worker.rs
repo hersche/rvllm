@@ -1006,15 +1006,16 @@ pub async fn spawn_cuda_worker(
                                 .to_string()));
                         continue;
                     }
-                    if !req.vision_items.is_empty()
-                        || !req.vision_slots.is_empty()
-                        || !req.audio_items.is_empty()
-                        || !req.audio_slots.is_empty()
-                    {
+                    // Stream-7: vision is now wired through
+                    // `Gemma4Nvfp4Bringup::forward_gemma_vision` + the
+                    // residual splice at the top of
+                    // `forward_prompt_to_all_tokens_impl`. Audio remains
+                    // unwired on Option B (E4B-only path).
+                    if !req.audio_items.is_empty() || !req.audio_slots.is_empty() {
                         let _ = req.events_tx.send(GenerateEvent::Error(
-                            "gemma4-nvfp4 path: vision and audio are not \
-                             yet wired on the Option B forward (codex \
-                             Stream-7 — text-only this commit)."
+                            "gemma4-nvfp4 path: audio is not wired on the \
+                             Option B forward (E4B-only). Use the E4B \
+                             profile for audio transcription."
                                 .to_string()));
                         continue;
                     }
@@ -1065,6 +1066,107 @@ pub async fn spawn_cuda_worker(
                     if spec_decode && spec_circuit_skip_remaining > 0 {
                         spec_circuit_skip_remaining -= 1;
                     }
+
+                    // Stream-7: vision pre-pass. Run the native Gemma 4
+                    // ViT for each image, narrow f16 → bf16 host-side,
+                    // build the splice list for the prefill. Spec mode
+                    // doesn't carry vision (no spec drafter ships with
+                    // a paired ViT) — reject with a clear error if
+                    // both are requested.
+                    if spec_probe_this_request && !req.vision_items.is_empty() {
+                        let _ = req.events_tx.send(GenerateEvent::Error(
+                            "gemma4-nvfp4 path: vision + spec-decode is \
+                             not supported (no paired drafter ViT). \
+                             Unset RVLLM_GEMMA4_SPEC_DECODE for vision \
+                             requests."
+                                .to_string()));
+                        continue;
+                    }
+                    // Build vision splice. Outputs from
+                    // `forward_gemma_vision` are little-endian f16 in
+                    // `out.data` of shape `[num_tokens, hidden]`;
+                    // Option B's residual buffer is bf16, so we
+                    // narrow f16 → bf16 here (host-side, one pass per
+                    // image) before handing the byte chunks to the
+                    // splice. Each ViT image already collapses to
+                    // ~256 tokens × 5376 hidden = 1.3 M floats so the
+                    // narrow is trivially cheap relative to the
+                    // device forward.
+                    let mut vision_splice_bytes: Vec<(usize, Vec<u8>)> =
+                        Vec::with_capacity(req.vision_items.len());
+                    let mut vision_failed_msg: Option<String> = None;
+                    for (i, item) in req.vision_items.iter().enumerate() {
+                        if req.cancelled.load(Ordering::Relaxed) {
+                            vision_failed_msg = Some("cancelled".to_string());
+                            break;
+                        }
+                        match bringup.forward_gemma_vision(&item.bytes) {
+                            Ok(out) => {
+                                tracing::info!(
+                                    idx = i,
+                                    tokens = out.num_tokens,
+                                    hidden = out.hidden_dim,
+                                    "vision: Gemma4Nvfp4 ViT forward done"
+                                );
+                                if out.num_tokens != item.num_tokens {
+                                    vision_failed_msg = Some(format!(
+                                        "vision tokens mismatch: predicted {} got {}",
+                                        item.num_tokens, out.num_tokens));
+                                    break;
+                                }
+                                // f16 → bf16 narrow.
+                                let nrows = out.num_tokens;
+                                let dim = out.hidden_dim;
+                                let n_elems = nrows * dim;
+                                let mut bf16_bytes = Vec::with_capacity(n_elems * 2);
+                                let src = &out.data;
+                                if src.len() != n_elems * 2 {
+                                    vision_failed_msg = Some(format!(
+                                        "vision data size mismatch: {} vs expected {}",
+                                        src.len(), n_elems * 2));
+                                    break;
+                                }
+                                for c in src.chunks_exact(2) {
+                                    let bits = u16::from_le_bytes([c[0], c[1]]);
+                                    let f = half::f16::from_bits(bits).to_f32();
+                                    let bf16 = half::bf16::from_f32(f);
+                                    bf16_bytes.extend_from_slice(&bf16.to_le_bytes());
+                                }
+                                // Use the i-th vision_slot's
+                                // token_start (set by tokenizer
+                                // chat-template expansion).
+                                let slot = req.vision_slots.get(i).copied();
+                                let token_start = match slot {
+                                    Some(s) => s.token_start,
+                                    None => {
+                                        vision_failed_msg = Some(
+                                            "vision_slots missing slot for image"
+                                                .to_string());
+                                        break;
+                                    }
+                                };
+                                vision_splice_bytes.push((token_start, bf16_bytes));
+                            }
+                            Err(e) => {
+                                vision_failed_msg = Some(format!(
+                                    "gemma4-nvfp4 vision forward: {e:?}"));
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(msg) = vision_failed_msg {
+                        let _ = req.events_tx.send(GenerateEvent::Error(msg));
+                        let _ = req.events_tx.send(GenerateEvent::Done {
+                            finish: FinishReason::Stop,
+                            prompt_tokens: prompt_len,
+                            completion_tokens: 0,
+                        });
+                        continue;
+                    }
+                    let vision_splice_refs: Vec<(usize, &[u8])> = vision_splice_bytes
+                        .iter()
+                        .map(|(ts, v)| (*ts, v.as_slice()))
+                        .collect();
 
                     // Spec-decode branch: drive the full request
                     // through the Option B greedy spec loop, then
@@ -1155,8 +1257,11 @@ pub async fn spawn_cuda_worker(
                     // generation token is what
                     // forward_prompt_to_token returns (argmax of
                     // the last prompt token's final residual).
-                    let next_first = match bringup.forward_prompt_to_token(
-                        &req.prompt_ids, 0, &kv,
+                    // Stream-7: vision splice (empty for text-only)
+                    // overwrites the image-pad rows in residual_dev
+                    // between embed and the layer loop.
+                    let next_first = match bringup.forward_prompt_to_token_with_vision(
+                        &req.prompt_ids, 0, &kv, &vision_splice_refs,
                     ) {
                         Ok(t) => t,
                         Err(e) => {

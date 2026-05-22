@@ -453,6 +453,11 @@ pub struct Gemma4Nvfp4Bringup {
     /// _f16io, flash_attention_decode_f16io_bc16, gemma4_drafter
     /// _dequant) only loads when `ensure_drafter_nvfp4` is called.
     pub kernels: Arc<KernelLoader>,
+    /// Stream-7: ViT kernel subset shared with the fp8-block path via
+    /// `crate::gemma4_vision::Gemma4VisionRuntime`. Loaded at startup
+    /// so `forward_gemma_vision` can splice ViT output rows into the
+    /// device-resident residual between embed and the layer loop.
+    pub vit: crate::gemma4_vision::Gemma4VisionKernels,
     /// Stream-6a: lazy-uploaded drafter runtime (parallel to
     /// production's `Gemma4Bringup::drafter`). Populated by
     /// `ensure_drafter_nvfp4` on first spec request. Behind a
@@ -740,6 +745,9 @@ impl Gemma4Nvfp4Bringup {
             _bf16_to_f16_sat_mod: bf16_to_f16_sat_mod,
             fn_bf16_to_f16_sat,
         };
+        // Stream-7: ViT kernel subset for native vision splice.
+        let vit = crate::gemma4_vision::Gemma4VisionKernels::load(&loader)?;
+
         let forward_checkpoint = arena.checkpoint();
 
         Ok(Self {
@@ -760,6 +768,7 @@ impl Gemma4Nvfp4Bringup {
             forward_checkpoint,
             kv_state_allocated: false,
             kernels: loader,
+            vit,
             drafter: std::sync::Mutex::new(None),
             base_last_hidden_ptr: std::sync::atomic::AtomicU64::new(0),
             decode_capture: std::sync::Mutex::new(None),
@@ -2914,6 +2923,30 @@ impl Gemma4Nvfp4Bringup {
     /// raise it for long-context inference (the 31B checkpoint
     /// supports up to 262144 but rope-table memory grows
     /// linearly).
+    /// Stream-7: native Gemma 4 SigLIP ViT forward, delegated to the
+    /// shared [`crate::gemma4_vision::Gemma4VisionRuntime`]. Returns
+    /// f16 embeddings of shape `[num_pooled_tokens, arch.hidden_size]`
+    /// ready for splice into the post-embed residual between the
+    /// `embed_one_token_to_device` loop and the layer loop in
+    /// `forward_prompt_to_all_tokens_impl`.
+    #[cfg(feature = "cuda")]
+    pub fn forward_gemma_vision(
+        &self,
+        image_bytes: &[u8],
+    ) -> Result<crate::qwen36_bring_up::VisionForwardOutput> {
+        let rt = crate::gemma4_vision::Gemma4VisionRuntime {
+            arch: &self.arch,
+            arena: &self.arena,
+            stream: &self.stream,
+            cublaslt: &self.cublaslt,
+            fused: &self.vit,
+            model: crate::gemma4_vision::Gemma4VisionModelView {
+                vision: self.model.vision.as_ref(),
+            },
+        };
+        rt.forward(image_bytes)
+    }
+
     pub fn allocate_kv_state(&mut self, max_pos: u32) -> Result<Gemma4Nvfp4KvState> {
         // Default per-forward chunk size matches single-token decode.
         // #5f raises this once chunked prefill is wired.
@@ -7460,7 +7493,30 @@ impl Gemma4Nvfp4Bringup {
         position_start: u32,
         kv: &Gemma4Nvfp4KvState,
     ) -> Result<u32> {
+        self.forward_prompt_to_token_with_vision(prompt, position_start, kv, &[])
+    }
+
+    /// Stream-7: prefill entry with native ViT splice. `vision_splice`
+    /// is a slice of `(token_start, embedding_bytes)` — each chunk's
+    /// rows overwrite `residual_dev[token_start..token_start+rows]`
+    /// AFTER the embed gather and BEFORE the layer loop. Empty slice
+    /// reduces to the text-only path.
+    pub fn forward_prompt_to_token_with_vision(
+        &self,
+        prompt: &[u32],
+        position_start: u32,
+        kv: &Gemma4Nvfp4KvState,
+        vision_splice: &[(usize, &[u8])],
+    ) -> Result<u32> {
         if std::env::var("G4N_PROMPT_DECODE_FALLBACK").ok().as_deref() == Some("1") {
+            if !vision_splice.is_empty() {
+                return Err(corrupt_runtime_err(
+                    "forward_prompt_to_token: vision splice requires the \
+                     device-resident batched-prefill path; unset \
+                     G4N_PROMPT_DECODE_FALLBACK for vision requests"
+                        .into(),
+                ));
+            }
             if prompt.is_empty() {
                 return Err(corrupt_runtime_err(
                     "forward_prompt_to_token: prompt is empty".into(),
@@ -7481,11 +7537,12 @@ impl Gemma4Nvfp4Bringup {
             return Ok(out);
         }
 
-        let (all, _) = self.forward_prompt_to_all_tokens_impl(
+        let (all, _) = self.forward_prompt_to_all_tokens_impl_with_vision(
             prompt,
             position_start,
             kv,
             Some(prompt.len().saturating_sub(1)),
+            vision_splice,
         )?;
         Ok(*all.last().expect(
             "forward_prompt_to_all_tokens_impl returned empty Vec \
@@ -7787,6 +7844,23 @@ impl Gemma4Nvfp4Bringup {
         kv: &Gemma4Nvfp4KvState,
         snapshot_row: Option<usize>,
     ) -> Result<(Vec<u32>, Vec<u16>)> {
+        self.forward_prompt_to_all_tokens_impl_with_vision(
+            prompt, position_start, kv, snapshot_row, &[])
+    }
+
+    /// Stream-7 prefill core with optional vision splice. `vision_splice`
+    /// items are `(token_start, embedding_host_bytes)`; each chunk's
+    /// rows overwrite the residual buffer at the matching offset after
+    /// the embed gather and before the layer loop. Empty splice
+    /// reduces to the text-only path (no vision overwrite occurs).
+    fn forward_prompt_to_all_tokens_impl_with_vision(
+        &self,
+        prompt: &[u32],
+        position_start: u32,
+        kv: &Gemma4Nvfp4KvState,
+        snapshot_row: Option<usize>,
+        vision_splice: &[(usize, &[u8])],
+    ) -> Result<(Vec<u32>, Vec<u16>)> {
         if prompt.is_empty() {
             return Err(corrupt_runtime_err(
                 "forward_prompt_to_all_tokens: prompt is empty".into(),
@@ -7849,6 +7923,49 @@ impl Gemma4Nvfp4Bringup {
         for (t, &tok) in prompt.iter().enumerate() {
             let dst = residual_dev.device_ptr() + (t * hidden_bytes) as u64;
             self.embed_one_token_to_device(tok, dst)?;
+        }
+
+        // Stream-7: native vision splice. For each (token_start,
+        // embedding_bytes) chunk, overwrite residual_dev rows
+        // [token_start..token_start+rows] with the ViT output. The
+        // chunk is bf16 (hidden_bytes per row) directly from the
+        // shared `Gemma4VisionRuntime::forward` output, so a single
+        // HtoD copy lands the splice. Empty splice = pure text path
+        // (no copies issued, byte-identical to the pre-Stream-7
+        // forward).
+        if !vision_splice.is_empty() {
+            for &(token_start, emb_bytes) in vision_splice {
+                if emb_bytes.is_empty() {
+                    continue;
+                }
+                if emb_bytes.len() % hidden_bytes != 0 {
+                    return Err(corrupt_runtime_err(format!(
+                        "vision_splice: chunk {} bytes not a multiple of \
+                         hidden_bytes {}", emb_bytes.len(), hidden_bytes)));
+                }
+                let n_rows = emb_bytes.len() / hidden_bytes;
+                let slot_end = token_start + n_rows;
+                if slot_end > n {
+                    return Err(corrupt_runtime_err(format!(
+                        "vision_splice: slot [{token_start}..{slot_end}) \
+                         exceeds prompt len {n}")));
+                }
+                let dst_off = (token_start * hidden_bytes) as u64;
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    let rc = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                        residual_dev.device_ptr() + dst_off,
+                        emb_bytes.as_ptr() as *const _,
+                        emb_bytes.len(),
+                        self.stream.raw() as _,
+                    );
+                    if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                        return Err(corrupt_runtime_err(format!(
+                            "vision_splice: cuMemcpyHtoDAsync failed (rc={rc:?})")));
+                    }
+                }
+            }
+            self.stream.fence()?;
         }
 
         // Per-layer arena checkpoint: each layer's Q/K/V/MLP

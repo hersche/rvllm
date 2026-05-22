@@ -640,19 +640,10 @@ pub async fn chat_completions(
     // vision fetch + tokenize round-trip before the bounce.
     // Same rationale as the Mistral35-RVLLM_LOAD_VISION=0
     // guard above.
-    if has_image_parts
-        && matches!(state.resolved_family,
-                    crate::config::ModelFamily::Gemma4Nvfp4)
-    {
-        return Err(ApiError::invalid_param(
-            "image input is not yet supported on the Gemma 4 NVFP4 \
-             (Option B) forward path — codex Stream-7. Use the \
-             fp8-block Gemma 4 profile for vision until the NVFP4 \
-             ViT splice + device-resident residual land.",
-            "messages",
-            "vision_not_supported_on_gemma4_nvfp4",
-        ));
-    }
+    // Stream-7 landed: vision on Gemma 4 NVFP4 (Option B) now runs
+    // through the shared `Gemma4VisionRuntime` with a bf16 residual
+    // splice inside `forward_prompt_to_all_tokens_impl`. Admission
+    // gate removed; per-request lifecycle handled in cuda_worker.
     let vision_items: Vec<crate::worker::VisionItem> = if !has_image_parts {
         Vec::new()
     } else {
