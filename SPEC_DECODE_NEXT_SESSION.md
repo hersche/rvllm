@@ -6,23 +6,60 @@
 
 * **#26 — `verify_batched_suffix_k_only` — LANDED, BYTE-EQUIV PENDING**
   (`3f9febd` Phase 1 scratch + scaffold, `4449903` Phase 2 body,
-  `4a43405` Phase 4 wire-in, `3a40819` debug). The new method exists
-  on `Gemma4Bringup`, allocates K-sized scratch via
+  `4a43405` Phase 4 wire-in, `3a40819` q_scale memset + bisect,
+  `269926e` argmax dump). The new method exists on
+  `Gemma4Bringup`, allocates K-sized scratch via
   `prepare_spec_prefill_scratch(MAX_SPEC_K=16)`, runs one chunk of
   prefill through `gemma4_forward_phase` directly (no run_generate),
   captures K post-layer-loop residual rows + K argmaxes. Wired
   through `RVLLM_GEMMA4_SPEC_NEW_PRIMITIVES=1` env knob, default
-  OFF. **Known regression on NEW path** — accept_rate drops from
-  87.5% (OLD) to 15.8% (NEW verify + OLD commit) to 0.9% (NEW
-  verify + NEW commit). Bisect knob `RVLLM_GEMMA4_SPEC_NEW_COMMIT=1`
-  added in `3a40819` to isolate verify vs commit contribution. The
-  GPU output diverges from the run_generate-driven path despite a
-  faithful per-layer setup mirror; root cause not yet identified.
-  Plausible candidates: missing PLE precompute (E4B only), per-
-  layer scratch field bind mismatch (38 fields), `q_scale_cache`
-  init shape (memset already added in `3a40819`). Next step: dump
-  K-row hidden + K argmax from BOTH paths on the SAME prompt and
-  diff to localize the divergence.
+  OFF.
+
+  **Known regression on NEW path.** Side-by-side dump of the FIRST
+  verify iter on mobile-31b-rvllm-spec (HADAMARD=0):
+
+      OLD path (NEW_PRIMITIVES=0):
+        start_pos=20 k=4 drafts=[13034, 229912, 3564, 99930]
+                           base_argmax=[229912, 3564, 99930, 3526]
+        → 3 accepts (drafts[1..4] match base_argmax[0..3])
+
+      NEW path (NEW_PRIMITIVES=1):
+        start_pos=20 k=4 drafts=[13034, 229912, 3564, 99930]
+                           base_argmax=[236771, 237860, 136456, 2735]
+        → 0 accepts (no draft matches)
+
+  Same drafts (same drafter input). Same warmup-populated KV cache
+  for slots [0..20). Same prompt + model weights. The K base
+  argmaxes diverge → the new verify path's GPU work produces
+  different residuals than `verify_batched_from_state`.
+
+  Per-iter accept rate drops to ~0.9% (NEW verify + NEW commit) or
+  ~15.8% (NEW verify + OLD commit). Bisect knob
+  `RVLLM_GEMMA4_SPEC_NEW_COMMIT=1` (in `3a40819`) splits the
+  contribution.
+
+  Ruled out so far:
+    * Missing q_scale_cache zero-init — added in `3a40819`; no
+      change.
+    * Wrong identity block table — same persistent ptr as OLD,
+      bit-identical content.
+    * Missing PLE precompute — N/A on 31B (no PLE).
+
+  Remaining candidates for the next debug session:
+    * Per-layer Gemma4LayerScratch field bind mismatch among the
+      38 fields. Hardest to spot — copy-pasted from
+      run_generate's chunked-prefill block.
+    * Subtle layer scratch buffer reuse-across-layers semantics
+      that depend on max_tokens > K sizing (run_generate's
+      scratch is prompt_len-sized; my new path sizes for K).
+    * Embed scale or rope-scale init paths that run_generate
+      hits before chunk start but spec_primitives doesn't.
+
+  Argmax dump infrastructure in commit `269926e` enables the
+  side-by-side comparison via `RVLLM_GEMMA4_SPEC_VERIFY_DUMP=1`.
+  Next step: extend the dump to capture per-LAYER hidden state
+  (e.g. RMS + max + first8 floats) on BOTH paths and find the
+  first layer where they diverge.
 
 * **#27 — `commit_base_tokens_from_state` — LANDED, BYTE-EQUIV PENDING**
   (`4449903` Phase 2 body, `4a43405` Phase 4 wire-in). K=1 wrapper
