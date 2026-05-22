@@ -501,6 +501,39 @@ pub struct VisionForwardOutput {
     pub grid_thw: [u32; 3],
 }
 
+/// Phase 8 follow-on: RAII guard that restores the arena bump
+/// pointer to a captured checkpoint when dropped. Used at the entry
+/// of `forward_qwen36_decode_inner_with_workspace_overrides_v2` to
+/// bound per-call arena growth + make per-call allocation addresses
+/// deterministic across decode steps + across requests.
+///
+/// Drop ordering vs CUDA work in flight: `arena.restore` is a pure
+/// bump-pointer mutation (no `cuFree`), so kernels still running on
+/// the stream that hold pointers into the restored region keep
+/// reading valid GPU memory. The next caller allocates into the
+/// same address range AFTER the previous kernels have completed
+/// (subsequent `arena.region` calls themselves go through the same
+/// stream's prior submissions). The captured-graph replay reads
+/// the restored region's address but the kernel sequence
+/// immediately re-fills it, so by the time the result is consumed,
+/// the data is fresh.
+struct Qwen36DecodeArenaGuard<'a> {
+    arena: &'a rvllm_mem::HbmArena<'static>,
+    checkpoint: usize,
+}
+
+impl<'a> Qwen36DecodeArenaGuard<'a> {
+    fn new(arena: &'a rvllm_mem::HbmArena<'static>, checkpoint: usize) -> Self {
+        Self { arena, checkpoint }
+    }
+}
+
+impl<'a> Drop for Qwen36DecodeArenaGuard<'a> {
+    fn drop(&mut self) {
+        unsafe { self.arena.restore(self.checkpoint); }
+    }
+}
+
 impl Qwen36Bringup {
     /// Phase 8 commit 3: try to capture a single decode step into a
     /// CUDA graph. The eager body runs once during capture (so this
@@ -4928,6 +4961,20 @@ impl Qwen36Bringup {
                 rvllm_core::CudaCtx::setup(),
             ));
         }
+        // Phase 8 follow-on (graph-cache reuse): take an internal
+        // arena checkpoint at fn entry; restore on every exit path
+        // via a Drop guard. This makes per-call arena allocations
+        // (positions_region, hidden_region, q_split_region, etc.)
+        // land at the same device addresses on every call —
+        // deterministic across decode steps AND across requests
+        // (since the worker keeps the workspace persistent above
+        // `scratch_ck`, every decode_inner call enters with
+        // `bump == scratch_ck`). The captured graph from request N's
+        // step 0 is therefore valid for request N+1's decode steps:
+        // workspace addresses are persistent, and per-call addresses
+        // are re-created at the same locations every call.
+        let _ck_guard = Qwen36DecodeArenaGuard::new(
+            &self.arena, self.arena.checkpoint());
         let hidden = self.arch.base.hidden_size as u32;
         let vocab = self.arch.base.vocab_size as u32;
         let num_tokens = token_ids.len() as u32;

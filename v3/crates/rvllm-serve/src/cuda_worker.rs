@@ -1438,6 +1438,37 @@ pub async fn spawn_cuda_worker(
                             return;
                         }
                     };
+                    // Phase 8 follow-on (graph-cache reuse):
+                    // allocate the workspace ONCE at worker
+                    // bring-up — BEFORE `scratch_ck` is taken —
+                    // so its device pointers stay stable across
+                    // every request. The captured decode-step
+                    // graph holds those pointers; with the
+                    // workspace persistent + decode_inner taking
+                    // its own internal checkpoint+restore (added
+                    // alongside this commit), every per-call
+                    // arena region inside decode_inner lands at
+                    // the same address on every call, every
+                    // request. The captured graph from request N
+                    // is therefore valid for request N+1 — no
+                    // re-capture needed.
+                    //
+                    // Allocated unconditionally (env-independent):
+                    // ~800KB overhead on a 65GB arena is trivial,
+                    // and the env check decides whether to USE
+                    // the workspace, not whether to allocate it.
+                    let persistent_decode_workspace =
+                        match qwen.alloc_decode_workspace() {
+                            Ok(w) => Some(w),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "qwen36 persistent workspace alloc \
+                                     failed: {e:?}. DECODE_GRAPH/WORKSPACE \
+                                     paths unavailable for this worker."
+                                );
+                                None
+                            }
+                        };
                     let scratch_ck = qwen.arena.checkpoint();
                     tracing::info!(
                         "qwen36 cuda worker ready (Phase 5d: \
@@ -1795,33 +1826,19 @@ pub async fn spawn_cuda_worker(
                                 .unwrap_or(false);
                         let need_workspace =
                             decode_graph_on || decode_workspace_only;
-                        // Phase 8: clear any stale captured graph
-                        // from a prior request. The graph holds
-                        // device-pointer references to per-call
-                        // arena allocations released by
-                        // `arena.restore(scratch_ck)` at the end of
-                        // each request; replaying a stale graph
-                        // against reclaimed memory hangs or
-                        // produces garbage. Must precede
-                        // `alloc_decode_workspace` so the workspace
-                        // allocations land at the same addresses
-                        // every request (deterministic arena bumps
-                        // after the checkpoint restore).
-                        if decode_graph_on {
-                            qwen.clear_decode_capture();
-                        }
+                        // Phase 8 follow-on: reuse the
+                        // worker-persistent workspace (allocated
+                        // above scratch_ck at worker bring-up).
+                        // The captured graph carries over across
+                        // requests since the workspace pointers
+                        // and the decode_inner per-call arena
+                        // addresses (stable via the inner
+                        // checkpoint+restore added alongside this
+                        // commit) are stable end-to-end. No
+                        // per-request workspace allocation, no
+                        // per-request `clear_decode_capture`.
                         let decode_workspace = if need_workspace {
-                            match qwen.alloc_decode_workspace() {
-                                Ok(w) => Some(w),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "qwen36 alloc_decode_workspace failed: \
-                                         {e:?}. Falling back to eager decode \
-                                         for this request."
-                                    );
-                                    None
-                                }
-                            }
+                            persistent_decode_workspace.as_ref().copied()
                         } else { None };
                         if let Some(t0) = prefill_start {
                             let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
