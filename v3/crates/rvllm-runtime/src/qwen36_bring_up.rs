@@ -493,6 +493,23 @@ pub struct VisionForwardOutput {
 }
 
 impl Qwen36Bringup {
+    /// Phase 8 scaffold: allocate the stable per-step decode workspace
+    /// for one request. Must be called BEFORE the per-request scratch
+    /// checkpoint so subsequent `arena.restore(ck)` doesn't reclaim
+    /// the workspace regions. Consumer wiring (the captured
+    /// `decode_step_launch_only` body) lands in the follow-up commit.
+    ///
+    /// `qwen36_decode_graph_enabled()` is the operator gate for the
+    /// captured path; when off, this method can be skipped entirely
+    /// and the eager `forward_qwen36_decode_inner` runs untouched.
+    #[cfg(feature = "cuda")]
+    pub fn alloc_decode_workspace(
+        &self,
+    ) -> Result<crate::qwen36_decode_workspace::Qwen36DecodeWorkspace> {
+        crate::qwen36_decode_workspace::Qwen36DecodeWorkspace::alloc(
+            &self.arena, &self.arch)
+    }
+
     /// Phase 1: CUDA init + arena + outside-tensor upload.
     /// Returns `Err` if `config.json` is missing required Qwen-3.6
     /// markers, or if any of the three outside tensors is missing.

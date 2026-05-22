@@ -73,6 +73,7 @@ pub mod gemma4_bring_up;
 pub mod gemma4_drafter;
 pub mod gemma4_vision;
 pub mod gemma4_nvfp4_bring_up;
+pub mod qwen36_decode_workspace;
 pub mod gemma4_nvfp4_load;
 pub mod gemma4_nvfp4_ops;
 pub mod qwen36_spec_decode;
