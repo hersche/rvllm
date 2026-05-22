@@ -1220,6 +1220,16 @@ pub struct Gemma4Bringup {
     /// in which case `forward_bf16` errors out with a clear message
     /// and the production f16 path stays unaffected.
     pub vit_bf16: Option<crate::gemma4_vision::Gemma4VisionKernelsBf16>,
+    /// Lazily-populated bf16 vision weight cache. Populated on the
+    /// first `forward_bf16` call via
+    /// `Gemma4VisionBf16::convert_from_f16` (one-shot device-side
+    /// f16→bf16 narrow of every vision weight, written to arena
+    /// scratch above the per-request checkpoint so it survives
+    /// `arena.restore(ck)` between requests). `None` until the
+    /// first bf16 forward; stays `None` forever when the operator
+    /// never flips `RVLLM_GEMMA4_VIT_USE_BF16=1`.
+    pub vit_bf16_weights:
+        std::sync::Mutex<Option<crate::gemma4_vision::Gemma4VisionBf16>>,
     pub sliding_attention: AttentionBackend,
     pub global_attention: AttentionBackend,
     pub cutlass: CutlassBackend,
@@ -2317,6 +2327,7 @@ impl Gemma4Bringup {
             fused,
             vit,
             vit_bf16,
+            vit_bf16_weights: std::sync::Mutex::new(None),
             assistant_kv_sources,
             drafter: std::sync::Mutex::new(None),
             base_last_hidden_ptr: std::sync::atomic::AtomicU64::new(0),
@@ -15708,10 +15719,48 @@ impl Gemma4Bringup {
             fused_bf16: self.vit_bf16.as_ref(),
         };
         if crate::gemma4_vision::gemma4_vit_use_bf16_enabled() {
+            // Lazy-populate the bf16 weight cache once on first call.
+            // The conversion runs once per process lifetime; reuses
+            // arena scratch above the per-request checkpoint so it
+            // survives arena.restore() between requests.
+            self.ensure_vit_bf16_weights()?;
             rt.forward_bf16(image_bytes)
         } else {
             rt.forward(image_bytes)
         }
+    }
+
+    /// Phase-3 bf16 vision support: lazy-populate
+    /// `self.vit_bf16_weights` on first `forward_bf16` call. No-op
+    /// after the first call. Errors out if `vit_bf16` (kernel set)
+    /// is None (older PTX tree).
+    #[cfg(feature = "cuda")]
+    fn ensure_vit_bf16_weights(&self) -> Result<()> {
+        {
+            let guard = self.vit_bf16_weights.lock().unwrap();
+            if guard.is_some() {
+                return Ok(());
+            }
+        }
+        let kernels = self.vit_bf16.as_ref().ok_or_else(|| {
+            RvllmError::cuda(
+                "vision: bf16 kernel set absent — rebuild kernels",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+        let vision = self.model.vision.as_ref().ok_or_else(|| {
+            RvllmError::cuda(
+                "vision: model.vision_tower not loaded",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+        let conv = crate::gemma4_vision::Gemma4VisionBf16::convert_from_f16(
+            &self.arena, vision, kernels, self.stream.raw() as u64)?;
+        let mut guard = self.vit_bf16_weights.lock().unwrap();
+        *guard = Some(conv);
+        Ok(())
     }
 
     /// Task #34 Phase 2 — convenience wrapper that runs un-rotate on

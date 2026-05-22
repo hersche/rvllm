@@ -141,6 +141,12 @@ impl Gemma4VisionKernels {
 /// per-sub-step dump tooling (`RVLLM_GEMMA4_VIT_SUBSTEP_BLK`) ready
 /// to localise the offending kernel inside block 0.
 pub struct Gemma4VisionKernelsBf16 {
+    /// `f16_to_bf16_kernel` — used by
+    /// [`Gemma4VisionBf16::convert_from_f16`] to one-time-convert the
+    /// f16 vision weights into a bf16 sibling buffer (allocated above
+    /// the per-request scratch checkpoint). Same kernel the text
+    /// path's bf16 residual chain uses.
+    pub fn_f16_to_bf16: KernelFn,
     /// `rmsnorm_inplace_bf16_gbf16_kernel` — bf16-input, bf16-gamma
     /// in-place RMSNorm. Vision-specific variant (the text path's
     /// `rmsnorm_inplace_bf16` keeps gamma in f16; vision's bf16 path
@@ -174,6 +180,10 @@ impl Gemma4VisionKernelsBf16 {
     pub fn try_load(loader: &KernelLoader) -> Result<Option<Self>> {
         // Each `load_ptx` returns Err on missing module; map to None
         // here so we can early-bail without polluting the call site.
+        let f16_to_bf16_mod = match loader.load_ptx("f16_to_bf16") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
         let rmsnorm_bf16_gbf16_mod = match loader.load_ptx("rmsnorm_inplace_bf16_gbf16") {
             Ok(m) => m,
             Err(_) => return Ok(None),
@@ -229,6 +239,7 @@ impl Gemma4VisionKernelsBf16 {
 
         // Resolve symbols; a missing entry is a real PTX/kernel
         // mismatch, not a back-compat case, so propagate the error.
+        let fn_f16_to_bf16 = f16_to_bf16_mod.get_function("f16_to_bf16_kernel")?;
         let fn_rmsnorm_bf16_gbf16 =
             rmsnorm_bf16_gbf16_mod.get_function("rmsnorm_inplace_bf16_gbf16_kernel")?;
         let fn_vnorm_bf16 = vnorm_bf16_mod.get_function("vnorm_bf16_kernel")?;
@@ -256,6 +267,7 @@ impl Gemma4VisionKernelsBf16 {
             .get_function("vit_standardize_f32_to_bf16_kernel")?;
 
         Ok(Some(Self {
+            fn_f16_to_bf16,
             fn_rmsnorm_bf16_gbf16,
             fn_vnorm_bf16,
             fn_vector_add_bf16,
@@ -271,6 +283,7 @@ impl Gemma4VisionKernelsBf16 {
             fn_vit_rotary_gemma4_2d_bf16,
             fn_vit_standardize_f32_to_bf16,
             _modules: vec![
+                f16_to_bf16_mod,
                 rmsnorm_bf16_gbf16_mod,
                 vnorm_bf16_mod,
                 vector_add_bf16_mod,
@@ -297,6 +310,229 @@ pub fn gemma4_vit_use_bf16_enabled() -> bool {
         .ok()
         .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
         .unwrap_or(false)
+}
+
+/// bf16 sibling of `Gemma4VisionBlock` — per-(transformer block,
+/// weight) device pointer into the bf16-converted vision weight
+/// arena. Field naming mirrors the f16 source struct so the body
+/// substitution in `forward_bf16` stays a 1:1 textual swap (e.g.
+/// `blk.q_proj_w.offset_bytes` → `bf16_blk.q_proj_w_ptr`).
+#[derive(Debug, Clone, Copy)]
+pub struct Gemma4VisionBf16Block {
+    pub input_layernorm_w_ptr: u64,
+    pub post_attention_layernorm_w_ptr: u64,
+    pub pre_feedforward_layernorm_w_ptr: u64,
+    pub post_feedforward_layernorm_w_ptr: u64,
+    pub q_proj_w_ptr: u64,
+    pub k_proj_w_ptr: u64,
+    pub v_proj_w_ptr: u64,
+    pub o_proj_w_ptr: u64,
+    pub q_norm_w_ptr: u64,
+    pub k_norm_w_ptr: u64,
+    pub gate_proj_w_ptr: u64,
+    pub up_proj_w_ptr: u64,
+    pub down_proj_w_ptr: u64,
+}
+
+/// bf16-converted vision weight buffer. Allocated once on first
+/// `forward_bf16` call via [`Gemma4VisionBf16::convert_from_f16`]
+/// and cached on `{Gemma4Bringup,Gemma4Nvfp4Bringup}.vit_bf16_weights`.
+/// Each device pointer addresses an arena scratch region that is
+/// allocated ABOVE the per-request scratch checkpoint so it survives
+/// `arena.restore(checkpoint)` between requests (same lifetime
+/// contract as `Gemma4Bringup::nvfp4_hadamard`).
+#[derive(Debug, Clone)]
+pub struct Gemma4VisionBf16 {
+    pub patch_embedder_input_proj_ptr: u64,
+    pub patch_embedder_pos_table_ptr: u64,
+    /// `Some` iff `Gemma4Vision::std_bias` is present (31B with
+    /// `vision_config.standardize=true`); `None` on E4B which omits
+    /// standardize and these tensors entirely.
+    pub std_bias_ptr: Option<u64>,
+    pub std_scale_ptr: Option<u64>,
+    pub embed_vision_projection_ptr: u64,
+    pub blocks: Vec<Gemma4VisionBf16Block>,
+}
+
+impl Gemma4VisionBf16 {
+    /// One-shot conversion of the f16 vision weights to bf16. Each
+    /// f16 tensor gets a same-byte-count arena region (f16 and bf16
+    /// are both 2-byte storage) and a `f16_to_bf16_kernel` launch
+    /// over its element count.
+    ///
+    /// MUST be called BEFORE the per-request scratch checkpoint
+    /// (i.e. once at first invocation of `forward_bf16`), so the
+    /// resulting device pointers persist across `arena.restore(ck)`
+    /// between requests.
+    ///
+    /// `stream` is the bringup's CUDA stream raw handle; launches
+    /// are async on this stream and a fence is taken at the end
+    /// before returning so the converted buffer is observable to
+    /// subsequent forward kernels on the same stream.
+    #[cfg(feature = "cuda")]
+    pub fn convert_from_f16(
+        arena: &rvllm_mem::HbmArena<'static>,
+        f16: &Gemma4Vision,
+        kernels: &Gemma4VisionKernelsBf16,
+        stream: u64,
+    ) -> Result<Self> {
+        use cudarc::driver::sys::*;
+
+        // Each weight is a same-byte-count region; element count =
+        // bytes / 2 (both f16 and bf16 are 2 bytes/elem).
+        fn convert_one(
+            arena: &rvllm_mem::HbmArena<'static>,
+            name: &'static str,
+            f16_ptr: u64,
+            shape: &[usize],
+            kernel: KernelFn,
+            stream: u64,
+        ) -> Result<u64> {
+            let n_elems: usize = shape.iter().product();
+            if n_elems == 0 {
+                return Ok(0);
+            }
+            let bytes = n_elems * 2;
+            let region = arena.region(name, bytes, 16)?;
+            let dst = region.device_ptr();
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut a_dst = dst;
+                let mut a_src = f16_ptr;
+                let mut a_n = n_elems as i32;
+                let args = [
+                    (&mut a_dst) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut a_src) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut a_n)   as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid: u32 = ((n_elems as u32) + block - 1) / block;
+                let rc = cuLaunchKernel(
+                    kernel.raw() as CUfunction,
+                    grid, 1, 1, block, 1, 1,
+                    0, stream as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(RvllmError::cuda(
+                        "Gemma4VisionBf16::convert_from_f16 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            let _ = stream;
+            Ok(dst)
+        }
+
+        let kf = kernels.fn_f16_to_bf16;
+        let patch_embedder_input_proj_ptr = convert_one(
+            arena, "g4vbf16_patch_in_proj",
+            f16.patch_embedder_input_proj.offset_bytes,
+            &f16.patch_embedder_input_proj.shape, kf, stream)?;
+        let patch_embedder_pos_table_ptr = convert_one(
+            arena, "g4vbf16_patch_pos_table",
+            f16.patch_embedder_pos_table.offset_bytes,
+            &f16.patch_embedder_pos_table.shape, kf, stream)?;
+        let std_bias_ptr = if let Some(b) = f16.std_bias.as_ref() {
+            Some(convert_one(arena, "g4vbf16_std_bias",
+                b.offset_bytes, &b.shape, kf, stream)?)
+        } else { None };
+        let std_scale_ptr = if let Some(s) = f16.std_scale.as_ref() {
+            Some(convert_one(arena, "g4vbf16_std_scale",
+                s.offset_bytes, &s.shape, kf, stream)?)
+        } else { None };
+        let embed_vision_projection_ptr = convert_one(
+            arena, "g4vbf16_embed_proj",
+            f16.embed_vision_projection.offset_bytes,
+            &f16.embed_vision_projection.shape, kf, stream)?;
+
+        // Per-block names need to be `&'static str` for the arena
+        // region API. The conversion runs once per process lifetime
+        // so `Box::leak`ing the per-block format strings is a
+        // bounded one-time leak (~13 names × 27 blocks × ~30 bytes
+        // each ≈ 11 KB total) acceptable for a once-per-process
+        // operation. Avoids a refactor of the arena's name API.
+        fn leaked(s: String) -> &'static str {
+            Box::leak(s.into_boxed_str())
+        }
+        let mut blocks = Vec::with_capacity(f16.blocks.len());
+        for (i, blk) in f16.blocks.iter().enumerate() {
+            blocks.push(Gemma4VisionBf16Block {
+                input_layernorm_w_ptr: convert_one(
+                    arena, leaked(format!("g4vbf16_blk{i}_iln")),
+                    blk.input_layernorm_w.offset_bytes,
+                    &blk.input_layernorm_w.shape, kf, stream)?,
+                post_attention_layernorm_w_ptr: convert_one(
+                    arena, leaked(format!("g4vbf16_blk{i}_paln")),
+                    blk.post_attention_layernorm_w.offset_bytes,
+                    &blk.post_attention_layernorm_w.shape, kf, stream)?,
+                pre_feedforward_layernorm_w_ptr: convert_one(
+                    arena, leaked(format!("g4vbf16_blk{i}_prffln")),
+                    blk.pre_feedforward_layernorm_w.offset_bytes,
+                    &blk.pre_feedforward_layernorm_w.shape, kf, stream)?,
+                post_feedforward_layernorm_w_ptr: convert_one(
+                    arena, leaked(format!("g4vbf16_blk{i}_poffln")),
+                    blk.post_feedforward_layernorm_w.offset_bytes,
+                    &blk.post_feedforward_layernorm_w.shape, kf, stream)?,
+                q_proj_w_ptr: convert_one(
+                    arena, leaked(format!("g4vbf16_blk{i}_q_proj")),
+                    blk.q_proj_w.offset_bytes, &blk.q_proj_w.shape,
+                    kf, stream)?,
+                k_proj_w_ptr: convert_one(
+                    arena, leaked(format!("g4vbf16_blk{i}_k_proj")),
+                    blk.k_proj_w.offset_bytes, &blk.k_proj_w.shape,
+                    kf, stream)?,
+                v_proj_w_ptr: convert_one(
+                    arena, leaked(format!("g4vbf16_blk{i}_v_proj")),
+                    blk.v_proj_w.offset_bytes, &blk.v_proj_w.shape,
+                    kf, stream)?,
+                o_proj_w_ptr: convert_one(
+                    arena, leaked(format!("g4vbf16_blk{i}_o_proj")),
+                    blk.o_proj_w.offset_bytes, &blk.o_proj_w.shape,
+                    kf, stream)?,
+                q_norm_w_ptr: convert_one(
+                    arena, leaked(format!("g4vbf16_blk{i}_q_norm")),
+                    blk.q_norm_w.offset_bytes, &blk.q_norm_w.shape,
+                    kf, stream)?,
+                k_norm_w_ptr: convert_one(
+                    arena, leaked(format!("g4vbf16_blk{i}_k_norm")),
+                    blk.k_norm_w.offset_bytes, &blk.k_norm_w.shape,
+                    kf, stream)?,
+                gate_proj_w_ptr: convert_one(
+                    arena, leaked(format!("g4vbf16_blk{i}_gate")),
+                    blk.gate_proj_w.offset_bytes,
+                    &blk.gate_proj_w.shape, kf, stream)?,
+                up_proj_w_ptr: convert_one(
+                    arena, leaked(format!("g4vbf16_blk{i}_up")),
+                    blk.up_proj_w.offset_bytes, &blk.up_proj_w.shape,
+                    kf, stream)?,
+                down_proj_w_ptr: convert_one(
+                    arena, leaked(format!("g4vbf16_blk{i}_down")),
+                    blk.down_proj_w.offset_bytes,
+                    &blk.down_proj_w.shape, kf, stream)?,
+            });
+        }
+        // Fence: every launch above ran async on `stream`. Caller
+        // synchronizes via its own stream's fence; we add one here
+        // too so subsequent reads on the same stream observe the
+        // converted buffer (single in-process consumer per stream).
+        #[cfg(feature = "cuda")]
+        unsafe {
+            let _ = cuStreamSynchronize(stream as CUstream);
+        }
+
+        Ok(Self {
+            patch_embedder_input_proj_ptr,
+            patch_embedder_pos_table_ptr,
+            std_bias_ptr,
+            std_scale_ptr,
+            embed_vision_projection_ptr,
+            blocks,
+        })
+    }
 }
 
 /// Tiny adapter exposing the body's `self.model.vision` reference
@@ -1565,37 +1801,40 @@ impl<'a> Gemma4VisionRuntime<'a> {
     }
 
     /// Phase-3 bf16 vision forward — deferred since 2026-05-05. The
-    /// real body lands in a follow-up commit (kernel-by-kernel
+    /// per-block body lands in a follow-up commit (kernel-by-kernel
     /// substitution of `forward` above using `fused_bf16` + bf16
     /// cuBLASLt). For now: if the env gate
-    /// `RVLLM_GEMMA4_VIT_USE_BF16=1` flips on, route here and emit a
-    /// clear NotImplemented error so the request fails fast and the
-    /// operator can see the gate is honoured. The f16 path remains
-    /// production-default and is fully untouched by this seam.
+    /// `RVLLM_GEMMA4_VIT_USE_BF16=1` flips on, route here, ensure
+    /// the bf16 weights are converted/cached, then emit a clear
+    /// NotImplemented error pointing at the next commit's body.
+    /// The f16 path remains production-default and untouched.
     ///
     /// Gates that must hold before this stub becomes a real forward:
     ///   * `fused_bf16` is `Some` (else clear "PTX missing" error),
-    ///   * vision weights have a bf16 sibling on `Gemma4Vision`
-    ///     (loader follow-up — currently weights are f16 only).
+    ///   * Caller has populated a [`Gemma4VisionBf16`] weights cache
+    ///     (typically via the lazy populator wired on each bringup's
+    ///     `vit_bf16_weights: Mutex<Option<Gemma4VisionBf16>>` field
+    ///     — see follow-up commit).
     pub fn forward_bf16(
         &self,
         _image_bytes: &[u8],
     ) -> Result<VisionForwardOutput> {
-        if self.fused_bf16.is_none() {
-            return Err(RvllmError::cuda(
+        let _kernels = match self.fused_bf16 {
+            Some(k) => k,
+            None => return Err(RvllmError::cuda(
                 "vision: bf16 kernel set not loaded (older PTX tree). \
                  Rebuild kernels via `bash kernels/build.sh sm_121`.",
                 rvllm_core::CudaErrorKind::Other,
                 rvllm_core::CudaCtx::setup(),
-            ));
-        }
+            )),
+        };
         Err(RvllmError::cuda(
-            "vision: bf16 forward body is staged for the Phase-3 \
-             follow-up — see v3/GEMMA_VISION_AUDIT.md. The kernel \
-             set + cuBLASLt bf16 entries are loaded and ready; the \
-             forward body lands in the next commit. Unset \
-             RVLLM_GEMMA4_VIT_USE_BF16 to use the production f16 \
-             path.",
+            "vision: bf16 forward body is staged for the next commit \
+             (kernel-by-kernel substitution of the f16 body using \
+             fused_bf16 + bf16_gemm_f32 + Gemma4VisionBf16 weight \
+             pointers). The kernel set + weight-converter \
+             infrastructure landed this commit. Unset \
+             RVLLM_GEMMA4_VIT_USE_BF16 to use the production f16 path.",
             rvllm_core::CudaErrorKind::Other,
             rvllm_core::CudaCtx::setup(),
         ))

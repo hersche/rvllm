@@ -461,6 +461,11 @@ pub struct Gemma4Nvfp4Bringup {
     /// Optional bf16 sibling vision kernel set — Option B mirror of
     /// `Gemma4Bringup::vit_bf16`. `None` on older kernel trees.
     pub vit_bf16: Option<crate::gemma4_vision::Gemma4VisionKernelsBf16>,
+    /// Lazily-populated bf16 vision weight cache. Mirror of
+    /// `Gemma4Bringup::vit_bf16_weights`; same lazy-populate-once
+    /// contract.
+    pub vit_bf16_weights:
+        std::sync::Mutex<Option<crate::gemma4_vision::Gemma4VisionBf16>>,
     /// Stream-6b: per-(base layer, channel) ±1 Hadamard signs used by
     /// drafter Q rotation. Allocated lazily by `ensure_drafter_nvfp4`
     /// (mirrors `Gemma4Bringup::nvfp4_hadamard`); zero-bytes overhead
@@ -805,6 +810,7 @@ impl Gemma4Nvfp4Bringup {
             kernels: loader,
             vit,
             vit_bf16,
+            vit_bf16_weights: std::sync::Mutex::new(None),
             nvfp4_hadamard: std::sync::Mutex::new(None),
             fn_hadamard_rotate_f16,
             fn_hadamard_unrotate_f16,
@@ -2987,10 +2993,43 @@ impl Gemma4Nvfp4Bringup {
             fused_bf16: self.vit_bf16.as_ref(),
         };
         if crate::gemma4_vision::gemma4_vit_use_bf16_enabled() {
+            self.ensure_vit_bf16_weights()?;
             rt.forward_bf16(image_bytes)
         } else {
             rt.forward(image_bytes)
         }
+    }
+
+    /// Phase-3 bf16 vision support: lazy-populate
+    /// `self.vit_bf16_weights` on first `forward_bf16` call.
+    /// Mirror of `Gemma4Bringup::ensure_vit_bf16_weights`.
+    #[cfg(feature = "cuda")]
+    fn ensure_vit_bf16_weights(&self) -> Result<()> {
+        {
+            let guard = self.vit_bf16_weights.lock().unwrap();
+            if guard.is_some() {
+                return Ok(());
+            }
+        }
+        let kernels = self.vit_bf16.as_ref().ok_or_else(|| {
+            rvllm_core::RvllmError::cuda(
+                "vision: bf16 kernel set absent — rebuild kernels",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+        let vision = self.model.vision.as_ref().ok_or_else(|| {
+            rvllm_core::RvllmError::cuda(
+                "vision: model.vision_tower not loaded",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+        let conv = crate::gemma4_vision::Gemma4VisionBf16::convert_from_f16(
+            &self.arena, vision, kernels, self.stream.raw() as u64)?;
+        let mut guard = self.vit_bf16_weights.lock().unwrap();
+        *guard = Some(conv);
+        Ok(())
     }
 
     /// Stream-6b: rotate drafter Q by per-base-layer R = H·diag(D)
