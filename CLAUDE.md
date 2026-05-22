@@ -856,19 +856,23 @@ blocking the prefill rollout above.
   Don't enable until the per-sub-step debug plan in
   `v3/GEMMA_VISION_AUDIT.md` is run through.
 
-## Option B (Gemma 4 31B NVFP4) — deferred-work register
+## Option B (Gemma 4 31B NVFP4) — production status + follow-up register
 
-Active branch `rusty_sm121_qwen36_26b`. Floor + Stream-5a/b
-landed (`bc89650..32d0b0e`). #5f-PRIME and #5g scaffolds at
-`fac2114` and `49a4ff0`. 60-layer single-token forward +
-device-resident residual + scaled-add kernel + Option B routed
-through `cuda_worker` text-only at 0.31 s/token. All 14 ondisk
-smokes pass; argmax stable. Remaining streams from the codex
-review:
+Active branch `rusty_sm121_qwen36_26b`. **Production status: shipping** —
+ZeroClaw default for tool-heavy work. Full NVFP4-weights stack runs at
+~12 tok/s steady-state decode, accept rate ≈ 0.965 on real prompts
+(K=7 spec decode + adaptive draft length + batched-MLP-verify).
+Loader + 60-layer decoder forward + unified-prefill + spec-decode +
+batched prefill all wired. Task #38's "31B NVFP4 native weight loader
++ decoder forward" acceptance criteria met.
 
-| Stream | Status | Next concrete step |
-|---|---|---|
-| #5f-PRIME (unified NVFP4 prefill) | Kernel handle loaded; not wired. | Inline launcher mirroring `PagedPrefillNvfp4Launcher::launch_nvfp4kv_unified_sm121` (~200 LOC) + batched M>1 MLP path (~300-500 LOC). Routes `forward_prompt_to_token` through unified prefill for N>1. |
-| Stream-6a (BaseKvSource trait) | `Gemma4Nvfp4Bringup::drafter_base_kv_view` returns a `DrafterBaseKvView`. Production drafter not yet consuming it. | Define `BaseKvSource` trait, implement for production `KvCache` + `Gemma4Nvfp4KvState`. Parameterize `populate_shadow_kv*_from_base` (gemma4_bring_up.rs:4583, 5742). Flip the `cuda_worker.rs` `spec_decode=1` rejection for `Gemma4Nvfp4`. |
-| Stream-6b (Hadamard drafter Q rotation) | Off on Option B (sign tables not allocated). | If Hadamard later turns on for Option B (production NVFP4 profile uses it), the drafter's Q must be rotated by the same per-layer R before cross-attn via `hadamard_rotate_f16_kernel`. Per-layer sign vectors live in production's `Gemma4LayerScratch.hadamard_signs_k`; Option B needs the same allocation + production-side rotate/unrotate (gemma4_bring_up.rs:4790-4860, :8985). Blocked by Stream-6a. |
-| Stream-7 (vision real splice) | Admission rejects vision for Gemma4Nvfp4 (commit `71cdcac`). Real splice deferred. | Attach Gemma ViT weights to `Gemma4Nvfp4LoadedModel` (loader change in `gemma4_nvfp4_load.rs` + new vision field). The ViT is weight-format-agnostic, runs in bf16. Splice output rows into Option B's device residual buffer between `embed_one_token_to_device` and the layer loop. Needs the multi-token device path from #5f-PRIME OR per-token-loop with vision-slot indexing. |
+### Current state of the codex-review streams
+
+| Stream | Status |
+|---|---|
+| Floor + Stream-5a/5b | **DONE** (`bc89650..32d0b0e`). Floor + scaled-add. |
+| #5f-PRIME (unified NVFP4 prefill) | **DONE.** `forward_prompt_to_all_tokens_impl` (gemma4_nvfp4_bring_up.rs:7780) is the device-resident batched-prefill path — residual lives as `[N, hidden]` bf16 across all 60 layers; unified-prefill kernel runs ONCE per layer. Long-prompt TTFT now scales with prefill throughput, not N decode launches. |
+| Stream-6a — cuda_worker spec gate | **DONE.** `cuda_worker.rs:116` accepts `RVLLM_GEMMA4_SPEC_DECODE=1` for `ModelFamily::Gemma4Nvfp4` as well as `Gemma4` (fp8-block). Production NVFP4 spec session runs via `run_spec_session_nvfp4_greedy_k` (gemma4_nvfp4_bring_up.rs:1056). |
+| Stream-6a — BaseKvSource trait | **Open (cleanup).** Option B's drafter machinery (`ensure_drafter_nvfp4`, `run_spec_session_nvfp4_greedy_k`) is PARALLEL to `Gemma4Bringup`'s drafter (which goes through tasks #26/#27's `verify_batched_suffix_k_only` + `commit_base_tokens_from_state`). Both paths work at production quality; unifying them behind a `BaseKvSource` trait would deduplicate but is not blocking. |
+| Stream-6b (Hadamard drafter Q for Option B) | **Open (feature).** Option B's drafter currently runs without Hadamard parity. If Hadamard later turns on for Option B's NVFP4 base path, the drafter's Q must be rotated by the same per-layer R before cross-attn. Per-layer sign vectors live in `Gemma4LayerScratch.hadamard_signs_k`; Option B needs the same allocation + rotate/unrotate. Blocked by Stream-6a's trait abstraction. |
+| Stream-7 (Option B vision splice) | **Open (feature).** ViT weights ARE loaded on Option B (`Gemma4Nvfp4LoadedModel.vision`, gemma4_nvfp4_load.rs:712). The forward-side splice + admission unblock are NOT wired — handlers.rs:643 rejects vision inputs with `"vision_not_supported_on_gemma4_nvfp4"`. Next concrete step: extract `Gemma4Bringup::forward_gemma_vision` (~1400 LOC) into a free function or `impl Trait` that accepts the kernel set + arena, then call from `Gemma4Nvfp4Bringup` and splice output rows into the device residual buffer between embed and layer loop. Removing the admission rejection is the final wire-up. |
