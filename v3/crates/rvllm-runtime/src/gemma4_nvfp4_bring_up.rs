@@ -458,6 +458,21 @@ pub struct Gemma4Nvfp4Bringup {
     /// so `forward_gemma_vision` can splice ViT output rows into the
     /// device-resident residual between embed and the layer loop.
     pub vit: crate::gemma4_vision::Gemma4VisionKernels,
+    /// Stream-6b: per-(base layer, channel) ±1 Hadamard signs used by
+    /// drafter Q rotation. Allocated lazily by `ensure_drafter_nvfp4`
+    /// (mirrors `Gemma4Bringup::nvfp4_hadamard`); zero-bytes overhead
+    /// when `RVLLM_NVFP4_HADAMARD=0`. `None` when the gate is off.
+    pub nvfp4_hadamard: std::sync::Mutex<Option<crate::gemma4_bring_up::NvFp4HadamardAlloc>>,
+    /// `hadamard_rotate_f16_kernel` PTX symbol. Loaded once at
+    /// startup so the drafter Q rotation helper can fire without a
+    /// per-call PTX resolve. `None` on older kernel trees.
+    pub fn_hadamard_rotate_f16: Option<KernelFn>,
+    /// Companion to `fn_hadamard_rotate_f16`: applies
+    /// `R^T = diag(D) · H` to drafter attn_out when the base
+    /// rotated V (`RVLLM_NVFP4_HADAMARD_V=1`).
+    pub fn_hadamard_unrotate_f16: Option<KernelFn>,
+    _hadamard_rotate_f16_mod: Option<LoadedModule>,
+    _hadamard_unrotate_f16_mod: Option<LoadedModule>,
     /// Stream-6a: lazy-uploaded drafter runtime (parallel to
     /// production's `Gemma4Bringup::drafter`). Populated by
     /// `ensure_drafter_nvfp4` on first spec request. Behind a
@@ -748,6 +763,20 @@ impl Gemma4Nvfp4Bringup {
         // Stream-7: ViT kernel subset for native vision splice.
         let vit = crate::gemma4_vision::Gemma4VisionKernels::load(&loader)?;
 
+        // Stream-6b: Hadamard rotate/unrotate kernels — optional on
+        // older PTX trees, .ok() lets the bringup still construct.
+        // Signs allocation is deferred to `ensure_drafter_nvfp4` so
+        // it lives ABOVE the per-request scratch checkpoint (same
+        // contract as fp8-block's `nvfp4_hadamard`).
+        let hadamard_rotate_f16_mod = loader.load_ptx("hadamard_rotate_f16").ok();
+        let fn_hadamard_rotate_f16 = hadamard_rotate_f16_mod
+            .as_ref()
+            .and_then(|m| m.get_function("hadamard_rotate_f16_kernel").ok());
+        let hadamard_unrotate_f16_mod = loader.load_ptx("hadamard_unrotate_f16").ok();
+        let fn_hadamard_unrotate_f16 = hadamard_unrotate_f16_mod
+            .as_ref()
+            .and_then(|m| m.get_function("hadamard_unrotate_f16_kernel").ok());
+
         let forward_checkpoint = arena.checkpoint();
 
         Ok(Self {
@@ -769,6 +798,11 @@ impl Gemma4Nvfp4Bringup {
             kv_state_allocated: false,
             kernels: loader,
             vit,
+            nvfp4_hadamard: std::sync::Mutex::new(None),
+            fn_hadamard_rotate_f16,
+            fn_hadamard_unrotate_f16,
+            _hadamard_rotate_f16_mod: hadamard_rotate_f16_mod,
+            _hadamard_unrotate_f16_mod: hadamard_unrotate_f16_mod,
             drafter: std::sync::Mutex::new(None),
             base_last_hidden_ptr: std::sync::atomic::AtomicU64::new(0),
             decode_capture: std::sync::Mutex::new(None),
@@ -2945,6 +2979,142 @@ impl Gemma4Nvfp4Bringup {
             },
         };
         rt.forward(image_bytes)
+    }
+
+    /// Stream-6b: rotate drafter Q by per-base-layer R = H·diag(D)
+    /// before the cross-attn launch when `RVLLM_NVFP4_HADAMARD=1`.
+    /// Mirrors `Gemma4Bringup::apply_hadamard_to_drafter_q`. No-op
+    /// when:
+    ///   * the gate env is off,
+    ///   * `self.nvfp4_hadamard` is still `None` (no signs uploaded),
+    ///   * `fn_hadamard_rotate_f16` is `None` (older PTX tree).
+    /// The drafter consumer is wired in follow-up — this method is
+    /// the launch primitive Option B's spec session calls when
+    /// HADAMARD-on becomes a supported path on Option B.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn apply_hadamard_to_drafter_q(
+        &self,
+        q_ptr: u64,
+        source_layer_idx: u32,
+        num_heads: u32,
+        eff_hd: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if !crate::gemma4_bring_up::nvfp4_hadamard_enabled() {
+            return Ok(());
+        }
+        let alloc = {
+            let guard = self.nvfp4_hadamard.lock().unwrap();
+            match guard.as_ref() {
+                Some(a) => *a,
+                None => return Ok(()),
+            }
+        };
+        let kernel = match self.fn_hadamard_rotate_f16 {
+            Some(k) => k,
+            None => return Ok(()),
+        };
+        let signs_ptr = alloc.layer_ptr(source_layer_idx);
+        if signs_ptr == 0 {
+            return Ok(());
+        }
+        let mut q = q_ptr;
+        let mut signs = signs_ptr;
+        let mut nt: i32 = 1;
+        let mut nh: i32 = num_heads as i32;
+        let mut hd: i32 = eff_hd as i32;
+        let args: [*mut core::ffi::c_void; 5] = [
+            &mut q     as *mut _ as *mut _,
+            &mut signs as *mut _ as *mut _,
+            &mut nt    as *mut _ as *mut _,
+            &mut nh    as *mut _ as *mut _,
+            &mut hd    as *mut _ as *mut _,
+        ];
+        use cudarc::driver::sys::*;
+        let rc = cuLaunchKernel(
+            kernel.raw() as CUfunction,
+            1, num_heads, 1,
+            eff_hd, 1, 1,
+            0,
+            stream as CUstream,
+            args.as_ptr() as *mut *mut core::ffi::c_void,
+            core::ptr::null_mut(),
+        );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "Gemma4Nvfp4: drafter Q hadamard_rotate_f16 launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Stream-6b companion: un-rotate drafter attn_out by R^T when
+    /// the base rotated V (`RVLLM_NVFP4_HADAMARD_V=1`). Same gates
+    /// and signs source as `apply_hadamard_to_drafter_q`.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn apply_hadamard_unrotate_drafter_attn_out(
+        &self,
+        attn_out_ptr: u64,
+        source_layer_idx: u32,
+        num_heads: u32,
+        eff_hd: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if !crate::gemma4_bring_up::nvfp4_hadamard_enabled() {
+            return Ok(());
+        }
+        let rotate_v = crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HADAMARD_V")
+            .unwrap_or(true);
+        if !rotate_v {
+            return Ok(());
+        }
+        let alloc = {
+            let guard = self.nvfp4_hadamard.lock().unwrap();
+            match guard.as_ref() {
+                Some(a) => *a,
+                None => return Ok(()),
+            }
+        };
+        let kernel = match self.fn_hadamard_unrotate_f16 {
+            Some(k) => k,
+            None => return Ok(()),
+        };
+        let signs_ptr = alloc.layer_ptr(source_layer_idx);
+        if signs_ptr == 0 {
+            return Ok(());
+        }
+        let mut x = attn_out_ptr;
+        let mut signs = signs_ptr;
+        let mut nt: i32 = 1;
+        let mut nh: i32 = num_heads as i32;
+        let mut hd: i32 = eff_hd as i32;
+        let args: [*mut core::ffi::c_void; 5] = [
+            &mut x     as *mut _ as *mut _,
+            &mut signs as *mut _ as *mut _,
+            &mut nt    as *mut _ as *mut _,
+            &mut nh    as *mut _ as *mut _,
+            &mut hd    as *mut _ as *mut _,
+        ];
+        use cudarc::driver::sys::*;
+        let rc = cuLaunchKernel(
+            kernel.raw() as CUfunction,
+            1, num_heads, 1,
+            eff_hd, 1, 1,
+            0,
+            stream as CUstream,
+            args.as_ptr() as *mut *mut core::ffi::c_void,
+            core::ptr::null_mut(),
+        );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "Gemma4Nvfp4: drafter attn_out hadamard_unrotate_f16 launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn allocate_kv_state(&mut self, max_pos: u32) -> Result<Gemma4Nvfp4KvState> {
