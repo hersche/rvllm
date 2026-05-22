@@ -16597,3 +16597,160 @@ fn load_gemma4_fused(
         fn_awq_int4_gemm_sm120_wmma,
     })
 }
+
+// =====================================================================
+// Stream-6a: symmetric `BaseKvSource` adapter for the fp8-block path.
+//
+// Mirrors `Gemma4Nvfp4BaseKvSource` (gemma4_nvfp4_bring_up.rs:8359).
+// The fp8-block KV cache is laid out as a single contiguous arena
+// region with per-layer byte offsets (the run_generate_speculative*
+// closures call this "compute_view"); to expose it as
+// `BaseKvSource::drafter_base_kv_view` we package the live pointers
+// + offsets + dtype table into a borrow-pair wrapper. Bound by the
+// lifetime of the underlying spec session.
+//
+// With both bringups now implementing the same trait, future
+// unification work (a shared `populate_shadow_kv_range_via_base`
+// helper consuming `&dyn BaseKvSource`) can drive the drafter from
+// either family without per-call inline pointer math.
+//
+// This wrapper deliberately does NOT model the
+// `RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1` shadow-override path — that
+// override decorates the regular view at the call site, and stays
+// outside the trait. Production spec sessions on the fp8-block path
+// remain on their existing inline `compute_view` closures; the
+// wrapper is the structured replacement available to call-site
+// refactors as they retire the closures one by one.
+// =====================================================================
+
+/// Borrow-view bundling the live fp8-block KV cache pointers + per-layer
+/// metadata needed to implement [`crate::gemma4_drafter::BaseKvSource`].
+pub struct Fp8BlockBaseKvSource<'a> {
+    pub bringup: &'a Gemma4Bringup,
+    /// Base ptr of the per-layer K/V cache arena.
+    pub kv_base_ptr: u64,
+    /// Base ptr of the per-layer K/V scale arena. Zero when KV is F16.
+    pub kv_scale_base_ptr: u64,
+    /// Per-layer byte offset into `kv_base_ptr` (sized
+    /// `arch.num_hidden_layers`).
+    pub kv_layer_offsets: &'a [u64],
+    /// Per-layer byte offset into `kv_scale_base_ptr`. Same length.
+    pub kv_scale_layer_offsets: &'a [u64],
+    /// Per-layer KV dtype (F16 / FP8 / NVFP4).
+    pub kv_dtype_per_layer: &'a [crate::gemma4_layer_exec::KvDtype],
+    /// Total physical blocks reserved for global-attention layers.
+    pub num_blocks_total: u32,
+    /// Physical blocks reserved for sliding-attention layers (often
+    /// equal to `num_blocks_total` on this codebase, kept separate
+    /// for symmetry with the fp8-block layout invariants).
+    pub sliding_blocks: u32,
+    /// Block size for paged-cache addressing.
+    pub block_size: u32,
+}
+
+impl<'a> Fp8BlockBaseKvSource<'a> {
+    /// Construct from the per-(spec session) locals that
+    /// `run_generate_speculative_iterative` (and siblings) already
+    /// carry in scope. Borrows-only — no allocations, no clones.
+    pub fn new(
+        bringup: &'a Gemma4Bringup,
+        kv_base_ptr: u64,
+        kv_scale_base_ptr: u64,
+        kv_layer_offsets: &'a [u64],
+        kv_scale_layer_offsets: &'a [u64],
+        kv_dtype_per_layer: &'a [crate::gemma4_layer_exec::KvDtype],
+        num_blocks_total: u32,
+        sliding_blocks: u32,
+        block_size: u32,
+    ) -> Self {
+        Self {
+            bringup,
+            kv_base_ptr,
+            kv_scale_base_ptr,
+            kv_layer_offsets,
+            kv_scale_layer_offsets,
+            kv_dtype_per_layer,
+            num_blocks_total,
+            sliding_blocks,
+            block_size,
+        }
+    }
+}
+
+impl<'a> crate::gemma4_drafter::BaseKvSource for Fp8BlockBaseKvSource<'a> {
+    fn drafter_base_kv_view(
+        &self,
+        layer_idx: usize,
+    ) -> Result<crate::gemma4_drafter::DrafterBaseKvView> {
+        let arch = &self.bringup.arch;
+        if layer_idx >= arch.num_hidden_layers {
+            return Err(RvllmError::cuda(
+                "Fp8BlockBaseKvSource::drafter_base_kv_view: layer_idx out of range",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        let off = self.kv_layer_offsets[layer_idx];
+        let scale_off = self.kv_scale_layer_offsets[layer_idx];
+        let is_global = arch.layer_types[layer_idx]
+            == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+        let layer_blocks = if is_global {
+            self.num_blocks_total
+        } else {
+            self.sliding_blocks
+        };
+        let nkvh = arch.num_kv_heads_for_layer(layer_idx) as u32;
+        let hd = arch.head_dim_for_layer(layer_idx) as u32;
+        // Total K+V element count for the layer; K and V each occupy
+        // half. Dtype-specific division mirrors the inline
+        // `compute_view` closure in `run_generate_speculative_*`.
+        let layer_elems = 2u64
+            * layer_blocks as u64
+            * self.block_size as u64
+            * nkvh as u64
+            * hd as u64;
+        let dtype = self.kv_dtype_per_layer[layer_idx];
+        let k_v_half_bytes = match dtype {
+            crate::gemma4_layer_exec::KvDtype::F16 => layer_elems,
+            crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems / 2,
+            crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 4,
+        };
+        let scale_half_slots =
+            layer_blocks as u64 * self.block_size as u64 * nkvh as u64;
+        let scale_half_bytes = match dtype {
+            crate::gemma4_layer_exec::KvDtype::F16 => 0,
+            crate::gemma4_layer_exec::KvDtype::Fp8 => scale_half_slots * 4,
+            crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 32,
+        };
+        let k_cache = self.kv_base_ptr + off;
+        let v_cache = k_cache + k_v_half_bytes;
+        let (k_scale_cache, v_scale_cache) = if dtype
+            == crate::gemma4_layer_exec::KvDtype::F16
+        {
+            (0u64, 0u64)
+        } else {
+            let k_s = self.kv_scale_base_ptr + scale_off;
+            (k_s, k_s + scale_half_bytes)
+        };
+        Ok(crate::gemma4_drafter::DrafterBaseKvView {
+            k_cache,
+            v_cache,
+            k_scale_cache,
+            v_scale_cache,
+            // fp8-block path doesn't allocate a per-token Q scale
+            // cache today (drafter cross-attn relies on the scalar
+            // `q_descale` path). Mirror the Option B view's choice.
+            q_scale_cache: 0,
+            block_tables: 0,
+            context_lens: 0,
+            block_size: self.block_size,
+            max_blocks_per_seq: layer_blocks,
+            num_blocks_total: layer_blocks,
+            kv_dtype: dtype,
+        })
+    }
+
+    fn assistant_shared_kv_sources(&self) -> Option<(usize, usize)> {
+        self.bringup.arch.assistant_shared_kv_sources()
+    }
+}
