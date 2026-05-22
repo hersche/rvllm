@@ -1017,6 +1017,23 @@ larger graphs DO matter, or for continuous-batch decoding where
 macro-graphs could share sequences across requests. Production
 default (`MULTI_STEP` unset) remains the single-step path.
 
+**Kernel fusion follow-on (`e47166b`)**: new
+`qwen36_argmax_with_link_f16_kernel` fuses the per-iteration
+argmax with the step-link side-effects (token_dst write +
+pos/ctx increment). Macro-graph body now runs
+`forward_qwen36_decode_step_to_workspace_no_closer` + the fused
+closer instead of the prior plain-argmax-then-step_link pair.
+Per N-step macro-block, kernel count drops from
+`N * forward + N argmax + (N-1) step_link` to
+`N * forward + N fused-closer`. Macro-graph node count drops
+14847 → **14840** at N=8 (exactly the predicted 7-node
+reduction). Latency 2.191s / 2.362s — within noise of pre-fusion;
+the value is architectural (cleaner "closer fuses link" pattern
+and 7 fewer launches per macro-block). The unfused
+`qwen36_step_link_i32_kernel` + Rust launcher stay loaded as
+parked infrastructure for future non-fused captured paths
+(continuous-batch, multi-sequence macro-graphs).
+
 ### Phase 8 follow-on (graph-cache reuse) — SHIPPED 2026-05-22
 
 Commit `bcdce94` lands cross-request graph cache reuse:
