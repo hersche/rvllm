@@ -295,6 +295,13 @@ photosynthesis output byte-identical to eager). Latency A/B at
 max_tokens=150: eager 2.315s vs replay 2.158s — replay ≈7%
 faster.
 
+Follow-on commit `bcdce94` adds cross-request graph cache reuse via
+a persistent workspace at worker bring-up + an inner RAII arena
+checkpoint+restore guard at decode_inner entry. The captured graph
+from request N is now valid for request N+1 (all device pointers
+stable). First request after worker startup pays the ≈600-700ms
+capture+instantiate cost; every subsequent request skips it.
+
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
 desired.

@@ -975,6 +975,30 @@ kernel-launch overhead; eager is already fast on GB10, so the
 captured path's primary value is as the foundation for further
 graph-level optimizations.
 
+### Phase 8 follow-on (graph-cache reuse) — SHIPPED 2026-05-22
+
+Commit `bcdce94` lands cross-request graph cache reuse:
+
+- **Persistent workspace** allocated once at worker bring-up
+  (BEFORE the `scratch_ck` checkpoint). Workspace.* device
+  pointers stay stable across all requests.
+- **Inner arena checkpoint+restore** via the RAII
+  `Qwen36DecodeArenaGuard` at the entry of
+  `forward_qwen36_decode_inner_with_workspace_overrides_v2`.
+  Every per-call `arena.region(...)` inside the function lands
+  at deterministic device addresses on every call, every
+  request (the entry bump is always `scratch_ck`).
+- **Removed per-request `clear_decode_capture`** — the
+  captured graph from request N is now reusable for request
+  N+1 since every captured pointer is address-stable.
+
+Hardware validation (3 sequential requests, different prompt
+lengths): all correct, log shows "[graph] captured 1855
+nodes" only ONCE on the first request. Cache reuse saves
+≈600-700ms on the first follow-up request (skips the capture
++ graph instantiate cost); subsequent requests maintain the
+≈7% replay-vs-eager per-token speedup.
+
 Eager decode path remains the production default
 (`RVLLM_QWEN36_DECODE_GRAPH` unset). Captured path opt-in only.
 
