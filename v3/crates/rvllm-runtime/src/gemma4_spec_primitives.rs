@@ -412,16 +412,27 @@ impl Gemma4Bringup {
 
         // q_scale cache (per-token Q amax buffer). Allocate a K-sized
         // region under a stable name so it's reused across spec calls.
-        // Spec verify always runs in the same dtype regime as the
-        // request's preceding decode, so a fresh K-sized scratch is
-        // safe (rope kernel re-populates per-token amax/448 inside).
+        // CRITICAL (Phase 4 debug): the rope kernel WRITES per-token
+        // amax/448 into this buffer at index [tok * num_heads + head];
+        // run_generate zero-inits via cuMemsetD8 at every call so stale
+        // amax values from a prior request can't leak into the current
+        // attention. We mirror that memset here.
         let q_scale_cache_ptr: u64 = if std::env::var(
             "RVLLM_PER_TOKEN_Q_SCALE").map_or(true, |v| v != "0")
         {
             let bytes = (MAX_SPEC_K as usize)
                 * (arch.num_attention_heads as usize) * 4;
-            arena.region("gemma4_spec_q_scale_cache", bytes, 16)?
-                .device_ptr()
+            let r = arena.region("gemma4_spec_q_scale_cache", bytes, 16)?;
+            let ptr = r.device_ptr();
+            use cudarc::driver::sys::*;
+            let rc = cuMemsetD8Async(ptr, 0, bytes, stream as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "spec_verify q_scale_cache memset",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+            ptr
         } else { 0 };
 
         // Populate q_scale / kv_scale at the same defaults run_generate

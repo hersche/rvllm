@@ -6253,16 +6253,17 @@ impl Gemma4Bringup {
                 // next argmax, matching prefill_one_from_state's
                 // contract.
                 let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
-                let new_next = if Self::spec_new_primitives_enabled() {
+                // Bisect: only switch commit when
+                // RVLLM_GEMMA4_SPEC_NEW_COMMIT=1 is ALSO set.
+                let new_next = if Self::spec_new_primitives_enabled()
+                    && std::env::var("RVLLM_GEMMA4_SPEC_NEW_COMMIT").as_deref() == Ok("1")
+                {
                     let r = self.commit_base_tokens_from_state(
                         fn_embed, bonus, session.committed_len,
                         k_hidden_buf)?;
                     session.tokens.push(bonus);
                     session.committed_len =
                         session.committed_len.saturating_add(1);
-                    // Row 0 of k_hidden_buf IS the bonus's post-
-                    // final-norm hidden (K=1 verify path runs
-                    // final_norm in place over the captured residual).
                     session.last_base_hidden_ptr = k_hidden_buf;
                     r
                 } else {
@@ -6332,7 +6333,9 @@ impl Gemma4Bringup {
                 if emitted.len() >= max_new { break; }
 
                 let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
-                let new_next = if Self::spec_new_primitives_enabled() {
+                let new_next = if Self::spec_new_primitives_enabled()
+                    && std::env::var("RVLLM_GEMMA4_SPEC_NEW_COMMIT").as_deref() == Ok("1")
+                {
                     let r = self.commit_base_tokens_from_state(
                         fn_embed, bonus, session.committed_len,
                         k_hidden_buf)?;
@@ -6351,7 +6354,7 @@ impl Gemma4Bringup {
                 }
                 session.next_base_argmax = new_next;
 
-                // Shadow KV update for the single new committed slot.
+                // Shadow KV update for the single new committed slot
                 let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
                 let guard = self.drafter.lock().unwrap();
                 let d = guard.as_ref().expect("drafter resident");
