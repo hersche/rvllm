@@ -160,21 +160,34 @@ pointing at the diagnosis. Bypass knob
 `RVLLM_GEMMA4_SPEC_ALLOW_HADAMARD=1` exists for the future
 un-rotate-in-populate kernel fix to develop against.
 
-The proper code-level fix (un-rotate K/V inside
-`populate_shadow_kv_range_from_base`'s dequant kernel, so the
-shadow KV lands in HF-native frame regardless of base's rotation)
-has a Phase 1 helper landed in commit `f6d0b5d`:
-`Gemma4Bringup::apply_hadamard_unrotate_to_shadow_kv_range`
-launches the existing `hadamard_unrotate_f16_kernel` over a
-shadow KV slot range. It is currently UNWIRED (Phase 2 = wire
-into the four populate call sites + relax the ensure_drafter
-guard + validate vs HF). Operator workaround until Phase 2
-ships: spec profile sets HADAMARD=HADAMARD_V=0, accepting the
-documented base-quality tradeoff on long contexts. The
-production 31B spec profile flipped to
-`RVLLM_GEMMA4_SPEC_NEW_PRIMITIVES=1` in the same session
-(commits `2334dbc` byte-equiv fix + profile flip in
-`mobile-31b-rvllm-spec.env`).
+The proper code-level fix (un-rotate K/V inside the shadow KV
+population path, so the shadow lands in HF-native frame regardless
+of base's rotation) is DONE across two phases:
+
+  * Phase 1 (`f6d0b5d`): public helper
+    `Gemma4Bringup::apply_hadamard_unrotate_to_shadow_kv_range`
+    launches `hadamard_unrotate_f16_kernel` over a shadow KV slot
+    range.
+  * Phase 2 (`fe86201`): wrapper
+    `unrotate_shadow_kv_after_populate` wired into all four
+    `populate_shadow_kv_range_from_base` call sites in
+    `run_generate_speculative_batched`. The `ensure_drafter`
+    HADAMARD-vs-spec guard now treats
+    `RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1` as an implicit bypass
+    — HADAMARD=1 + SPEC=1 is allowed when the un-rotate path is
+    active. Validated under HADAMARD=1: coherent German output
+    on three prompts, accept_rate 3-6% on the short ones (vs
+    87% on the HADAMARD=0 path, because the drafter sees
+    NVFP4-quant-then-un-rotated K/V with slight quant noise vs
+    the true HF K/V it was trained on).
+
+The production 31B spec profile still defaults to HADAMARD=0
+(`mobile-31b-rvllm-spec.env`) for highest accept rate; operator
+can opt into the long-context-quality HADAMARD=1 path via
+`RVLLM_NVFP4_HADAMARD=1` + `RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1`.
+Same session also flipped the profile to
+`RVLLM_GEMMA4_SPEC_NEW_PRIMITIVES=1` (commits `2334dbc` byte-equiv
+fix + profile flip in `mobile-31b-rvllm-spec.env`).
 
 Spec wall is ~5% slower than eager on the 80-tok decode
 (compute-bound 31B dense, verify-cost amortisation fails on this

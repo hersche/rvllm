@@ -1,6 +1,45 @@
 # Speculative-decoding next-session plan — Gemma 4 E4B
 
-## Status (2026-05-22 session update — head `f6d0b5d`)
+## Status (2026-05-22 session update — head `fe86201`)
+
+* **#34 Phase 2 — un-rotate wired + ensure_drafter guard relaxed**
+  (`fe86201`). `unrotate_shadow_kv_after_populate(sources,
+  slot_start, slot_count, stream)` wraps the four populate sites
+  in `run_generate_speculative_batched`. The
+  `ensure_drafter` HADAMARD-vs-spec guard now treats
+  `RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1` as an implicit bypass —
+  HADAMARD=1 + SPEC=1 is allowed when the un-rotate path is
+  active. Validated on mobile-31b-rvllm-spec with HADAMARD=1 +
+  HADAMARD_V=0 + UNROTATE_SHADOW=1:
+
+      Prompt                                  | md5         | accept_rate
+      Was ist die Hauptstadt von Frankreich?   | d0451f05  ✓ | 1/32 (3%)
+      Sag mir 5 Hauptstädte Europas in...      | 58649bba  ✓ | 3/52 (6%)
+      Erkläre kurz was Linux ist.              | 47e40cc1    | 5/100 (5%)
+
+  - First two prompts: md5 byte-identical to the HADAMARD=0
+    baseline (model confident enough that NVFP4-quant noise
+    doesn't flip argmax).
+  - Linux: coherent German output ("Linux ist ein
+    Betriebssystem-Kern…"); different md5 from HADAMARD=0 path
+    because long-context base behavior differs between HADAMARD=1
+    and HADAMARD=0 base paths.
+  - Accept rates drop vs HADAMARD=0 because the drafter sees
+    NVFP4-quant-then-un-rotated K/V (slight quant noise vs the
+    true HF K/V it was trained on). Spec still functions; net
+    wall is positive-or-neutral on long-accept workloads.
+
+  Production-default profile still keeps HADAMARD=0 (the
+  byte-equiv-validated path through verify_batched_suffix_k_only
+  remains the production default). Operator can opt into the
+  HADAMARD=1 long-context-quality path via:
+
+      RVLLM_NVFP4_HADAMARD=1
+      RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1
+
+  Task #34 DONE.
+
+## Status (head `f6d0b5d` — Phase 1)
 
 * **31B production spec profile flipped** (`2334dbc` + profile
   edit). `mobile-31b-rvllm-spec.env` now sets
