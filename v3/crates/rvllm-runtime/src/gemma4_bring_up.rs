@@ -1642,11 +1642,30 @@ pub fn build_nvfp4_shadow_alloc(
     sliding_blocks: u32,
     block_size: u32,
     arena: &HbmArena<'_>,
+    spec_source_layers: Option<Gemma4AssistantKvSources>,
 ) -> Result<Option<NvFp4ShadowAlloc>> {
-    let shadow_set = match crate::gemma4_layer_exec::parse_shadow_layers() {
-        Some(s) => s,
-        None => return Ok(None),
-    };
+    // Task #34 — when spec is on and the operator opted into
+    // `RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1`, force the spec source
+    // layers (sliding + full) into the nvfp4-shadow set. This makes
+    // the rope kernel write POST-RoPE, PRE-HADAMARD, PRE-NVFP4-QUANT
+    // F16 K/V to the shadow region for those layers. The drafter's
+    // populate path can then DtoD-copy F16 directly into the drafter
+    // shadow (zero quant noise) instead of dequanting the
+    // rotated-quantized NVFP4 base cache. Drafter accept rate then
+    // matches the HADAMARD=0 path without sacrificing base quality.
+    let mut shadow_set = crate::gemma4_layer_exec::parse_shadow_layers()
+        .unwrap_or_default();
+    let spec_f16_shadow =
+        parse_truthy_env("RVLLM_GEMMA4_SPEC_USE_F16_SHADOW").unwrap_or(false);
+    if spec_f16_shadow {
+        if let Some(s) = spec_source_layers {
+            for li in [s.sliding_source_layer, s.full_source_layer] {
+                if !shadow_set.contains(&li) {
+                    shadow_set.push(li);
+                }
+            }
+        }
+    }
     if shadow_set.is_empty() {
         return Ok(None);
     }
@@ -2365,7 +2384,16 @@ impl Gemma4Bringup {
         // populate. Treat the un-rotate gate as an implicit bypass.
         let unrotate_active = crate::gemma4_bring_up::parse_truthy_env(
             "RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW").unwrap_or(false);
-        if (had || had_v) && !allow_bypass && !unrotate_active &&
+        // Task #34 Phase 3: F16-shadow path. The drafter reads
+        // POST-RoPE, PRE-HADAMARD, PRE-NVFP4-QUANT F16 K/V directly
+        // from the nvfp4-shadow region. Rotated NVFP4 base cache is
+        // bypassed for the drafter entirely → drafter sees the same
+        // HF-native frame the HADAMARD=0 path provides, with zero
+        // quant noise. Implicit bypass of the guard.
+        let f16_shadow_active = crate::gemma4_bring_up::parse_truthy_env(
+            "RVLLM_GEMMA4_SPEC_USE_F16_SHADOW").unwrap_or(false);
+        if (had || had_v) && !allow_bypass && !unrotate_active
+            && !f16_shadow_active &&
             crate::gemma4_bring_up::parse_truthy_env(
                 "RVLLM_GEMMA4_SPEC_DECODE").unwrap_or(false)
         {
@@ -5929,9 +5957,57 @@ impl Gemma4Bringup {
         let sliding_li = sources.sliding_source_layer as usize;
         let full_li = sources.full_source_layer as usize;
 
+        // Task #34 — when RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1, route
+        // the drafter to read POST-RoPE-PRE-HADAMARD-PRE-NVFP4-QUANT
+        // F16 K/V from the nvfp4-shadow region instead of dequanting
+        // the rotated-quantized NVFP4 base KV cache. With this on,
+        // drafter sees zero-quant-noise K/V → accept rate matches the
+        // HADAMARD=0 baseline even when HADAMARD=1 (preserving base
+        // long-context quality benefit).
+        let spec_f16_shadow =
+            crate::gemma4_bring_up::parse_truthy_env(
+                "RVLLM_GEMMA4_SPEC_USE_F16_SHADOW").unwrap_or(false);
+        let (shadow_alloc_ptr, shadow_layer_offsets_clone): (u64, Vec<u64>) = {
+            let g = self.nvfp4_shadow.lock().unwrap();
+            match g.as_ref() {
+                Some(a) => (a.shadow_ptr, a.layer_offsets.clone()),
+                None => (0u64, Vec::new()),
+            }
+        };
+        // For per-source-layer override, precompute the shadow F16
+        // ptr and the per-layer bytes (= K-region size; V follows
+        // immediately after). When the shadow alloc is missing the
+        // layer (offset == u64::MAX), the override is skipped and
+        // populate falls back to the NVFP4 dequant path.
+        let shadow_view_for_layer = |layer_idx: u32| -> Option<(u64, u64)> {
+            if !spec_f16_shadow { return None; }
+            if shadow_alloc_ptr == 0 { return None; }
+            let li = layer_idx as usize;
+            if li >= shadow_layer_offsets_clone.len() { return None; }
+            let off = shadow_layer_offsets_clone[li];
+            if off == u64::MAX { return None; }
+            // Compute per-layer K-region bytes (matches
+            // build_nvfp4_shadow_alloc's layer_bytes / 2 for K).
+            let is_global = arch.layer_types[li]
+                == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+            let nkvh = arch.num_kv_heads_for_layer(li) as u32;
+            let hd = arch.head_dim_for_layer(li) as u32;
+            let k_layer_bytes = (layer_blocks as u64) * (block_size as u64)
+                * (nkvh as u64) * (hd as u64) * 2;
+            let base = shadow_alloc_ptr + off;
+            Some((base, base + k_layer_bytes))
+        };
+
         // Compute per-layer K/V pointers + scale pointers for the
         // sliding + full source layers (used by populate_shadow_kv_range).
+        // When the F16-shadow override applies, returns the shadow ptr
+        // + zero scales (drafter will use the KvDtype::F16 path → no
+        // scale needed; caller MUST pass KvDtype::F16 for the populate).
         let compute_view = |layer_idx: u32| -> (u64, u64, u64, u64) {
+            if let Some((sk, sv)) = shadow_view_for_layer(layer_idx) {
+                return (sk, sv, 0u64, 0u64);
+            }
             let li = layer_idx as usize;
             let off = kv_layer_offsets[li];
             let scale_off = kv_scale_layer_offsets[li];
@@ -5967,6 +6043,16 @@ impl Gemma4Bringup {
             };
             (k_cache, v_cache, k_scale, v_scale)
         };
+        // Effective dtype for the populate dispatch — F16 when the
+        // override engaged (shadow source is f16), original NVFP4/FP8
+        // otherwise.
+        let effective_kv_dtype = |layer_idx: u32| -> crate::gemma4_layer_exec::KvDtype {
+            if shadow_view_for_layer(layer_idx).is_some() {
+                crate::gemma4_layer_exec::KvDtype::F16
+            } else {
+                kv_dtype_per_layer[layer_idx as usize]
+            }
+        };
         let (sliding_k, sliding_v, sliding_ks, sliding_vs) =
             compute_view(sources.sliding_source_layer);
         let (full_k, full_v, full_ks, full_vs) =
@@ -5988,8 +6074,8 @@ impl Gemma4Bringup {
                 full_k, full_v,
                 sliding_ks, sliding_vs,
                 full_ks, full_vs,
-                kv_dtype_per_layer[sliding_li],
-                kv_dtype_per_layer[full_li],
+                effective_kv_dtype(sources.sliding_source_layer),
+                effective_kv_dtype(sources.full_source_layer),
                 shadow_sliding_bytes,
                 shadow_full_bytes,
                 /* slot_start */ 0,
@@ -6029,8 +6115,8 @@ impl Gemma4Bringup {
                 sources.full_source_layer,
                 sliding_k, sliding_v, full_k, full_v,
                 shadow_sliding_bytes, shadow_full_bytes,
-                kv_dtype_per_layer[sliding_li],
-                kv_dtype_per_layer[full_li],
+                effective_kv_dtype(sources.sliding_source_layer),
+                effective_kv_dtype(sources.full_source_layer),
             )?;
         }
 
@@ -6241,8 +6327,8 @@ impl Gemma4Bringup {
                         full_k, full_v,
                         sliding_ks, sliding_vs,
                         full_ks, full_vs,
-                        kv_dtype_per_layer[sliding_li],
-                        kv_dtype_per_layer[full_li],
+                        effective_kv_dtype(sources.sliding_source_layer),
+                        effective_kv_dtype(sources.full_source_layer),
                         shadow_sliding_bytes,
                         shadow_full_bytes,
                         /* slot_start */ old_committed,
@@ -6317,8 +6403,8 @@ impl Gemma4Bringup {
                         full_k, full_v,
                         sliding_ks, sliding_vs,
                         full_ks, full_vs,
-                        kv_dtype_per_layer[sliding_li],
-                        kv_dtype_per_layer[full_li],
+                        effective_kv_dtype(sources.sliding_source_layer),
+                        effective_kv_dtype(sources.full_source_layer),
                         shadow_sliding_bytes,
                         shadow_full_bytes,
                         /* slot_start */ bonus_slot,
@@ -6397,8 +6483,8 @@ impl Gemma4Bringup {
                         full_k, full_v,
                         sliding_ks, sliding_vs,
                         full_ks, full_vs,
-                        kv_dtype_per_layer[sliding_li],
-                        kv_dtype_per_layer[full_li],
+                        effective_kv_dtype(sources.sliding_source_layer),
+                        effective_kv_dtype(sources.full_source_layer),
                         shadow_sliding_bytes,
                         shadow_full_bytes,
                         /* slot_start */ old_committed,
@@ -7134,6 +7220,11 @@ impl Gemma4Bringup {
             // For a 100-token chat prompt that's ~320× fewer
             // dequant work-elements per iter.
             let valid_len_slots = prompt_ids.len() as u32;
+            // Legacy iterative spec path — does NOT receive the F16
+            // shadow override because the per-source dtype here is
+            // read from the existing kv_dtype_per_layer (no
+            // compute_view in this code path). Keeps the legacy
+            // path's behavior unchanged.
             drafter.populate_shadow_kv_from_base(
                 sliding_view.k_cache,
                 sliding_view.v_cache,

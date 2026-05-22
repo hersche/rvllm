@@ -1921,6 +1921,7 @@ pub async fn spawn_cuda_worker(
                     sliding_blocks,
                     BLOCK_SIZE,
                     &bringup.arena,
+                    bringup.assistant_kv_sources,
                 ) {
                     Ok(alloc) => {
                         if alloc.is_some() {
