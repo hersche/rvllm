@@ -163,9 +163,18 @@ un-rotate-in-populate kernel fix to develop against.
 The proper code-level fix (un-rotate K/V inside
 `populate_shadow_kv_range_from_base`'s dequant kernel, so the
 shadow KV lands in HF-native frame regardless of base's rotation)
-is deferred — separate, larger lift. Operator workaround until
-then: spec profile sets HADAMARD=HADAMARD_V=0, accepting the
-documented base-quality tradeoff on long contexts.
+has a Phase 1 helper landed in commit `f6d0b5d`:
+`Gemma4Bringup::apply_hadamard_unrotate_to_shadow_kv_range`
+launches the existing `hadamard_unrotate_f16_kernel` over a
+shadow KV slot range. It is currently UNWIRED (Phase 2 = wire
+into the four populate call sites + relax the ensure_drafter
+guard + validate vs HF). Operator workaround until Phase 2
+ships: spec profile sets HADAMARD=HADAMARD_V=0, accepting the
+documented base-quality tradeoff on long contexts. The
+production 31B spec profile flipped to
+`RVLLM_GEMMA4_SPEC_NEW_PRIMITIVES=1` in the same session
+(commits `2334dbc` byte-equiv fix + profile flip in
+`mobile-31b-rvllm-spec.env`).
 
 Spec wall is ~5% slower than eager on the 80-tok decode
 (compute-bound 31B dense, verify-cost amortisation fails on this

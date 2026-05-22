@@ -1,6 +1,34 @@
 # Speculative-decoding next-session plan — Gemma 4 E4B
 
-## Status (2026-05-22 session update — head `2334dbc`)
+## Status (2026-05-22 session update — head `f6d0b5d`)
+
+* **31B production spec profile flipped** (`2334dbc` + profile
+  edit). `mobile-31b-rvllm-spec.env` now sets
+  `RVLLM_GEMMA4_SPEC_NEW_PRIMITIVES=1` +
+  `RVLLM_GEMMA4_SPEC_NEW_COMMIT=1`, routing the batched spec
+  session through the new primitives in production. Byte-
+  equivalent on 3 regression prompts (md5 match). E4B spec
+  deliberately left on the env-default-OFF path until PLE
+  precompute is wired into the new path.
+
+* **#34 Phase 1 — `apply_hadamard_unrotate_to_shadow_kv_range`
+  helper landed** (`f6d0b5d`, +133 LOC on `Gemma4Bringup`).
+  Public method that launches the existing
+  `hadamard_unrotate_f16_kernel` over a shadow KV slot range
+  `[slot_start, slot_start + slot_count)` using the per-source-
+  layer Hadamard sign vector from `self.nvfp4_hadamard`. Layout
+  `[num_slots, nkvh, head_dim]` matches the kernel exactly —
+  grid = (slot_count, nkvh, 1), block = (head_dim, 1, 1). K is
+  always un-rotated when HADAMARD=1; V conditional on caller's
+  `unrotate_v` flag (caller passes HADAMARD_V). No-ops cleanly
+  when Hadamard env is off, signs alloc absent, or kernel not
+  loaded. Currently UNWIRED — Phase 2 (wire into the four
+  `populate_shadow_kv_range_from_base` call sites + relax the
+  `ensure_drafter` HADAMARD-vs-spec guard + validate vs HF on
+  identical prompts) is the remaining work for #34's full DONE
+  status.
+
+## Status (2026-05-22 earlier-in-session — head `2334dbc`)
 
 * **#26 — `verify_batched_suffix_k_only` — DONE** (`3f9febd`,
   `4449903`, `4a43405`, `2334dbc`). Byte-equivalent to the existing
