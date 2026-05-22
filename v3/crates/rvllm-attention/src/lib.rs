@@ -367,11 +367,21 @@ pub struct Fa2PtxKernels {
     /// handling all `num_heads / num_kv_heads` queries sharing that
     /// KV slice. Halves K/V dequant + smem traffic at decode for
     /// models with GQA > 1 (Gemma 4: ratio 2). Dispatched when
-    /// `num_heads > num_kv_heads` and GQA ≤ MAX_GQA_DECODE (=4).
+    /// `num_heads > num_kv_heads` and GQA ≤ MAX_GQA_DECODE (=4 for the
+    /// default kernel, =16 for the `_max16` variant — see below).
     #[cfg(feature = "cuda")]
     pub fn_decode_nvfp4kv_gqa: Option<rvllm_kernels::KernelFn>,
     #[cfg(feature = "cuda")]
     pub fn_decode_nvfp4kv_gqa_bc16: Option<rvllm_kernels::KernelFn>,
+    /// MAX_GQA=16 variant of `_gqa_kernel` for models with GQA > 4
+    /// (Mistral 3.5 GQA=12, Gemma 4 31B global GQA=8, Qwen 3.6 35B-A3B
+    /// GQA=8). Same body, larger per-thread register array. Host
+    /// dispatcher (`decode.rs`) picks this variant when actual GQA
+    /// exceeds the default cap; low-GQA models keep using the
+    /// minimal-register-footprint default. Optional — `None` on older
+    /// kernel trees that pre-date the variant.
+    #[cfg(feature = "cuda")]
+    pub fn_decode_nvfp4kv_gqa_max16: Option<rvllm_kernels::KernelFn>,
     /// `flash_attention_2_prefill_nvfp4kv_kernel` — NVFP4 KV prefill,
     /// BC=32 variant.
     #[cfg(feature = "cuda")]
@@ -525,6 +535,7 @@ impl Fa2PtxKernels {
                 fn_prefill_nvfp4kv_bc16,
                 fn_decode_nvfp4kv_gqa,
                 fn_decode_nvfp4kv_gqa_bc16,
+                fn_decode_nvfp4kv_gqa_max16,
             ) = match loader.load_ptx("flash_attention_nvfp4kv") {
                 Ok(m) => {
                     let d    = m.get_function("flash_attention_2_decode_nvfp4kv_kernel").ok();
@@ -533,9 +544,14 @@ impl Fa2PtxKernels {
                     let p16  = m.get_function("flash_attention_2_prefill_nvfp4kv_bc16_kernel").ok();
                     let dg   = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_kernel").ok();
                     let dg16 = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_bc16_kernel").ok();
-                    (Some(m), d, d16, p, p16, dg, dg16)
+                    // MAX_GQA=16 variant for Mistral 3.5 + Gemma 4 31B
+                    // global + Qwen 3.6 35B-A3B. `None` on older kernel
+                    // trees → host falls back to the per-head kernel
+                    // for actual GQA > 4 (existing behavior).
+                    let dgm  = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_max16_kernel").ok();
+                    (Some(m), d, d16, p, p16, dg, dg16, dgm)
                 }
-                Err(_) => (None, None, None, None, None, None, None),
+                Err(_) => (None, None, None, None, None, None, None, None),
             };
             let (fused_rope_nvfp4kv_mod, fn_rope_nvfp4kv) =
                 match loader.load_ptx("fused_rope_partial_nvfp4kv") {
@@ -677,6 +693,7 @@ impl Fa2PtxKernels {
                 fn_decode_nvfp4kv_bc16,
                 fn_decode_nvfp4kv_gqa,
                 fn_decode_nvfp4kv_gqa_bc16,
+                fn_decode_nvfp4kv_gqa_max16,
                 fn_prefill_nvfp4kv,
                 fn_prefill_nvfp4kv_bc16,
                 fn_prefill_nvfp4kv_unified,

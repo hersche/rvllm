@@ -843,14 +843,19 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             };
             use cudarc::driver::sys::*;
             const FA2_THREADS: i32 = 128;
-            const MAX_GQA_DECODE: u32 = 4;
+            // Default GQA-decode cap — matches the original kernel
+            // (`flash_attention_2_decode_nvfp4kv_gqa_kernel`). Models
+            // with GQA ∈ (1, 4] take this minimal-register-footprint
+            // path. See commits 2562b71-onward.
+            const MAX_GQA_DECODE_DEFAULT: u32 = 4;
+            // MAX_GQA=16 variant cap — matches
+            // `flash_attention_2_decode_nvfp4kv_gqa_max16_kernel`.
+            // Models with GQA ∈ (4, 16] take this variant: Mistral 3.5
+            // GQA=12, Gemma 4 31B global GQA=8, Qwen 3.6 35B-A3B
+            // GQA=8. Adaptive per-model dispatch — see repo CLAUDE.md
+            // "Cross-model invariants".
+            const MAX_GQA_DECODE_MAX16: u32 = 16;
             let hd = params.head_dim as i32;
-            // GQA-grouped path: one CTA per (seq, kv_head) shares a
-            // single KV dequant across all queries in the group. Only
-            // valid when ratio > 1 and ≤ MAX_GQA_DECODE (matches the
-            // compile-time cap on per-thread register arrays in the
-            // kernel). Transparent fallback to per-head kernel when
-            // the GQA symbol is absent (older PTX tree).
             let gqa_ratio = if params.num_kv_heads > 0 {
                 params.num_heads / params.num_kv_heads
             } else {
@@ -863,25 +868,51 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             let gqa_env_on = std::env::var("RVLLM_NVFP4_DECODE_GQA")
                 .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
                 .unwrap_or(false);
-            let use_gqa = gqa_env_on && gqa_ratio > 1 && gqa_ratio <= MAX_GQA_DECODE;
+            // Two-tier dispatch:
+            //   gqa ∈ (1,  4]: use `_gqa_kernel` (MAX_GQA=4).
+            //   gqa ∈ (4, 16]: use `_gqa_max16_kernel` (MAX_GQA=16) if
+            //                  loaded, else fall back to per-head.
+            //   gqa > 16 or both missing: per-head fallback.
+            // `effective_max_gqa` is the cap of the variant we pick;
+            // smem `score_rows` below uses THIS, not the global max.
+            let use_gqa_default = gqa_env_on
+                && gqa_ratio > 1
+                && gqa_ratio <= MAX_GQA_DECODE_DEFAULT;
+            let use_gqa_max16 = gqa_env_on
+                && gqa_ratio > MAX_GQA_DECODE_DEFAULT
+                && gqa_ratio <= MAX_GQA_DECODE_MAX16
+                && fa2.fn_decode_nvfp4kv_gqa_max16.is_some()
+                // bc16 path doesn't yet have the _max16 variant.
+                && hd <= 256;
+            let effective_max_gqa = if use_gqa_max16 {
+                MAX_GQA_DECODE_MAX16 as i32
+            } else if use_gqa_default {
+                MAX_GQA_DECODE_DEFAULT as i32
+            } else {
+                1
+            };
             let (kernel_opt, fa2_bc) = if hd > 256 {
-                let k = if use_gqa {
+                let k = if use_gqa_default {
                     fa2.fn_decode_nvfp4kv_gqa_bc16.or(fa2.fn_decode_nvfp4kv_bc16)
                 } else {
                     fa2.fn_decode_nvfp4kv_bc16
                 };
                 (k, 16)
+            } else if use_gqa_max16 {
+                (fa2.fn_decode_nvfp4kv_gqa_max16.or(fa2.fn_decode_nvfp4kv), 32)
             } else {
-                let k = if use_gqa {
+                let k = if use_gqa_default {
                     fa2.fn_decode_nvfp4kv_gqa.or(fa2.fn_decode_nvfp4kv)
                 } else {
                     fa2.fn_decode_nvfp4kv
                 };
                 (k, 32)
             };
-            let gqa_dispatched = use_gqa
+            let gqa_dispatched = (use_gqa_default || use_gqa_max16)
                 && if hd > 256 {
                     fa2.fn_decode_nvfp4kv_gqa_bc16.is_some()
+                } else if use_gqa_max16 {
+                    fa2.fn_decode_nvfp4kv_gqa_max16.is_some()
                 } else {
                     fa2.fn_decode_nvfp4kv_gqa.is_some()
                 };
@@ -903,8 +934,10 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             // f16 smem (2 bytes/elem) instead of f32 (4 bytes/elem),
             // halving the K/V tile footprint. s_score and s_reduce
             // stay f32 for softmax precision. GQA path widens s_score
-            // by MAX_GQA_DECODE (one scores row per query in group).
-            let score_rows = if gqa_dispatched { MAX_GQA_DECODE as i32 } else { 1 };
+            // by `effective_max_gqa` — the cap of the variant the
+            // dispatch above selected (4 for default, 16 for the
+            // _max16 variant).
+            let score_rows = if gqa_dispatched { effective_max_gqa } else { 1 };
             let smem_bytes =
                 2 * fa2_bc * hd * 2 + score_rows * fa2_bc * 4 + (FA2_THREADS / 32) * 4;
             if smem_bytes as u32 >= 48 * 1024 {
