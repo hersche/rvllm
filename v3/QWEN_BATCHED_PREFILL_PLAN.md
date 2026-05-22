@@ -302,6 +302,21 @@ from request N is now valid for request N+1 (all device pointers
 stable). First request after worker startup pays the ≈600-700ms
 capture+instantiate cost; every subsequent request skips it.
 
+Multi-step macro-replay + argmax+link fusion (commits `a14af12`,
+`e47166b`) infrastructure shipped — kernel-count reductions
+real, latency within noise of single-step replay (the per-step
+host overhead is small relative to kernel work).
+
+**MoE expert kernel fusion (commit `f0f79d5`) — first Phase 8
+optimization with a real measurable speedup**. The fused
+`fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_kernel`
+collapses the per-k-round (down-projection FP8 GEMV +
+scaled-add accumulator) pair into ONE launch. Saves 320 kernel
+launches + 320 f16 round-trips per decode token on Qwen 3.6
+35B-A3B. Latency: 2.140s → **1.717s** for a 150-token
+photosynthesis decode (≈20-25% speedup). The CLAUDE.md
+"Phase 8 MoE-fusion — SHIPPED" section has the full A/B table.
+
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
 desired.
