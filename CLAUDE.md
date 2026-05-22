@@ -880,24 +880,49 @@ blocking the prefill rollout above.
   fences + DtoHs OUTSIDE the captured region. Mirrors Gemma 4
   NVFP4's `forward_full_to_token_device_argmax` pattern.
 
+**Foundations shipped 2026-05-22 (continued)**:
+
+* `81a487f` — Phase 8 commit 2b: optional workspace overrides on
+  `forward_qwen36_decode_inner_with_workspace_overrides`. The
+  embed-gather now reads token indices from `workspace.token_dev`
+  when the override is provided (no legacy `copy_from_host`), and
+  the closer routes to `forward_qwen36_outside_closer_device_argmax`
+  to write argmax into `workspace.argmax_token_dev` instead of
+  doing a sync DtoH at the tail. Top-level
+  `forward_qwen36_decode_step_to_workspace(workspace, position)`
+  combines both overrides; this is the entry point that the
+  captured graph wraps. Hardware-validated: qwen3-6-35b-a3b
+  "Was ist die Hauptstadt von Frankreich?" → "Die Hauptstadt von
+  Frankreich ist Paris." (byte-identical to pre-commit eager).
+* `8505f90` — Phase 8 commit 3: CUDA graph capture + replay
+  infrastructure. New `Qwen36Bringup.decode_capture:
+  Mutex<Option<CapturedGraph>>` field; `try_capture_decode_step`
+  wraps `forward_qwen36_decode_step_to_workspace` in
+  `cuStreamBeginCapture` / `cuStreamEndCapture`; `replay_decode_step`
+  calls `cuGraphLaunch`; `decode_step_via_graph_or_eager` is the
+  high-level operator-facing entry (writes token to
+  `workspace.token_dev` via async HtoD, picks capture vs replay vs
+  eager, returns the token via `argmax_dev_to_host_token`).
+  `RVLLM_QWEN36_DECODE_GRAPH=1` opts in (default off).
+
 **Remaining**:
 
-* Phase 8 commit 2b — refactor the per-layer chain inside
-  `forward_qwen36_decode_inner` so it reads/writes workspace
-  device pointers instead of per-call `arena.region(...)`. The
-  embed-gather must read from `workspace.token_dev` (instead of
-  the current host→device `tok_region.copy_from_host`). This is
-  the deeper plumbing piece.
-* Phase 8 commit 3 — wire `rvllm_graph::CapturedGraph::capture(...)`
-  around the workspace-based decode step inside `cuda_worker.rs`'s
-  qwen36 dispatch, mirroring Gemma 4 NVFP4's `decode_capture`
-  state. Update token/pos/ctx via `cuMemsetD32Async` before
-  `graph.replay()`, extract via `argmax_dev_to_host_token`
-  outside the captured region.
+The per-layer chain inside `forward_qwen36_decode_inner` still
+allocates per-call `arena.region(...)` scratch and reads scalar
+position kernel args. Capture currently succeeds when the arena
+bumps land at deterministic addresses (which holds inside one
+request), AND when the captured kernel scalars are valid for the
+replay step. Because **position** is a kernel scalar (not yet a
+device pointer), captured replay is correct only at the SAME
+position as capture. Multi-step replay across moving positions
+needs "indirect" RoPE + KV-slot kernel variants (Qwen's
+equivalent of Gemma 4 NVFP4's
+`G4N_DECODE_GRAPH_INDIRECT=1`). That's the next chunk of work;
+the capture/replay scaffold landed here unblocks it without
+disturbing the eager production path.
 
-Eager decode path remains the production default. The captured
-path stays opt-in (`RVLLM_QWEN36_DECODE_GRAPH=1`) until commits
-2b + 3 land and accept-rate / latency A/B validates.
+Eager decode path remains the production default
+(`RVLLM_QWEN36_DECODE_GRAPH` unset). Captured path opt-in only.
 
 ## Other docs in this tree
 

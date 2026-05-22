@@ -93,14 +93,18 @@ text-recognition tasks degrade.
 deferred indefinitely. Re-open only if a real quality regression
 appears that the f16 path can't service.
 
-### Scaffold landed 2026-05-22 (commit `257945d`)
+### Scaffold landed 2026-05-22 (commits `257945d`, `b2cfdbc`)
 
-The bf16 path now has a callable seam ready for the next debug
-session, but the forward body itself is still stubbed:
+The bf16 path now has a callable seam + weight conversion infra
+ready for the next debug session, but the forward body itself is
+still stubbed:
+
+**`257945d` — kernel set + env gate**:
 
 - `Gemma4VisionKernelsBf16` struct in
   `v3/crates/rvllm-runtime/src/gemma4_vision.rs` holds the 13
-  bf16-typed vision KernelFns + the existing `f32_to_bf16_kernel`.
+  bf16-typed vision KernelFns + `f16_to_bf16_kernel` for weight
+  conversion + the existing `f32_to_bf16_kernel`.
   `try_load(loader) → Result<Option<Self>>` returns Ok(None) on
   older kernel trees so the bringup still constructs.
 - Loaded on BOTH `Gemma4Bringup.vit_bf16` (fp8-block) and
@@ -112,15 +116,35 @@ session, but the forward body itself is still stubbed:
   `gemma4_vit_use_bf16_enabled()`); each
   `forward_gemma_vision` shim now checks the gate and routes to
   `forward_bf16` when set.
-- `Gemma4VisionRuntime::forward_bf16` currently STUBBED: errors
-  out with a clear "PTX missing" / "body staged for follow-up"
-  message. The actual ~1200-LOC body — mechanical kernel-by-kernel
-  substitution of `forward` using `fused_bf16` + `cublaslt.
-  bf16_gemm_f32_batched_strided` — is the next commit's content.
-  The substep dump harness
-  (`RVLLM_GEMMA4_VIT_SUBSTEP_BLK` + `cmp_g4v_substep.py`) is
-  already in place to localise the prior blk0_out cos=0.76
-  failure within block 0's first sub-step that drifts.
+
+**`b2cfdbc` — weight conversion infrastructure**:
+
+- `Gemma4VisionBf16` weight cache: per-block (`Gemma4VisionBf16Block`,
+  13 u64 ptr fields) + top-level (patch_embedder, std_bias/scale,
+  embed_vision_projection). Mirrors the f16 Gemma4Vision layout
+  so the forward-body substitution stays a 1:1 textual swap
+  (`blk.q_proj_w.offset_bytes` → `bf16_blk.q_proj_w_ptr`).
+- `Gemma4VisionBf16::convert_from_f16(arena, vision, kernels,
+  stream)` runs the device-side f16→bf16 narrow once per
+  process; each weight gets a same-byte arena region and one
+  `f16_to_bf16_kernel` launch over its element count. Per-block
+  names are `Box::leak`ed `&'static str` (bounded ~11 KB
+  one-time leak; arena name API requires `&'static`).
+- New `vit_bf16_weights: Mutex<Option<Gemma4VisionBf16>>` field
+  on both bringups. `ensure_vit_bf16_weights()` lazy-populator
+  runs the conversion on the first `forward_bf16` call; arena
+  regions live ABOVE the per-request scratch checkpoint so they
+  survive `arena.restore(ck)` between requests.
+
+**Still stubbed**: `Gemma4VisionRuntime::forward_bf16` body. The
+~1200-LOC mechanical kernel-by-kernel substitution of `forward`
+using `fused_bf16` + `bf16_gemm_f32` + the now-available
+`Gemma4VisionBf16` weight pointers is the next commit. With the
+weights + kernels both ready, the body can land as a focused
+diff and be debugged via the per-substep dump harness
+(`RVLLM_GEMMA4_VIT_SUBSTEP_BLK` + `cmp_g4v_substep.py`) to
+localise the prior blk0_out cos=0.76 failure within block 0's
+first sub-step that drifts.
 
 ### Justification
 - f16 path delivers correct vision output on real images for both
