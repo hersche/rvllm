@@ -255,6 +255,16 @@ pub struct Qwen36OutsideKernels {
     /// increments pos/ctx by 1, fully device-side.
     pub qwen36_step_link_i32_mod: LoadedModule,
     pub fn_qwen36_step_link_i32: KernelFn,
+    /// Phase 8 kernel fusion: argmax + step-link merged into one
+    /// kernel. When `do_link != 0`, the kernel writes argmax to
+    /// `argmax_token_dst[0]` AND `token_dst[0]`, plus increments
+    /// pos/ctx by 1 — same effect as the separate
+    /// `argmax_f16_kernel` + `qwen36_step_link_i32_kernel` pair but
+    /// one launch instead of two. Used inside the macro-captured
+    /// graph for iterations 0..N-2; iteration N-1 uses `do_link == 0`
+    /// (pure argmax, no successor to link to).
+    pub qwen36_argmax_with_link_f16_mod: LoadedModule,
+    pub fn_qwen36_argmax_with_link_f16: KernelFn,
     /// Phase 6a / Round-27: batched router GEMV. Per-token grid.y
     /// dimension over the existing single-token kernel; one launch
     /// per layer instead of N. Kernel:
@@ -705,6 +715,109 @@ impl Qwen36Bringup {
         Ok(())
     }
 
+    /// Phase 8 kernel fusion: graph-capture-friendly closer that
+    /// fuses lm_head argmax with the step-link side-effects. Mirror
+    /// of `forward_qwen36_outside_closer_device_argmax` but the
+    /// trailing argmax kernel is `qwen36_argmax_with_link_f16_kernel`
+    /// instead of plain `argmax_f16_kernel`. When `do_link != 0`,
+    /// the kernel ALSO writes argmax → `token_dst` and increments
+    /// `pos_dst` / `ctx_dst` — same effect as a separate
+    /// `qwen36_step_link_i32_kernel` launch, but ONE launch instead
+    /// of TWO inside the macro-captured graph.
+    ///
+    /// The first three stages (rmsnorm + fp8_quant + fp8_gemm) are
+    /// byte-identical to `forward_qwen36_outside_closer_device_argmax`
+    /// — diverges only at the tail (fused vs plain argmax kernel).
+    #[cfg(feature = "cuda")]
+    fn forward_qwen36_outside_closer_device_argmax_with_link(
+        &self,
+        hidden_region: &rvllm_mem::Region<'_>,
+        num_tokens: u32,
+        hidden: u32,
+        vocab: u32,
+        last_idx: usize,
+        argmax_token_dst: u64,
+        token_dst: u64,
+        pos_dst: u64,
+        ctx_dst: u64,
+        do_link: i32,
+    ) -> Result<()> {
+        let _ = num_tokens;
+        let eps = self.arch.base.rms_norm_eps;
+        let hidden_fp8_bytes = hidden as usize;
+        let hidden_scale_bytes = 4usize;
+        let logits_bytes = (vocab as usize) * 2;
+        let hidden_fp8_region =
+            self.arena.region("qwen36_pl_h_fp8_argl", hidden_fp8_bytes, 16)?;
+        let hidden_scale_region =
+            self.arena.region("qwen36_pl_h_scale_argl", hidden_scale_bytes, 16)?;
+        let logits_region =
+            self.arena.region("qwen36_pl_logits_argl", logits_bytes, 16)?;
+        let stream_raw = self.stream.raw() as u64;
+        let last_hidden_row_ptr =
+            hidden_region.device_ptr() + (last_idx as u64) * (hidden as u64) * 2;
+        unsafe {
+            rvllm_fused::FusedRmsnormFp8QuantLaunch {
+                num_tokens: 1,
+                hidden,
+                eps,
+            }
+            .launch(
+                self.outside_kernels.fn_fused_rmsnorm_fp8_quant,
+                hidden_fp8_region.device_ptr(),
+                hidden_scale_region.device_ptr(),
+                last_hidden_row_ptr,
+                self.model.outside.final_norm.offset_bytes,
+                stream_raw,
+            )?;
+            self.cublaslt.fp8_gemm(
+                hidden_fp8_region.device_ptr(),
+                self.model.outside.lm_head_fp8.offset_bytes,
+                logits_region.device_ptr(),
+                1,
+                vocab as i32,
+                hidden as i32,
+                hidden_scale_region.device_ptr(),
+                self.model.outside.lm_head_fp8.scale_ptr,
+                stream_raw,
+            )?;
+            use cudarc::driver::sys::*;
+            let mut a_logits = logits_region.device_ptr();
+            let mut a_argmax_dst = argmax_token_dst;
+            let mut a_token_dst = token_dst;
+            let mut a_pos_dst = pos_dst;
+            let mut a_ctx_dst = ctx_dst;
+            let mut a_vocab = vocab as i32;
+            let mut a_link = do_link;
+            let args: [*mut core::ffi::c_void; 7] = [
+                (&mut a_logits)     as *mut _ as *mut _,
+                (&mut a_argmax_dst) as *mut _ as *mut _,
+                (&mut a_token_dst)  as *mut _ as *mut _,
+                (&mut a_pos_dst)    as *mut _ as *mut _,
+                (&mut a_ctx_dst)    as *mut _ as *mut _,
+                (&mut a_vocab)      as *mut _ as *mut _,
+                (&mut a_link)       as *mut _ as *mut _,
+            ];
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_qwen36_argmax_with_link_f16.raw() as CUfunction,
+                1, 1, 1,
+                512, 1, 1,
+                0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 argmax_with_link_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Phase 8 deeper: launch the step-linker kernel device-side
     /// between two consecutive decode-step iterations inside the
     /// macro-captured graph. Reads `argmax_token_src`, writes to
@@ -804,25 +917,50 @@ impl Qwen36Bringup {
                 fingerprint,
                 stream_u64,
                 || -> Result<()> {
+                    // Phase 8 kernel-fusion: each iter runs the
+                    // layer stack via the skip-closer wrapper, then
+                    // the FUSED argmax+link closer emits per-iter
+                    // argmax AND (when not last) writes the next-
+                    // iter token + bumps pos/ctx in ONE launch.
+                    // Replaces the (plain argmax + step_link_i32)
+                    // PAIR with ONE kernel — saves N kernel-graph
+                    // nodes per macro-block (1 closer + 0 linker
+                    // per iter, vs 1 closer + 1 linker before).
+                    //
+                    // Hidden-region address stability: decode_inner
+                    // with override-mode skips positions/context
+                    // _lens allocations, so its hidden_region lands
+                    // at scratch_ck exactly. After decode_inner
+                    // exits (inner-ckpt restored to scratch_ck),
+                    // our outer arena.region(...) here re-bumps to
+                    // the SAME address — so the fused closer reads
+                    // the body's hidden output at the correct
+                    // location. Within ONE replay execution all
+                    // kernels run sequentially on the stream, so
+                    // body-writes-then-closer-reads stays ordered
+                    // per iteration.
+                    let hidden = self.arch.base.hidden_size as u32;
+                    let vocab = self.arch.base.vocab_size as u32;
+                    let hb = (hidden as usize) * 2;
                     for i in 0..n_steps {
-                        // Each iteration's forward writes argmax to
-                        // a DIFFERENT slot. Construct a sub-
-                        // workspace whose `argmax_token_dev` = base
-                        // + i*4. All OTHER workspace pointers stay
-                        // unchanged (scratch is reused per step;
-                        // token/pos/ctx are advanced by the linker).
-                        let mut sub = *workspace;
-                        sub.argmax_token_dev = base_argmax + (i as u64) * 4;
-                        self.forward_qwen36_decode_step_to_workspace(
-                            &sub, position + i)?;
-                        if i + 1 < n_steps {
-                            // Stitch: argmax[i] → token_dev,
-                            // pos_dev++, ctx_dev++. Next iteration's
-                            // forward reads the updated values.
-                            self.launch_step_link_i32(
-                                base_argmax + (i as u64) * 4,
-                                workspace)?;
-                        }
+                        self.forward_qwen36_decode_step_to_workspace_no_closer(
+                            workspace, position + i)?;
+                        let hidden_region =
+                            self.arena.region("qwen36_pl_hidden", hb, 16)?;
+                        let argmax_dst = base_argmax + (i as u64) * 4;
+                        let do_link = if i + 1 < n_steps { 1 } else { 0 };
+                        self.forward_qwen36_outside_closer_device_argmax_with_link(
+                            &hidden_region,
+                            /* num_tokens */ 1,
+                            hidden,
+                            vocab,
+                            /* last_idx */ 0,
+                            argmax_dst,
+                            workspace.token_dev,
+                            workspace.pos_dev,
+                            workspace.ctx_dev,
+                            do_link,
+                        )?;
                     }
                     Ok(())
                 },
@@ -846,18 +984,28 @@ impl Qwen36Bringup {
                      Falling back to per-step replay path."
                 );
                 // Body kernels weren't executed under capture; re-
-                // run eagerly so the host has correct argmax tokens
-                // in `argmax_tokens_dev_base[0..n_steps]`.
+                // run eagerly via the fused closer path (same as
+                // the capture body above) so the host has correct
+                // argmax tokens in `argmax_tokens_dev_base[0..n_steps]`.
+                let hidden = self.arch.base.hidden_size as u32;
+                let vocab = self.arch.base.vocab_size as u32;
+                let hb = (hidden as usize) * 2;
                 for i in 0..n_steps {
-                    let mut sub = *workspace;
-                    sub.argmax_token_dev = base_argmax + (i as u64) * 4;
-                    self.forward_qwen36_decode_step_to_workspace(
-                        &sub, position + i)?;
-                    if i + 1 < n_steps {
-                        self.launch_step_link_i32(
-                            base_argmax + (i as u64) * 4,
-                            workspace)?;
-                    }
+                    self.forward_qwen36_decode_step_to_workspace_no_closer(
+                        workspace, position + i)?;
+                    let hidden_region =
+                        self.arena.region("qwen36_pl_hidden", hb, 16)?;
+                    let argmax_dst = base_argmax + (i as u64) * 4;
+                    let do_link = if i + 1 < n_steps { 1 } else { 0 };
+                    self.forward_qwen36_outside_closer_device_argmax_with_link(
+                        &hidden_region,
+                        1, hidden, vocab, 0,
+                        argmax_dst,
+                        workspace.token_dev,
+                        workspace.pos_dev,
+                        workspace.ctx_dev,
+                        do_link,
+                    )?;
                 }
                 Ok(())
             }
@@ -972,17 +1120,28 @@ impl Qwen36Bringup {
         if graph_enabled && !have_capture {
             self.try_capture_decode_steps_n(workspace, position, n_steps)?;
         } else {
-            // Pure eager path: just re-run the macro-body without
-            // capture machinery.
+            // Pure eager path (no capture machinery). Same fused-
+            // closer body as the captured macro-block.
             let base_argmax = workspace.argmax_tokens_dev_base;
+            let hidden = self.arch.base.hidden_size as u32;
+            let vocab = self.arch.base.vocab_size as u32;
+            let hb = (hidden as usize) * 2;
             for i in 0..n_steps {
-                let mut sub = *workspace;
-                sub.argmax_token_dev = base_argmax + (i as u64) * 4;
-                self.forward_qwen36_decode_step_to_workspace(&sub, position + i)?;
-                if i + 1 < n_steps {
-                    self.launch_step_link_i32(
-                        base_argmax + (i as u64) * 4, workspace)?;
-                }
+                self.forward_qwen36_decode_step_to_workspace_no_closer(
+                    workspace, position + i)?;
+                let hidden_region =
+                    self.arena.region("qwen36_pl_hidden", hb, 16)?;
+                let argmax_dst = base_argmax + (i as u64) * 4;
+                let do_link = if i + 1 < n_steps { 1 } else { 0 };
+                self.forward_qwen36_outside_closer_device_argmax_with_link(
+                    &hidden_region,
+                    1, hidden, vocab, 0,
+                    argmax_dst,
+                    workspace.token_dev,
+                    workspace.pos_dev,
+                    workspace.ctx_dev,
+                    do_link,
+                )?;
             }
         }
         self.argmax_tokens_dev_to_host(workspace, n_steps)
@@ -1153,6 +1312,41 @@ impl Qwen36Bringup {
             // Captured graph reads from these stable pointers, so
             // replay picks up per-step values without freezing
             // step-0's scalar.
+            Some(workspace.pos_dev),
+            Some(workspace.ctx_dev),
+        )?;
+        Ok(())
+    }
+
+    /// Phase 8 kernel fusion: skip-closer variant of
+    /// `forward_qwen36_decode_step_to_workspace`. Runs the full
+    /// layer stack + KV writes + linear-state advancement but
+    /// returns BEFORE the closer kernel sequence — caller invokes
+    /// the closer separately (typically via
+    /// `forward_qwen36_outside_closer_device_argmax_with_link` so
+    /// the per-iteration argmax+link fuse into one kernel inside
+    /// the macro-captured graph).
+    #[cfg(feature = "cuda")]
+    pub fn forward_qwen36_decode_step_to_workspace_no_closer(
+        &self,
+        workspace:
+            &crate::qwen36_decode_workspace::Qwen36DecodeWorkspace,
+        position: u32,
+    ) -> Result<()> {
+        let dummy_tok = [0i32; 1];
+        self.forward_qwen36_decode_inner_with_workspace_overrides_v2(
+            &dummy_tok,
+            position,
+            /* vision_splice */ &[],
+            /* cancel */ None,
+            /* all_argmaxes */ None,
+            /* skip_closer */ true,
+            /* mtp_shadow_out */ None,
+            Some(workspace.token_dev),
+            // closer_argmax_dev is meaningless when skip_closer=true,
+            // but pass `argmax_token_dev` anyway so the override
+            // shape stays uniform.
+            Some(workspace.argmax_token_dev),
             Some(workspace.pos_dev),
             Some(workspace.ctx_dev),
         )?;
@@ -1441,6 +1635,11 @@ impl Qwen36Bringup {
         let qwen36_step_link_i32_mod = kernels.load_ptx("qwen36_step_link_i32")?;
         let fn_qwen36_step_link_i32 =
             qwen36_step_link_i32_mod.get_function("qwen36_step_link_i32_kernel")?;
+        let qwen36_argmax_with_link_f16_mod =
+            kernels.load_ptx("qwen36_argmax_with_link_f16")?;
+        let fn_qwen36_argmax_with_link_f16 =
+            qwen36_argmax_with_link_f16_mod
+                .get_function("qwen36_argmax_with_link_f16_kernel")?;
         let qwen_fill_pos_slots_i32_mod = kernels.load_ptx("qwen_fill_pos_slots_i32")?;
         let fn_qwen_fill_pos_slots_i32 =
             qwen_fill_pos_slots_i32_mod.get_function("qwen_fill_pos_slots_i32_kernel")?;
@@ -1594,6 +1793,8 @@ impl Qwen36Bringup {
             fn_qwen_fill_pos_slots_i32,
             qwen36_step_link_i32_mod,
             fn_qwen36_step_link_i32,
+            qwen36_argmax_with_link_f16_mod,
+            fn_qwen36_argmax_with_link_f16,
             router_gemv_batched_f16_to_f32_mod,
             fn_router_gemv_batched_f16_to_f32,
             topk_softmax_batched_f32_mod,

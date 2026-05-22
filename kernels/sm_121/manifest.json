@@ -686,6 +686,11 @@
       "path": "probe_green_ctx.ptx",
       "sha256": "7fddcc1223529f89736a859f33a5b7fab538c90ee2411dffb3282b9cec1f57fc"
     },
+    "qwen36_argmax_with_link_f16": {
+      "bytes": 6413,
+      "path": "qwen36_argmax_with_link_f16.ptx",
+      "sha256": "5e4c0afee5a6a78e4a01c8992fd5e2f7f4b999f8cf2fb7df4fdcddfc616479d9"
+    },
     "qwen36_step_link_i32": {
       "bytes": 1304,
       "path": "qwen36_step_link_i32.ptx",
@@ -1022,5 +1027,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "17721ad"
+  "revision": "9b73734"
 }
