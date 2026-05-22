@@ -1,6 +1,39 @@
 # Speculative-decoding next-session plan — Gemma 4 E4B
 
-## Status (2026-05-22 session update — head `fe86201`)
+## Status (2026-05-22 session update — head `eb66ef3`)
+
+* **#34 Phase 3 — F16-shadow path landed** (`eb66ef3`). The proper
+  fix: drafter reads POST-RoPE, PRE-HADAMARD, PRE-NVFP4-QUANT F16
+  K/V directly from the nvfp4-shadow region instead of dequanting
+  the rotated-quantized NVFP4 base cache. `build_nvfp4_shadow_alloc`
+  auto-includes the spec source layers when
+  `RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1`; the spec session's
+  `compute_view` routes the drafter populate to read from the
+  shadow ptr with KvDtype::F16. Validated on
+  mobile-31b-rvllm-spec with HADAMARD=1 + F16_SHADOW=1:
+
+      Prompt                                 | md5         | accept    | wall
+      Was ist die Hauptstadt von Frankreich?  | d0451f05  ✓ | 5/16=31%  | 3.67s
+      Sag mir 5 Hauptstädte Europas in einem  | 58649bba  ✓ | 8/32=25%  | 6.45s
+      Erkläre kurz was Linux ist.             | 47e40cc1    | 18/52=35% | 9.31s
+
+  - First two: md5 byte-identical to HADAMARD=0 baseline. Drafter
+    accept rates 25-35% are 10× better than Phase 2's un-rotate
+    path (3-6%) because the drafter now sees zero-quant-noise K/V.
+  - Remaining gap to HADAMARD=0's 42-87% is HADAMARD=1 base
+    attention's slightly-different argmaxes (NVFP4 quant noise on
+    rotated K vs unrotated K), NOT a drafter-side deficit.
+
+  Production-default profile still HADAMARD=0. Operator opt-in
+  for HADAMARD=1 + F16_SHADOW recipe:
+
+      RVLLM_NVFP4_HADAMARD=1
+      RVLLM_NVFP4_SHADOW_F16=1
+      RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1
+
+  Task #34 DONE.
+
+## Status (head `fe86201` — Phase 2)
 
 * **#34 Phase 2 — un-rotate wired + ensure_drafter guard relaxed**
   (`fe86201`). `unrotate_shadow_kv_after_populate(sources,

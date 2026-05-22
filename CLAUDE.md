@@ -160,9 +160,7 @@ pointing at the diagnosis. Bypass knob
 `RVLLM_GEMMA4_SPEC_ALLOW_HADAMARD=1` exists for the future
 un-rotate-in-populate kernel fix to develop against.
 
-The proper code-level fix (un-rotate K/V inside the shadow KV
-population path, so the shadow lands in HF-native frame regardless
-of base's rotation) is DONE across two phases:
+The proper code-level fix landed in three phases:
 
   * Phase 1 (`f6d0b5d`): public helper
     `Gemma4Bringup::apply_hadamard_unrotate_to_shadow_kv_range`
@@ -170,21 +168,33 @@ of base's rotation) is DONE across two phases:
     range.
   * Phase 2 (`fe86201`): wrapper
     `unrotate_shadow_kv_after_populate` wired into all four
-    `populate_shadow_kv_range_from_base` call sites in
-    `run_generate_speculative_batched`. The `ensure_drafter`
-    HADAMARD-vs-spec guard now treats
-    `RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1` as an implicit bypass
-    — HADAMARD=1 + SPEC=1 is allowed when the un-rotate path is
-    active. Validated under HADAMARD=1: coherent German output
-    on three prompts, accept_rate 3-6% on the short ones (vs
-    87% on the HADAMARD=0 path, because the drafter sees
-    NVFP4-quant-then-un-rotated K/V with slight quant noise vs
-    the true HF K/V it was trained on).
+    `populate_shadow_kv_range_from_base` call sites. The
+    `ensure_drafter` HADAMARD-vs-spec guard now treats
+    `RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1` as an implicit bypass.
+    Validated under HADAMARD=1: coherent output, accept_rate
+    3-6% (drafter sees NVFP4-quant-then-un-rotated K/V; quant
+    noise structure diverges from the true HF K/V it was
+    trained against).
+  * Phase 3 (`eb66ef3`): **F16-shadow path — the optimal fix.**
+    Drafter reads POST-RoPE, PRE-HADAMARD, PRE-NVFP4-QUANT F16
+    K/V directly from the nvfp4-shadow region instead of
+    dequanting the rotated-quantized base cache.
+    `build_nvfp4_shadow_alloc` auto-includes the spec source
+    layers when `RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1`; the spec
+    session's `compute_view` routes the drafter populate to
+    read from the shadow ptr with `KvDtype::F16`. Validated
+    under HADAMARD=1 + F16_SHADOW=1: md5 byte-identical to
+    HADAMARD=0 on 2 of 3 prompts, accept rates 25-35% — 10×
+    better than Phase 2's un-rotate path.
 
 The production 31B spec profile still defaults to HADAMARD=0
 (`mobile-31b-rvllm-spec.env`) for highest accept rate; operator
-can opt into the long-context-quality HADAMARD=1 path via
-`RVLLM_NVFP4_HADAMARD=1` + `RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1`.
+can opt into the long-context-quality HADAMARD=1 path via the
+recommended F16-shadow recipe:
+
+    RVLLM_NVFP4_HADAMARD=1
+    RVLLM_NVFP4_SHADOW_F16=1
+    RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1
 Same session also flipped the profile to
 `RVLLM_GEMMA4_SPEC_NEW_PRIMITIVES=1` (commits `2334dbc` byte-equiv
 fix + profile flip in `mobile-31b-rvllm-spec.env`).
