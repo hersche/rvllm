@@ -77,6 +77,7 @@ pub mod gemma4_nvfp4_ops;
 pub mod qwen36_spec_decode;
 pub mod qwen35_spec_decode;
 pub mod gemma4_layer_exec;
+pub mod gemma4_spec_primitives;
 pub mod layer_exec;
 pub mod qwen35_arch;
 pub mod qwen35_bring_up;
