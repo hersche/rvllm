@@ -6076,10 +6076,16 @@ impl Gemma4Bringup {
         };
 
         // ---- Initial shadow KV populate (prompt slots) ----
+        // Task #34 fused-unrotate: when RVLLM_GEMMA4_SPEC_FUSED_UNROTATE=1
+        // AND the per-base-layer signs alloc is present, dispatch the
+        // fused dequant+unrotate kernels (1 launch each) instead of
+        // plain dequant + separate post-pass (2 launches each).
+        let fused_signs = self.fused_unrotate_signs(sources);
         {
             let guard = self.drafter.lock().unwrap();
             let d = guard.as_ref().expect("checked above");
-            d.populate_shadow_kv_range_from_base(
+            let (s_sg, f_sg) = fused_signs.unwrap_or((0, 0));
+            d.populate_shadow_kv_range_from_base_with_signs(
                 sliding_k, sliding_v,
                 full_k, full_v,
                 sliding_ks, sliding_vs,
@@ -6090,12 +6096,15 @@ impl Gemma4Bringup {
                 shadow_full_bytes,
                 /* slot_start */ 0,
                 /* slot_count */ prompt_ids.len() as u32,
+                s_sg, f_sg,
                 stream,
             )?;
         }
         // Task #34 Phase 2: un-rotate Hadamard from the freshly-populated
         // shadow slots so the drafter cross-attends in HF-native frame.
-        // No-op unless RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1.
+        // No-op unless RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1. Also a no-op
+        // when the fused path already did the rotation (see env guard
+        // inside `unrotate_shadow_kv_after_populate`).
         self.unrotate_shadow_kv_after_populate(
             sources, 0, prompt_ids.len() as u32, stream)?;
 
@@ -6328,11 +6337,15 @@ impl Gemma4Bringup {
                 session.commit_drafts(&drafts.tokens, accept_len, session.next_base_argmax);
 
                 // Incremental shadow KV for the newly-committed slots
-                // [old_committed, old_committed + accept_len).
+                // [old_committed, old_committed + accept_len). Task
+                // #34 fused-unrotate path applies when signs are
+                // present; else legacy populate + separate unrotate.
+                let fused_signs_incr = self.fused_unrotate_signs(sources);
                 {
                     let guard = self.drafter.lock().unwrap();
                     let d = guard.as_ref().expect("drafter resident");
-                    d.populate_shadow_kv_range_from_base(
+                    let (s_sg, f_sg) = fused_signs_incr.unwrap_or((0, 0));
+                    d.populate_shadow_kv_range_from_base_with_signs(
                         sliding_k, sliding_v,
                         full_k, full_v,
                         sliding_ks, sliding_vs,
@@ -6343,12 +6356,14 @@ impl Gemma4Bringup {
                         shadow_full_bytes,
                         /* slot_start */ old_committed,
                         /* slot_count */ accept_len as u32,
+                        s_sg, f_sg,
                         stream,
                     )?;
                 }
                 // Task #34 Phase 2: un-rotate Hadamard from freshly-
                 // populated shadow slots. No-op unless
-                // RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1.
+                // RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1; also no-op
+                // when fused path already applied rotation.
                 self.unrotate_shadow_kv_after_populate(
                     sources, old_committed, accept_len as u32, stream)?;
 
@@ -6405,10 +6420,12 @@ impl Gemma4Bringup {
                 // Shadow KV for the bonus's slot.
                 let bonus_slot = old_committed + accept_len as u32;
                 let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
+                let fused_signs_bonus = self.fused_unrotate_signs(sources);
                 {
                     let guard = self.drafter.lock().unwrap();
                     let d = guard.as_ref().expect("drafter resident");
-                    d.populate_shadow_kv_range_from_base(
+                    let (s_sg, f_sg) = fused_signs_bonus.unwrap_or((0, 0));
+                    d.populate_shadow_kv_range_from_base_with_signs(
                         sliding_k, sliding_v,
                         full_k, full_v,
                         sliding_ks, sliding_vs,
@@ -6419,10 +6436,12 @@ impl Gemma4Bringup {
                         shadow_full_bytes,
                         /* slot_start */ bonus_slot,
                         /* slot_count */ 1,
+                        s_sg, f_sg,
                         stream,
                     )?;
                 }
                 // Task #34 Phase 2: un-rotate the bonus's shadow slot.
+                // No-op when fused path already applied rotation.
                 self.unrotate_shadow_kv_after_populate(
                     sources, bonus_slot, 1, stream)?;
                 if perf_trace {
@@ -6485,10 +6504,12 @@ impl Gemma4Bringup {
 
                 // Shadow KV update for the single new committed slot
                 let t0 = if perf_trace { Some(std::time::Instant::now()) } else { None };
+                let fused_signs_def = self.fused_unrotate_signs(sources);
                 {
                     let guard = self.drafter.lock().unwrap();
                     let d = guard.as_ref().expect("drafter resident");
-                    d.populate_shadow_kv_range_from_base(
+                    let (s_sg, f_sg) = fused_signs_def.unwrap_or((0, 0));
+                    d.populate_shadow_kv_range_from_base_with_signs(
                         sliding_k, sliding_v,
                         full_k, full_v,
                         sliding_ks, sliding_vs,
@@ -6499,10 +6520,12 @@ impl Gemma4Bringup {
                         shadow_full_bytes,
                         /* slot_start */ old_committed,
                         /* slot_count */ 1,
+                        s_sg, f_sg,
                         stream,
                     )?;
                 }
                 // Task #34 Phase 2: un-rotate the deferred-bonus slot.
+                // No-op when fused path already applied rotation.
                 self.unrotate_shadow_kv_after_populate(
                     sources, old_committed, 1, stream)?;
                 if perf_trace {
@@ -15690,6 +15713,37 @@ impl Gemma4Bringup {
     /// during Phase 2 bring-up — flipping the default ON moves with
     /// the `ensure_drafter` HADAMARD-vs-spec guard relaxation.
     #[cfg(feature = "cuda")]
+    /// Task #34 fused-unrotate signs lookup. Returns
+    /// `Some((sliding_signs_ptr, full_signs_ptr))` when:
+    ///   * `RVLLM_GEMMA4_SPEC_FUSED_UNROTATE=1`,
+    ///   * `RVLLM_NVFP4_HADAMARD=1` (the base actually rotated K/V),
+    ///   * `self.nvfp4_hadamard` is allocated (covers num_layers and
+    ///     head_dim of the spec source pair).
+    /// Returns `None` otherwise — caller falls back to the legacy
+    /// populate + separate unrotate post-pass. Either signs ptr is
+    /// zero if the alloc's `layer_ptr()` rejects the source layer
+    /// (out of range), so the call site can mix-and-match.
+    pub fn fused_unrotate_signs(
+        &self,
+        sources: Gemma4AssistantKvSources,
+    ) -> Option<(u64, u64)> {
+        if !parse_truthy_env("RVLLM_GEMMA4_SPEC_FUSED_UNROTATE").unwrap_or(false) {
+            return None;
+        }
+        if !nvfp4_hadamard_enabled() {
+            return None;
+        }
+        let guard = self.nvfp4_hadamard.lock().unwrap();
+        let alloc = match guard.as_ref() {
+            Some(a) => *a,
+            None => return None,
+        };
+        Some((
+            alloc.layer_ptr(sources.sliding_source_layer),
+            alloc.layer_ptr(sources.full_source_layer),
+        ))
+    }
+
     pub unsafe fn unrotate_shadow_kv_after_populate(
         &self,
         sources: Gemma4AssistantKvSources,
@@ -15699,6 +15753,13 @@ impl Gemma4Bringup {
     ) -> Result<()> {
         if slot_count == 0 { return Ok(()); }
         if !parse_truthy_env("RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW").unwrap_or(false) {
+            return Ok(());
+        }
+        // Task #34 fused-unrotate path already applied the rotation
+        // inside the dequant kernel — the separate post-pass would
+        // double-rotate (R^T applied twice ≠ I, the result is R^T·R^T
+        // which yields garbage). Skip when fused is active.
+        if parse_truthy_env("RVLLM_GEMMA4_SPEC_FUSED_UNROTATE").unwrap_or(false) {
             return Ok(());
         }
         let unrotate_v = parse_truthy_env("RVLLM_NVFP4_HADAMARD_V").unwrap_or(false);

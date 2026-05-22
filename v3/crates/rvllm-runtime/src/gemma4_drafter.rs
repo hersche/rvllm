@@ -847,6 +847,51 @@ impl Gemma4DrafterRuntime {
         slot_count: u32,
         stream: u64,
     ) -> Result<()> {
+        self.populate_shadow_kv_range_from_base_with_signs(
+            base_sliding_k, base_sliding_v,
+            base_full_k, base_full_v,
+            base_sliding_k_scale, base_sliding_v_scale,
+            base_full_k_scale, base_full_v_scale,
+            sliding_kv_dtype, full_kv_dtype,
+            sliding_bytes, full_bytes,
+            slot_start, slot_count,
+            /* sliding_signs */ 0, /* full_signs */ 0,
+            stream)
+    }
+
+    /// Task #34 fused-unrotate entry point. Identical contract to
+    /// [`populate_shadow_kv_range_from_base`] except for the two extra
+    /// `*_signs_ptr` arguments: when non-zero AND the fused kernel
+    /// PTX symbol is loaded
+    /// (`fn_drafter_dequant_{nvfp4,fp8}_to_f16_unrotate`), dequant +
+    /// Hadamard un-rotate happen in one launch per (K, V) pair, and
+    /// the caller MUST NOT run the separate
+    /// `apply_hadamard_unrotate_to_shadow_kv_range` post-pass. When
+    /// signs are zero, behaviour is byte-identical to the no-signs
+    /// entry. Mixed (only one source has signs) is supported — each
+    /// source dispatches independently.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn populate_shadow_kv_range_from_base_with_signs(
+        &self,
+        base_sliding_k: u64,
+        base_sliding_v: u64,
+        base_full_k: u64,
+        base_full_v: u64,
+        base_sliding_k_scale: u64,
+        base_sliding_v_scale: u64,
+        base_full_k_scale: u64,
+        base_full_v_scale: u64,
+        sliding_kv_dtype: crate::gemma4_layer_exec::KvDtype,
+        full_kv_dtype: crate::gemma4_layer_exec::KvDtype,
+        sliding_bytes: usize,
+        full_bytes: usize,
+        slot_start: u32,
+        slot_count: u32,
+        sliding_signs_ptr: u64,
+        full_signs_ptr: u64,
+        stream: u64,
+    ) -> Result<()> {
         let shadow = self.shadow_kv.as_ref().ok_or_else(|| RvllmError::Attention {
             err: AttentionError::FeatureNotAvailable {
                 op: "populate_shadow_kv_from_base: shadow_kv not attached",
@@ -918,7 +963,7 @@ impl Gemma4DrafterRuntime {
         };
 
         // Sliding source layer (K + V).
-        self.populate_one_source_layer(
+        self.populate_one_source_layer_with_signs(
             shadow.sliding_k_ptr,
             shadow.sliding_v_ptr,
             base_sliding_k,
@@ -931,11 +976,12 @@ impl Gemma4DrafterRuntime {
             sliding_elems,
             sliding_kv_dtype,
             "sliding",
+            sliding_signs_ptr,
             stream,
         )?;
 
         // Full / global source layer (K + V).
-        self.populate_one_source_layer(
+        self.populate_one_source_layer_with_signs(
             shadow.full_k_ptr,
             shadow.full_v_ptr,
             base_full_k,
@@ -948,6 +994,7 @@ impl Gemma4DrafterRuntime {
             full_elems,
             full_kv_dtype,
             "full",
+            full_signs_ptr,
             stream,
         )?;
         Ok(())
@@ -957,6 +1004,12 @@ impl Gemma4DrafterRuntime {
     /// One call writes both K and V for ONE source layer using the dtype
     /// the base actually used at that layer (the bug commit 20 fixed:
     /// hybrid configs have different sliding vs full dtypes).
+    /// Task #34 fused-unrotate wire-up: when `signs_ptr` is non-zero
+    /// (and the fused PTX is loaded), dequant + Hadamard un-rotate
+    /// happen in ONE kernel launch per (K, V) pair, dropping the
+    /// separate `hadamard_unrotate_f16_kernel` post-pass. Callers
+    /// that hand a zero pointer get the legacy two-pass path
+    /// bit-identical to pre-fix behavior.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     unsafe fn populate_one_source_layer(
@@ -973,6 +1026,32 @@ impl Gemma4DrafterRuntime {
         n_elems: i64,
         kv_dtype: crate::gemma4_layer_exec::KvDtype,
         which: &'static str,
+        stream: u64,
+    ) -> Result<()> {
+        self.populate_one_source_layer_with_signs(
+            shadow_k, shadow_v, base_k, base_v,
+            base_k_scale, base_v_scale,
+            nkvh, head_dim, elem_offset, n_elems,
+            kv_dtype, which, 0u64, stream)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn populate_one_source_layer_with_signs(
+        &self,
+        shadow_k: u64,
+        shadow_v: u64,
+        base_k: u64,
+        base_v: u64,
+        base_k_scale: u64,
+        base_v_scale: u64,
+        nkvh: i32,
+        head_dim: i32,
+        elem_offset: i64,
+        n_elems: i64,
+        kv_dtype: crate::gemma4_layer_exec::KvDtype,
+        which: &'static str,
+        signs_ptr: u64,
         stream: u64,
     ) -> Result<()> {
         if n_elems <= 0 {
@@ -1021,6 +1100,41 @@ impl Gemma4DrafterRuntime {
                 Ok(())
             }
             crate::gemma4_layer_exec::KvDtype::Fp8 => {
+                // FP8 src: 1 byte/elem. F16 dst: 2 bytes/elem.
+                // Scales: f32 per (slot, kv_head) row-major → byte
+                // offset = slot_offset * nkvh * 4.
+                let src_byte_off = elem_offset as u64;
+                let dst_byte_off = (elem_offset as u64) * 2;
+                let scale_byte_off = (slot_offset as u64) * (nkvh as u64) * 4;
+                // Task #34 fused-unrotate path: when signs ptr is
+                // non-zero AND the fused PTX entry is loaded, dequant
+                // + Hadamard un-rotate happen in one launch. n_elems
+                // must be slot-aligned (= num_tokens * nkvh * head_dim).
+                if signs_ptr != 0 {
+                    if let Some(fn_fp8_u) = self.fn_drafter_dequant_fp8_to_f16_unrotate {
+                        let num_tokens = (n_elems / per_slot_elems) as i32;
+                        self.launch_fp8_dequant_unrotate_to_shadow(
+                            fn_fp8_u,
+                            base_k + src_byte_off,
+                            base_k_scale + scale_byte_off,
+                            signs_ptr,
+                            shadow_k + dst_byte_off,
+                            num_tokens, nkvh, head_dim, stream)?;
+                        self.launch_fp8_dequant_unrotate_to_shadow(
+                            fn_fp8_u,
+                            base_v + src_byte_off,
+                            base_v_scale + scale_byte_off,
+                            signs_ptr,
+                            shadow_v + dst_byte_off,
+                            num_tokens, nkvh, head_dim, stream)?;
+                        let _ = which;
+                        return Ok(());
+                    }
+                    // Fall through to plain dequant if fused entry
+                    // missing (older PTX tree). Caller will still run
+                    // the separate `apply_hadamard_unrotate_to_shadow
+                    // _kv_range` post-pass to recover HF-native frame.
+                }
                 let fn_fp8 = self.fn_drafter_dequant_fp8_to_f16.ok_or_else(|| {
                     RvllmError::Attention {
                         err: AttentionError::FeatureNotAvailable {
@@ -1037,12 +1151,6 @@ impl Gemma4DrafterRuntime {
                         bt: std::backtrace::Backtrace::capture(),
                     }
                 })?;
-                // FP8 src: 1 byte/elem. F16 dst: 2 bytes/elem.
-                // Scales: f32 per (slot, kv_head) row-major → byte
-                // offset = slot_offset * nkvh * 4.
-                let src_byte_off = elem_offset as u64;
-                let dst_byte_off = (elem_offset as u64) * 2;
-                let scale_byte_off = (slot_offset as u64) * (nkvh as u64) * 4;
                 self.launch_fp8_dequant_to_shadow(
                     fn_fp8,
                     base_k + src_byte_off,
@@ -1098,6 +1206,32 @@ impl Gemma4DrafterRuntime {
                 let src_byte_off = (elem_offset as u64) / 2;
                 let dst_byte_off = (elem_offset as u64) * 2;
                 let scale_byte_off = (elem_offset as u64) / 16;
+                // Task #34 fused-unrotate path: when signs ptr is
+                // non-zero AND the fused PTX entry is loaded, NVFP4
+                // dequant + Hadamard un-rotate happen in one launch.
+                if signs_ptr != 0 {
+                    if let Some(fn_nvfp4_u) =
+                        self.fn_drafter_dequant_nvfp4_to_f16_unrotate
+                    {
+                        let num_tokens = (n_elems / per_slot_elems) as i32;
+                        self.launch_nvfp4_dequant_unrotate_to_shadow(
+                            fn_nvfp4_u,
+                            base_k + src_byte_off,
+                            base_k_scale + scale_byte_off,
+                            signs_ptr,
+                            shadow_k + dst_byte_off,
+                            num_tokens, nkvh, head_dim, stream)?;
+                        self.launch_nvfp4_dequant_unrotate_to_shadow(
+                            fn_nvfp4_u,
+                            base_v + src_byte_off,
+                            base_v_scale + scale_byte_off,
+                            signs_ptr,
+                            shadow_v + dst_byte_off,
+                            num_tokens, nkvh, head_dim, stream)?;
+                        let _ = (nkvh, head_dim, which);
+                        return Ok(());
+                    }
+                }
                 self.launch_nvfp4_dequant_to_shadow(
                     fn_nvfp4,
                     base_k + src_byte_off,
