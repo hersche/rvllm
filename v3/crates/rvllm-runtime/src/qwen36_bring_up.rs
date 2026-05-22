@@ -6935,10 +6935,19 @@ impl Qwen36Bringup {
                         .ok()
                         .and_then(|s| s.parse::<u32>().ok())
                         .unwrap_or(0);
+                    // Default-ON since 2026-05-22. Mirrors the Gemma 4
+                    // NVFP4 (Option B) and qwen35 dense paths which call
+                    // `launch_nvfp4kv_unified_sm121` unconditionally.
+                    // Operator opts OUT via `=0` for A/B-vs-per-token
+                    // diagnostics. Prior FROM=5 default was the only
+                    // reason the 35B-A3B profile carried this env
+                    // explicitly (per CLAUDE.md "resolved 2026-05-20"
+                    // note); with FULL_PREFILL default-on the FROM
+                    // selector still applies (default 0 = every layer).
                     let use_unified = full_layer_ordinal >= unified_from
                         && std::env::var("RVLLM_QWEN36_NVFP4_UNIFIED_BATCH_FULL_PREFILL")
                             .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
-                            .unwrap_or(false);
+                            .unwrap_or(true);
                     if use_unified {
                         prefill.launch_nvfp4kv_unified_sm121(
                             params,
