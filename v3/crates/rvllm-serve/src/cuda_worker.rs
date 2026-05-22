@@ -1770,6 +1770,44 @@ pub async fn spawn_cuda_worker(
                                 continue;
                             }
                         };
+
+                        // Phase 8 follow-up wiring: when
+                        // `RVLLM_QWEN36_DECODE_GRAPH=1`, alloc the
+                        // workspace ONCE per request and route the
+                        // per-step decode loop through
+                        // `decode_step_via_graph_or_eager`. The
+                        // method internally picks capture / replay /
+                        // eager based on the env gate + the
+                        // captured-state mutex on `qwen`. Default-off
+                        // path stays on the legacy per-step
+                        // `forward_qwen36_decode` call below.
+                        //
+                        // KNOWN LIMITATION (documented in CLAUDE.md
+                        // "Phase 8 — IN PROGRESS"): position is still
+                        // a kernel scalar arg inside the per-layer
+                        // chain, so captured-replay is only correct
+                        // at the SAME position as capture. Multi-step
+                        // replay needs the position-indirect RoPE +
+                        // KV-slot kernel variants — that's the
+                        // next chunk of work. Until those land, the
+                        // captured path is single-position only;
+                        // operator-validated infrastructure only.
+                        let decode_graph_on =
+                            rvllm_runtime::qwen36_decode_workspace
+                                ::qwen36_decode_graph_enabled();
+                        let decode_workspace = if decode_graph_on {
+                            match qwen.alloc_decode_workspace() {
+                                Ok(w) => Some(w),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "qwen36 alloc_decode_workspace failed: \
+                                         {e:?}. Falling back to eager decode \
+                                         for this request."
+                                    );
+                                    None
+                                }
+                            }
+                        } else { None };
                         if let Some(t0) = prefill_start {
                             let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
                             // Round-27d: gates are default-ON post-audit;
@@ -1842,7 +1880,15 @@ pub async fn spawn_cuda_worker(
                             // Decode step: feed just this token at
                             // start_position = prompt_len + step.
                             let pos = prompt_len + step;
-                            match qwen.forward_qwen36_decode(&[next_token], pos, &[]) {
+                            let step_res = if let Some(ws) = decode_workspace.as_ref() {
+                                qwen.decode_step_via_graph_or_eager(
+                                    ws, next_token as i32, pos)
+                                    .map(|t| t as i32)
+                            } else {
+                                qwen.forward_qwen36_decode(
+                                    &[next_token], pos, &[])
+                            };
+                            match step_res {
                                 Ok(t) => next_token = t,
                                 Err(e) => {
                                     let _ = req.events_tx.send(GenerateEvent::Error(

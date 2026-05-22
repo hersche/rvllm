@@ -654,23 +654,42 @@ impl Qwen36Bringup {
 
         let graph_enabled =
             crate::qwen36_decode_workspace::qwen36_decode_graph_enabled();
+        // **Two-gate design**: `RVLLM_QWEN36_DECODE_GRAPH=1` enables
+        // ATTEMPTING capture (validates that the workspace-driven body
+        // is capture-clean: no residual sync HtoD/DtoH). Actual
+        // REPLAY of the captured graph requires the SECOND env knob
+        // `RVLLM_QWEN36_DECODE_GRAPH_REPLAY=1`. The split exists
+        // because replay is incorrect at moving positions until
+        // Qwen's RoPE + KV-slot kernels grow indirect-args variants
+        // (their position scalar is captured into the graph; replay
+        // re-applies it as a frozen value, producing garbage tokens
+        // from step 2 onward). Operators validating the capture
+        // infrastructure can set the first gate alone (always eager
+        // + first-step capture attempt); operators experimenting
+        // with the parked indirect-kernel path enable both.
+        let replay_enabled = std::env::var("RVLLM_QWEN36_DECODE_GRAPH_REPLAY")
+            .ok()
+            .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+            .unwrap_or(false);
         let have_capture = {
             let guard = self.decode_capture.lock().unwrap();
             guard.is_some()
         };
 
-        if graph_enabled && have_capture {
-            // Replay path.
+        if graph_enabled && replay_enabled && have_capture {
+            // Replay path (currently incorrect for position > capture
+            // position — operator-opt-in for indirect-kernel A/B).
             self.replay_decode_step(workspace)?;
             return self.argmax_dev_to_host_token(workspace.argmax_token_dev);
         }
 
         // Eager path. When graph_enabled but no capture yet, the
         // first call eagerly runs AND attempts to capture for the
-        // next call (capture body re-runs the eager step under
-        // cuStreamBeginCapture). When graph_disabled, just runs
-        // eager and never attempts capture.
-        if graph_enabled {
+        // next call. With replay_enabled OFF (the default), every
+        // step continues eager — capture is only validated, not
+        // consumed. When graph_disabled, just runs eager and never
+        // attempts capture.
+        if graph_enabled && !have_capture {
             self.try_capture_decode_step(workspace, position)?;
         } else {
             self.forward_qwen36_decode_step_to_workspace(
