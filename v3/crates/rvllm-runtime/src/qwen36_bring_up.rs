@@ -196,6 +196,15 @@ pub struct Qwen36OutsideKernels {
     pub fn_fp8_gemv_dual_silu_indirect: KernelFn,
     pub fp8_gemv_indirect_mod: LoadedModule,
     pub fn_fp8_gemv_indirect: KernelFn,
+    /// Phase 8 MoE-fusion (2026-05-23): fused FP8 GEMV (indirect-
+    /// expert) + scaled f32 accumulation. Single-kernel replacement
+    /// for the back-to-back pair (fp8_gemv_indirect + scaled_add_
+    /// f16_to_f32_devw) used per k-round in the per-token MoE
+    /// decode path. Eliminates 1 launch + 1 f16-roundtrip per
+    /// k-round × 8 k-rounds × 40 MoE layers = 320 launches saved
+    /// per decode token.
+    pub fp8_gemv_indirect_scaled_add_mod: LoadedModule,
+    pub fn_fp8_gemv_indirect_scaled_add: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -1608,6 +1617,10 @@ impl Qwen36Bringup {
             kernels.load_ptx("fp8_gemv_blockwise_wpr_native_f16in_indirect")?;
         let fn_fp8_gemv_indirect = fp8_gemv_indirect_mod
             .get_function("fp8_gemv_blockwise_wpr_native_f16in_indirect_kernel")?;
+        let fp8_gemv_indirect_scaled_add_mod = kernels
+            .load_ptx("fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add")?;
+        let fn_fp8_gemv_indirect_scaled_add = fp8_gemv_indirect_scaled_add_mod
+            .get_function("fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_f16kv =
             flash_attention_mod.get_function("flash_attention_2_f16kv_kernel")?;
@@ -1773,6 +1786,8 @@ impl Qwen36Bringup {
             fn_fp8_gemv_dual_silu_indirect,
             fp8_gemv_indirect_mod,
             fn_fp8_gemv_indirect,
+            fp8_gemv_indirect_scaled_add_mod,
+            fn_fp8_gemv_indirect_scaled_add,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             fn_flash_attention_2_f16kv,
@@ -9847,15 +9862,31 @@ impl Qwen36Bringup {
                     ));
                 }
             }
-            // Indirect down GEMV: reads expert idx from device.
+            // Phase 8 MoE-fusion (2026-05-23): fused indirect-
+            // down-GEMV + scaled f32 accumulate. Replaces the
+            // separate (fp8_gemv_indirect → down_region f16 →
+            // scaled_add_f16_to_f32_devw) pair with ONE kernel:
+            // reads input + expert idx + topk_w, computes the
+            // FP8 GEMV exactly as before, then on lane 0 does
+            // `routed_sum[n] = routed_sum[n] + topk_w * acc`
+            // directly (no f16 round-trip, no second launch).
+            //
+            // Numerical contract: identical inner GEMV reduction
+            // (same fp8 decode, blockscale loads, lane stride,
+            // warp-shuffle). Epilogue eliminates the f16 round-
+            // trip the original (down → scaled_add) pair did,
+            // PRESERVING precision (and accidentally making the
+            // accumulation more accurate). Per-element accumulator
+            // is touched by exactly one thread → no atomic needed.
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
-                let mut out = down_region.device_ptr();
+                let mut acc_f32 = routed_sum_region.device_ptr();
                 let mut bw = moe.experts_down_proj_fused.offset_bytes;
                 let mut bs = down_bs;
                 let mut inp = silu_region.device_ptr();
                 let mut idx_p = idx_ptr_i;
+                let mut devw = w_ptr_i;
                 let mut w_stride = down_per_expert_w as i64;
                 let mut s_stride_elems = (down_per_expert_bs / 4) as i64;
                 let mut m_i = m as i32;
@@ -9863,11 +9894,12 @@ impl Qwen36Bringup {
                 let mut k_i = k_down as i32;
                 let mut ncb = ((k_down + 127) / 128) as i32;
                 let args = [
-                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut acc_f32) as *mut u64 as *mut core::ffi::c_void,
                     (&mut bw) as *mut u64 as *mut core::ffi::c_void,
                     (&mut bs) as *mut u64 as *mut core::ffi::c_void,
                     (&mut inp) as *mut u64 as *mut core::ffi::c_void,
                     (&mut idx_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut devw) as *mut u64 as *mut core::ffi::c_void,
                     (&mut w_stride) as *mut i64 as *mut core::ffi::c_void,
                     (&mut s_stride_elems) as *mut i64 as *mut core::ffi::c_void,
                     (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
@@ -9878,7 +9910,7 @@ impl Qwen36Bringup {
                 let grid = ((n_down + 7) / 8, m, 1u32);
                 let block = (256u32, 1u32, 1u32);
                 let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_fp8_gemv_indirect.raw() as CUfunction,
+                    self.outside_kernels.fn_fp8_gemv_indirect_scaled_add.raw() as CUfunction,
                     grid.0,
                     grid.1,
                     grid.2,
@@ -9892,14 +9924,18 @@ impl Qwen36Bringup {
                 );
                 if rc != CUresult::CUDA_SUCCESS {
                     return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 fp8_gemv_indirect launch",
+                        "qwen36 fp8_gemv_indirect_scaled_add launch",
                         rvllm_core::CudaErrorKind::LaunchFailed,
                         rvllm_core::CudaCtx::setup(),
                     ));
                 }
             }
-            // scaled_add_devw: routed_sum_region += topk_w[i] * down_region.
-            #[cfg(feature = "cuda")]
+            // (Old: separate scaled_add_f16_to_f32_devw call has
+            // been folded into the fused kernel above. Kept the
+            // arena layout (down_region, w_ptr_i, etc.) the same
+            // so other call sites that might still use the
+            // unfused path stay unaffected.)
+            #[cfg(all(feature = "cuda", any()))]
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut acc = routed_sum_region.device_ptr();
