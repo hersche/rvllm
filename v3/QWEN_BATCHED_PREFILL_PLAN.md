@@ -445,17 +445,18 @@ identical to `fused_qnorm_knorm_rope_qwen_partial_f16kv` (commit
 `fused_qnorm_knorm_rope_qwen_partial_nvfp4kv` (commit `6f6a25a`)
 given normalised inputs.
 
-A/B on qwen3-6-35b-a3b, deterministic across 3 runs each:
+Re-verified A/B on qwen3-6-35b-a3b NVFP4-KV (max_tokens=150,
+3 runs each, freshly-installed symlinked binary):
 
-  | Path                          | OFF     | ON      |
-  |-------------------------------|---------|---------|
-  | F16-KV decode (150-tok)       | 3.83 s  | 3.82 s  |
-  | NVFP4-KV decode (150-tok)     | 3.68 s  | 3.08 s  |
-  | NVFP4-KV prefill (M=48)       | 489 ms  | 447 ms  |
+  | Cell             | wall   | tokens | tok/s | prefill_ms | md5(completion) |
+  |------------------|--------|--------|-------|------------|-----------------|
+  | QKV_MEGA_OFF     | 3.69 s | 150    | 40.65 | 215        | b5d33eaa        |
+  | QKV_MEGA_ON      | 3.09 s | 125    | 40.45 | 197        | b73335f8        |
 
-NVFP4-KV decode shows the largest win because the unfused NVFP4
-chain has more launches per layer than F16. CUTLASS path at M≥128
-unchanged.
+Decode tok/s **parity** — wall-time delta explained by ON path
+hitting EOS at 125 tokens. prefill_ms shows **~8% speedup**
+(215→197) which IS apples-to-apples. md5 differs ON vs OFF
+(fusion fires). CUTLASS path at M≥128 unchanged.
 
 **Batched-prefill down k_round-batch port** (commit `38afff0`).
 The decode-side down k_round-batch fusion (commit `b1f221e`) was
@@ -469,9 +470,10 @@ the dual_silu kround-batched launch) already matches the kernel's
 preserved per-warp sequential over k_rounds).
 
 A/B on qwen3-6-35b-a3b NVFP4-KV (115-token prompt), deterministic
-over 3 runs each: BATCH_MOE_ROUTED_FFN=on → prefill_ms 1157-1159;
-BATCH_MOE_ROUTED_FFN=off (full per-token fallback) → prefill_ms
-1495-1499. 22% prefill speedup from the whole batched-MoE stack
+over 3 runs each: BATCH_MOE_ROUTED_FFN=on → prefill_ms 217 / wall
+3.69s / 40.65 tok/s; BATCH_MOE_ROUTED_FFN=off (full per-token
+fallback) → prefill_ms 273 / wall 3.75s / 40.00 tok/s. **21%
+prefill speedup**, decode tok/s parity, from the whole batched-MoE stack
 (this port + dual_silu kround-batch + router+topk batched +
 shared-expert batched).
 
@@ -485,8 +487,8 @@ on the same warp's lane 0; routed_sum f32 write preserved so the
 `RVLLM_QWEN36_DEBUG_MOE` probe stays visible. Env-gated opt-in
 (`RVLLM_QWEN36_MOE_CLOSER_FUSED=1`, default off). A/B on
 qwen3-6-35b-a3b NVFP4-KV (150-token photosynthesis), deterministic
-over 3 runs each: 3.68 s ON vs 3.68 s OFF. md5 differs ON vs OFF
-(fusion fires). Saves 1 launch per MoE layer per decode token
+on top of QKV_MEGAKERNEL=1: wall 3.09s / 125 tok / 40.45 tok/s /
+prefill 197ms — no measurable delta vs QKV megakernel alone. Saves 1 launch per MoE layer per decode token
 (~40 launches/token); architectural cleanup at this scale, not a
 measurable wall-clock win.
 

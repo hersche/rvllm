@@ -1145,19 +1145,24 @@ because the warp-cooperative reduction order is not the same as
 the unfused chain's per-step reductions, but the math is
 equivalent up to float-rounding.
 
-Hardware A/B on qwen3-6-35b-a3b, deterministic across 3 runs each:
+Re-verified A/B on qwen3-6-35b-a3b NVFP4-KV (max_tokens=150,
+deterministic across 3 runs each, freshly-installed symlinked
+binary, profile = mobile-qwen3635b-rvllm-nvfp4-spec):
 
-  | Path                          | OFF     | ON      |
-  |-------------------------------|---------|---------|
-  | F16-KV decode (150-tok)       | 3.83 s  | 3.82 s  |
-  | NVFP4-KV decode (150-tok)     | 3.68 s  | 3.08 s  |
-  | NVFP4-KV prefill (M=48)       | 489 ms  | 447 ms  |
+  | Cell             | wall   | tokens | tok/s | prefill_ms | md5(completion) |
+  |------------------|--------|--------|-------|------------|-----------------|
+  | QKV_MEGA_OFF     | 3.69 s | 150    | 40.65 | 215        | b5d33eaa        |
+  | QKV_MEGA_ON      | 3.09 s | 125    | 40.45 | 197        | b73335f8        |
 
-NVFP4-KV decode shows the largest win because the unfused
-NVFP4 chain has more launches per layer than F16 (each NVFP4
-quant + pack step is its own kernel). The batched-prefill arm
-fires at small M only (< 128); CUTLASS path at M≥128 is
-unchanged.
+Decode-throughput (tok/s) is at **parity** — the wall-time delta
+is explained by the ON path hitting EOS at 125 tokens (different
+MAC ordering → slightly different token choices → earlier
+sentence-ending). prefill_ms shows **~8% prefill speedup**
+(215→197) which IS apples-to-apples since both legs ran the
+same prompt. md5 differs ON vs OFF (fusion fires).
+
+The batched-prefill arm fires at small M only (< 128); CUTLASS
+path at M≥128 is unchanged.
 
 Production qwen3627b smoke ("Die Hauptstadt von Frankreich ist
 Paris.") verified after every restart.
@@ -1177,11 +1182,12 @@ The routed_sum f32 write is preserved so the
 `RVLLM_QWEN36_DEBUG_MOE` post-residual probe stays visible.
 
 Env-gated opt-in (`RVLLM_QWEN36_MOE_CLOSER_FUSED=1`); default off
-keeps the unfused 2-launch chain byte-untouched. A/B on
-qwen3-6-35b-a3b NVFP4-KV (150-token photosynthesis),
-deterministic across 3 runs each: 3.68 s ON vs 3.68 s OFF.
-md5 differs ON vs OFF (fusion fires). Saves 1 launch per MoE
-layer per decode token (~40 launches/token across 40 layers);
+keeps the unfused 2-launch chain byte-untouched. Re-verified A/B
+on qwen3-6-35b-a3b NVFP4-KV (max_tokens=150, 3 runs each, on top
+of `RVLLM_QWEN36_QKV_MEGAKERNEL=1`): wall 3.09 s / 125 tok /
+40.45 tok/s / prefill 197 ms — no measurable delta vs QKV
+megakernel alone. Saves 1 launch per MoE layer per decode token
+(~40 launches/token across 40 layers);
 architectural cleanup at this scale, not a measurable wall-clock
 win.
 
@@ -1244,8 +1250,22 @@ closer-reads correct within each iteration.
 Result on qwen3-6-35b-a3b at N=8: macro-graph node count drops
 roughly in half (the per-iter arena.region call + the captured-
 graph bookkeeping it implied are gone from the kernel sequence).
-Single-step
-remains the recommended path; multi-step is operator-opt-in.
+
+Re-verified A/B on qwen3-6-35b-a3b NVFP4-KV (max_tokens=150,
+deterministic across 3 runs each, freshly-installed symlinked
+binary):
+
+  | Cell             | wall   | tokens | tok/s | prefill_ms | md5(completion) |
+  |------------------|--------|--------|-------|------------|-----------------|
+  | DG_OFF_EAGER     | 3.69 s | 150    | 40.65 | 217        | b5d33eaa        |
+  | DG_ON_REPLAY     | 3.66 s | 150    | 40.98 | 213        | b5d33eaa        |
+  | DG_MULTISTEP8    | 3.73 s | 150    | 40.21 | 217        | b5d33eaa        |
+
+Single-step replay vs eager: **+0.8% tok/s** (within noise).
+Multi-step N=8 vs single-step replay: **-1.9% tok/s** — N=8 is
+slower than single-step on this shape. md5 identical across all
+three (graph capture/replay is bit-equivalent to eager). Single-
+step remains the recommended path; multi-step is operator-opt-in.
 
 ### Phase 8 hidden-state → workspace refactor — SHIPPED 2026-05-23
 
@@ -1312,10 +1332,17 @@ dual_silu kround-batched launch) already matches the kernel's
 Bit-equivalent numerics (same kernel as decode hot path, sum
 order preserved per-warp sequential over k_rounds).
 
-A/B on qwen3-6-35b-a3b NVFP4-KV (115-token prompt),
-deterministic over 3 runs each:
-- BATCH_MOE_ROUTED_FFN=on  → prefill_ms 1157-1159
-- BATCH_MOE_ROUTED_FFN=off → prefill_ms 1495-1499
+Re-verified A/B on qwen3-6-35b-a3b NVFP4-KV (5-word prompt,
+max_tokens=150, 3 runs each, freshly-installed symlinked binary):
+
+  | Cell      | wall   | tokens | tok/s | prefill_ms | md5(completion) |
+  |-----------|--------|--------|-------|------------|-----------------|
+  | MOE_ON    | 3.69 s | 150    | 40.65 | 217        | b5d33eaa        |
+  | MOE_OFF   | 3.75 s | 150    | 40.00 | 273        | 1a136b5a        |
+
+**21% prefill speedup** (273→217 ms) from the whole batched-MoE
+stack. Decode tok/s ~parity (40.65 vs 40.00 = +1.6%). md5 differs
+ON vs OFF (stack fires).
 
 22% prefill speedup from the whole batched-MoE stack (this
 port + dual_silu kround-batch + router+topk batched + shared-
