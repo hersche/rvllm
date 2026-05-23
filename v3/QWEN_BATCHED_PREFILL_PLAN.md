@@ -331,6 +331,37 @@ infrastructure is now available for Mistral 3.5 / Gemma 4 31B
 dense paths but the latency win on those would also be below
 noise.
 
+**Batched-prefill fusion follow-on (commit `8060834`)** — new
+kernel `..._indirect_scaled_add_batched_topk_kernel` extends the
+f0f79d5 pattern to `apply_layer_moe_batched`'s prefill k_round
+loop. Saves 1 launch + 1 f16 round-trip per k-round across the
+entire prompt. ~4.5% prefill speedup (2.66s → 2.54s baseline
+toggled via `RVLLM_QWEN36_BATCH_MOE_PREFILL`).
+
+**Shared-expert fusion (commit `99e6cde`)** — new kernel
+`fp8_gemv_blockwise_wpr_native_f16in_scaled_add_devw_kernel`
+fuses the shared-expert down + scaled_add into one launch.
+Saves 40 launches/decode token at 40 MoE layers. Latency
+1.708s deterministic.
+
+**Dual_silu k_round-batch fusion (commit `442a72c`)** — new
+kernel `..._dual_silu_indirect_kround_batched_kernel` batches
+the 8-k_round host loop into ONE launch via `grid.z = top_k`.
+silu_region grows to `[top_k, M, N_int]`; down loop still
+serial. 7 launches saved per MoE layer per token.
+**2.4% additional decode speedup** (1.717s → 1.676s).
+
+**Router+topk fusion (commit `e049258`)** — new kernel
+`router_gemv_with_topk_f16_to_f32_kernel` uses atomic-counter
+last-block-does-topk pattern. Saves 1 launch per MoE layer
+per token (~40 per decode token). Latency 1.675s
+(below-noise additional speedup as predicted).
+
+**Cumulative MoE-fusion stack** on qwen3-6-35b-a3b 150-token
+photosynthesis: 2.140s baseline → 1.717s (f0f79d5) → 1.708s
+(99e6cde) → 1.676s (442a72c) → 1.675s (e049258). **Total
+≈22% decode speedup** across today's stack.
+
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
 desired.
