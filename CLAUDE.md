@@ -1147,6 +1147,40 @@ qwen3-6-35b-a3b 150-token photosynthesis:
 - After down kround-batch (b1f221e): **1.644s**
 - **Total ≈23% decode speedup** across today's MoE fusion stack.
 
+### Phase 8 hidden-state → workspace refactor — SHIPPED 2026-05-23
+
+Commit `e13e2eb` routes the hidden-state residual stream
+through the persistent `workspace.hidden_dev` slot when the
+caller passes `hidden_dev_override: Some(...)`. Adds a new
+parameter to
+`forward_qwen36_decode_inner_with_workspace_overrides_v2`;
+the four closer fns (eager + device_argmax + with_link +
+closer_all) refactored from `hidden_region: &Region<'_>` to
+`hidden_dev_ptr: u64`. The arena `hidden_region` allocation
+stays unconditionally so downstream arena addresses stay
+layout-stable; the override merely substitutes which device
+address the in-body reads/writes target.
+
+Both `forward_qwen36_decode_step_to_workspace` entry points
+plumb `Some(workspace.hidden_dev)` as the override. The
+persistent workspace slot survives the inner-checkpoint
+restore (commit bcdce94 RAII guard) AND stays address-stable
+across requests (workspace allocated above scratch_ck).
+Captured decode graph references now valid for the lifetime
+of the worker — unlocks broader closer/post-attn fusion
+patterns (the kernel-fusion attempt from commit e47166b
+already exploited the same property but via re-allocating
+`hidden_region` post-restore; this commit removes the need
+for that workaround).
+
+Hardware-validated on qwen3-6-35b-a3b:
+- Eager (legacy path, no overrides): 1.654s. Coherent.
+- DECODE_WORKSPACE=1 (overrides on, no capture):
+  1.648-1.652s, coherent (within noise of eager).
+- DECODE_GRAPH=1 + REPLAY=1: coherent short + 1-10 counting.
+
+Production qwen27b (qwen35 dense path) — unaffected.
+
 ### Phase 8 batched router+topk + down kround-batch — SHIPPED 2026-05-23
 
 **Batched router+topk fusion (commit `314dbe6`)**: ports the
