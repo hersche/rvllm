@@ -400,6 +400,20 @@ patterns. Hardware-validated coherent under
 DECODE_WORKSPACE=1 (1.648-1.652s, within noise of 1.654s
 eager) and DECODE_GRAPH=1 + REPLAY=1 (short + 1-10 counting).
 
+**Multi-step graph with persistent hidden (commit `eb26d86`)**
+— exploits e13e2eb to retire the per-iteration
+`arena.region("qwen36_pl_hidden", ...)` re-allocation in the
+multi-step macro-graph (`try_capture_decode_steps_n` capture
+body + eager fallback + the pure-eager branch of
+`decode_steps_n_via_graph_or_eager`). The fused closer reads
+hidden state directly from `workspace.hidden_dev` (which the
+decode-step body already writes to). Result on qwen3-6-35b-a3b
+at N=8: macro-graph node count **14840 → 7160** (cut nearly
+in half), multi-step replay latency **2.188s → 1.727s** (≈21%
+multi-step improvement; deterministic across 5 cached replays).
+Still ~80ms slower than single-step replay (1.644s); multi-
+step stays operator-opt-in via `RVLLM_QWEN36_DECODE_MULTI_STEP`.
+
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
 desired.
