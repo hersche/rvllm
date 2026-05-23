@@ -357,10 +357,30 @@ last-block-does-topk pattern. Saves 1 launch per MoE layer
 per token (~40 per decode token). Latency 1.675s
 (below-noise additional speedup as predicted).
 
+**Batched router+topk fusion (commit `314dbe6`)** — same
+pattern ported to the prefill batched path with per-token
+counter slots (one per token). New kernel
+`router_gemv_with_topk_batched_f16_to_f32_kernel`. Eliminates
+1 launch per MoE layer per prefill. Counter region sized by
+`kv_cache_num_blocks`, zeroed once at bring-up; kernel self-
+resets per-token slots.
+
+**Down k_round-batch fusion (commit `b1f221e`)** — fuses the
+8 per-k_round host-loop down launches in
+`apply_layer_moe_with_override` into ONE kernel via per-warp
+f32-register accumulation. The LITERAL dual_silu+down
+megakernel is infeasible (silu_mul recomputation per output
+would explode work ~1000x); this is the closest tractable
+analog. New kernel `..._indirect_scaled_add_kround_batched_kernel`
+has each warp own one (m, n) output slot and sequentially
+process all top_k k_rounds — no atomic, single global RMW at
+the end. Saves 280 launches/decode token.
+
 **Cumulative MoE-fusion stack** on qwen3-6-35b-a3b 150-token
 photosynthesis: 2.140s baseline → 1.717s (f0f79d5) → 1.708s
-(99e6cde) → 1.676s (442a72c) → 1.675s (e049258). **Total
-≈22% decode speedup** across today's stack.
+(99e6cde) → 1.676s (442a72c) → 1.675s (e049258) → **1.644s
+(b1f221e)**. **Total ≈23% decode speedup** across today's
+stack.
 
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
