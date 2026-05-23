@@ -958,6 +958,25 @@ impl Gemma4Nvfp4Bringup {
         stop_token_ids: &[u32],
         kv: &Gemma4Nvfp4KvState,
     ) -> Result<SpecSessionStats> {
+        self.run_spec_session_nvfp4_greedy_k1_with_vision(
+            prompt_ids, max_new, stop_token_ids, kv, &[])
+    }
+
+    /// Stream-7 spec+vision unblock: drop-in for
+    /// `run_spec_session_nvfp4_greedy_k1` that threads a
+    /// `vision_splice` into the prefill call. The drafter cross-
+    /// attends to the SAME shadow K/V the prefill populates, so the
+    /// vision-spliced base tokens propagate to the drafter for free.
+    /// No drafter-side ViT is needed because the drafter operates in
+    /// token space, not pixel space.
+    pub fn run_spec_session_nvfp4_greedy_k1_with_vision(
+        &mut self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        stop_token_ids: &[u32],
+        kv: &Gemma4Nvfp4KvState,
+        vision_splice: &[(usize, &[u8])],
+    ) -> Result<SpecSessionStats> {
         if max_new == 0 {
             return Err(corrupt_runtime_err(
                 "run_spec_session_nvfp4_greedy_k1: max_new must be \
@@ -989,11 +1008,14 @@ impl Gemma4Nvfp4Bringup {
         }
 
         // 1. Prefill — runs the full base forward over the
-        //    prompt, populates KV slots [0..L-1], and (via the
-        //    #6b-base-hidden hook in `forward_final_to_token`)
-        //    snapshots base's post-final-norm hidden for the
-        //    last prompt token into `base_last_hidden_ptr`.
-        let mut t_committed = self.forward_prompt_to_token(prompt_ids, 0, kv)?;
+        //    prompt (with optional vision splice — Stream-7,
+        //    empty for text-only), populates KV slots [0..L-1],
+        //    and (via the #6b-base-hidden hook in
+        //    `forward_final_to_token`) snapshots base's post-
+        //    final-norm hidden for the last prompt token into
+        //    `base_last_hidden_ptr`.
+        let mut t_committed = self.forward_prompt_to_token_with_vision(
+            prompt_ids, 0, kv, vision_splice)?;
         let mut emitted: Vec<u32> = vec![t_committed];
         let mut ctx_len: u32 = prompt_ids.len() as u32;
 
@@ -1117,6 +1139,24 @@ impl Gemma4Nvfp4Bringup {
         stop_token_ids: &[u32],
         kv: &Gemma4Nvfp4KvState,
     ) -> Result<SpecSessionStats> {
+        self.run_spec_session_nvfp4_greedy_k_with_vision(
+            prompt_ids, max_new, spec_k, stop_token_ids, kv, &[])
+    }
+
+    /// Stream-7 spec+vision unblock: drop-in for
+    /// `run_spec_session_nvfp4_greedy_k` that threads a
+    /// `vision_splice` into the prefill call. Same rationale as
+    /// `_k1_with_vision`: drafter inherits vision-spliced base
+    /// tokens via shared shadow K/V; no drafter ViT needed.
+    pub fn run_spec_session_nvfp4_greedy_k_with_vision(
+        &mut self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        spec_k: usize,
+        stop_token_ids: &[u32],
+        kv: &Gemma4Nvfp4KvState,
+        vision_splice: &[(usize, &[u8])],
+    ) -> Result<SpecSessionStats> {
         if spec_k == 0 {
             return Err(corrupt_runtime_err(
                 "run_spec_session_nvfp4_greedy_k: spec_k must be >= 1".into(),
@@ -1183,9 +1223,12 @@ impl Gemma4Nvfp4Bringup {
         let mut adaptive_k_sum = 0usize;
 
         // Prefill prompt and snapshot the prompt-final base hidden for
-        // drafter step 0.
+        // drafter step 0. Stream-7: vision_splice (empty for text-only)
+        // overwrites the image-pad rows in residual_dev between embed
+        // and the layer loop.
         let prefill_t0 = std::time::Instant::now();
-        let mut t_committed = self.forward_prompt_to_token(prompt_ids, 0, kv)?;
+        let mut t_committed = self.forward_prompt_to_token_with_vision(
+            prompt_ids, 0, kv, vision_splice)?;
         prefill_elapsed += prefill_t0.elapsed();
         let mut emitted: Vec<u32> = vec![t_committed];
         let mut ctx_len: u32 = prompt_ids.len() as u32;

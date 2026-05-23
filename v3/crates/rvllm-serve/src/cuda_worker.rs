@@ -1070,18 +1070,13 @@ pub async fn spawn_cuda_worker(
                     // Stream-7: vision pre-pass. Run the native Gemma 4
                     // ViT for each image, narrow f16 → bf16 host-side,
                     // build the splice list for the prefill. Spec mode
-                    // doesn't carry vision (no spec drafter ships with
-                    // a paired ViT) — reject with a clear error if
-                    // both are requested.
-                    if spec_probe_this_request && !req.vision_items.is_empty() {
-                        let _ = req.events_tx.send(GenerateEvent::Error(
-                            "gemma4-nvfp4 path: vision + spec-decode is \
-                             not supported (no paired drafter ViT). \
-                             Unset RVLLM_GEMMA4_SPEC_DECODE for vision \
-                             requests."
-                                .to_string()));
-                        continue;
-                    }
+                    // ALSO carries vision now (Stream-7 spec+vision
+                    // unblock, 2026-05-23): the drafter cross-attends
+                    // to the SAME shadow K/V the prefill populates, so
+                    // vision-spliced base tokens propagate to the
+                    // drafter for free. No paired drafter ViT needed
+                    // because the drafter operates in token space, not
+                    // pixel space.
                     // Build vision splice. Outputs from
                     // `forward_gemma_vision` are little-endian f16 in
                     // `out.data` of shape `[num_tokens, hidden]`;
@@ -1177,14 +1172,19 @@ pub async fn spawn_cuda_worker(
                     // a follow-up.
                     if spec_probe_this_request {
                         let stop_vec: Vec<u32> = stop_set.iter().copied().collect();
+                        // Stream-7 spec+vision: route the same
+                        // vision_splice_refs the non-spec branch uses
+                        // into the spec prefill. Empty slice reduces
+                        // to the text-only path byte-identically.
                         let stats = match if spec_cfg.k == 1 {
-                            bringup.run_spec_session_nvfp4_greedy_k1(
+                            bringup.run_spec_session_nvfp4_greedy_k1_with_vision(
                                 &req.prompt_ids, max_new as usize,
-                                &stop_vec, &kv)
+                                &stop_vec, &kv, &vision_splice_refs)
                         } else {
-                            bringup.run_spec_session_nvfp4_greedy_k(
+                            bringup.run_spec_session_nvfp4_greedy_k_with_vision(
                                 &req.prompt_ids, max_new as usize,
-                                spec_cfg.k as usize, &stop_vec, &kv)
+                                spec_cfg.k as usize, &stop_vec, &kv,
+                                &vision_splice_refs)
                         } {
                             Ok(s) => s,
                             Err(e) => {
