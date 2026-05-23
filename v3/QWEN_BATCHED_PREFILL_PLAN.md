@@ -773,3 +773,36 @@ coherent. Default-off regression matches the 6020 ms GEMV baseline.
 
 The cumulative MoE-prefill speedup vs raw GEMV stays at +84%
 (architectural cleanup, not a perf gain).
+
+
+## Phase 16: Fresh nsys profile post-#98+#99 (task #100, 2026-05-24)
+
+Captured against fresh binary md5 `65cb2a35` with both grouped MMA
+paths active (M=4412 prompt). Top kernels in the prefill window:
+
+  | Time% | Kernel                                          | Instances | Notes |
+  |-------|-------------------------------------------------|-----------|-------|
+  | 15.8% | gated_delta_rule_prefill_f16                    |    30     | **NEW TOP — linear-attn** |
+  | 12.5% | fp8_mma_dual_silu_grouped_m16_w4c               |    40     | #96 path |
+  | 12.3% | flash_attention_2_prefill_nvfp4kv_unified       |    10     | full-attn (CUTLASS NVFP4) |
+  | 10.5% | fp8_mma_down_grouped_m16_w4                     |    40     | #98 path |
+  |  6.4% | router_gemv_with_topk_batched_f16_to_f32        |    40     | |
+  |  6.2% | fp8_gemv_blockwise_wpr_native_f16in (per-token) |  1940     | |
+  |  4.6% | fp8_gemv_dual_silu (shared expert)              |   800     | |
+
+**MoE routed FFN: 88.9% → 23.0%** (5.7× absolute time reduction).
+The cumulative perf work since Phase 9 (commit `443d77b`) has
+broken the original dominant bottleneck. Prefill walltime at
+M=4412 dropped from 24775 ms (GEMV baseline) → 4116 ms (-83.4%).
+
+**New top hotspot: linear-attn `gated_delta_rule_prefill_f16`
+(15.8%).** Was a relative minor at 3.6% in the original profile
+but absolute time stayed similar (~900 ms then / now); now
+dominates the smaller wall.
+
+Path forward documented in CLAUDE.md (descending expected impact):
+1. Linear-attn `gated_delta_rule_prefill_f16` optimization (single
+   biggest hotspot, ~650 ms at M=4412)
+2. Apply grouped MMA pattern to shared-expert dual_silu (no routing
+   indirection — simpler than #94-#97; expected ~5-8%)
+3. Apply grouped MMA pattern to other model families
