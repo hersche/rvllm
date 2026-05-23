@@ -1306,6 +1306,31 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 MoE shared sort + per-kblk a_scale fix — task #99 (2026-05-24)
+
+Two paired cleanups (commit `81b4b21`):
+
+* **Shared sort across dual_silu + down**: new layer-scoped
+  `shared_sort_ptrs` in `apply_layer_moe_batched`. When dual_silu
+  grouped runs its sort+tile_table+DtoH, it publishes outputs
+  there. Down grouped, if Some is observed, reuses persistent
+  buffer + cached tile_count and skips its own sort pre-pass.
+  Saves 2 kernel launches + 1 sync DtoH per layer when both
+  grouped paths are enabled.
+* **Per-kblk a_scale fix** to all 4 dual_silu grouped kernels
+  (#94 grouped_m16, #95 w4, #96 w4c, #97 w4cb). Same pattern as
+  the #98 down kernel: fold per-(row, kblk) a_scale into
+  g_outer/u_outer inside the K-loop instead of multiplying by
+  `smem_ascale[row]` at write time (= LAST kblk's value).
+  Previously invisible for dual_silu (RMSNormed input → nearly-
+  constant per-K-block amax). Fixed for correctness + consistency.
+
+A/B perf (qwen3-6-35b-a3b NVFP4, deterministic, fresh binary
+md5 `65cb2a35`): parity with #98 measurements within noise. The
+fix is FREE perf-wise (architectural correctness improvement);
+shared sort is also at parity (the saved ~µs/layer is below
+noise on the 1000ms prefill).
+
 ### qwen36 MoE grouped MMA down projection — task #98 (2026-05-24, +84% with both grouped)
 
 `fp8_mma_down_grouped_m16_w4_kernel` (commit `3e5c097`) extends

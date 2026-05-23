@@ -736,3 +736,40 @@ Cumulative MoE-prefill speedup vs raw GEMV:
 * Phase 4-7 reference 6020 ms
 * Phase 12 dual_silu grouped: 2533 ms (+57.9%)
 * **Phase 14 both grouped:    955 ms (+84.1%)**
+
+
+## Phase 15: Shared sort + per-kblk a_scale fix (task #99, 2026-05-24)
+
+Two paired cleanups in commit `81b4b21`:
+
+* **Shared sort across dual_silu + down**: layer-scoped
+  `shared_sort_ptrs: Option<(...)>` published by dual_silu's grouped
+  path after its sort+tile_table+DtoH succeeds. Down's grouped
+  path consults it; if `Some`, reuses persistent buffer + cached
+  tile_count and skips its own sort. Saves 2 kernel launches + 1
+  sync DtoH per layer when both grouped paths are enabled.
+
+* **Per-kblk a_scale fix** applied to all 4 dual_silu grouped
+  kernels (#94 grouped_m16, #95 w4, #96 w4c, #97 w4cb). Mirrors
+  the #98 down kernel's fix: `a_lo = smem_ascale[r_lo_c]`,
+  `a_hi = smem_ascale[r_hi_c]` inside K-loop, fold per-(row, kblk)
+  a_scale into outer accumulators. Write applies only `silu(g)*u`.
+  Previously `smem_ascale[row]` at write time used the LAST kblk's
+  value (under-counted earlier kblks). Invisible for dual_silu
+  (RMSNormed input → ~constant per-K-block amax) but a real
+  correctness issue.
+
+A/B (qwen3-6-35b-a3b NVFP4, deterministic):
+
+  | Cell                                    | 1112 tok    |
+  |-----------------------------------------|-------------|
+  | GEMV default-off                        |   6045 ms   |
+  | BOTH grouped + shared + a_scale fix     |   946 ms    |
+
+Parity vs #98 within noise. Quality verified: 80-word quantum
+entanglement gives Einstein "spooky action" reference, no garbage
+tokens. Down-only path (own sort, when MMA_GROUPED is off) also
+coherent. Default-off regression matches the 6020 ms GEMV baseline.
+
+The cumulative MoE-prefill speedup vs raw GEMV stays at +84%
+(architectural cleanup, not a perf gain).
