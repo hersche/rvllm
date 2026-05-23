@@ -10019,6 +10019,15 @@ impl Qwen36Bringup {
         let n_down_us = n_down as usize;
         let h_us = hidden as usize;
         let mut rs_batched_ptr_opt: Option<u64> = None;
+        // Task #99: shared sort outputs between dual_silu grouped
+        // and down grouped dispatches (same layer, same routing).
+        // dual_silu writes this when its grouped path runs sort+
+        // tile_table+DtoH; down's grouped path reuses if Some
+        // instead of re-running its own sort.
+        // Tuple: (sorted_p, counts_p, tiles_p, tcount_p,
+        //         eff_max_per_expert, tile_count_host)
+        let mut shared_sort_ptrs:
+            Option<(u64, u64, u64, u64, u32, i32)> = None;
         if routed_ffn_batched {
             let gate_bs = match moe.experts_gate_proj_fused.blockscale_ptr {
                 Some(p) => p,
@@ -10500,6 +10509,15 @@ impl Qwen36Bringup {
                                 rvllm_core::CudaCtx::setup(),
                             ));
                         }
+                        // Task #99: publish sort outputs for the down
+                        // dispatch below to reuse (skip re-running
+                        // sort+tile_table+DtoH when both grouped paths
+                        // are enabled in the same layer).
+                        shared_sort_ptrs = Some((
+                            outer_sorted_p, outer_counts_p,
+                            outer_tiles_p, outer_tcount_p,
+                            eff_max_per_expert, tile_count_host,
+                        ));
                     }
                 } else {
                     let grid = (((n_int + 7) / 8).max(1), num_tokens, top_k as u32);
@@ -10565,6 +10583,68 @@ impl Qwen36Bringup {
             #[cfg(feature = "cuda")]
             if down_grouped {
                 use cudarc::driver::sys::*;
+                // Task #99: reuse sort outputs from dual_silu grouped
+                // dispatch (same layer, same routing) when available.
+                // Saves 2 kernel launches + 1 DtoH per layer when both
+                // grouped paths are enabled.
+                let mut handled_by_shared = false;
+                if let Some((sp_r, _cp_r, tp_r, _tcp_r, mpe_r, tc_r)) = shared_sort_ptrs {
+                    let mut acc_p = rs_b.device_ptr();
+                    let mut bw_p  = moe.experts_down_proj_fused.offset_bytes;
+                    let mut bs_p  = down_bs;
+                    let mut inp_p = silu_b.device_ptr();
+                    let mut twp   = topk_w_base;
+                    let mut sp_p  = sp_r;
+                    let mut tp_p  = tp_r;
+                    let mut ws: i64 = down_per_expert_w as i64;
+                    let mut ss: i64 = (down_per_expert_bs / 4) as i64;
+                    let mut mfull = num_tokens as i32;
+                    let mut nd    = n_down as i32;
+                    let mut ki    = k_down as i32;
+                    let mut ncb   = num_col_blocks_down;
+                    let mut tki   = top_k as i32;
+                    let mut mpe   = mpe_r as i32;
+                    let args = [
+                        (&mut acc_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut bw_p)  as *mut u64 as *mut core::ffi::c_void,
+                        (&mut bs_p)  as *mut u64 as *mut core::ffi::c_void,
+                        (&mut inp_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut twp)   as *mut u64 as *mut core::ffi::c_void,
+                        (&mut sp_p)  as *mut u64 as *mut core::ffi::c_void,
+                        (&mut tp_p)  as *mut u64 as *mut core::ffi::c_void,
+                        (&mut ws)    as *mut i64 as *mut core::ffi::c_void,
+                        (&mut ss)    as *mut i64 as *mut core::ffi::c_void,
+                        (&mut mfull) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nd)    as *mut i32 as *mut core::ffi::c_void,
+                        (&mut ki)    as *mut i32 as *mut core::ffi::c_void,
+                        (&mut ncb)   as *mut i32 as *mut core::ffi::c_void,
+                        (&mut tki)   as *mut i32 as *mut core::ffi::c_void,
+                        (&mut mpe)   as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let grid_x = ((n_down + 31) / 32).max(1);
+                    unsafe {
+                        let rc = cuLaunchKernel(
+                            self.outside_kernels.fn_fp8_mma_down_grouped_m16_w4.raw() as CUfunction,
+                            grid_x, tc_r as u32, 1,
+                            128, 1, 1,
+                            1792,
+                            self.stream.raw() as CUstream,
+                            args.as_ptr() as *mut *mut core::ffi::c_void,
+                            core::ptr::null_mut(),
+                        );
+                        if rc != CUresult::CUDA_SUCCESS {
+                            return Err(rvllm_core::RvllmError::cuda(
+                                "qwen36 moe_down_grouped mma (shared sort)",
+                                rvllm_core::CudaErrorKind::LaunchFailed,
+                                rvllm_core::CudaCtx::setup(),
+                            ));
+                        }
+                    }
+                    rs_batched_ptr_opt = Some(rs_b.device_ptr());
+                    let _ = (silu_b.device_ptr(), down_b.device_ptr());
+                    handled_by_shared = true;
+                }
+                if !handled_by_shared {
                 let num_experts = self.arch.num_experts as u32;
                 let total_assign = (num_tokens as usize) * top_k;
                 let typical_per_expert =
@@ -10773,6 +10853,7 @@ impl Qwen36Bringup {
                         // routed_ffn_batched ran; legacy is the else
                         // branch.)
                     }
+                }
                 }
             } else {
             #[cfg(feature = "cuda")]

@@ -109,6 +109,11 @@ __global__ void fp8_mma_dual_silu_grouped_m16_kernel(
     }
 
     // === MMA accumulators (per-lane fragment, 4 f32) for gate + up.
+    // Per-lane MMA D-frag row indices. Used for per-row a_scale
+    // lookup inside the K-loop fold (task #99 numerical fix).
+    int r_lo_c = lane >> 2;
+    int r_hi_c = r_lo_c + 8;
+
     float g_outer[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float u_outer[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -243,13 +248,25 @@ __global__ void fp8_mma_dual_silu_grouped_m16_kernel(
             rvllm::mma_m16n8k32_e4m3_e4m3_f32(u_inner, a_frag, bu_frag);
         }
 
-        // Fold per-K=128 inner into outer with weight scale (not
-        // a_scale — that's per-row, applied at write).
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            g_outer[i] += sg * g_inner[i];
-            u_outer[i] += su * u_inner[i];
-        }
+        // Task #99 numerical fix: fold per-row a_scale into outer
+        // PER kblk (a_scale varies per K=128 block). Previous code
+        // only applied smem_ascale at write time = last kblk's value
+        // — bug invisible here for W=1 / M=1 first cut but corrected
+        // for consistency with #98 down kernel's fix.
+        float a_lo = smem_ascale[r_lo_c];
+        float a_hi = smem_ascale[r_hi_c];
+        float klo_g = a_lo * sg;
+        float klo_u = a_lo * su;
+        float khi_g = a_hi * sg;
+        float khi_u = a_hi * su;
+        g_outer[0] += klo_g * g_inner[0];
+        g_outer[1] += klo_g * g_inner[1];
+        u_outer[0] += klo_u * u_inner[0];
+        u_outer[1] += klo_u * u_inner[1];
+        g_outer[2] += khi_g * g_inner[2];
+        g_outer[3] += khi_g * g_inner[3];
+        u_outer[2] += khi_u * u_inner[2];
+        u_outer[3] += khi_u * u_inner[3];
     }
 
     // === Scatter output.
@@ -269,17 +286,14 @@ __global__ void fp8_mma_dual_silu_grouped_m16_kernel(
     int n0   = n_base + c0;
     int n1   = n_base + c1;
 
+    // a_scale already folded into g_outer per-kblk above; write applies
+    // only silu(g_outer) * u_outer.
     auto write_row = [&] (int row, float g_v, float u_v, int n_col) {
         if (row >= tile_m || n_col >= N) return;
-        // Look up token_idx + k_round for this row via the sorted list.
-        // (Cheap re-read; better cached but acceptable here.)
         int tok = sorted_per_expert[sorted_base + row * 2 + 0];
         int kr  = sorted_per_expert[sorted_base + row * 2 + 1];
-        float scale_r = smem_ascale[row];
-        float g_scaled = scale_r * g_v;
-        float u_scaled = scale_r * u_v;
         long long off = ((long long)kr * M_full + tok) * N + n_col;
-        out_silu[off] = __float2half(silu_f(g_scaled) * u_scaled);
+        out_silu[off] = __float2half(silu_f(g_v) * u_v);
     };
 
     write_row(r_lo, g_outer[0], u_outer[0], n0);

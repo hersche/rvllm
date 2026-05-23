@@ -74,6 +74,8 @@ __global__ void fp8_mma_dual_silu_grouped_m16_w4cb_kernel(
 
     int sorted_base = (e * max_per_expert + m_off_in_exp) * 2;
 
+    int r_lo_c = lane >> 2;
+    int r_hi_c = r_lo_c + 8;
     float g_outer[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float u_outer[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -206,11 +208,21 @@ __global__ void fp8_mma_dual_silu_grouped_m16_w4cb_kernel(
             rvllm::mma_m16n8k32_e4m3_e4m3_f32(u_inner, a_frag, bu_frag);
         }
 
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            g_outer[i] += sg * g_inner[i];
-            u_outer[i] += su * u_inner[i];
-        }
+        // Task #99 numerical fix: per-row a_scale folded per-kblk.
+        float a_lo = smem_ascale[r_lo_c];
+        float a_hi = smem_ascale[r_hi_c];
+        float klo_g = a_lo * sg;
+        float klo_u = a_lo * su;
+        float khi_g = a_hi * sg;
+        float khi_u = a_hi * su;
+        g_outer[0] += klo_g * g_inner[0];
+        g_outer[1] += klo_g * g_inner[1];
+        u_outer[0] += klo_u * u_inner[0];
+        u_outer[1] += klo_u * u_inner[1];
+        g_outer[2] += khi_g * g_inner[2];
+        g_outer[3] += khi_g * g_inner[3];
+        u_outer[2] += khi_u * u_inner[2];
+        u_outer[3] += khi_u * u_inner[3];
     }
 
     int r_lo = lane >> 2;
@@ -220,15 +232,13 @@ __global__ void fp8_mma_dual_silu_grouped_m16_w4cb_kernel(
     int n0   = n_base + c0;
     int n1   = n_base + c1;
 
+    // a_scale already folded into g_outer per-kblk above.
     auto write_row = [&] (int row, float g_v, float u_v, int n_col) {
         if (row >= tile_m || n_col >= N) return;
         int tok = sorted_per_expert[sorted_base + row * 2 + 0];
         int kr  = sorted_per_expert[sorted_base + row * 2 + 1];
-        float scale_r = smem_ascale[row];
-        float g_scaled = scale_r * g_v;
-        float u_scaled = scale_r * u_v;
         long long off = ((long long)kr * M_full + tok) * N + n_col;
-        out_silu[off] = __float2half(silu_f(g_scaled) * u_scaled);
+        out_silu[off] = __float2half(silu_f(g_v) * u_v);
     };
 
     write_row(r_lo, g_outer[0], u_outer[0], n0);
