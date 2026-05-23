@@ -478,6 +478,33 @@ token decode. Architectural value remains: 4 fewer launches per
 full-attn layer per token, and the foundation for an NVFP4-KV
 sibling (where the unfused chain is even launch-heavier).
 
+**NVFP4-KV sibling shipped 2026-05-23** (commit `71fdf33`): new
+kernel `fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv_kernel`
+ports the F16-KV warp-coop megakernel to the production NVFP4 path.
+Fuses Q+K+V FP8 GEMVs + Q+gate split + Q-norm + K-norm + RoPE +
+Q FP8 quant + K/V NVFP4 quant + pack (with per-16-element FP8-e4m3
+microscales) into ONE launch. Env-gate `RVLLM_QWEN36_QKV_MEGAKERNEL=1`
+now accepts BOTH F16 and NVFP4 KV dtypes; default off. Hardware-
+validated on qwen3-6-35b-a3b NVFP4-KV (150-token photosynthesis):
+3.68s deterministic ON vs 3.67s deterministic OFF — PARITY, same
+as F16-KV. ~880 fewer captured-graph nodes at N=8 if multi-step
+graph is on simultaneously.
+
+**Batched-prefill down k_round-batch port shipped 2026-05-23**
+(commit `38afff0`): decode-side down k_round-batch fusion
+(commit `b1f221e`) was ported to the BATCHED prefill MoE path in
+`apply_layer_moe_batched`. Same kernel reused (M-agnostic), just
+dispatched with `M=num_tokens`. Replaces the host-side
+`for k_round in 0..top_k` loop of 8 separate batched_topk
+launches with ONE launch per MoE layer. Saves
+(top_k-1) × num_moe_layers = 7 × 40 = 280 kernel launches per
+prefill. Hardware-validated on qwen3-6-35b-a3b NVFP4-KV
+(115-token prompt): prefill_ms 1160 (fix on) vs 1497
+(`RVLLM_QWEN36_BATCH_MOE_ROUTED_FFN=0`, full fallback) —
+deterministic over 3 runs each. Bit-equivalent numerics (same
+kernel as decode hot path, sum order preserved per-warp
+sequential over k_rounds).
+
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
 desired.
