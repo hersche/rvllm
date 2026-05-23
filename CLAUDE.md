@@ -1306,6 +1306,46 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 MoE TensorCore MMA dual_silu — task #93 first cut (2026-05-23, +4.9%)
+
+`fp8_mma_dual_silu_indirect_kround_batched_kernel` — first
+TensorCore-MMA-based FP8 kernel targeting the qwen36 MoE prefill
+hot path (88.9% of prefill GPU time per the nsys profile below).
+Uses
+`mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32`
+via existing helpers in `kernels/fp8_mma_frag_pack.cuh`. Opt-in via
+`RVLLM_QWEN36_MOE_MMA_DUAL_SILU=1`; default GEMV path untouched.
+
+A/B (qwen3-6-35b-a3b NVFP4, deterministic across runs, fresh binary
+md5 `6b9bd230`):
+
+  | Cell        | 1112 tok prefill | 4412 tok prefill |
+  |-------------|------------------|------------------|
+  | GEMV (def.) |      6020 ms     |     24775 ms     |
+  | MMA (=1)    |      5738 ms     |     23636 ms     |
+  | Speedup     |      +4.9%       |      +4.8%       |
+
+First-cut semantics deliberately conservative: 1 warp per block,
+1 token per block, MMA tile [M=16, N=8] with only row 0 active
+(rows 1..15 zero-staged → 15/16 of MMA throughput wasted). The
+measured 5% win at this configuration validates that the FP8×FP8
+MMA path executes correctly on sm_121 against real qwen36
+weights AND that the path can beat the GEMV path even at extreme
+M-direction underutilisation.
+
+Real perf gain requires a follow-up that token-sorts (token,
+k_round) pairs by routed expert id so a tile of M=16 contiguous
+sorted assignments shares ONE expert (recovering full M-reuse).
+Expected with proper M=16 grouping: 4-8× on the dual_silu
+portion → 30-50% overall prefill speedup. That work is bounded
+(~500-800 LOC: sort kernel + new MMA dispatch + scatter back to
+`[k_round, M, N]` output layout) and sits on the foundation
+shipped here.
+
+Output coherence verified: both paths produce identical text on
+the smoke prompt and coherent multi-token output on the 4412-token
+German quantum-physics prompt (no NaNs, no garbage).
+
 ### qwen36 prefill profile — nsys 2026-05-23 (qwen3-6-35b-a3b NVFP4-KV, task #91)
 
 Captured against fresh binary md5 `63122454` with the production
