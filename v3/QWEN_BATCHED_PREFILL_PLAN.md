@@ -448,11 +448,22 @@ production NVFP4-KV (qwen3635b spec profile, NVFP4=1):
 full-attn layer per decode token (~22/token at 11 layers)
 on the production path.
 
-Phase 2 of the full megakernel — folding the 3 FP8 GEMV
-projection launches into the same kernel — is the
-substantial follow-on (~1000+ LOC of additional CUDA work
-with shared-memory tile management for the K-dim reduction
-across hidden=2048).
+**Phase 2 (F16-KV, naive) shipped 2026-05-23** in commits
+`63ef718` (kernel + loader, ~270 LOC CUDA) + `34140ba`
+(dispatch wiring, env-gated opt-in via
+`RVLLM_QWEN36_QKV_MEGAKERNEL=1`). New kernel
+`fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv_kernel`
+fuses Q+K+V FP8 GEMVs + Q+gate split + Q-norm + K-norm +
+partial-NeoX RoPE + KV-write into ONE launch on the F16-KV
+path. Grid `(num_tokens, num_heads + 2*num_kv_heads)`, block
+dim `head_dim*2`. Hardware-validated coherent (short prompt +
+1-10 counting). Naive 1-thread-per-output GEMV is **~12%
+SLOWER** than the unfused chain (2.83s vs 2.53s on 150-token
+F16-KV decode) due to uncoalesced FP8 weight reads — exactly
+as predicted upfront. Default off, no production regression.
+Warp-cooperative re-impl (each warp does 32 outputs
+sequentially with 32-thread K-dim cooperation per output)
+is the next perf step to net-win on latency.
 
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
