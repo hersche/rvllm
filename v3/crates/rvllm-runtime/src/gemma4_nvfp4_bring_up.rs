@@ -3402,6 +3402,47 @@ impl Gemma4Nvfp4Bringup {
         if self.drafter.lock().unwrap().is_some() {
             return Ok(());
         }
+        // Task #92: Stream-6b drafter-Q rotation (Option B path)
+        // is RETIRED — at HADAMARD=1 it produces accept_rate=0 even
+        // though output stays coherent via base verify-fallback
+        // (validated 2026-05-23 against fresh binary, see CLAUDE.md
+        // "Stream-6b drafter-Q rotation" entry). Task #90's
+        // `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` path supersedes it
+        // (commit 1449833, accept_rate 2.333 at HADAMARD=1). Guard
+        // here: refuse to load the drafter on HADAMARD=1 unless
+        // the operator either opts into PRE_HAD_SHADOW or the
+        // explicit bypass `RVLLM_GEMMA4_SPEC_ALLOW_HADAMARD=1`.
+        // Mirrors the fp8-block `Gemma4Bringup::ensure_drafter`
+        // guard pattern.
+        let hadamard_on = std::env::var("RVLLM_NVFP4_HADAMARD")
+            .ok().as_deref() == Some("1")
+            || std::env::var("RVLLM_NVFP4_HADAMARD_V")
+                .ok().as_deref() == Some("1");
+        if hadamard_on {
+            let pre_had = std::env::var("RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW")
+                .ok().as_deref() == Some("1");
+            let allow = std::env::var("RVLLM_GEMMA4_SPEC_ALLOW_HADAMARD")
+                .ok().as_deref() == Some("1");
+            if !pre_had && !allow {
+                // Auto-enable PRE_HAD_SHADOW: it's the only sane
+                // choice at HADAMARD=1 (the legacy drafter-Q rotation
+                // path produces accept_rate=0 under Stream-6b in
+                // current state — see commit 1449833 A/B). Modify
+                // process env so the cached helper sees the gate on
+                // for all subsequent reads. Opt-out is explicit via
+                // RVLLM_GEMMA4_SPEC_ALLOW_HADAMARD=1.
+                eprintln!(
+                    "[g4n-drafter] HADAMARD on + spec: auto-enabling \
+                     RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1 (drafter \
+                     reads pre-rotation F16 K/V; accept_rate ~2.33 \
+                     vs 0.000 on the legacy drafter-Q rotation path). \
+                     Set RVLLM_GEMMA4_SPEC_ALLOW_HADAMARD=1 to keep \
+                     the legacy path (will produce accept_rate=0)."
+                );
+                std::env::set_var(
+                    "RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW", "1");
+            }
+        }
         let sources = self.arch.assistant_shared_kv_sources().ok_or_else(|| {
             corrupt_runtime_err(
                 "ensure_drafter_nvfp4: base arch has no \
