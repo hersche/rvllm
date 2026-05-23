@@ -9522,82 +9522,81 @@ impl Qwen36Bringup {
                     ));
                 }
             }
-            let silu_b_slice_bytes = (n * n_int_us * 2) as u64;
-            for k_round in 0..top_k {
-                let silu_kround_ptr = silu_b.device_ptr()
-                    + (k_round as u64) * silu_b_slice_bytes;
-                // (b+c) Fused down_indirect_batched_topk +
-                // scaled_add_batched_topk (Phase 8 MoE-fusion
-                // follow-on, 2026-05-23). Single-kernel replacement
-                // for the back-to-back pair: writes f32-accumulated
-                // routed_sum[m*hidden + n] directly via lane 0,
-                // reads top_w[m*top_k + k_round] per row. Eliminates
-                // 1 launch + 1 f16 round-trip per k-round across
-                // the entire token batch — extends the f0f79d5 win
-                // from per-token decode to batched prefill /
-                // batched decode.
-                #[cfg(feature = "cuda")]
-                unsafe {
-                    use cudarc::driver::sys::*;
-                    let mut acc = rs_b.device_ptr();
-                    let mut bw = moe.experts_down_proj_fused.offset_bytes;
-                    let mut bs = down_bs;
-                    // Phase 8 dual_silu k_round-batch: read this
-                    // iteration's silu slice from the k_round-major
-                    // silu_b layout.
-                    let mut inp = silu_kround_ptr;
-                    let mut idx_p = topk_idx_base;
-                    let mut wp = topk_w_base;
-                    let mut wstride: i64 = down_per_expert_w as i64;
-                    let mut sstride: i64 = (down_per_expert_bs / 4) as i64;
-                    let mut nn = n_down as i32;
-                    let mut kk = k_down as i32;
-                    let mut ncb = num_col_blocks_down;
-                    let mut tk = top_k as i32;
-                    let mut kr = k_round as i32;
-                    let mut nt = num_tokens as i32;
-                    let args = [
-                        (&mut acc) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut bw) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut bs) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut inp) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut idx_p) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut wp) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut wstride) as *mut i64 as *mut core::ffi::c_void,
-                        (&mut sstride) as *mut i64 as *mut core::ffi::c_void,
-                        (&mut nn) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut kk) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut tk) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut kr) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
-                    ];
-                    let block: u32 = 256;
-                    let grid_x: u32 = ((n_down + 7) / 8).max(1);
-                    let rc = cuLaunchKernel(
-                        self.outside_kernels
-                            .fn_fp8_gemv_indirect_scaled_add_batched_topk
-                            .raw() as CUfunction,
-                        grid_x,
-                        num_tokens,
-                        1,
-                        block,
-                        1,
-                        1,
-                        0,
-                        self.stream.raw() as CUstream,
-                        args.as_ptr() as *mut *mut core::ffi::c_void,
-                        core::ptr::null_mut(),
-                    );
-                    if rc != CUresult::CUDA_SUCCESS {
-                        return Err(rvllm_core::RvllmError::cuda(
-                            "qwen36 moe_routed_batched fused indirect+scaled_add",
-                            rvllm_core::CudaErrorKind::LaunchFailed,
-                            rvllm_core::CudaCtx::setup(),
-                        ));
-                    }
-                    let _ = down_b.device_ptr();  // suppress unused warning
+            // Phase 8 batched-prefill down k_round-batch fusion
+            // (2026-05-23, follow-on to decode-side commit b1f221e):
+            // single launch handles all top_k k_rounds for every
+            // (m, n_down) via per-warp sequential f32-register
+            // accumulation. Reuses the decode kround_batched kernel
+            // verbatim — it is M-agnostic (M=num_tokens here vs
+            // M=1 in the decode hot path) and bit-equivalent to the
+            // prior host-side loop of top_k separate
+            // `fp8_gemv_indirect_scaled_add_batched_topk` launches
+            // (same sum order: per-warp sequential over k_rounds).
+            //
+            // Eliminates (top_k - 1) launches per MoE layer per
+            // prefill — top_k=8 × 40 MoE layers = 280 launches
+            // saved per prefill batch.
+            let _ = (n, silu_b_bytes); // silu_b_bytes still used elsewhere
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut acc = rs_b.device_ptr();
+                let mut bw = moe.experts_down_proj_fused.offset_bytes;
+                let mut bs = down_bs;
+                // silu_b layout: [top_k, num_tokens, n_int] f16
+                // (k_round-major, populated by the dual_silu
+                // kround-batched launch above). The kernel reads
+                // input_kround[k_round * M * K + m * K + ...].
+                let mut inp = silu_b.device_ptr();
+                let mut idx_p = topk_idx_base;
+                let mut wp = topk_w_base;
+                let mut w_stride: i64 = down_per_expert_w as i64;
+                let mut s_stride: i64 = (down_per_expert_bs / 4) as i64;
+                let mut m_i = num_tokens as i32;
+                let mut n_i = n_down as i32;
+                let mut k_i = k_down as i32;
+                let mut ncb = num_col_blocks_down;
+                let mut tk_i = top_k as i32;
+                let args = [
+                    (&mut acc) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut bw) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut bs) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut idx_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut wp) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_stride) as *mut i64 as *mut core::ffi::c_void,
+                    (&mut s_stride) as *mut i64 as *mut core::ffi::c_void,
+                    (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut tk_i) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid_x: u32 = ((n_down + 7) / 8).max(1);
+                let rc = cuLaunchKernel(
+                    self.outside_kernels
+                        .fn_fp8_gemv_indirect_scaled_add_kround_batched
+                        .raw() as CUfunction,
+                    grid_x,
+                    num_tokens,
+                    1,
+                    block,
+                    1,
+                    1,
+                    0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 moe_routed_batched down_kround_batched",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
                 }
+                let _ = down_b.device_ptr();  // suppress unused warning
             }
             rs_batched_ptr_opt = Some(rs_b.device_ptr());
             // Keep regions alive for the per-token loop / shared-
