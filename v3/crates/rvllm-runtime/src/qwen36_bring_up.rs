@@ -989,30 +989,30 @@ impl Qwen36Bringup {
                     // nodes per macro-block (1 closer + 0 linker
                     // per iter, vs 1 closer + 1 linker before).
                     //
-                    // Hidden-region address stability: decode_inner
-                    // with override-mode skips positions/context
-                    // _lens allocations, so its hidden_region lands
-                    // at scratch_ck exactly. After decode_inner
-                    // exits (inner-ckpt restored to scratch_ck),
-                    // our outer arena.region(...) here re-bumps to
-                    // the SAME address — so the fused closer reads
-                    // the body's hidden output at the correct
-                    // location. Within ONE replay execution all
-                    // kernels run sequentially on the stream, so
-                    // body-writes-then-closer-reads stays ordered
-                    // per iteration.
+                    // Phase 8 hidden-state→workspace (e13e2eb, this
+                    // commit's follow-up): the fused closer now
+                    // reads from the PERSISTENT `workspace.hidden_dev`
+                    // slot directly, NOT from a per-iter
+                    // arena.region("qwen36_pl_hidden", ...) re-
+                    // allocation. The decode_step's
+                    // forward_qwen36_decode_step_to_workspace_no_closer
+                    // ALREADY routes its hidden writes to
+                    // workspace.hidden_dev (via hidden_dev_override).
+                    // The closer reads from the same address →
+                    // body-writes-then-closer-reads ordering holds
+                    // per iteration on the stream. The per-iter
+                    // arena.region allocation is now retired; the
+                    // captured graph references a buffer that's
+                    // address-stable across the worker's lifetime.
                     let hidden = self.arch.base.hidden_size as u32;
                     let vocab = self.arch.base.vocab_size as u32;
-                    let hb = (hidden as usize) * 2;
                     for i in 0..n_steps {
                         self.forward_qwen36_decode_step_to_workspace_no_closer(
                             workspace, position + i)?;
-                        let hidden_region =
-                            self.arena.region("qwen36_pl_hidden", hb, 16)?;
                         let argmax_dst = base_argmax + (i as u64) * 4;
                         let do_link = if i + 1 < n_steps { 1 } else { 0 };
                         self.forward_qwen36_outside_closer_device_argmax_with_link(
-                            hidden_region.device_ptr(),
+                            workspace.hidden_dev,
                             /* num_tokens */ 1,
                             hidden,
                             vocab,
@@ -1047,20 +1047,18 @@ impl Qwen36Bringup {
                 );
                 // Body kernels weren't executed under capture; re-
                 // run eagerly via the fused closer path (same as
-                // the capture body above) so the host has correct
-                // argmax tokens in `argmax_tokens_dev_base[0..n_steps]`.
+                // the capture body above, also using workspace
+                // .hidden_dev) so the host has correct argmax
+                // tokens in `argmax_tokens_dev_base[0..n_steps]`.
                 let hidden = self.arch.base.hidden_size as u32;
                 let vocab = self.arch.base.vocab_size as u32;
-                let hb = (hidden as usize) * 2;
                 for i in 0..n_steps {
                     self.forward_qwen36_decode_step_to_workspace_no_closer(
                         workspace, position + i)?;
-                    let hidden_region =
-                        self.arena.region("qwen36_pl_hidden", hb, 16)?;
                     let argmax_dst = base_argmax + (i as u64) * 4;
                     let do_link = if i + 1 < n_steps { 1 } else { 0 };
                     self.forward_qwen36_outside_closer_device_argmax_with_link(
-                        hidden_region.device_ptr(),
+                        workspace.hidden_dev,
                         1, hidden, vocab, 0,
                         argmax_dst,
                         workspace.token_dev,
@@ -1183,20 +1181,19 @@ impl Qwen36Bringup {
             self.try_capture_decode_steps_n(workspace, position, n_steps)?;
         } else {
             // Pure eager path (no capture machinery). Same fused-
-            // closer body as the captured macro-block.
+            // closer body as the captured macro-block — both read
+            // hidden state from the persistent workspace.hidden_dev
+            // slot (Phase 8 hidden-state→workspace refactor).
             let base_argmax = workspace.argmax_tokens_dev_base;
             let hidden = self.arch.base.hidden_size as u32;
             let vocab = self.arch.base.vocab_size as u32;
-            let hb = (hidden as usize) * 2;
             for i in 0..n_steps {
                 self.forward_qwen36_decode_step_to_workspace_no_closer(
                     workspace, position + i)?;
-                let hidden_region =
-                    self.arena.region("qwen36_pl_hidden", hb, 16)?;
                 let argmax_dst = base_argmax + (i as u64) * 4;
                 let do_link = if i + 1 < n_steps { 1 } else { 0 };
                 self.forward_qwen36_outside_closer_device_argmax_with_link(
-                    hidden_region.device_ptr(),
+                    workspace.hidden_dev,
                     1, hidden, vocab, 0,
                     argmax_dst,
                     workspace.token_dev,
