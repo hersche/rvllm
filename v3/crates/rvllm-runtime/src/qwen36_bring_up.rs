@@ -261,6 +261,11 @@ pub struct Qwen36OutsideKernels {
     /// inner reduction).
     pub fp8_gemv_dual_silu_indirect_kround_batched_mod: LoadedModule,
     pub fn_fp8_gemv_dual_silu_indirect_kround_batched: KernelFn,
+    // Task #93: TensorCore MMA-based first-cut dual_silu (opt-in via
+    // `RVLLM_QWEN36_MOE_MMA_DUAL_SILU=1`). Same signature as the
+    // GEMV variant above; block.x = 32 (1 warp) vs the GEMV's 256.
+    pub fp8_mma_dual_silu_indirect_kround_batched_mod: LoadedModule,
+    pub fn_fp8_mma_dual_silu_indirect_kround_batched: KernelFn,
     pub fp8_gemv_indirect_mod: LoadedModule,
     pub fn_fp8_gemv_indirect: KernelFn,
     /// Phase 8 MoE-fusion (2026-05-23): fused FP8 GEMV (indirect-
@@ -1771,6 +1776,14 @@ impl Qwen36Bringup {
             fp8_gemv_dual_silu_indirect_kround_batched_mod.get_function(
                 "fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_kround_batched_kernel",
             )?;
+        // Task #93: load the TensorCore-MMA sibling for opt-in A/B
+        // testing in the batched MoE prefill path.
+        let fp8_mma_dual_silu_indirect_kround_batched_mod = kernels
+            .load_ptx("fp8_mma_dual_silu_indirect_kround_batched")?;
+        let fn_fp8_mma_dual_silu_indirect_kround_batched =
+            fp8_mma_dual_silu_indirect_kround_batched_mod.get_function(
+                "fp8_mma_dual_silu_indirect_kround_batched_kernel",
+            )?;
         let fn_fp8_gemv_dual_silu_indirect = fp8_gemv_dual_silu_indirect_mod
             .get_function("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_kernel")?;
         let fp8_gemv_indirect_mod =
@@ -1987,6 +2000,8 @@ impl Qwen36Bringup {
             fn_fp8_gemv_dual_silu_indirect,
             fp8_gemv_dual_silu_indirect_kround_batched_mod,
             fn_fp8_gemv_dual_silu_indirect_kround_batched,
+            fp8_mma_dual_silu_indirect_kround_batched_mod,
+            fn_fp8_mma_dual_silu_indirect_kround_batched,
             fp8_gemv_indirect_mod,
             fn_fp8_gemv_indirect,
             fp8_gemv_indirect_scaled_add_mod,
@@ -9928,14 +9943,37 @@ impl Qwen36Bringup {
                     (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
                     (&mut tk_i) as *mut i32 as *mut core::ffi::c_void,
                 ];
+                // Task #93: opt-in TensorCore MMA path. Same kernel
+                // arg signature; block is 1 warp (32 threads) vs the
+                // GEMV's 8 warps (256). MMA path needs 1024 B smem for
+                // A + B_g + B_u staging.
+                let use_mma = std::env::var("RVLLM_QWEN36_MOE_MMA_DUAL_SILU")
+                    .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
+                    .unwrap_or(false);
                 let grid = (((n_int + 7) / 8).max(1), num_tokens, top_k as u32);
-                let block: u32 = 256;
+                let (fn_handle, block, smem_bytes): (cudarc::driver::sys::CUfunction, u32, u32) =
+                    if use_mma {
+                        (
+                            self.outside_kernels
+                                .fn_fp8_mma_dual_silu_indirect_kround_batched
+                                .raw() as CUfunction,
+                            32u32,
+                            1024u32,
+                        )
+                    } else {
+                        (
+                            self.outside_kernels
+                                .fn_fp8_gemv_dual_silu_indirect_kround_batched
+                                .raw() as CUfunction,
+                            256u32,
+                            0u32,
+                        )
+                    };
                 let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_fp8_gemv_dual_silu_indirect_kround_batched
-                        .raw() as CUfunction,
+                    fn_handle,
                     grid.0, grid.1, grid.2,
                     block, 1, 1,
-                    0,
+                    smem_bytes,
                     self.stream.raw() as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
