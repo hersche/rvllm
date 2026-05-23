@@ -1235,6 +1235,31 @@ multi-step graph are on simultaneously.
 Production NVFP4-KV default path uses the Phase 1 fused chain
 (commit 6f6a25a) — unchanged.
 
+### Phase 8 closer + last-block-residual_add fusion — SHIPPED 2026-05-23
+
+Commit `505e9ea` adds
+`fp8_gemv_blockwise_wpr_native_f16in_scaled_add_devw_then_residual_kernel`
+that folds the in-place `hidden += f16(routed_sum)` residual add
+into the shared-expert closer's existing fp8_gemv + scaled-add
+epilogue. Drop-in for the back-to-back pair at the end of
+`apply_layer_moe_with_override`. Per output n both side-effect
+writes (acc_f32 + hidden_f16) touched by exactly one thread → no
+atomic needed.
+
+The routed_sum f32 write is preserved so the
+`RVLLM_QWEN36_DEBUG_MOE` post-residual probe stays visible.
+
+Env-gated opt-in (`RVLLM_QWEN36_MOE_CLOSER_FUSED=1`); default off
+keeps the unfused 2-launch chain byte-untouched. Hardware-
+validated on qwen3-6-35b-a3b NVFP4-KV (150-token photosynthesis):
+- CLOSER_FUSED off: 3.68s deterministic over 3 runs
+- CLOSER_FUSED on:  3.68s deterministic over 3 runs
+PARITY within noise — same conclusion as the QKV megakernel work.
+1 launch saved per MoE layer per decode token (~200 µs/token,
+below ±50 ms noise on 24 ms/token decode). Architectural value:
+40 fewer launches per decode token, ~40 fewer captured-graph nodes
+per N-step macro-graph chunk.
+
 ### Phase 8 Q-norm + K-norm + RoPE + KV megakernel (Phase 1) — SHIPPED 2026-05-23
 
 First step toward the full QKV+norm+RoPE+KV megakernel goal.

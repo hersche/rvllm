@@ -505,6 +505,20 @@ deterministic over 3 runs each. Bit-equivalent numerics (same
 kernel as decode hot path, sum order preserved per-warp
 sequential over k_rounds).
 
+**Closer + last-block-residual_add fusion shipped 2026-05-23**
+(commit `505e9ea`): new kernel
+`fp8_gemv_blockwise_wpr_native_f16in_scaled_add_devw_then_residual_kernel`
+folds the per-token MoE tail's in-place `hidden += f16(routed_sum)`
+into the shared-expert closer's existing fp8_gemv + scaled-add
+epilogue. Both side-effect writes (acc_f32 + hidden_f16) happen
+on the same warp's lane 0; routed_sum f32 write preserved so the
+`RVLLM_QWEN36_DEBUG_MOE` probe stays visible. Env-gated opt-in
+(`RVLLM_QWEN36_MOE_CLOSER_FUSED=1`, default off). Hardware-
+validated on qwen3-6-35b-a3b NVFP4-KV (150-token photosynthesis):
+3.68s deterministic ON vs 3.68s deterministic OFF — parity within
+noise. 1 launch saved per MoE layer per decode token (~40 launches/
+token = ~200 µs/token below ±50 ms noise on 24 ms/token decode).
+
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
 desired.
