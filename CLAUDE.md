@@ -1306,6 +1306,49 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 MoE expert-sort + grouped MMA — task #94 (2026-05-23, +45%)
+
+Recovers the M-direction MMA reuse the task #93 first-cut sacrificed.
+Pre-pass sorts (token, k_round) pairs by routed expert id; new MMA
+kernel processes M=16 sorted-contiguous tiles sharing one expert.
+Opt-in via `RVLLM_QWEN36_MOE_MMA_GROUPED=1` (precedence over #93's
+`RVLLM_QWEN36_MOE_MMA_DUAL_SILU`).
+
+Pipeline (3 kernels + 1 DtoH per MoE layer):
+1. `qwen36_moe_expert_sort_kernel` — atomicAdd bucketing
+2. `qwen36_moe_tile_table_kernel` — per-expert ceil(C/16) tiles
+3. (host) DtoH tile_count to size grid.y
+4. `fp8_mma_dual_silu_grouped_m16_kernel` — grouped FP8 MMA
+
+A/B (qwen3-6-35b-a3b NVFP4, fresh binary, deterministic):
+
+  | Cell                        | 1112 tok | 4412 tok |
+  |-----------------------------|----------|----------|
+  | GEMV baseline               |  6020 ms | 24775 ms |
+  | MMA first-cut (#93, M=1)    |  5738 ms | 23636 ms |
+  | **MMA grouped (#94, M=16)** | **3265 ms** | **13674 ms** |
+  | Win vs GEMV                 | **+45.8%** | **+45.0%** |
+  | Win vs first-cut            |  +43.1%  |  +42.2%  |
+
+Output coherence verified on 2k + 4k German prompts. Production-safe:
+default-off; legacy GEMV unchanged.
+
+Debug knob: `RVLLM_QWEN36_MOE_MMA_GROUPED_DEBUG=1` inserts a
+cuStreamSynchronize after each pre-pass kernel so any kernel failure
+surfaces with its own op label.
+
+max_per_expert sizing: `(typical*32).max(256).min(total_assign)`. The
+naive 8× sigma estimate proved insufficient (one expert exceeded 278
+on M=1112 prompts → silent OOB → cuStreamSynchronize trap). 32×
+sigma handles real qwen36 routing skew at ~2.3 MB per layer call.
+
+Follow-up parked (not blocking the production rollout decision):
+- Same expert-sort foundation could feed a grouped MMA `down`
+  projection sibling (27% of prefill GPU time).
+- Persistent sort buffers across layers (routing is per-layer so
+  this requires per-layer sort but the buffer alloc can be reused).
+- Multi-warp tiling per block (currently 1 warp/block).
+
 ### qwen36 MoE TensorCore MMA dual_silu — task #93 first cut (2026-05-23, +4.9%)
 
 `fp8_mma_dual_silu_indirect_kround_batched_kernel` — first
