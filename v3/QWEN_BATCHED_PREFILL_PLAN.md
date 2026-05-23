@@ -505,6 +505,19 @@ deterministic over 3 runs each. Bit-equivalent numerics (same
 kernel as decode hot path, sum order preserved per-warp
 sequential over k_rounds).
 
+**Batched-prefill dispatch wiring shipped 2026-05-23** (commit
+`b08774e`): same per-token QKV megakernel symbols (commits
+fa48141 F16, 71fdf33 NVFP4) extended to
+`apply_layer_full_attn_batched`. Kernel is M-agnostic at the
+block level (grid.x = num_tokens). Hard-gated to `num_tokens <
+128` because at M≥128 `fp8_proj_dispatch` uses CUTLASS SM120
+GEMM (≈102 TFLOPS at QKV shape) and the warp-coop GEMV cannot
+compete. Honest A/B at M=48: 498-507 ms ON vs 493-494 ms OFF —
+~1-3% SLOWER (cuBLASLt at M=2..127 beats warp-coop GEMV).
+Default-off env-gate keeps production on the existing dispatch
+chain; the megakernel arm is now available infrastructure for
+future bench studies and graph-capture follow-ons.
+
 **Closer + last-block-residual_add fusion shipped 2026-05-23**
 (commit `505e9ea`): new kernel
 `fp8_gemv_blockwise_wpr_native_f16in_scaled_add_devw_then_residual_kernel`

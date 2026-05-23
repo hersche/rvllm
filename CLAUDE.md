@@ -1235,6 +1235,28 @@ multi-step graph are on simultaneously.
 Production NVFP4-KV default path uses the Phase 1 fused chain
 (commit 6f6a25a) — unchanged.
 
+**Batched-prefill dispatch wiring SHIPPED 2026-05-23 (commit
+`b08774e`)**: extends the same megakernel symbols to
+`apply_layer_full_attn_batched` (M=num_tokens). The kernel is
+M-agnostic at the block level. Hard-gated to `num_tokens < 128`
+because at M≥128 `fp8_proj_dispatch` routes to CUTLASS SM120
+GEMM (≈102 TFLOPS at the QKV shape) — running the warp-coop
+GEMV megakernel at M≥128 would be a clear regression.
+
+Honest A/B on qwen3-6-35b-a3b NVFP4-KV (prompt_tokens=48,
+megakernel arm fires):
+- Megakernel OFF: prefill 493.1-494.3 ms deterministic ×3
+- Megakernel ON:  prefill 498.4-507.6 ms (~1-3% slower)
+
+At M=2..127 the existing dispatch uses cuBLASLt (not the slow
+looped-GEMV fallback initially hypothesized); cuBLASLt
+outperforms the warp-coop GEMV even at modest M. Net: NOT a
+perf win at any practical batched-prefill M. Shipped as
+available infrastructure under the same default-off env-gate
+(`RVLLM_QWEN36_QKV_MEGAKERNEL=1`) so the alternative path
+exists for future bench studies and graph-capture follow-ons,
+but production runs the existing dispatch chain unchanged.
+
 ### Phase 8 closer + last-block-residual_add fusion — SHIPPED 2026-05-23
 
 Commit `505e9ea` adds
