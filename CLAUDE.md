@@ -1147,6 +1147,49 @@ qwen3-6-35b-a3b 150-token photosynthesis:
 - After down kround-batch (b1f221e): **1.644s**
 - **Total ≈23% decode speedup** across today's MoE fusion stack.
 
+### Phase 8 QKV megakernel Phase 2 (F16-KV, naive) — SHIPPED 2026-05-23
+
+Commits `63ef718` (kernel + loader) + `34140ba` (dispatch
+wiring) deliver the literal Phase 2 megakernel goal end-to-end
+on the F16-KV path. New kernel
+`fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv_kernel`
+fuses Q+K+V FP8 GEMVs + Q+gate split + Q-norm + K-norm +
+partial-NeoX RoPE + KV-cache write into ONE launch. Grid
+`(num_tokens, num_heads + 2*num_kv_heads)` dispatches by
+block.y range to Q/K/V; block dim `head_dim*2` covers Q+gate
+threads, K/V heads use the first `head_dim` threads.
+
+Dispatch wiring (apply_layer_full_attn): env-gated opt-in via
+`RVLLM_QWEN36_QKV_MEGAKERNEL=1` AND `kv_dtype == F16`. Steps
+2-5 of the unfused chain (3 fp8_proj launches + split_q_gate
++ fused_qnorm_knorm_rope) are wrapped in
+`if !qkv_megakernel_on { ... }`; the megakernel launch lives
+in a new `Qwen36KvDtype::F16 if qkv_megakernel_on` match arm.
+Default off so production paths byte-untouched.
+
+Numerical contract: FP8 dequant + block scale + MAC per-output
+byte-identical to `fp8_gemv_blockwise_wpr_native_f16in_kernel`.
+Norm + RoPE phases byte-identical to
+`fused_qnorm_knorm_rope_qwen_partial_f16kv` (commit 943f8bb).
+
+Hardware-validated on qwen3-6-35b-a3b F16-KV:
+- Short: "Die Hauptstadt von Frankreich ist **Paris**."
+- 1-10 counting: full "eins, zwei, ..., zehn."
+
+**Latency: 2.83s vs unfused 2.53s = ~12% SLOWER** at 150-token
+photosynthesis decode. Exactly as predicted upfront: the
+NAIVE 1-thread-per-output GEMV has UNCOALESCED FP8 weight
+reads (W[tid][k] across the warp is strided by K bytes vs
+the existing warp-cooperative fp8_gemv's coalesced row reads).
+The kernel + dispatch are real architectural infrastructure
+demonstrating Phase 2 end-to-end with correctness validation;
+the next perf step is a warp-cooperative re-implementation
+(each warp does 32 outputs sequentially with 32-thread K-dim
+cooperation per output) to net-win on latency.
+
+Production NVFP4-KV path uses the Phase 1 fused chain
+(commit 6f6a25a) — unchanged.
+
 ### Phase 8 Q-norm + K-norm + RoPE + KV megakernel (Phase 1) — SHIPPED 2026-05-23
 
 First step toward the full QKV+norm+RoPE+KV megakernel goal.
