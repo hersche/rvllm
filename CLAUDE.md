@@ -1144,7 +1144,29 @@ qwen3-6-35b-a3b 150-token photosynthesis:
 - After shared-expert down+scaled_add (99e6cde): 1.708s
 - After dual_silu kround-batch (442a72c): 1.676s
 - After router+topk (e049258): 1.675s
-- **Total ≈22% decode speedup** across today's MoE fusion stack.
+- After down kround-batch (b1f221e): **1.644s**
+- **Total ≈23% decode speedup** across today's MoE fusion stack.
+
+### Phase 8 batched router+topk + down kround-batch — SHIPPED 2026-05-23
+
+**Batched router+topk fusion (commit `314dbe6`)**: ports the
+e049258 last-block-does-topk pattern to the BATCHED prefill
+path. New kernel `router_gemv_with_topk_batched_f16_to_f32_kernel`
+has per-token counter slots (`counter[t]`), eliminates 1 launch
+per MoE layer per prefill. Persistent counter region sized by
+`kv_cache_num_blocks`, zeroed once via cuMemsetD8Async.
+
+**Down k_round-batch fusion (commit `b1f221e`)**: fuses the 8
+per-k_round host-loop launches of `fp8_gemv_indirect_scaled_add`
+into ONE kernel. The literal "dual_silu+down megakernel" task
+is infeasible (silu_mul recomputation per output element would
+explode work ~1000x); this is the closest tractable analog. New
+kernel `..._indirect_scaled_add_kround_batched_kernel` has each
+warp own one (m, n) output slot and sequentially process all
+top_k k_rounds with a warp-local f32 accumulator — no atomic,
+single global RMW per warp at the end. Saves 7 launches/layer
+× 40 MoE layers = 280 launches/decode token. Latency 1.644s
+deterministic (~30 ms faster than 1.675s post-router+topk).
 
 ### Phase 8 other-models fusion (qwen27b dense) — SHIPPED 2026-05-23
 
