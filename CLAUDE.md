@@ -1210,7 +1210,29 @@ one closer pattern for future Q+K+V+O fusion, and the building
 block for an NVFP4-KV sibling (where the unfused chain is even
 launch-heavier).
 
-Production NVFP4-KV path uses the Phase 1 fused chain
+**NVFP4-KV sibling SHIPPED 2026-05-23 (commit `71fdf33`)**: new
+kernel `fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv_kernel`
+ports the F16-KV warp-coop megakernel to NVFP4-KV. Fuses the
+same 5 unfused steps (3 FP8 GEMVs + split + Q-norm + K-norm + RoPE
++ Q FP8 quant + K/V NVFP4 quant + pack with per-16-elem microscales)
+into ONE launch. GEMV math byte-identical to
+`fp8_gemv_blockwise_wpr_native_f16in_kernel`; norm + RoPE + quant +
+pack byte-identical to `fused_qnorm_knorm_rope_qwen_partial_nvfp4kv`
+(commit 6f6a25a) given normalised inputs. The env-gate
+`RVLLM_QWEN36_QKV_MEGAKERNEL=1` now accepts BOTH F16 and NVFP4 KV
+dtypes; default off. Hardware-validated on qwen3-6-35b-a3b NVFP4-KV
+(150-token photosynthesis):
+- Megakernel OFF: 3.67-3.68s
+- Megakernel ON:  3.68-3.72s
+Parity within noise (same conclusion as F16-KV) — F16 is memory-
+bandwidth-bound on its end-to-end shape, NVFP4 likewise dominated
+by GEMV + attention work; 4 launches saved per layer (~110 µs/token)
+is below ±50 ms noise on 24 ms/token decode. Architectural value
+preserved: 4 fewer launches per layer on the production NVFP4 path,
+~880 fewer captured-graph nodes at N=8 if both megakernel and
+multi-step graph are on simultaneously.
+
+Production NVFP4-KV default path uses the Phase 1 fused chain
 (commit 6f6a25a) — unchanged.
 
 ### Phase 8 Q-norm + K-norm + RoPE + KV megakernel (Phase 1) — SHIPPED 2026-05-23
