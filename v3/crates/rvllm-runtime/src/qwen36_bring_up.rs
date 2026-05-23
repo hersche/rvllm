@@ -288,6 +288,11 @@ pub struct Qwen36OutsideKernels {
     // smem_token_idx broadcast.
     pub fp8_mma_dual_silu_grouped_m16_w4c_mod: LoadedModule,
     pub fn_fp8_mma_dual_silu_grouped_m16_w4c: KernelFn,
+    // Task #97: coop A + coop B via u64-vector loads. Default-on
+    // within GROUPED+W4+COOP umbrella. Opt-out via
+    // `RVLLM_QWEN36_MOE_MMA_GROUPED_W4_COOP_B=0`.
+    pub fp8_mma_dual_silu_grouped_m16_w4cb_mod: LoadedModule,
+    pub fn_fp8_mma_dual_silu_grouped_m16_w4cb: KernelFn,
     pub fp8_gemv_indirect_mod: LoadedModule,
     pub fn_fp8_gemv_indirect: KernelFn,
     /// Phase 8 MoE-fusion (2026-05-23): fused FP8 GEMV (indirect-
@@ -1852,6 +1857,10 @@ impl Qwen36Bringup {
             kernels.load_ptx("fp8_mma_dual_silu_grouped_m16_w4c")?;
         let fn_fp8_mma_dual_silu_grouped_m16_w4c = fp8_mma_dual_silu_grouped_m16_w4c_mod
             .get_function("fp8_mma_dual_silu_grouped_m16_w4c_kernel")?;
+        let fp8_mma_dual_silu_grouped_m16_w4cb_mod =
+            kernels.load_ptx("fp8_mma_dual_silu_grouped_m16_w4cb")?;
+        let fn_fp8_mma_dual_silu_grouped_m16_w4cb = fp8_mma_dual_silu_grouped_m16_w4cb_mod
+            .get_function("fp8_mma_dual_silu_grouped_m16_w4cb_kernel")?;
         let fn_fp8_gemv_dual_silu_indirect = fp8_gemv_dual_silu_indirect_mod
             .get_function("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_kernel")?;
         let fp8_gemv_indirect_mod =
@@ -2080,6 +2089,8 @@ impl Qwen36Bringup {
             fn_fp8_mma_dual_silu_grouped_m16_w4,
             fp8_mma_dual_silu_grouped_m16_w4c_mod,
             fn_fp8_mma_dual_silu_grouped_m16_w4c,
+            fp8_mma_dual_silu_grouped_m16_w4cb_mod,
+            fn_fp8_mma_dual_silu_grouped_m16_w4cb,
             fp8_gemv_indirect_mod,
             fn_fp8_gemv_indirect,
             fp8_gemv_indirect_scaled_add_mod,
@@ -10409,9 +10420,31 @@ impl Qwen36Bringup {
                             && std::env::var("RVLLM_QWEN36_MOE_MMA_GROUPED_W4_COOP")
                                 .map(|s| !matches!(s.as_str(), "0" | "false"))
                                 .unwrap_or(true);
+                        // Task #97: coop B-staging via u64-vector
+                        // loads on top of coop A. K must be 8-byte
+                        // aligned per N row (qwen36 K=2048 always
+                        // satisfies). DEFAULT-OFF: hardware A/B
+                        // showed parity vs coop-A-only at 2k+4k
+                        // (within ~0.5% noise) — kept opt-in via
+                        // `RVLLM_QWEN36_MOE_MMA_GROUPED_W4_COOP_B=1`
+                        // for future tuning / nsys-driven analysis.
+                        let prefer_coop_b = prefer_coop
+                            && (k_in % 8 == 0)
+                            && std::env::var("RVLLM_QWEN36_MOE_MMA_GROUPED_W4_COOP_B")
+                                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
+                                .unwrap_or(false);
                         let (g_fn, g_grid_x, g_block, g_smem): (
                             cudarc::driver::sys::CUfunction, u32, u32, u32) =
-                            if prefer_coop {
+                            if prefer_coop_b {
+                                (
+                                    self.outside_kernels
+                                        .fn_fp8_mma_dual_silu_grouped_m16_w4cb
+                                        .raw() as CUfunction,
+                                    ((n_int + 31) / 32).max(1),
+                                    128u32,
+                                    2688u32,
+                                )
+                            } else if prefer_coop {
                                 (
                                     self.outside_kernels
                                         .fn_fp8_mma_dual_silu_grouped_m16_w4c
