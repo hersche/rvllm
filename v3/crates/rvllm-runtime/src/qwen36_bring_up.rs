@@ -127,6 +127,14 @@ pub struct Qwen36OutsideKernels {
     /// `RVLLM_NVFP4_KV=1`.
     pub fused_qnorm_knorm_rope_qwen_partial_nvfp4kv_mod: Option<LoadedModule>,
     pub fn_fused_qnorm_knorm_rope_qwen_partial_nvfp4kv: Option<KernelFn>,
+    /// Phase 8 QKV megakernel NVFP4-KV sibling (2026-05-23). Fuses
+    /// Q+K+V FP8 GEMVs + Q+gate split + Q-norm + K-norm + partial-NeoX
+    /// RoPE + Q FP8 quant + K/V NVFP4 pack into ONE launch. Mirrors
+    /// the F16-KV megakernel (commit fa48141). Only loaded when the
+    /// NVFP4 KV path is active (`RVLLM_NVFP4_KV=1`) — same `Option<_>`
+    /// pattern as the unfused NVFP4 fused-rope kernel above.
+    pub fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv_mod: Option<LoadedModule>,
+    pub fn_fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv: Option<KernelFn>,
     /// NVFP4 commit 2: paged FA-2 decode kernel that reads packed
     /// 4-bit K/V + per-(slot, kv_head) E4M3 microscale and writes
     /// f16 output. Same PTX the Qwen 3.5 27B path uses; one CTA
@@ -1672,6 +1680,21 @@ impl Qwen36Bringup {
         } else {
             (None, None)
         };
+        // Phase 8 QKV megakernel NVFP4-KV sibling — same gate as the
+        // unfused NVFP4 fused-rope kernel above; only loaded when the
+        // NVFP4 KV path is active.
+        let (
+            fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv_mod,
+            fn_fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv,
+        ) = if nvfp4_kv_on {
+            let m = kernels.load_ptx(
+                "fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv")?;
+            let f = m.get_function(
+                "fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv_kernel")?;
+            (Some(m), Some(f))
+        } else {
+            (None, None)
+        };
         let (flash_attention_nvfp4kv_mod, fn_flash_attention_2_decode_nvfp4kv) = if nvfp4_kv_on {
             let m = kernels.load_ptx("flash_attention_nvfp4kv")?;
             let f = m.get_function("flash_attention_2_decode_nvfp4kv_kernel")?;
@@ -1900,6 +1923,8 @@ impl Qwen36Bringup {
             fused_rope_qwen_partial_nvfp4kv_mod,
             fused_qnorm_knorm_rope_qwen_partial_nvfp4kv_mod,
             fn_fused_qnorm_knorm_rope_qwen_partial_nvfp4kv,
+            fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv_mod,
+            fn_fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv,
             fn_fused_rope_qwen_partial_nvfp4kv,
             flash_attention_nvfp4kv_mod,
             fn_flash_attention_2_decode_nvfp4kv,
@@ -8536,9 +8561,13 @@ impl Qwen36Bringup {
         // split + norm + RoPE + KV-write chain (steps 2-5 below)
         // is replaced by a single megakernel launch. Default off
         // so production paths stay on the existing chain.
+        // Phase 8 QKV megakernel — env-gate accepts BOTH F16 and
+        // NVFP4 KV dtypes. F16 sibling shipped 2026-05-23 (commit
+        // fa48141 warp-coop re-impl), NVFP4 sibling shipped same
+        // day. Default off; user opts in via env to A/B against the
+        // unfused chain.
         let qkv_megakernel_on =
-            std::env::var("RVLLM_QWEN36_QKV_MEGAKERNEL").as_deref() == Ok("1")
-                && matches!(self.kv_dtype, Qwen36KvDtype::F16);
+            std::env::var("RVLLM_QWEN36_QKV_MEGAKERNEL").as_deref() == Ok("1");
 
         // 2. q_proj, k_proj, v_proj GEMVs.
         let q_region = self.arena.region("qwen36_pf_qg", (q_n as usize) * 2, 16)?;
@@ -8852,6 +8881,107 @@ impl Qwen36Bringup {
                 if rc != CUresult::CUDA_SUCCESS {
                     return Err(rvllm_core::RvllmError::cuda(
                         "qwen36 full_attn fused_rope_qwen launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            },
+            Qwen36KvDtype::Nvfp4 if qkv_megakernel_on => unsafe {
+                // Phase 8 QKV-megakernel NVFP4-KV sibling
+                // (2026-05-23): single-launch fusion of Q+K+V FP8
+                // GEMVs + Q+gate split + Q-norm + K-norm + partial-
+                // NeoX RoPE + Q FP8 quant + K/V NVFP4 pack. Skips
+                // steps 2-5 of the unfused NVFP4 chain when
+                // `RVLLM_QWEN36_QKV_MEGAKERNEL=1`.
+                use cudarc::driver::sys::*;
+                let fn_mega = self
+                    .outside_kernels
+                    .fn_fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv
+                    .expect(
+                        "qwen36 NVFP4 QKV megakernel not loaded — \
+                         RVLLM_NVFP4_KV env gate inconsistency",
+                    );
+                let mut input_p = normed_region.device_ptr();
+                let mut w_q = fl.q_proj.offset_bytes;
+                let mut w_k = fl.k_proj.offset_bytes;
+                let mut w_v = fl.v_proj.offset_bytes;
+                let mut s_q = q_bs;
+                let mut s_k = k_bs;
+                let mut s_v = v_bs;
+                let mut q_fp8_out = q_fp8_ptr;
+                let mut gate_out_p = gate_region.device_ptr();
+                let mut kc_packed = k_cache_layer_ptr;
+                let mut vc_packed = v_cache_layer_ptr;
+                let mut kc_scale = k_scale_layer_ptr;
+                let mut vc_scale = v_scale_layer_ptr;
+                let mut cos_p = self.rope_cos;
+                let mut sin_p = self.rope_sin;
+                let mut qn_p = fl.q_norm.offset_bytes;
+                let mut kn_p = fl.k_norm.offset_bytes;
+                let mut pos_p = pos_dev_ptr;
+                let mut slot_p = slot_dev_ptr;
+                // For dynamic-Q-scale we pass the cache pointer
+                // (mirrors the unfused NVFP4 kernel's
+                // `q_scale_static = q_scale_dyn = q_scale_cache_ptr`
+                // convention); the kernel treats non-null as
+                // dynamic-mode.
+                let mut q_scale_static = q_scale_cache_ptr;
+                let mut q_scale_dyn = q_scale_cache_ptr;
+                let mut nt: i32 = m as i32;
+                let mut nh: i32 = num_heads as i32;
+                let mut nkh: i32 = num_kv_heads as i32;
+                let mut hd_i: i32 = head_dim as i32;
+                let mut hi: i32 = hidden as i32;
+                let mut rd: i32 = rotary_dim as i32;
+                let mut ncb_q: i32 = (hidden as i32) / 128;
+                let mut ncb_kv: i32 = (hidden as i32) / 128;
+                let mut eps_f: f32 = eps;
+                let args = [
+                    (&mut input_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_q) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_k) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_v) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_q) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_k) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_v) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_fp8_out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut gate_out_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut kc_packed) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut vc_packed) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut kc_scale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut vc_scale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut qn_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut kn_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_scale_static) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_scale_dyn) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hi) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb_q) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb_kv) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut eps_f) as *mut f32 as *mut core::ffi::c_void,
+                ];
+                let grid_y = num_heads + 2 * num_kv_heads;
+                let block_x: u32 = (head_dim * 2) as u32;
+                let rc = cuLaunchKernel(
+                    fn_mega.raw() as CUfunction,
+                    m as u32, grid_y, 1,
+                    block_x, 1, 1,
+                    0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 full_attn qkv_megakernel_nvfp4 launch",
                         rvllm_core::CudaErrorKind::LaunchFailed,
                         rvllm_core::CudaCtx::setup(),
                     ));
