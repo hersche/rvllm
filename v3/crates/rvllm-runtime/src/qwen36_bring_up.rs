@@ -288,6 +288,16 @@ pub struct Qwen36OutsideKernels {
     /// + 1 f16 round-trip per layer per token.
     pub fp8_gemv_f16in_scaled_add_devw_mod: LoadedModule,
     pub fn_fp8_gemv_f16in_scaled_add_devw: KernelFn,
+    /// Phase 8 closer fusion (2026-05-23): fp8_gemv_f16in +
+    /// scaled-add (devw) + IN-PLACE f16 residual add to hidden.
+    /// Drop-in for the back-to-back pair currently used in the per-
+    /// token MoE closer (shared-expert down + scaled-add followed
+    /// by f16_plus_f32_inplace_f16 on the residual stream).
+    /// Eliminates 1 launch per MoE layer per decode token; the
+    /// routed_sum f32 write is preserved for the `RVLLM_QWEN36_DEBUG_MOE`
+    /// post-residual probe. Opt-in via `RVLLM_QWEN36_MOE_CLOSER_FUSED=1`.
+    pub fp8_gemv_f16in_scaled_add_devw_then_residual_mod: LoadedModule,
+    pub fn_fp8_gemv_f16in_scaled_add_devw_then_residual: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -1781,6 +1791,15 @@ impl Qwen36Bringup {
             kernels.load_ptx("fp8_gemv_f16in_scaled_add_devw")?;
         let fn_fp8_gemv_f16in_scaled_add_devw = fp8_gemv_f16in_scaled_add_devw_mod
             .get_function("fp8_gemv_blockwise_wpr_native_f16in_scaled_add_devw_kernel")?;
+        // Phase 8 closer fusion: fp8_gemv + scaled_add (devw) + IN-PLACE
+        // f16 residual add to hidden. Symbol+module pair the per-token
+        // MoE closer optionally targets via env-gate.
+        let fp8_gemv_f16in_scaled_add_devw_then_residual_mod =
+            kernels.load_ptx("fp8_gemv_f16in_scaled_add_devw_then_residual")?;
+        let fn_fp8_gemv_f16in_scaled_add_devw_then_residual =
+            fp8_gemv_f16in_scaled_add_devw_then_residual_mod.get_function(
+                "fp8_gemv_blockwise_wpr_native_f16in_scaled_add_devw_then_residual_kernel"
+            )?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_f16kv =
             flash_attention_mod.get_function("flash_attention_2_f16kv_kernel")?;
@@ -1976,6 +1995,8 @@ impl Qwen36Bringup {
             fn_fp8_gemv_indirect_scaled_add_kround_batched,
             fp8_gemv_f16in_scaled_add_devw_mod,
             fn_fp8_gemv_f16in_scaled_add_devw,
+            fp8_gemv_f16in_scaled_add_devw_then_residual_mod,
+            fn_fp8_gemv_f16in_scaled_add_devw_then_residual,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             fn_flash_attention_2_f16kv,
@@ -10522,6 +10543,19 @@ impl Qwen36Bringup {
                     ));
                 }
             }
+            // Phase 8 closer-fusion opt-in: when
+            // `RVLLM_QWEN36_MOE_CLOSER_FUSED=1`, the shared-expert
+            // (down + scaled-add) AND the trailing
+            // `f16_plus_f32_inplace_f16` residual-add are collapsed
+            // into ONE launch via
+            // `fn_fp8_gemv_f16in_scaled_add_devw_then_residual`.
+            // routed_sum f32 is still written (debug probe stays
+            // visible); the final residual-add launch below is
+            // skipped via the same gate. Default off → byte-untouched
+            // 2-launch chain.
+            let closer_fused = std::env::var("RVLLM_QWEN36_MOE_CLOSER_FUSED")
+                .map(|s| s == "1")
+                .unwrap_or(false);
             // Fused shared-expert (down + scaled-add) kernel:
             // computes the FP8 GEMV exactly as the standalone
             // `fp8_gemv_blockwise_wpr_native_f16in_kernel`, then on
@@ -10533,6 +10567,7 @@ impl Qwen36Bringup {
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut acc = routed_sum_region.device_ptr();
+                let mut hidden_dst = last_hidden_ptr;
                 let mut weight = moe.shared_expert_down_proj.offset_bytes;
                 let mut scl = sh_down_bs;
                 let mut inp = silu_region.device_ptr();
@@ -10541,31 +10576,57 @@ impl Qwen36Bringup {
                 let mut n_i = n_down as i32;
                 let mut k_i = k_down as i32;
                 let mut ncb = ((k_down + 127) / 128) as i32;
-                let args = [
-                    (&mut acc) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut weight) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut scl) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut inp) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut devw) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
-                ];
+                let (fn_raw, args_vec): (CUfunction, Vec<*mut core::ffi::c_void>) =
+                    if closer_fused {
+                        let args = vec![
+                            (&mut acc) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut hidden_dst) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut weight) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut scl) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut devw) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+                            (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+                            (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                            (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+                        ];
+                        (self.outside_kernels
+                            .fn_fp8_gemv_f16in_scaled_add_devw_then_residual
+                            .raw() as CUfunction,
+                         args)
+                    } else {
+                        let args = vec![
+                            (&mut acc) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut weight) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut scl) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut devw) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+                            (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+                            (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                            (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+                        ];
+                        (self.outside_kernels.fn_fp8_gemv_f16in_scaled_add_devw.raw() as CUfunction,
+                         args)
+                    };
                 let grid = ((n_down + 7) / 8, m, 1u32);
                 let block = (256u32, 1u32, 1u32);
                 let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_fp8_gemv_f16in_scaled_add_devw.raw() as CUfunction,
+                    fn_raw,
                     grid.0, grid.1, grid.2,
                     block.0, block.1, block.2,
                     0,
                     stream_raw as CUstream,
-                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    args_vec.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
                 if rc != CUresult::CUDA_SUCCESS {
                     return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 fp8_gemv_f16in_scaled_add_devw (shared-expert fused) launch",
+                        if closer_fused {
+                            "qwen36 fp8_gemv_f16in_scaled_add_devw_then_residual (closer fused) launch"
+                        } else {
+                            "qwen36 fp8_gemv_f16in_scaled_add_devw (shared-expert fused) launch"
+                        },
                         rvllm_core::CudaErrorKind::LaunchFailed,
                         rvllm_core::CudaCtx::setup(),
                     ));
@@ -10619,9 +10680,19 @@ impl Qwen36Bringup {
             eprintln!("[moe] normed_L2={normed_l2:.2} routed_L2={routed_only_l2:.3} shared_L2~{shared_l2:.3} total_L2={total_l2:.3}");
             let _ = lh_host; // reserved for future per-element debugging
         }
+        // Phase 8 closer-fusion opt-in: when
+        // `RVLLM_QWEN36_MOE_CLOSER_FUSED=1`, the in-place
+        // `hidden += f16(routed_sum)` was already folded into the
+        // shared-expert closer launch above. Skip the standalone
+        // launch entirely to claim the save.
+        let closer_fused = std::env::var("RVLLM_QWEN36_MOE_CLOSER_FUSED")
+            .map(|s| s == "1")
+            .unwrap_or(false);
         #[cfg(feature = "cuda")]
-        unsafe {
+        if !closer_fused
+        {
             use cudarc::driver::sys::*;
+            unsafe {
             let mut inout = last_hidden_ptr;
             let mut add = routed_sum_region.device_ptr();
             let mut nn = hidden as i32;
@@ -10652,7 +10723,8 @@ impl Qwen36Bringup {
                     rvllm_core::CudaCtx::setup(),
                 ));
             }
-        }
+            }  // close `unsafe { ... }`
+        }  // close `if !closer_fused`
         // No fence: the residual kernel runs on stream_raw, the next
         // layer's first read of last_hidden_ptr is also on stream_raw,
         // so ordering is automatic.
