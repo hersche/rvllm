@@ -266,6 +266,16 @@ pub struct Qwen36OutsideKernels {
     // GEMV variant above; block.x = 32 (1 warp) vs the GEMV's 256.
     pub fp8_mma_dual_silu_indirect_kround_batched_mod: LoadedModule,
     pub fn_fp8_mma_dual_silu_indirect_kround_batched: KernelFn,
+    // Task #94: per-expert sort pre-pass + true M=16 grouped MMA
+    // (opt-in via `RVLLM_QWEN36_MOE_MMA_GROUPED=1`, takes precedence
+    // over MMA_DUAL_SILU when both are set). Recovers the
+    // M-direction MMA reuse the task #93 first cut sacrificed.
+    pub qwen36_moe_expert_sort_mod: LoadedModule,
+    pub fn_qwen36_moe_expert_sort: KernelFn,
+    pub qwen36_moe_tile_table_mod: LoadedModule,
+    pub fn_qwen36_moe_tile_table: KernelFn,
+    pub fp8_mma_dual_silu_grouped_m16_mod: LoadedModule,
+    pub fn_fp8_mma_dual_silu_grouped_m16: KernelFn,
     pub fp8_gemv_indirect_mod: LoadedModule,
     pub fn_fp8_gemv_indirect: KernelFn,
     /// Phase 8 MoE-fusion (2026-05-23): fused FP8 GEMV (indirect-
@@ -1784,6 +1794,20 @@ impl Qwen36Bringup {
             fp8_mma_dual_silu_indirect_kround_batched_mod.get_function(
                 "fp8_mma_dual_silu_indirect_kround_batched_kernel",
             )?;
+        // Task #94: load the per-expert sort + tile-table + grouped-
+        // M=16 MMA siblings.
+        let qwen36_moe_expert_sort_mod =
+            kernels.load_ptx("qwen36_moe_expert_sort")?;
+        let fn_qwen36_moe_expert_sort = qwen36_moe_expert_sort_mod
+            .get_function("qwen36_moe_expert_sort_kernel")?;
+        let qwen36_moe_tile_table_mod =
+            kernels.load_ptx("qwen36_moe_tile_table")?;
+        let fn_qwen36_moe_tile_table = qwen36_moe_tile_table_mod
+            .get_function("qwen36_moe_tile_table_kernel")?;
+        let fp8_mma_dual_silu_grouped_m16_mod =
+            kernels.load_ptx("fp8_mma_dual_silu_grouped_m16")?;
+        let fn_fp8_mma_dual_silu_grouped_m16 = fp8_mma_dual_silu_grouped_m16_mod
+            .get_function("fp8_mma_dual_silu_grouped_m16_kernel")?;
         let fn_fp8_gemv_dual_silu_indirect = fp8_gemv_dual_silu_indirect_mod
             .get_function("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_kernel")?;
         let fp8_gemv_indirect_mod =
@@ -2002,6 +2026,12 @@ impl Qwen36Bringup {
             fn_fp8_gemv_dual_silu_indirect_kround_batched,
             fp8_mma_dual_silu_indirect_kround_batched_mod,
             fn_fp8_mma_dual_silu_indirect_kround_batched,
+            qwen36_moe_expert_sort_mod,
+            fn_qwen36_moe_expert_sort,
+            qwen36_moe_tile_table_mod,
+            fn_qwen36_moe_tile_table,
+            fp8_mma_dual_silu_grouped_m16_mod,
+            fn_fp8_mma_dual_silu_grouped_m16,
             fp8_gemv_indirect_mod,
             fn_fp8_gemv_indirect,
             fp8_gemv_indirect_scaled_add_mod,
@@ -9943,47 +9973,343 @@ impl Qwen36Bringup {
                     (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
                     (&mut tk_i) as *mut i32 as *mut core::ffi::c_void,
                 ];
-                // Task #93: opt-in TensorCore MMA path. Same kernel
-                // arg signature; block is 1 warp (32 threads) vs the
-                // GEMV's 8 warps (256). MMA path needs 1024 B smem for
-                // A + B_g + B_u staging.
-                let use_mma = std::env::var("RVLLM_QWEN36_MOE_MMA_DUAL_SILU")
+                // Task #93/#94: opt-in TensorCore MMA paths.
+                //   RVLLM_QWEN36_MOE_MMA_GROUPED=1  → task #94 sort+M=16
+                //   RVLLM_QWEN36_MOE_MMA_DUAL_SILU=1 → task #93 first cut
+                //   (both unset)                    → legacy GEMV
+                // GROUPED takes precedence when both are set.
+                let use_grouped = std::env::var("RVLLM_QWEN36_MOE_MMA_GROUPED")
                     .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
                     .unwrap_or(false);
-                let grid = (((n_int + 7) / 8).max(1), num_tokens, top_k as u32);
-                let (fn_handle, block, smem_bytes): (cudarc::driver::sys::CUfunction, u32, u32) =
-                    if use_mma {
-                        (
-                            self.outside_kernels
-                                .fn_fp8_mma_dual_silu_indirect_kround_batched
+                let use_mma = !use_grouped
+                    && std::env::var("RVLLM_QWEN36_MOE_MMA_DUAL_SILU")
+                        .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
+                        .unwrap_or(false);
+
+                if use_grouped {
+                    // === Task #94: sort + tile-table + grouped MMA. ===
+                    let num_experts = self.arch.num_experts as u32;
+                    let m_full      = num_tokens;
+                    let total_assign = (m_full as usize) * top_k;
+                    // Per-expert safety budget. Worst case = total_assign
+                    // (all-to-one); typical ~ total_assign/num_experts.
+                    // Use 8× sigma + floor=64 to absorb skew.
+                    let typical_per_expert =
+                        (total_assign + (num_experts as usize) - 1)
+                            / (num_experts as usize);
+                    // 32× sigma headroom over the expected even-distribution
+                    // bucket size handles the worst routing skew observed
+                    // on real qwen36 prompts (one expert > 8× mean). The
+                    // 8× initial estimate proved insufficient at M=1112
+                    // (one expert overflowed at 278 → kernel OOB write
+                    // → cuStreamSynchronize trap). Cap at total_assign so
+                    // pathological all-to-one routing still fits.
+                    let max_per_expert: u32 = ((typical_per_expert * 32)
+                        .max(256) as u32)
+                        .min(total_assign as u32);
+                    let max_total_tiles: u32 =
+                        ((total_assign / 16 + (num_experts as usize) + 8)
+                            as u32)
+                            .min(total_assign as u32);
+
+                    let sorted_bytes = (num_experts as usize)
+                        * (max_per_expert as usize) * 2 * 4;
+                    let counts_bytes  = (num_experts as usize) * 4;
+                    let tiles_bytes   = (max_total_tiles as usize) * 3 * 4;
+                    let tcount_bytes  = 4usize;
+                    let sorted_region = self.arena.region(
+                        "qwen36_pmb_moe_sorted", sorted_bytes, 16)?;
+                    let counts_region = self.arena.region(
+                        "qwen36_pmb_moe_counts", counts_bytes, 16)?;
+                    let tiles_region  = self.arena.region(
+                        "qwen36_pmb_moe_tiles", tiles_bytes, 16)?;
+                    let tcount_region = self.arena.region(
+                        "qwen36_pmb_moe_tcnt", tcount_bytes, 16)?;
+
+                    // Zero expert_counts + tile_count.
+                    let r1 = cuMemsetD32Async(
+                        counts_region.device_ptr(),
+                        0u32, counts_bytes / 4,
+                        self.stream.raw() as _);
+                    let r2 = cuMemsetD32Async(
+                        tcount_region.device_ptr(),
+                        0u32, 1,
+                        self.stream.raw() as _);
+                    if r1 != CUresult::CUDA_SUCCESS
+                        || r2 != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 moe_grouped zero-init",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+
+                    // Diagnostic: per-stage sync to isolate failures.
+                    let dbg_sync = std::env::var("RVLLM_QWEN36_MOE_MMA_GROUPED_DEBUG")
+                        .map(|s| matches!(s.as_str(), "1" | "true"))
+                        .unwrap_or(false);
+
+                    // --- Launch 1: sort kernel ---
+                    {
+                        let mut tidx       = idx_b;            // top_idx ptr (alias of topk_idx_base)
+                        let mut sorted_ptr = sorted_region.device_ptr();
+                        let mut counts_ptr = counts_region.device_ptr();
+                        let mut m_i        = m_full as i32;
+                        let mut tk_i       = top_k as i32;
+                        let mut ne_i       = num_experts as i32;
+                        let mut mpe_i      = max_per_expert as i32;
+                        let sort_args = [
+                            (&mut tidx)       as *mut u64 as *mut core::ffi::c_void,
+                            (&mut sorted_ptr) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut counts_ptr) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut m_i)        as *mut i32 as *mut core::ffi::c_void,
+                            (&mut tk_i)       as *mut i32 as *mut core::ffi::c_void,
+                            (&mut ne_i)       as *mut i32 as *mut core::ffi::c_void,
+                            (&mut mpe_i)      as *mut i32 as *mut core::ffi::c_void,
+                        ];
+                        let total_threads = ((total_assign as u32) + 255) / 256;
+                        let rc = cuLaunchKernel(
+                            self.outside_kernels.fn_qwen36_moe_expert_sort
                                 .raw() as CUfunction,
-                            32u32,
-                            1024u32,
-                        )
+                            total_threads, 1, 1,
+                            256, 1, 1,
+                            0,
+                            self.stream.raw() as CUstream,
+                            sort_args.as_ptr() as *mut *mut core::ffi::c_void,
+                            core::ptr::null_mut(),
+                        );
+                        if rc != CUresult::CUDA_SUCCESS {
+                            return Err(rvllm_core::RvllmError::cuda(
+                                "qwen36 moe_grouped sort",
+                                rvllm_core::CudaErrorKind::LaunchFailed,
+                                rvllm_core::CudaCtx::setup(),
+                            ));
+                        }
+                        if dbg_sync {
+                            let s = cuStreamSynchronize(self.stream.raw() as _);
+                            if s != CUresult::CUDA_SUCCESS {
+                                return Err(rvllm_core::RvllmError::cuda(
+                                    "qwen36 moe_grouped sort-sync",
+                                    rvllm_core::CudaErrorKind::LaunchFailed,
+                                    rvllm_core::CudaCtx::setup(),
+                                ));
+                            }
+                        }
+                    }
+
+                    // --- Launch 2: tile-table kernel ---
+                    {
+                        let mut counts_ptr = counts_region.device_ptr();
+                        let mut tiles_ptr  = tiles_region.device_ptr();
+                        let mut tcount_ptr = tcount_region.device_ptr();
+                        let mut ne_i       = num_experts as i32;
+                        let mut mt_i       = max_total_tiles as i32;
+                        let tt_args = [
+                            (&mut counts_ptr) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut tiles_ptr)  as *mut u64 as *mut core::ffi::c_void,
+                            (&mut tcount_ptr) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut ne_i)       as *mut i32 as *mut core::ffi::c_void,
+                            (&mut mt_i)       as *mut i32 as *mut core::ffi::c_void,
+                        ];
+                        let grid_x = (num_experts + 63) / 64;
+                        let rc = cuLaunchKernel(
+                            self.outside_kernels.fn_qwen36_moe_tile_table
+                                .raw() as CUfunction,
+                            grid_x, 1, 1,
+                            64, 1, 1,
+                            0,
+                            self.stream.raw() as CUstream,
+                            tt_args.as_ptr() as *mut *mut core::ffi::c_void,
+                            core::ptr::null_mut(),
+                        );
+                        if rc != CUresult::CUDA_SUCCESS {
+                            return Err(rvllm_core::RvllmError::cuda(
+                                "qwen36 moe_grouped tile_table",
+                                rvllm_core::CudaErrorKind::LaunchFailed,
+                                rvllm_core::CudaCtx::setup(),
+                            ));
+                        }
+                        if dbg_sync {
+                            let s = cuStreamSynchronize(self.stream.raw() as _);
+                            if s != CUresult::CUDA_SUCCESS {
+                                return Err(rvllm_core::RvllmError::cuda(
+                                    "qwen36 moe_grouped tile-sync",
+                                    rvllm_core::CudaErrorKind::LaunchFailed,
+                                    rvllm_core::CudaCtx::setup(),
+                                ));
+                            }
+                        }
+                    }
+
+                    // --- DtoH tile_count[0] to size the MMA grid. ---
+                    let mut tile_count_host: i32 = 0;
+                    {
+                        let rc = cuMemcpyDtoHAsync_v2(
+                            (&mut tile_count_host) as *mut i32 as *mut core::ffi::c_void,
+                            tcount_region.device_ptr(),
+                            4,
+                            self.stream.raw() as _,
+                        );
+                        if rc != CUresult::CUDA_SUCCESS {
+                            return Err(rvllm_core::RvllmError::cuda(
+                                "qwen36 moe_grouped DtoH tile_count",
+                                rvllm_core::CudaErrorKind::MemcpyFailed,
+                                rvllm_core::CudaCtx::setup(),
+                            ));
+                        }
+                        let rs = cuStreamSynchronize(self.stream.raw() as _);
+                        if rs != CUresult::CUDA_SUCCESS {
+                            return Err(rvllm_core::RvllmError::cuda(
+                                "qwen36 moe_grouped stream sync",
+                                rvllm_core::CudaErrorKind::LaunchFailed,
+                                rvllm_core::CudaCtx::setup(),
+                            ));
+                        }
+                    }
+                    if tile_count_host <= 0 || (tile_count_host as u32) > max_total_tiles {
+                        // Overflow or no work — fall through to GEMV.
+                        // (This silently demotes; production should
+                        // ideally widen max_per_expert / max_total_tiles
+                        // first.)
+                        let mut out_p2 = silu_b.device_ptr();
+                        let mut bwg2 = moe.experts_gate_proj_fused.offset_bytes;
+                        let mut bwu2 = moe.experts_up_proj_fused.offset_bytes;
+                        let mut bsg2 = gate_bs;
+                        let mut bsu2 = up_bs;
+                        let mut inp2 = normed_region.device_ptr();
+                        let mut idx_b2 = topk_idx_base;
+                        let mut ws2: i64 = int_per_expert_w as i64;
+                        let mut ss2: i64 = (int_per_expert_bs / 4) as i64;
+                        let mut m_i2 = num_tokens as i32;
+                        let mut n_i2 = n_int as i32;
+                        let mut k_i2 = k_in as i32;
+                        let mut ncb2 = num_col_blocks_int;
+                        let mut tk_i2 = top_k as i32;
+                        let fb_args = [
+                            (&mut out_p2) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut bwg2)   as *mut u64 as *mut core::ffi::c_void,
+                            (&mut bwu2)   as *mut u64 as *mut core::ffi::c_void,
+                            (&mut bsg2)   as *mut u64 as *mut core::ffi::c_void,
+                            (&mut bsu2)   as *mut u64 as *mut core::ffi::c_void,
+                            (&mut inp2)   as *mut u64 as *mut core::ffi::c_void,
+                            (&mut idx_b2) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut ws2)    as *mut i64 as *mut core::ffi::c_void,
+                            (&mut ss2)    as *mut i64 as *mut core::ffi::c_void,
+                            (&mut m_i2)   as *mut i32 as *mut core::ffi::c_void,
+                            (&mut n_i2)   as *mut i32 as *mut core::ffi::c_void,
+                            (&mut k_i2)   as *mut i32 as *mut core::ffi::c_void,
+                            (&mut ncb2)   as *mut i32 as *mut core::ffi::c_void,
+                            (&mut tk_i2)  as *mut i32 as *mut core::ffi::c_void,
+                        ];
+                        let fb_grid = (((n_int + 7) / 8).max(1), num_tokens, top_k as u32);
+                        let rc = cuLaunchKernel(
+                            self.outside_kernels.fn_fp8_gemv_dual_silu_indirect_kround_batched
+                                .raw() as CUfunction,
+                            fb_grid.0, fb_grid.1, fb_grid.2,
+                            256, 1, 1,
+                            0,
+                            self.stream.raw() as CUstream,
+                            fb_args.as_ptr() as *mut *mut core::ffi::c_void,
+                            core::ptr::null_mut(),
+                        );
+                        if rc != CUresult::CUDA_SUCCESS {
+                            return Err(rvllm_core::RvllmError::cuda(
+                                "qwen36 moe_grouped fallback",
+                                rvllm_core::CudaErrorKind::LaunchFailed,
+                                rvllm_core::CudaCtx::setup(),
+                            ));
+                        }
                     } else {
-                        (
-                            self.outside_kernels
-                                .fn_fp8_gemv_dual_silu_indirect_kround_batched
+                        // --- Launch 3: grouped MMA dual_silu ---
+                        let mut out_p3   = silu_b.device_ptr();
+                        let mut bwg3     = moe.experts_gate_proj_fused.offset_bytes;
+                        let mut bwu3     = moe.experts_up_proj_fused.offset_bytes;
+                        let mut bsg3     = gate_bs;
+                        let mut bsu3     = up_bs;
+                        let mut inp3     = normed_region.device_ptr();
+                        let mut sorted_p = sorted_region.device_ptr();
+                        let mut tiles_p  = tiles_region.device_ptr();
+                        let mut ws3: i64 = int_per_expert_w as i64;
+                        let mut ss3: i64 = (int_per_expert_bs / 4) as i64;
+                        let mut mfull_i  = num_tokens as i32;
+                        let mut n_i3     = n_int as i32;
+                        let mut k_i3     = k_in as i32;
+                        let mut ncb3     = num_col_blocks_int;
+                        let mut tk_i3    = top_k as i32;
+                        let mut mpe_i3   = max_per_expert as i32;
+                        let gargs = [
+                            (&mut out_p3)   as *mut u64 as *mut core::ffi::c_void,
+                            (&mut bwg3)     as *mut u64 as *mut core::ffi::c_void,
+                            (&mut bwu3)     as *mut u64 as *mut core::ffi::c_void,
+                            (&mut bsg3)     as *mut u64 as *mut core::ffi::c_void,
+                            (&mut bsu3)     as *mut u64 as *mut core::ffi::c_void,
+                            (&mut inp3)     as *mut u64 as *mut core::ffi::c_void,
+                            (&mut sorted_p) as *mut u64 as *mut core::ffi::c_void,
+                            (&mut tiles_p)  as *mut u64 as *mut core::ffi::c_void,
+                            (&mut ws3)      as *mut i64 as *mut core::ffi::c_void,
+                            (&mut ss3)      as *mut i64 as *mut core::ffi::c_void,
+                            (&mut mfull_i)  as *mut i32 as *mut core::ffi::c_void,
+                            (&mut n_i3)     as *mut i32 as *mut core::ffi::c_void,
+                            (&mut k_i3)     as *mut i32 as *mut core::ffi::c_void,
+                            (&mut ncb3)     as *mut i32 as *mut core::ffi::c_void,
+                            (&mut tk_i3)    as *mut i32 as *mut core::ffi::c_void,
+                            (&mut mpe_i3)   as *mut i32 as *mut core::ffi::c_void,
+                        ];
+                        let g_grid = (((n_int + 7) / 8).max(1), tile_count_host as u32, 1u32);
+                        let rc = cuLaunchKernel(
+                            self.outside_kernels.fn_fp8_mma_dual_silu_grouped_m16
                                 .raw() as CUfunction,
-                            256u32,
-                            0u32,
-                        )
-                    };
-                let rc = cuLaunchKernel(
-                    fn_handle,
-                    grid.0, grid.1, grid.2,
-                    block, 1, 1,
-                    smem_bytes,
-                    self.stream.raw() as CUstream,
-                    args.as_ptr() as *mut *mut core::ffi::c_void,
-                    core::ptr::null_mut(),
-                );
-                if rc != CUresult::CUDA_SUCCESS {
-                    return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 moe_routed_batched dual_silu_kround_batched",
-                        rvllm_core::CudaErrorKind::LaunchFailed,
-                        rvllm_core::CudaCtx::setup(),
-                    ));
+                            g_grid.0, g_grid.1, g_grid.2,
+                            32, 1, 1,
+                            1088,  // smem: A 512 + B_g 256 + B_u 256 + ascale 64
+                            self.stream.raw() as CUstream,
+                            gargs.as_ptr() as *mut *mut core::ffi::c_void,
+                            core::ptr::null_mut(),
+                        );
+                        if rc != CUresult::CUDA_SUCCESS {
+                            return Err(rvllm_core::RvllmError::cuda(
+                                "qwen36 moe_grouped mma_dual_silu",
+                                rvllm_core::CudaErrorKind::LaunchFailed,
+                                rvllm_core::CudaCtx::setup(),
+                            ));
+                        }
+                    }
+                } else {
+                    let grid = (((n_int + 7) / 8).max(1), num_tokens, top_k as u32);
+                    let (fn_handle, block, smem_bytes): (cudarc::driver::sys::CUfunction, u32, u32) =
+                        if use_mma {
+                            (
+                                self.outside_kernels
+                                    .fn_fp8_mma_dual_silu_indirect_kround_batched
+                                    .raw() as CUfunction,
+                                32u32,
+                                1024u32,
+                            )
+                        } else {
+                            (
+                                self.outside_kernels
+                                    .fn_fp8_gemv_dual_silu_indirect_kround_batched
+                                    .raw() as CUfunction,
+                                256u32,
+                                0u32,
+                            )
+                        };
+                    let rc = cuLaunchKernel(
+                        fn_handle,
+                        grid.0, grid.1, grid.2,
+                        block, 1, 1,
+                        smem_bytes,
+                        self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 moe_routed_batched dual_silu_kround_batched",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
                 }
             }
             // Phase 8 batched-prefill down k_round-batch fusion
