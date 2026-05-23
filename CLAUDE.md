@@ -1306,6 +1306,46 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 linear-attn prefill — task #101 (2026-05-24, +2.3% with v3)
+
+Targets the new top hotspot identified by #100 (`gated_delta_rule
+_prefill_f16_kernel`, 15.8% of prefill GPU time). Two opt-in sibling
+kernels (commit `50c3b1e`):
+
+* **v2** vectorised state I/O (u64 4-half load/store): PARITY with
+  v1 at hardware A/B. Opt-in via
+  `RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V2=1`. Kept loaded as building
+  block; state I/O is not the bottleneck.
+* **v3** drops the inner-loop f16 RTNE round-trip on `s_row[kd]`
+  (v1 rounded `s = __half2float(__float2half(s_old * a))` every
+  Phase-1 + Phase-2 inner-loop iteration for byte-equivalence with
+  the per-token decode kernel). v3 keeps the recurrent state in
+  pure fp32 across one prefill call; rounds to f16 only at boundary
+  write-back. NOT bit-equivalent to v1; mathematically MORE correct
+  (less quantisation noise). Opt-in via
+  `RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V3=1`.
+
+A/B (qwen3-6-35b-a3b NVFP4, both grouped MMA paths active,
+deterministic over 3 runs, fresh binary md5 `862b81cb`):
+
+  | Cell                 | 1112 tok    | 4412 tok    |
+  |----------------------|-------------|-------------|
+  | v1 baseline (#99)    |   944 ms    |  4116 ms    |
+  | v2 vector I/O        |   946 ms    |    --       |
+  | **v3 skip-RTNE**     | **920 ms**  | **4022 ms** |
+  | v3 win vs v1         |   +2.5%     |   +2.3%     |
+
+Quality verified: quantum entanglement coherent. Default-off
+regression-checked.
+
+Remaining bottleneck on this kernel is NOT memory I/O (v2 parity)
+nor exclusively the f16 RTNE round-trips (v3 gives only +2.3%). The
+dominant cost likely sits in per-token `__syncthreads` barriers
+(~9000 per kernel call at M=4412) or the inner-loop FMA throughput
+(75M FMAs per launch). Both would require deeper rewrite (warp-
+level reduction, multi-token batching across the recurrence) — multi-
+week scope.
+
 ### qwen36 prefill nsys post-#98+#99 — task #100 (2026-05-24)
 
 Captured against fresh binary md5 `65cb2a35` with the production

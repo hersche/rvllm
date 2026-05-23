@@ -806,3 +806,37 @@ Path forward documented in CLAUDE.md (descending expected impact):
 2. Apply grouped MMA pattern to shared-expert dual_silu (no routing
    indirection — simpler than #94-#97; expected ~5-8%)
 3. Apply grouped MMA pattern to other model families
+
+
+## Phase 17: Linear-attn prefill v2/v3 (task #101, 2026-05-24, +2.3% with v3)
+
+Targets the new top hotspot identified by Phase 16 (`gated_delta_rule
+_prefill_f16_kernel`, 15.8% of prefill GPU time). Two opt-in sibling
+kernels in commit `50c3b1e`:
+
+* **v2** vectorised state load/store via aligned u64 (4 fp16 halves
+  per access). PARITY with v1 at hardware A/B — state I/O is not the
+  bottleneck. Opt-in: `RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V2=1`.
+* **v3** drops inner-loop f16 RTNE round-trip on `s_row[kd]` (kept
+  in v1 for byte-equivalence with the per-token decode kernel). v3
+  keeps state in fp32 across the prefill; rounds at boundary only.
+  Mathematically MORE correct (less quantisation noise). Opt-in:
+  `RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V3=1`.
+
+A/B (qwen3-6-35b-a3b NVFP4, both grouped MMA active, deterministic):
+
+  | Cell                 | 1112 tok    | 4412 tok    |
+  |----------------------|-------------|-------------|
+  | v1 baseline          |   944 ms    |  4116 ms    |
+  | v3 skip-RTNE         | **920 ms**  | **4022 ms** |
+  | v3 win vs v1         |   +2.5%     |   +2.3%     |
+
+Quality verified on quantum-entanglement prompt. Default-off
+regression-checked at 6020 ms baseline.
+
+The kernel's REMAINING bottleneck is NOT state I/O (v2 parity) and
+only partially the f16 RTNE (v3 +2.3%). Likely candidates: per-token
+`__syncthreads` barriers (~9000 per call at M=4412) or inner-loop
+FMA throughput (75M FMAs/launch). Both would require deeper rewrite
+(warp-level reduction, multi-token recurrence batching) — multi-week
+scope, parked.
