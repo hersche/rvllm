@@ -1147,6 +1147,50 @@ qwen3-6-35b-a3b 150-token photosynthesis:
 - After down kround-batch (b1f221e): **1.644s**
 - **Total ≈23% decode speedup** across today's MoE fusion stack.
 
+### Phase 8 Q-norm + K-norm + RoPE + KV megakernel (Phase 1) — SHIPPED 2026-05-23
+
+First step toward the full QKV+norm+RoPE+KV megakernel goal.
+Commit `943f8bb` folds the two standalone `rmsnorm_inplace_f16`
+launches (Q-norm + K-norm per full-attn layer) into the
+existing `fused_rope_qwen_partial_f16kv` kernel. New kernel
+`fused_qnorm_knorm_rope_qwen_partial_f16kv_kernel` runs a
+2-phase per-head body:
+
+  Phase 1: block-reduce sum-of-squares across head_dim,
+  inv_norm = rsqrtf(mean_sq + eps), apply gamma * inv_norm to
+  the (tid, tid+half_head) element pair in-place.
+  Phase 2: standard partial-NeoX RoPE on the rotary half +
+  KV-cache write.
+
+Numerical contract: Phase 1 RMSNorm matches the standalone
+kernel byte-for-byte; Phase 2 rotation+KV-write is byte-
+identical to the unfused fused_rope_qwen_partial_f16kv given
+normalised input. Coverage tightened over the unfused kernel:
+each thread writes BOTH halves of its pair (so the non-rotary
+tail [rotary_dim, head_dim) gets normalised even without the
+in-place trick the unfused kernel relied on).
+
+Wired for F16-KV branch only; NVFP4-KV keeps the standalone
+Q-norm/K-norm + existing NVFP4 RoPE kernel (extending the
+fusion to NVFP4 is the next step — the NVFP4 RoPE kernel has
+more complex internals: fp8 K-quantisation, per-block
+microscale, per-token Q-scale cache).
+
+Saves 2 launches/layer in F16-KV mode (~22 launches/token at
+~11 full-attn layers). Hardware-validated coherent on
+qwen3-6-35b-a3b: short / 1-10 counting / 150-token
+photosynthesis all correct. F16-KV path is memory-bandwidth-
+bound by the 2x larger KV cache vs NVFP4 (2.528s vs NVFP4's
+1.654s for 150-token decode); launch savings are below noise
+on this dominantly memory-bound path. The fusion's value is
+architectural — eliminates 2 redundant kernel launches per
+layer + foundation for fusing in the QKV projection (Phase 2:
+~1000 LOC of additional CUDA work to bring the 3 FP8 GEMV
+projection launches into the same megakernel; substantial
+follow-on).
+
+Production NVFP4-KV path unchanged.
+
 ### Phase 8 multi-step graph with persistent hidden — SHIPPED 2026-05-23
 
 Commit `eb26d86` builds on e13e2eb: the multi-step macro-graph
