@@ -414,6 +414,32 @@ multi-step improvement; deterministic across 5 cached replays).
 Still ~80ms slower than single-step replay (1.644s); multi-
 step stays operator-opt-in via `RVLLM_QWEN36_DECODE_MULTI_STEP`.
 
+**Q-norm + K-norm + RoPE + KV megakernel Phase 1 (commit
+`943f8bb`)** — first step toward the QKV+norm+RoPE+KV
+megakernel goal. New kernel
+`fused_qnorm_knorm_rope_qwen_partial_f16kv_kernel` folds the
+two standalone `rmsnorm_inplace_f16` launches (Q-norm + K-
+norm per full-attn layer) into the existing partial-NeoX
+RoPE kernel via a 2-phase per-head body: Phase 1 block-
+reduces sum-of-squares across head_dim + applies
+gamma*inv_norm in-place; Phase 2 standard rotation + KV-
+cache write. Each thread covers both halves of its
+(tid, tid+half_head) pair so the non-rotary tail
+[rotary_dim, head_dim) gets normalised without relying on
+the in-place trick the unfused kernel used. Wired for F16-KV
+branch only (NVFP4 RoPE kernel has fp8 K-quantisation +
+microscale internals that need a separate sibling). Saves 2
+launches per full-attn layer per token in F16-KV mode (~22
+launches/token at 11 layers). Hardware-validated coherent on
+qwen3-6-35b-a3b F16-KV + production NVFP4-KV regression-
+clean. F16-KV path is memory-bandwidth-bound (2.528s for 150-
+token decode vs NVFP4's 1.654s); the fusion's launch savings
+are below noise on this dominantly memory-bound path. Phase
+2 of the full megakernel — folding the 3 FP8 GEMV projection
+launches into the same kernel — is the substantial follow-on
+(~1000+ LOC of additional CUDA work with shared-memory tile
+management for the K-dim reduction across hidden=2048).
+
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
 desired.
