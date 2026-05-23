@@ -276,6 +276,11 @@ pub struct Qwen36OutsideKernels {
     pub fn_qwen36_moe_tile_table: KernelFn,
     pub fp8_mma_dual_silu_grouped_m16_mod: LoadedModule,
     pub fn_fp8_mma_dual_silu_grouped_m16: KernelFn,
+    // Task #95: W=4 multi-warp variant (4 warps share one A tile;
+    // covers 4× N cols per block → 4× fewer blocks). Opt-in via
+    // `RVLLM_QWEN36_MOE_MMA_GROUPED_W4=1` (alongside `_GROUPED=1`).
+    pub fp8_mma_dual_silu_grouped_m16_w4_mod: LoadedModule,
+    pub fn_fp8_mma_dual_silu_grouped_m16_w4: KernelFn,
     pub fp8_gemv_indirect_mod: LoadedModule,
     pub fn_fp8_gemv_indirect: KernelFn,
     /// Phase 8 MoE-fusion (2026-05-23): fused FP8 GEMV (indirect-
@@ -514,6 +519,23 @@ pub struct Qwen36LinearAttnHostCache {
     pub h_us: usize,
 }
 
+/// Task #95: persistent device-side scratch for grouped MMA's sort
+/// + tile-table pre-passes. Allocated once at load(); dispatch reads
+/// these ptrs each layer (cheap) instead of bumping the arena per
+/// call. `m_max` is the per-prefill upper bound the persistent
+/// alloc supports; larger prompts fall through to the legacy per-
+/// call `arena.region()` allocation path.
+#[derive(Clone, Copy, Debug)]
+pub struct MmaSortScratch {
+    pub sorted_ptr: u64,
+    pub counts_ptr: u64,
+    pub tiles_ptr: u64,
+    pub tcount_ptr: u64,
+    pub m_max: u32,
+    pub max_per_expert: u32,
+    pub max_total_tiles: u32,
+}
+
 pub struct Qwen36Bringup {
     pub paths: Gemma4EnginePaths,
     pub arena_bytes: usize,
@@ -639,6 +661,13 @@ pub struct Qwen36Bringup {
     /// the worker for that).
     pub decode_capture_multi_step:
         std::sync::Mutex<Option<rvllm_graph::pool::CapturedGraph>>,
+    // Task #95 part 2: persistent device-side scratch for the
+    // expert-sort + tile-table pipeline used by the grouped MMA
+    // dual_silu path. Allocated once at load() with
+    // `M_MAX_FOR_PERSISTENT` capacity; dispatch consults `m_max` +
+    // `max_per_expert` + `max_total_tiles` and falls back to per-
+    // call `arena.region()` when this prefill exceeds capacity.
+    pub mma_sort_scratch: Option<MmaSortScratch>,
 }
 
 /// Output of `Qwen36Bringup::forward_qwen_vision`.
@@ -1808,6 +1837,10 @@ impl Qwen36Bringup {
             kernels.load_ptx("fp8_mma_dual_silu_grouped_m16")?;
         let fn_fp8_mma_dual_silu_grouped_m16 = fp8_mma_dual_silu_grouped_m16_mod
             .get_function("fp8_mma_dual_silu_grouped_m16_kernel")?;
+        let fp8_mma_dual_silu_grouped_m16_w4_mod =
+            kernels.load_ptx("fp8_mma_dual_silu_grouped_m16_w4")?;
+        let fn_fp8_mma_dual_silu_grouped_m16_w4 = fp8_mma_dual_silu_grouped_m16_w4_mod
+            .get_function("fp8_mma_dual_silu_grouped_m16_w4_kernel")?;
         let fn_fp8_gemv_dual_silu_indirect = fp8_gemv_dual_silu_indirect_mod
             .get_function("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_kernel")?;
         let fp8_gemv_indirect_mod =
@@ -2032,6 +2065,8 @@ impl Qwen36Bringup {
             fn_qwen36_moe_tile_table,
             fp8_mma_dual_silu_grouped_m16_mod,
             fn_fp8_mma_dual_silu_grouped_m16,
+            fp8_mma_dual_silu_grouped_m16_w4_mod,
+            fn_fp8_mma_dual_silu_grouped_m16_w4,
             fp8_gemv_indirect_mod,
             fn_fp8_gemv_indirect,
             fp8_gemv_indirect_scaled_add_mod,
@@ -2450,6 +2485,7 @@ impl Qwen36Bringup {
             conv_state_layer_bytes,
             decode_capture: std::sync::Mutex::new(None),
             decode_capture_multi_step: std::sync::Mutex::new(None),
+            mma_sort_scratch: None,  // populated below
         };
         // Phase 4b-prep iter25: upload the constant identity block
         // table once. The paged-attention layer used to rebuild it
@@ -2803,6 +2839,61 @@ impl Qwen36Bringup {
                 },
                 Err(e) => eprintln!("[qwen36] vision probe: cannot read {path}: {e}"),
             }
+        }
+
+        // Task #95: pre-allocate persistent MMA sort scratch
+        // (sorted_per_expert + expert_counts + tile_descriptors +
+        // tile_count). Sized for M_MAX_FOR_PERSISTENT tokens × top_k
+        // assignments × 32× sigma per-expert headroom. Larger prompts
+        // fall through to per-call arena.region() at dispatch time.
+        //
+        // For M=16384, top_k=8, num_experts=256: ~32 MB persistent.
+        {
+            const M_MAX_FOR_PERSISTENT: u32 = 16384;
+            let top_k = bringup.arch.num_experts_per_tok as u32;
+            let num_experts = bringup.arch.num_experts as u32;
+            let total_assign = (M_MAX_FOR_PERSISTENT as usize) * (top_k as usize);
+            let typical_per_expert =
+                (total_assign + (num_experts as usize) - 1)
+                    / (num_experts as usize);
+            let max_per_expert: u32 = ((typical_per_expert * 32)
+                .max(256) as u32)
+                .min(total_assign as u32);
+            let max_total_tiles: u32 =
+                ((total_assign / 16 + (num_experts as usize) + 8) as u32)
+                    .min(total_assign as u32);
+
+            let sorted_bytes = (num_experts as usize)
+                * (max_per_expert as usize) * 2 * 4;
+            let counts_bytes = (num_experts as usize) * 4;
+            let tiles_bytes  = (max_total_tiles as usize) * 3 * 4;
+            let tcount_bytes = 4usize;
+
+            let sorted_region = bringup.arena.region(
+                "qwen36_mma_sort_persistent", sorted_bytes, 16)?;
+            let counts_region = bringup.arena.region(
+                "qwen36_mma_counts_persistent", counts_bytes, 16)?;
+            let tiles_region  = bringup.arena.region(
+                "qwen36_mma_tiles_persistent", tiles_bytes, 16)?;
+            let tcount_region = bringup.arena.region(
+                "qwen36_mma_tcount_persistent", tcount_bytes, 16)?;
+
+            bringup.mma_sort_scratch = Some(MmaSortScratch {
+                sorted_ptr: sorted_region.device_ptr(),
+                counts_ptr: counts_region.device_ptr(),
+                tiles_ptr:  tiles_region.device_ptr(),
+                tcount_ptr: tcount_region.device_ptr(),
+                m_max: M_MAX_FOR_PERSISTENT,
+                max_per_expert,
+                max_total_tiles,
+            });
+            eprintln!(
+                "[qwen36] MMA sort scratch persistent: M_max={M_MAX_FOR_PERSISTENT} \
+                 max_per_expert={max_per_expert} max_total_tiles={max_total_tiles} \
+                 — sorted={} KB tiles={} KB",
+                sorted_bytes / 1024,
+                tiles_bytes / 1024,
+            );
         }
 
         Ok(bringup)
@@ -10017,22 +10108,56 @@ impl Qwen36Bringup {
                     let counts_bytes  = (num_experts as usize) * 4;
                     let tiles_bytes   = (max_total_tiles as usize) * 3 * 4;
                     let tcount_bytes  = 4usize;
-                    let sorted_region = self.arena.region(
-                        "qwen36_pmb_moe_sorted", sorted_bytes, 16)?;
-                    let counts_region = self.arena.region(
-                        "qwen36_pmb_moe_counts", counts_bytes, 16)?;
-                    let tiles_region  = self.arena.region(
-                        "qwen36_pmb_moe_tiles", tiles_bytes, 16)?;
-                    let tcount_region = self.arena.region(
-                        "qwen36_pmb_moe_tcnt", tcount_bytes, 16)?;
+                    // Task #95 part 2: use persistent scratch when
+                    // this prefill's M fits the pre-allocated capacity.
+                    // Saves 4 arena.region() bump-pointer ops per layer
+                    // (~160 ops/prefill). Larger prompts fall back to
+                    // per-call alloc. The persistent buffers were sized
+                    // with the SAME formula so max_per_expert /
+                    // max_total_tiles are LARGER than this call needs —
+                    // safe to use without re-sizing.
+                    let (outer_sorted_p, outer_counts_p, outer_tiles_p,
+                         outer_tcount_p, eff_max_per_expert) =
+                        if let Some(p) = self.mma_sort_scratch.as_ref() {
+                            if m_full <= p.m_max
+                                && max_per_expert <= p.max_per_expert
+                                && max_total_tiles <= p.max_total_tiles {
+                                (p.sorted_ptr, p.counts_ptr, p.tiles_ptr,
+                                 p.tcount_ptr, p.max_per_expert)
+                            } else {
+                                let sr = self.arena.region(
+                                    "qwen36_pmb_moe_sorted", sorted_bytes, 16)?;
+                                let cr = self.arena.region(
+                                    "qwen36_pmb_moe_counts", counts_bytes, 16)?;
+                                let tr = self.arena.region(
+                                    "qwen36_pmb_moe_tiles", tiles_bytes, 16)?;
+                                let tcr = self.arena.region(
+                                    "qwen36_pmb_moe_tcnt", tcount_bytes, 16)?;
+                                (sr.device_ptr(), cr.device_ptr(),
+                                 tr.device_ptr(), tcr.device_ptr(),
+                                 max_per_expert)
+                            }
+                        } else {
+                            let sr = self.arena.region(
+                                "qwen36_pmb_moe_sorted", sorted_bytes, 16)?;
+                            let cr = self.arena.region(
+                                "qwen36_pmb_moe_counts", counts_bytes, 16)?;
+                            let tr = self.arena.region(
+                                "qwen36_pmb_moe_tiles", tiles_bytes, 16)?;
+                            let tcr = self.arena.region(
+                                "qwen36_pmb_moe_tcnt", tcount_bytes, 16)?;
+                            (sr.device_ptr(), cr.device_ptr(),
+                             tr.device_ptr(), tcr.device_ptr(),
+                             max_per_expert)
+                        };
 
                     // Zero expert_counts + tile_count.
                     let r1 = cuMemsetD32Async(
-                        counts_region.device_ptr(),
+                        outer_counts_p,
                         0u32, counts_bytes / 4,
                         self.stream.raw() as _);
                     let r2 = cuMemsetD32Async(
-                        tcount_region.device_ptr(),
+                        outer_tcount_p,
                         0u32, 1,
                         self.stream.raw() as _);
                     if r1 != CUresult::CUDA_SUCCESS
@@ -10052,12 +10177,12 @@ impl Qwen36Bringup {
                     // --- Launch 1: sort kernel ---
                     {
                         let mut tidx       = idx_b;            // top_idx ptr (alias of topk_idx_base)
-                        let mut sorted_ptr = sorted_region.device_ptr();
-                        let mut counts_ptr = counts_region.device_ptr();
+                        let mut sorted_ptr = outer_sorted_p;
+                        let mut counts_ptr = outer_counts_p;
                         let mut m_i        = m_full as i32;
                         let mut tk_i       = top_k as i32;
                         let mut ne_i       = num_experts as i32;
-                        let mut mpe_i      = max_per_expert as i32;
+                        let mut mpe_i      = eff_max_per_expert as i32;
                         let sort_args = [
                             (&mut tidx)       as *mut u64 as *mut core::ffi::c_void,
                             (&mut sorted_ptr) as *mut u64 as *mut core::ffi::c_void,
@@ -10099,9 +10224,9 @@ impl Qwen36Bringup {
 
                     // --- Launch 2: tile-table kernel ---
                     {
-                        let mut counts_ptr = counts_region.device_ptr();
-                        let mut tiles_ptr  = tiles_region.device_ptr();
-                        let mut tcount_ptr = tcount_region.device_ptr();
+                        let mut counts_ptr = outer_counts_p;
+                        let mut tiles_ptr  = outer_tiles_p;
+                        let mut tcount_ptr = outer_tcount_p;
                         let mut ne_i       = num_experts as i32;
                         let mut mt_i       = max_total_tiles as i32;
                         let tt_args = [
@@ -10146,7 +10271,7 @@ impl Qwen36Bringup {
                     {
                         let rc = cuMemcpyDtoHAsync_v2(
                             (&mut tile_count_host) as *mut i32 as *mut core::ffi::c_void,
-                            tcount_region.device_ptr(),
+                            outer_tcount_p,
                             4,
                             self.stream.raw() as _,
                         );
@@ -10227,8 +10352,8 @@ impl Qwen36Bringup {
                         let mut bsg3     = gate_bs;
                         let mut bsu3     = up_bs;
                         let mut inp3     = normed_region.device_ptr();
-                        let mut sorted_p = sorted_region.device_ptr();
-                        let mut tiles_p  = tiles_region.device_ptr();
+                        let mut sorted_p = outer_sorted_p;
+                        let mut tiles_p  = outer_tiles_p;
                         let mut ws3: i64 = int_per_expert_w as i64;
                         let mut ss3: i64 = (int_per_expert_bs / 4) as i64;
                         let mut mfull_i  = num_tokens as i32;
@@ -10236,7 +10361,7 @@ impl Qwen36Bringup {
                         let mut k_i3     = k_in as i32;
                         let mut ncb3     = num_col_blocks_int;
                         let mut tk_i3    = top_k as i32;
-                        let mut mpe_i3   = max_per_expert as i32;
+                        let mut mpe_i3   = eff_max_per_expert as i32;
                         let gargs = [
                             (&mut out_p3)   as *mut u64 as *mut core::ffi::c_void,
                             (&mut bwg3)     as *mut u64 as *mut core::ffi::c_void,
@@ -10255,13 +10380,41 @@ impl Qwen36Bringup {
                             (&mut tk_i3)    as *mut i32 as *mut core::ffi::c_void,
                             (&mut mpe_i3)   as *mut i32 as *mut core::ffi::c_void,
                         ];
-                        let g_grid = (((n_int + 7) / 8).max(1), tile_count_host as u32, 1u32);
+                        // Task #95: W=4 multi-warp variant covers 32 N
+                        // cols per block (vs 8 for W=1). Use it when
+                        // N is divisible by 32 (qwen36 moe_int=512
+                        // satisfies). Opt-in env keeps the W=1 path
+                        // accessible for A/B diagnostics.
+                        let prefer_w4 = (n_int % 32 == 0)
+                            && std::env::var("RVLLM_QWEN36_MOE_MMA_GROUPED_W4")
+                                .map(|s| !matches!(s.as_str(), "0" | "false"))
+                                .unwrap_or(true);
+                        let (g_fn, g_grid_x, g_block, g_smem): (
+                            cudarc::driver::sys::CUfunction, u32, u32, u32) =
+                            if prefer_w4 {
+                                (
+                                    self.outside_kernels
+                                        .fn_fp8_mma_dual_silu_grouped_m16_w4
+                                        .raw() as CUfunction,
+                                    ((n_int + 31) / 32).max(1),
+                                    128u32,    // 4 warps
+                                    2624u32,   // smem: 512 + 4*256 + 4*256 + 64
+                                )
+                            } else {
+                                (
+                                    self.outside_kernels
+                                        .fn_fp8_mma_dual_silu_grouped_m16
+                                        .raw() as CUfunction,
+                                    ((n_int + 7) / 8).max(1),
+                                    32u32,
+                                    1088u32,
+                                )
+                            };
                         let rc = cuLaunchKernel(
-                            self.outside_kernels.fn_fp8_mma_dual_silu_grouped_m16
-                                .raw() as CUfunction,
-                            g_grid.0, g_grid.1, g_grid.2,
-                            32, 1, 1,
-                            1088,  // smem: A 512 + B_g 256 + B_u 256 + ascale 64
+                            g_fn,
+                            g_grid_x, tile_count_host as u32, 1u32,
+                            g_block, 1, 1,
+                            g_smem,
                             self.stream.raw() as CUstream,
                             gargs.as_ptr() as *mut *mut core::ffi::c_void,
                             core::ptr::null_mut(),
