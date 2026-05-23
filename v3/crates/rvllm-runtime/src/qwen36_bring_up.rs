@@ -236,6 +236,14 @@ pub struct Qwen36OutsideKernels {
     /// per decode token.
     pub fp8_gemv_indirect_scaled_add_mod: LoadedModule,
     pub fn_fp8_gemv_indirect_scaled_add: KernelFn,
+    /// Phase 8 down k_round-batch fusion (2026-05-23): fuses the
+    /// 8-iter host loop of `fp8_gemv_indirect_scaled_add` calls
+    /// (one per k_round) into ONE launch. Each warp owns one
+    /// (m, n) output slot and sequentially processes top_k
+    /// k_rounds with a warp-local f32 accumulator — no atomic,
+    /// no global RMW per k_round (just one at the end).
+    pub fp8_gemv_indirect_scaled_add_kround_batched_mod: LoadedModule,
+    pub fn_fp8_gemv_indirect_scaled_add_kround_batched: KernelFn,
     /// Phase 8 shared-expert fusion (2026-05-23): fused FP8 GEMV
     /// (single-expert, f16 in) + scaled f32 accumulate with a
     /// device-pointer scalar weight. Drop-in for the
@@ -1682,6 +1690,12 @@ impl Qwen36Bringup {
             .load_ptx("fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add")?;
         let fn_fp8_gemv_indirect_scaled_add = fp8_gemv_indirect_scaled_add_mod
             .get_function("fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_kernel")?;
+        let fp8_gemv_indirect_scaled_add_kround_batched_mod = kernels.load_ptx(
+            "fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_kround_batched")?;
+        let fn_fp8_gemv_indirect_scaled_add_kround_batched =
+            fp8_gemv_indirect_scaled_add_kround_batched_mod.get_function(
+                "fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_kround_batched_kernel",
+            )?;
         let fp8_gemv_f16in_scaled_add_devw_mod =
             kernels.load_ptx("fp8_gemv_f16in_scaled_add_devw")?;
         let fn_fp8_gemv_f16in_scaled_add_devw = fp8_gemv_f16in_scaled_add_devw_mod
@@ -1869,6 +1883,8 @@ impl Qwen36Bringup {
             fn_fp8_gemv_indirect,
             fp8_gemv_indirect_scaled_add_mod,
             fn_fp8_gemv_indirect_scaled_add,
+            fp8_gemv_indirect_scaled_add_kround_batched_mod,
+            fn_fp8_gemv_indirect_scaled_add_kround_batched,
             fp8_gemv_f16in_scaled_add_devw_mod,
             fn_fp8_gemv_f16in_scaled_add_devw,
             flash_attention_mod,
@@ -9931,71 +9947,54 @@ impl Qwen36Bringup {
                 }
             }
         }
-        for i in 0..(if skip_routed_ffn { 0 } else { top_k }) {
-            let idx_ptr_i = topk_idx_base + (i as u64) * 4;
-            let w_ptr_i = topk_w_base + (i as u64) * 4;
-            // silu slice for this k_round: [m, n_int] at offset
-            // `i * mid_bytes` from silu_region base.
-            let silu_kround_ptr = silu_region.device_ptr()
-                + (i as u64) * (mid_bytes as u64);
-            // Phase 8 MoE-fusion (2026-05-23): fused indirect-
-            // down-GEMV + scaled f32 accumulate. Replaces the
-            // separate (fp8_gemv_indirect → down_region f16 →
-            // scaled_add_f16_to_f32_devw) pair with ONE kernel:
-            // reads input + expert idx + topk_w, computes the
-            // FP8 GEMV exactly as before, then on lane 0 does
-            // `routed_sum[n] = routed_sum[n] + topk_w * acc`
-            // directly (no f16 round-trip, no second launch).
-            //
-            // Numerical contract: identical inner GEMV reduction
-            // (same fp8 decode, blockscale loads, lane stride,
-            // warp-shuffle). Epilogue eliminates the f16 round-
-            // trip the original (down → scaled_add) pair did,
-            // PRESERVING precision (and accidentally making the
-            // accumulation more accurate). Per-element accumulator
-            // is touched by exactly one thread → no atomic needed.
+        if !skip_routed_ffn && top_k > 0 {
+            // Phase 8 down k_round-batch fusion (2026-05-23):
+            // ONE launch handles all top_k k_rounds for every
+            // (m, n_down) via per-warp sequential accumulation.
+            // The literal dual_silu+down megakernel is infeasible
+            // (recomputing silu_mul per output element would
+            // explode work by ~2048x); this is the closest
+            // tractable analog — fuse the 8 down launches into 1
+            // by exploiting per-warp f32-register accumulation,
+            // no atomic, no global RMW per k_round.
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut acc_f32 = routed_sum_region.device_ptr();
                 let mut bw = moe.experts_down_proj_fused.offset_bytes;
                 let mut bs = down_bs;
-                // Phase 8 dual_silu k_round-batch: read this
-                // iteration's silu slice from the k_round-batched
-                // silu_region layout.
-                let mut inp = silu_kround_ptr;
-                let mut idx_p = idx_ptr_i;
-                let mut devw = w_ptr_i;
+                let mut inp = silu_region.device_ptr();  // [top_k, m, n_int]
+                let mut idx_b = topk_idx_base;
+                let mut wp = topk_w_base;
                 let mut w_stride = down_per_expert_w as i64;
                 let mut s_stride_elems = (down_per_expert_bs / 4) as i64;
                 let mut m_i = m as i32;
                 let mut n_i = n_down as i32;
                 let mut k_i = k_down as i32;
                 let mut ncb = ((k_down + 127) / 128) as i32;
+                let mut tk_i = top_k as i32;
                 let args = [
                     (&mut acc_f32) as *mut u64 as *mut core::ffi::c_void,
                     (&mut bw) as *mut u64 as *mut core::ffi::c_void,
                     (&mut bs) as *mut u64 as *mut core::ffi::c_void,
                     (&mut inp) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut idx_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut devw) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut idx_b) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut wp) as *mut u64 as *mut core::ffi::c_void,
                     (&mut w_stride) as *mut i64 as *mut core::ffi::c_void,
                     (&mut s_stride_elems) as *mut i64 as *mut core::ffi::c_void,
                     (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
                     (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
                     (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
                     (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut tk_i) as *mut i32 as *mut core::ffi::c_void,
                 ];
                 let grid = ((n_down + 7) / 8, m, 1u32);
                 let block = (256u32, 1u32, 1u32);
                 let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_fp8_gemv_indirect_scaled_add.raw() as CUfunction,
-                    grid.0,
-                    grid.1,
-                    grid.2,
-                    block.0,
-                    block.1,
-                    block.2,
+                    self.outside_kernels.fn_fp8_gemv_indirect_scaled_add_kround_batched
+                        .raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block.0, block.1, block.2,
                     0,
                     stream_raw as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -10003,11 +10002,29 @@ impl Qwen36Bringup {
                 );
                 if rc != CUresult::CUDA_SUCCESS {
                     return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 fp8_gemv_indirect_scaled_add launch",
+                        "qwen36 fp8_gemv_indirect_scaled_add_kround_batched launch",
                         rvllm_core::CudaErrorKind::LaunchFailed,
                         rvllm_core::CudaCtx::setup(),
                     ));
                 }
+            }
+        }
+        // (Legacy per-k_round loop kept dead-code-gated so the
+        // arena layout / closure captures stay identical to the
+        // pre-fusion build; the fused launch above handles all
+        // k_rounds in one go.)
+        for i in 0..0usize {
+            let idx_ptr_i = topk_idx_base + (i as u64) * 4;
+            let w_ptr_i = topk_w_base + (i as u64) * 4;
+            let silu_kround_ptr = silu_region.device_ptr()
+                + (i as u64) * (mid_bytes as u64);
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let _ = (idx_ptr_i, w_ptr_i, silu_kround_ptr,
+                         routed_sum_region.device_ptr(),
+                         moe.experts_down_proj_fused.offset_bytes,
+                         down_bs, down_per_expert_w, down_per_expert_bs,
+                         m, n_down, k_down, stream_raw);
             }
             // (Old: separate scaled_add_f16_to_f32_devw call has
             // been folded into the fused kernel above. Kept the

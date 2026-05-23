@@ -246,6 +246,11 @@
       "path": "fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_batched_topk.ptx",
       "sha256": "ffdcd99c539be0e88db5ff7f0830a248c45653ea079cdf8b77e1da8613dd39c9"
     },
+    "fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_kround_batched": {
+      "bytes": 27631,
+      "path": "fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_kround_batched.ptx",
+      "sha256": "0800c2f60bf89fe113cc5f5cec4bb03d1cf605f21984fb3b7f47187a8db8cf39"
+    },
     "fp8_gemv_f16in_residual_add": {
       "bytes": 23476,
       "path": "fp8_gemv_f16in_residual_add.ptx",
@@ -1062,5 +1067,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "d2ee6b2"
+  "revision": "314dbe6"
 }
