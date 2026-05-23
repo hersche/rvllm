@@ -1068,6 +1068,36 @@ prefill / MTP / shared-expert chains. The fusion targets ONLY
 the per-k-round routed-expert pair in the per-token decode
 hot-path.
 
+### Phase 8 MoE batched-prefill + shared-expert fusion — SHIPPED 2026-05-23
+
+Two follow-on MoE fusions on top of f0f79d5's per-token win.
+
+**Batched-prefill fusion (commit `8060834`)**: new kernel
+`fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_batched_topk_kernel`
+mirrors the per-token f0f79d5 epilogue but for the batched-MoE
+prefill path (`apply_layer_moe_batched`). Reads per-row
+`top_w[m * top_k + k_round]` and accumulates `w * acc` directly
+to `routed_sum[m*N+n]`. Replaces the (down_indirect_batched_topk
++ scaled_add_f16_to_f32_devw_batched_topk) pair with ONE launch
+per k-round across the entire token batch.
+
+Latency A/B (qwen3-6-35b-a3b, 150-token photosynthesis,
+DECODE_GRAPH unset):
+- `RVLLM_QWEN36_BATCH_MOE_PREFILL=0` (fusion never fires): 2.66s
+- Default (fused batched-prefill on): **2.54s** (~4.5% faster)
+Scales linearly with prompt length × MoE layers × k-rounds.
+
+**Shared-expert fusion (commit `99e6cde`)**: new kernel
+`fp8_gemv_blockwise_wpr_native_f16in_scaled_add_devw_kernel`
+fuses the shared-expert down-projection + the trailing
+scaled-add into one launch. Per-token decode shared-expert
+chain now runs 3 launches per layer instead of 4 (gate+up+silu
++mul fused; down+scaled_add fused; sigmoid_gate stands alone).
+Saves 40 launches per decode token at 40 MoE layers.
+
+Latency: 1.708s / 1.709s / 1.709s (deterministic, ≈10 ms
+faster than yesterday's 1.717s post-MoE-fusion baseline).
+
 ### Phase 8 other-models fusion (qwen27b dense) — SHIPPED 2026-05-23
 
 Commit `39f7c1a` ports the same fusion pattern to the Qwen 3.5/3.6
