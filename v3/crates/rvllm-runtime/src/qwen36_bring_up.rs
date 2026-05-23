@@ -8531,50 +8531,62 @@ impl Qwen36Bringup {
         }
         // No fence: q/k/v projections run on the same stream.
 
+        // Phase 8 QKV megakernel Phase 2: env-gated opt-in. When
+        // set and the KV-cache dtype is F16, ALL of the proj +
+        // split + norm + RoPE + KV-write chain (steps 2-5 below)
+        // is replaced by a single megakernel launch. Default off
+        // so production paths stay on the existing chain.
+        let qkv_megakernel_on =
+            std::env::var("RVLLM_QWEN36_QKV_MEGAKERNEL").as_deref() == Ok("1")
+                && matches!(self.kv_dtype, Qwen36KvDtype::F16);
+
         // 2. q_proj, k_proj, v_proj GEMVs.
         let q_region = self.arena.region("qwen36_pf_qg", (q_n as usize) * 2, 16)?;
         let k_region = self.arena.region("qwen36_pf_k", (k_n as usize) * 2, 16)?;
         let v_region = self.arena.region("qwen36_pf_v", (v_n as usize) * 2, 16)?;
+        let _ = (&q_region, &k_region, &v_region);
         // Phase 4a: route projections through `fp8_proj_dispatch`.
         // At m=1 (today's caller) this dispatches to the same
         // Fp8GemvF16InLaunch byte-identically. Phase 4b/5/7 will
         // flip m=1 → m=num_tokens and the dispatcher will pick up
         // CUTLASS SM120 (m≥128) automatically — no further edits
         // needed in this function.
-        unsafe {
-            self.fp8_proj_dispatch(
-                kernel_gemv,
-                q_region.device_ptr(),
-                fl.q_proj.offset_bytes,
-                q_bs,
-                normed_region.device_ptr(),
-                m,
-                q_n,
-                hidden,
-                stream_raw,
-            )?;
-            self.fp8_proj_dispatch(
-                kernel_gemv,
-                k_region.device_ptr(),
-                fl.k_proj.offset_bytes,
-                k_bs,
-                normed_region.device_ptr(),
-                m,
-                k_n,
-                hidden,
-                stream_raw,
-            )?;
-            self.fp8_proj_dispatch(
-                kernel_gemv,
-                v_region.device_ptr(),
-                fl.v_proj.offset_bytes,
-                v_bs,
-                normed_region.device_ptr(),
-                m,
-                v_n,
-                hidden,
-                stream_raw,
-            )?;
+        if !qkv_megakernel_on {
+            unsafe {
+                self.fp8_proj_dispatch(
+                    kernel_gemv,
+                    q_region.device_ptr(),
+                    fl.q_proj.offset_bytes,
+                    q_bs,
+                    normed_region.device_ptr(),
+                    m,
+                    q_n,
+                    hidden,
+                    stream_raw,
+                )?;
+                self.fp8_proj_dispatch(
+                    kernel_gemv,
+                    k_region.device_ptr(),
+                    fl.k_proj.offset_bytes,
+                    k_bs,
+                    normed_region.device_ptr(),
+                    m,
+                    k_n,
+                    hidden,
+                    stream_raw,
+                )?;
+                self.fp8_proj_dispatch(
+                    kernel_gemv,
+                    v_region.device_ptr(),
+                    fl.v_proj.offset_bytes,
+                    v_bs,
+                    normed_region.device_ptr(),
+                    m,
+                    v_n,
+                    hidden,
+                    stream_raw,
+                )?;
+            }
         }
         // No fence: split_q_gate runs on the same stream.
 
@@ -8590,40 +8602,42 @@ impl Qwen36Bringup {
         let gate_region = self
             .arena
             .region("qwen36_pf_gt", q_size * (m as usize) * 2, 16)?;
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let mut qo = q_split_region.device_ptr();
-            let mut go = gate_region.device_ptr();
-            let mut qi = q_region.device_ptr();
-            let mut nh: i32 = num_heads as i32;
-            let mut hd_i: i32 = head_dim as i32;
-            let args = [
-                (&mut qo) as *mut u64 as *mut core::ffi::c_void,
-                (&mut go) as *mut u64 as *mut core::ffi::c_void,
-                (&mut qi) as *mut u64 as *mut core::ffi::c_void,
-                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
-                (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let rc = cuLaunchKernel(
-                self.outside_kernels.fn_split_q_gate_f16.raw() as CUfunction,
-                num_heads,
-                m,
-                1,
-                head_dim,
-                1,
-                1,
-                0,
-                self.stream.raw() as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 full_attn split_q_gate launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
+        if !qkv_megakernel_on {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut qo = q_split_region.device_ptr();
+                let mut go = gate_region.device_ptr();
+                let mut qi = q_region.device_ptr();
+                let mut nh: i32 = num_heads as i32;
+                let mut hd_i: i32 = head_dim as i32;
+                let args = [
+                    (&mut qo) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut go) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut qi) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_split_q_gate_f16.raw() as CUfunction,
+                    num_heads,
+                    m,
+                    1,
+                    head_dim,
+                    1,
+                    1,
+                    0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 full_attn split_q_gate launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
         }
 
@@ -8689,6 +8703,87 @@ impl Qwen36Bringup {
         // shared with the Qwen 3.5 27B NVFP4 wiring.
         #[cfg(feature = "cuda")]
         match self.kv_dtype {
+            Qwen36KvDtype::F16 if qkv_megakernel_on => unsafe {
+                // Phase 8 QKV-megakernel Phase 2 (F16-KV): single-
+                // launch fusion of Q+K+V projections + norm + RoPE
+                // + KV-write. Skipped steps 2-5 of the unfused
+                // chain (gated on `RVLLM_QWEN36_QKV_MEGAKERNEL=1`).
+                use cudarc::driver::sys::*;
+                let mut input_p = normed_region.device_ptr();
+                let mut w_q = fl.q_proj.offset_bytes;
+                let mut w_k = fl.k_proj.offset_bytes;
+                let mut w_v = fl.v_proj.offset_bytes;
+                let mut s_q = q_bs;
+                let mut s_k = k_bs;
+                let mut s_v = v_bs;
+                let mut q_out_p = q_split_region.device_ptr();
+                let mut gate_out_p = gate_region.device_ptr();
+                let mut kc = k_cache_layer_ptr;
+                let mut vc = v_cache_layer_ptr;
+                let mut cos_p = self.rope_cos;
+                let mut sin_p = self.rope_sin;
+                let mut qn_p = fl.q_norm.offset_bytes;
+                let mut kn_p = fl.k_norm.offset_bytes;
+                let mut pos_p = pos_dev_ptr;
+                let mut slot_p = slot_dev_ptr;
+                let mut nt: i32 = m as i32;
+                let mut nh: i32 = num_heads as i32;
+                let mut nkh: i32 = num_kv_heads as i32;
+                let mut hd_i: i32 = head_dim as i32;
+                let mut hi: i32 = hidden as i32;
+                let mut rd: i32 = rotary_dim as i32;
+                let mut ncb_q: i32 = (hidden as i32) / 128;
+                let mut ncb_kv: i32 = (hidden as i32) / 128;
+                let mut eps_f: f32 = eps;
+                let args = [
+                    (&mut input_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_q) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_k) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_v) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_q) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_k) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_v) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_out_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut gate_out_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut kc) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut vc) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut qn_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut kn_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hi) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb_q) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb_kv) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut eps_f) as *mut f32 as *mut core::ffi::c_void,
+                ];
+                let grid_y = num_heads + 2 * num_kv_heads;
+                let block_x: u32 = (head_dim * 2) as u32;
+                let rc = cuLaunchKernel(
+                    self.outside_kernels
+                        .fn_fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv
+                        .raw() as CUfunction,
+                    m as u32, grid_y, 1,
+                    block_x, 1, 1,
+                    0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 full_attn qkv_megakernel launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            },
             Qwen36KvDtype::F16 => unsafe {
                 // Phase 8 QKV-megakernel Phase 1: Q-norm + K-norm
                 // FUSED into the RoPE+KV-write kernel via two
