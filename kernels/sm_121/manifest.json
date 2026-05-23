@@ -246,6 +246,11 @@
       "path": "fp8_gemv_f16in_residual_add.ptx",
       "sha256": "9c1f99f167164ccd2118e9cf2539007f658254cd9b336a3947095f3bd1d38e2c"
     },
+    "fp8_gemv_f16in_scaled_add_devw": {
+      "bytes": 23669,
+      "path": "fp8_gemv_f16in_scaled_add_devw.ptx",
+      "sha256": "48db3f851fbabb740d0e36619fca862a972ab1c28f70b6c70e33a44e00e9eb00"
+    },
     "fp8_mma_smem_probe": {
       "bytes": 2967,
       "path": "fp8_mma_smem_probe.ptx",
@@ -1042,5 +1047,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "ab0f9c4"
+  "revision": "8060834"
 }

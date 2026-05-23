@@ -205,6 +205,14 @@ pub struct Qwen36OutsideKernels {
     /// per decode token.
     pub fp8_gemv_indirect_scaled_add_mod: LoadedModule,
     pub fn_fp8_gemv_indirect_scaled_add: KernelFn,
+    /// Phase 8 shared-expert fusion (2026-05-23): fused FP8 GEMV
+    /// (single-expert, f16 in) + scaled f32 accumulate with a
+    /// device-pointer scalar weight. Drop-in for the
+    /// (shared_expert_down + scaled_add_f16_to_f32_devw) pair in
+    /// the per-token MoE shared-expert chain. Eliminates 1 launch
+    /// + 1 f16 round-trip per layer per token.
+    pub fp8_gemv_f16in_scaled_add_devw_mod: LoadedModule,
+    pub fn_fp8_gemv_f16in_scaled_add_devw: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -1627,6 +1635,10 @@ impl Qwen36Bringup {
             .load_ptx("fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add")?;
         let fn_fp8_gemv_indirect_scaled_add = fp8_gemv_indirect_scaled_add_mod
             .get_function("fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_kernel")?;
+        let fp8_gemv_f16in_scaled_add_devw_mod =
+            kernels.load_ptx("fp8_gemv_f16in_scaled_add_devw")?;
+        let fn_fp8_gemv_f16in_scaled_add_devw = fp8_gemv_f16in_scaled_add_devw_mod
+            .get_function("fp8_gemv_blockwise_wpr_native_f16in_scaled_add_devw_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_f16kv =
             flash_attention_mod.get_function("flash_attention_2_f16kv_kernel")?;
@@ -1800,6 +1812,8 @@ impl Qwen36Bringup {
             fn_fp8_gemv_indirect,
             fp8_gemv_indirect_scaled_add_mod,
             fn_fp8_gemv_indirect_scaled_add,
+            fp8_gemv_f16in_scaled_add_devw_mod,
+            fn_fp8_gemv_f16in_scaled_add_devw,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             fn_flash_attention_2_f16kv,
@@ -10026,19 +10040,16 @@ impl Qwen36Bringup {
                     ));
                 }
             }
-            unsafe {
-                self.fp8_proj_dispatch(
-                    kernel_gemv,
-                    down_region.device_ptr(),
-                    moe.shared_expert_down_proj.offset_bytes,
-                    sh_down_bs,
-                    silu_region.device_ptr(),
-                    m,
-                    n_down,
-                    k_down,
-                    stream_raw,
-                )?;
-            }
+            // Phase 8 shared-expert fusion (2026-05-23): the
+            // shared_expert_down GEMV and the subsequent
+            // scaled_add_f16_to_f32_devw collapse into a single
+            // kernel below — `fp8_gemv_f16in_scaled_add_devw`.
+            // The standalone down GEMV here is skipped; the fused
+            // closer below reads `silu_region` + the sigmoid
+            // scalar + accumulates to `routed_sum_region` directly.
+            let _ = kernel_gemv;
+            let _ = down_region.device_ptr();
+            let _ = sh_down_bs;
             // shared_expert_gate is Linear(hidden→1) per vLLM
             // qwen3_next.py:127-133: gate_logit = weight · normed_hidden
             // (scalar per token), then sigmoid(gate_logit) scales the
@@ -10087,33 +10098,42 @@ impl Qwen36Bringup {
                     ));
                 }
             }
-            // GPU scaled_add (devw variant): routed_sum_region +=
-            // *sg_sigmoid_region * down_region. Reads the sigmoid
-            // from the device scalar produced by the kernel above —
-            // stream-ordered, no fence or host round-trip.
+            // Fused shared-expert (down + scaled-add) kernel:
+            // computes the FP8 GEMV exactly as the standalone
+            // `fp8_gemv_blockwise_wpr_native_f16in_kernel`, then on
+            // lane 0 reads routed_sum[m*N+n], adds
+            // *sg_sigmoid_region * acc, writes back. Replaces the
+            // (down → scaled_add_f16_to_f32_devw) pair with ONE
+            // launch.
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut acc = routed_sum_region.device_ptr();
-                let mut input = down_region.device_ptr();
+                let mut weight = moe.shared_expert_down_proj.offset_bytes;
+                let mut scl = sh_down_bs;
+                let mut inp = silu_region.device_ptr();
                 let mut devw = sg_sigmoid_region.device_ptr();
-                let mut nn = n_down as i32;
+                let mut m_i = m as i32;
+                let mut n_i = n_down as i32;
+                let mut k_i = k_down as i32;
+                let mut ncb = ((k_down + 127) / 128) as i32;
                 let args = [
                     (&mut acc) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut weight) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut scl) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut inp) as *mut u64 as *mut core::ffi::c_void,
                     (&mut devw) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
                 ];
-                let block: u32 = 256;
-                let grid = (n_down as u32 + block - 1) / block;
+                let grid = ((n_down + 7) / 8, m, 1u32);
+                let block = (256u32, 1u32, 1u32);
                 let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_scaled_add_f16_to_f32_devw.raw() as CUfunction,
-                    grid,
-                    1,
-                    1,
-                    block,
-                    1,
-                    1,
+                    self.outside_kernels.fn_fp8_gemv_f16in_scaled_add_devw.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block.0, block.1, block.2,
                     0,
                     stream_raw as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -10121,7 +10141,7 @@ impl Qwen36Bringup {
                 );
                 if rc != CUresult::CUDA_SUCCESS {
                     return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 scaled_add_f16_to_f32_devw launch",
+                        "qwen36 fp8_gemv_f16in_scaled_add_devw (shared-expert fused) launch",
                         rvllm_core::CudaErrorKind::LaunchFailed,
                         rvllm_core::CudaCtx::setup(),
                     ));
