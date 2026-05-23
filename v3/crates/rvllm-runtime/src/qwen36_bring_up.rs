@@ -281,6 +281,13 @@ pub struct Qwen36OutsideKernels {
     // `RVLLM_QWEN36_MOE_MMA_GROUPED_W4=1` (alongside `_GROUPED=1`).
     pub fp8_mma_dual_silu_grouped_m16_w4_mod: LoadedModule,
     pub fn_fp8_mma_dual_silu_grouped_m16_w4: KernelFn,
+    // Task #96: cooperative A-staging sibling. All 128 threads stage
+    // the [16,32] A tile in one pass instead of warp-0 sequential.
+    // Opt-in via `RVLLM_QWEN36_MOE_MMA_GROUPED_W4_COOP=1` (default on
+    // when GROUPED+W4 are on; opt-out for A/B). 64 B extra smem for
+    // smem_token_idx broadcast.
+    pub fp8_mma_dual_silu_grouped_m16_w4c_mod: LoadedModule,
+    pub fn_fp8_mma_dual_silu_grouped_m16_w4c: KernelFn,
     pub fp8_gemv_indirect_mod: LoadedModule,
     pub fn_fp8_gemv_indirect: KernelFn,
     /// Phase 8 MoE-fusion (2026-05-23): fused FP8 GEMV (indirect-
@@ -1841,6 +1848,10 @@ impl Qwen36Bringup {
             kernels.load_ptx("fp8_mma_dual_silu_grouped_m16_w4")?;
         let fn_fp8_mma_dual_silu_grouped_m16_w4 = fp8_mma_dual_silu_grouped_m16_w4_mod
             .get_function("fp8_mma_dual_silu_grouped_m16_w4_kernel")?;
+        let fp8_mma_dual_silu_grouped_m16_w4c_mod =
+            kernels.load_ptx("fp8_mma_dual_silu_grouped_m16_w4c")?;
+        let fn_fp8_mma_dual_silu_grouped_m16_w4c = fp8_mma_dual_silu_grouped_m16_w4c_mod
+            .get_function("fp8_mma_dual_silu_grouped_m16_w4c_kernel")?;
         let fn_fp8_gemv_dual_silu_indirect = fp8_gemv_dual_silu_indirect_mod
             .get_function("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_kernel")?;
         let fp8_gemv_indirect_mod =
@@ -2067,6 +2078,8 @@ impl Qwen36Bringup {
             fn_fp8_mma_dual_silu_grouped_m16,
             fp8_mma_dual_silu_grouped_m16_w4_mod,
             fn_fp8_mma_dual_silu_grouped_m16_w4,
+            fp8_mma_dual_silu_grouped_m16_w4c_mod,
+            fn_fp8_mma_dual_silu_grouped_m16_w4c,
             fp8_gemv_indirect_mod,
             fn_fp8_gemv_indirect,
             fp8_gemv_indirect_scaled_add_mod,
@@ -10389,9 +10402,25 @@ impl Qwen36Bringup {
                             && std::env::var("RVLLM_QWEN36_MOE_MMA_GROUPED_W4")
                                 .map(|s| !matches!(s.as_str(), "0" | "false"))
                                 .unwrap_or(true);
+                        // Task #96: cooperative A-staging variant.
+                        // Default-on when GROUPED+W4 are on; opt out
+                        // for A/B with RVLLM_QWEN36_MOE_MMA_GROUPED_W4_COOP=0.
+                        let prefer_coop = prefer_w4
+                            && std::env::var("RVLLM_QWEN36_MOE_MMA_GROUPED_W4_COOP")
+                                .map(|s| !matches!(s.as_str(), "0" | "false"))
+                                .unwrap_or(true);
                         let (g_fn, g_grid_x, g_block, g_smem): (
                             cudarc::driver::sys::CUfunction, u32, u32, u32) =
-                            if prefer_w4 {
+                            if prefer_coop {
+                                (
+                                    self.outside_kernels
+                                        .fn_fp8_mma_dual_silu_grouped_m16_w4c
+                                        .raw() as CUfunction,
+                                    ((n_int + 31) / 32).max(1),
+                                    128u32,    // 4 warps
+                                    2688u32,   // 512+1024+1024+64+64
+                                )
+                            } else if prefer_w4 {
                                 (
                                     self.outside_kernels
                                         .fn_fp8_mma_dual_silu_grouped_m16_w4
