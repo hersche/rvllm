@@ -382,6 +382,24 @@ photosynthesis: 2.140s baseline → 1.717s (f0f79d5) → 1.708s
 (b1f221e)**. **Total ≈23% decode speedup** across today's
 stack.
 
+**Hidden-state → workspace refactor (commit `e13e2eb`)** — adds
+`hidden_dev_override: Option<u64>` to
+`forward_qwen36_decode_inner_with_workspace_overrides_v2`;
+when Some, all hidden-state reads/writes (embed_gather output,
+residual stream, vision-splice destination, layer loop's
+tok_ptr, closer's last_hidden_row_ptr) route through that
+pointer instead of the per-call arena `hidden_region`. The
+four closer fns (`outside_closer`, `_device_argmax`,
+`_device_argmax_with_link`, `_all`) refactored to take
+`hidden_dev_ptr: u64`. Workspace forward entry points plumb
+`Some(workspace.hidden_dev)`. Persistent workspace slot
+survives the inner-ckpt restore + is address-stable across
+requests, so the captured graph's hidden-state references stay
+valid forever — unlocks broader closer/post-attn fusion
+patterns. Hardware-validated coherent under
+DECODE_WORKSPACE=1 (1.648-1.652s, within noise of 1.654s
+eager) and DECODE_GRAPH=1 + REPLAY=1 (short + 1-10 counting).
+
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
 desired.
