@@ -1210,6 +1210,78 @@ path at M≥128 is unchanged.
 Production qwen3627b smoke ("Die Hauptstadt von Frankreich ist
 Paris.") verified after every restart.
 
+### fp8_gemv optimization attempts — shared-mem input staging is a no-op on GB10
+
+Tried 2026-05-23: replace the in-place global-memory input reads in
+`fp8_gemv_blockwise_wpr_native_f16in_kernel` with a cooperative
+shared-mem staging pass (8 warps in a block all process the same M,
+so they could share a single loaded copy of the input row). Capped
+at K_SMEM_CAP=6144 (12 KB at f16).
+
+A/B on qwen3-6-35b-a3b NVFP4-KV with QKV_MEGAKERNEL=1 (the same
+decode-hot-path the profile flagged as 64.3% fp8_gemv): smem-staging
+ON gave 40.32 tok/s, prefill 198 ms. Pre-change baseline was 40.45
+tok/s, prefill 197 ms. Within measurement noise — no measurable
+delta.
+
+Root cause: the L1 cache on sm_121 already absorbs the redundant
+input reads. With 8 warps × 32 lanes × stride-256 K access pattern,
+the 2 KB input row fits in 8 cache lines and gets ~100% L1 hit rate
+after the first warp loads it. Smem staging just moves the same
+work from L1 to smem with no bandwidth or latency reduction.
+
+Reverted. Real perf gains in this kernel would need either:
+- TensorCore MMA rewrite (FP8 → FP16 micro-GEMM that batches
+  multiple output rows simultaneously, replacing the lane-per-row
+  scalar FMA), multi-week project.
+- cp.async-based K-dim pipelining (overlap weight loads with prior
+  chunk's MAC compute), single-week project but requires careful
+  Blackwell-arch tuning.
+
+### Stream-6b drafter-Q rotation — math is right, NVFP4 noise is the killer
+
+2026-05-23 investigation. The original 2026-05-22 commit
+(`6ab88d4` primitives + `d75067c` wiring) claimed drafter-Q
+rotation produces coherent multi-token output on HADAMARD=1+V=1.
+Today's A/B against fresh binary gave accept_rate=0.000 (output
+coherent only because the BASE verify-fallback always wins).
+
+Math check: R = H · diag(D) where the FWHT applies 1/sqrt(D)
+normalization (see `kernels/hadamard.cuh::fwht_inplace_f32`).
+So R IS orthonormal, R^T R = I, and the dot-product invariance
+`(R·Q) · (R·K)^T = Q · K^T` should hold mathematically.
+
+But base K is rotated AND THEN NVFP4-quantized (4-bit with
+per-16-element FP8 microscale). The rotation reshapes the K
+distribution, and the NVFP4 quantization noise on the rotated
+distribution is structured differently than on the natural
+distribution the drafter was trained against. The drafter Q
+rotation correctly aligns the frames, but the drafter still
+mispredicts because the noise pattern is unfamiliar.
+
+Real fix would require drafter retraining against rotated-
+quantized K, OR a noise-compensation step on the drafter Q
+side. Neither is a code-edit. Production stays HADAMARD=0
+(accept_rate 1.056).
+
+### Phase 3 F16-shadow accept_rate gap — populate code suspect
+
+2026-05-23 investigation. F16-shadow stores pre-rotation /
+pre-quantization F16 K/V for the drafter to cross-attend to.
+Logical expectation: should give the same accept_rate as the
+HADAMARD=0 baseline (1.056) because the drafter sees the same
+unrotated unquantized values. Today's A/B: F16-shadow gives
+0.200 — 5× worse than baseline.
+
+The 0.200 result suggests the shadow buffer is populated with
+something other than the pre-rotation K (most likely the
+rotated-then-dequant K, which inherits the rotated-quant noise
+from `populate_shadow_kv_range_from_base`). Without walking
+that code path and validating what bytes land in the shadow
+region, we can't say more. Next-session work: dump the shadow
+buffer contents on each layer's populate and diff against the
+HADAMARD=0 KV cache contents.
+
 ### qwen36 decode profile — nsys 2025-05-23 (qwen3-6-35b-a3b NVFP4-KV)
 
 Captured with `nsys profile -y 25 -d 20 -t cuda
