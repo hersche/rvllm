@@ -104,7 +104,7 @@ sudo systemctl restart rvllm-serve
 | Gemma 4 E4B-it | `gemma4_bring_up.rs` | wired (`mobile-e4b-rvllm-nvfp4.env`). Validated 2026-05-15 with the full E4B modality stack — text + SigLIP vision (256 ViT tokens spliced, "orangefarbene kreisförmige Sonne" on ball.png) all coherent on the NVFP4 KV path. Vision/audio splice and NVFP4 attention are orthogonal code paths, so the combo required no new wiring. Family-specific knob: `RVLLM_NVFP4_HADAMARD=0` (E4B's smaller hidden=2560 + GQA-4 distribution makes Hadamard rotation degrade quality — opposite of 31B where it's required). |
 | Mistral 3.5 128B | `mistral35_bring_up.rs` | NVFP4 weights + NVFP4 KV (active production profile). |
 | Qwen 3.5 27B dense | `qwen35_bring_up.rs` | **wired 2026-05-14** (`mobile-qwen35-rvllm-nvfp4.env`). Five-step landing: KV allocator + dtype field, Qwen-specific `fused_rope_qwen_partial_nvfp4kv` kernel (NeoX partial RoPE with rotary_dim=64, amax6 V policy, no Hadamard), kernel load + Q-side scratch, decode dispatch (per-head FA-2 NVFP4, no GQA cap), prefill via per-token decode fallback. Validated on hardware: text + Qwen3-VL vision. F16 path bit-identical when `RVLLM_NVFP4_KV` is unset. |
-| Qwen 3.6 35B-A3B | `qwen36_bring_up.rs` | **wired 2026-05-15** (`mobile-qwen-rvllm-nvfp4.env`). 4-commit port (~384 LOC, 0dd5d98..d31b8ae): layout plumbing, kernel load, decode dispatch, prefill fallback. Both kernels (`fused_rope_qwen_partial_nvfp4kv` + `flash_attention_2_decode_nvfp4kv_kernel`) reused as-is from the Qwen 3.5 work — only the dispatch wiring is per-family. Per-head decode handles GQA=8 without split-decode. Batched prefill flips to per-token loop on Nvfp4; unified-NVFP4-prefill (PTX exists) is a follow-up. Validated on hardware: text (German ghost joke 31 tok in 1.07s) + Qwen3-VL vision (same caption as F16 baseline). KV memory at 4096 ctx: 20 MiB packed + 2.5 MiB scales vs 80 MiB F16 (3.5× reduction). F16 path bit-identical when the gate is off. |
+| Qwen 3.6 35B-A3B | `qwen36_bring_up.rs` | **wired 2026-05-15** (`mobile-qwen-rvllm-nvfp4.env`). 4-commit port (~384 LOC, 0dd5d98..d31b8ae): layout plumbing, kernel load, decode dispatch, prefill fallback. Both kernels (`fused_rope_qwen_partial_nvfp4kv` + `flash_attention_2_decode_nvfp4kv_kernel`) reused as-is from the Qwen 3.5 work — only the dispatch wiring is per-family. Per-head decode handles GQA=8 without split-decode. Batched prefill flips to per-token loop on Nvfp4; unified-NVFP4-prefill (PTX exists) is a follow-up. Validated on hardware: text (German ghost joke) + Qwen3-VL vision (same caption as F16 baseline). KV memory at 4096 ctx: 20 MiB packed + 2.5 MiB scales vs 80 MiB F16 (3.5× reduction). F16 path bit-identical when the gate is off. |
 
 ## Speculative decoding — Gemma 4 family (state as of 2026-05-17)
 
@@ -121,9 +121,8 @@ parked, see commit message of `689fba3`). Hardware-validated:
 
 * 3 factual prompts byte-identical to non-spec E4B
   ("Die Hauptstadt von Frankreich ist **Paris**.", etc.).
-* 80-token counting prompt: non-spec ~11.0 s vs spec ~4.47 s,
-  `accepted_per_verify=1.5`, `drafter_avg_ms=6.9`,
-  `verify_avg_ms=62.6`, `prefill_one_avg_ms=67.5`.
+* 80-token counting prompt: validated coherent end-to-end
+  (spec accept_len>0 commit fix + classical bonus push).
 * Drafter forward uses the centroid masked-embedding head
   (drafter ships `use_ordered_embeddings=true`).
 * ZeroClaw config (`~/workspace/data/zeroclaw/config.toml`)
@@ -229,7 +228,6 @@ What works:
 * Hardware: 31B spec produces **correct output** via the
   verify-fallback path ("Die Hauptstadt von Frankreich ist
   **Paris**."), but `accepted_per_verify = 0.0` always.
-  Drafter wall: ~28 ms/iter (vs E4B's ~7 ms).
 
 What we ruled out (all `accept_rate=0` regardless):
 * Source-pair: tried `(58,59) (52,53) (58,53) (52,59) (4,5)`
@@ -455,11 +453,9 @@ which never changed — confirms the same quant-noise floor).
   * 5 Europ. capitals: 10 / 24 drafted (42%), 2.0/verify
   * Explain Linux:     33 / 72 drafted (46%), 1.94/verify
 
-All outputs correct German. Wall is ~5% slower than eager on
-80-tok decode (compute-bound 31B dense, verify-cost amortisation
-still fails — same shape as mistral35 spec). Per user direction
-this is acceptable as long as quality is verified against HF,
-which the cosine table above establishes.
+All outputs correct German. Per user direction this is acceptable
+as long as quality is verified against HF, which the cosine table
+above establishes.
 
 **Why Hadamard + spec was breaking accept_rate to 0**: base
 attention's Hadamard rotation puts K/V in an orthogonally-
@@ -801,9 +797,7 @@ curl -s http://127.0.0.1:8010/v1/chat/completions -d \
 ## Qwen 3.6 batched prefill (Phases 4b/5/6/7) — production default
 
 Status (head `aac7220`): all transformer-stack batched-prefill
-phases are GREEN and **default-ON** in production. Per-request
-1.77×–2.69× TTFT improvement at N = 22 / 293 vs the legacy
-token-major path.
+phases are GREEN and **default-ON** in production.
 
 Five env-gates control the path; each is ON by default and can be
 opted out individually with `=0`:
@@ -830,12 +824,7 @@ the N = 22 canary).
 
 ### Bench
 `RVLLM_QWEN36_TIMING=1` logs per-prefill `[qwen36-timing]` lines
-with prompt_tokens + prefill_ms + per-gate state. Headline:
-* N = 22:  449 ms → 254 ms (1.77×, −43%)
-* N = 293: 6836 ms → 2539 ms (2.69×, −63%)
-
-The win scales with prompt length because per-token launch
-overhead dominates for the legacy path.
+with prompt_tokens + prefill_ms + per-gate state.
 
 ### Production rollout invariant — round-26 / 27 race fixes
 * `pos_cl_region` / `context_lens` / `positions` per-token slot
@@ -1225,7 +1214,7 @@ shared-mem `s_normalized` buffer to feed the rotation, then
 the unchanged FP8-Q quantise + NVFP4 K/V pack epilogue. Both
 KV-dtype branches now retire the standalone Q/K-norm
 launches. Hardware-validated coherent on NVFP4 production
-(qwen3635b NVFP4 spec profile) — 1.650s photosynthesis vs
+(qwen3635b NVFP4 spec profile).
 
 Saves 2 launches/layer in F16-KV mode (~22 launches/token at
 ~11 full-attn layers). Hardware-validated coherent on
@@ -1470,8 +1459,7 @@ adaptive `_max16` variant pattern documented in rule (3) above.
 
 Active branch `rusty_sm121_qwen36_26b`. **Production status: shipping** —
 ZeroClaw default for tool-heavy work. Full NVFP4-weights stack runs at
-~12 tok/s steady-state decode, accept rate ≈ 0.965 on real prompts
-(K=7 spec decode + adaptive draft length + batched-MLP-verify).
+K=7 spec decode + adaptive draft length + batched-MLP-verify.
 Loader + 60-layer decoder forward + unified-prefill + spec-decode +
 batched prefill all wired. Task #38's "31B NVFP4 native weight loader
 + decoder forward" acceptance criteria met.

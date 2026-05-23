@@ -177,9 +177,7 @@ Production race fixes en route:
   diagnosed by codex, structurally fixed via device-fill kernel
   `qwen_fill_pos_slots_i32`. Both token-major and layer-major.
 
-Bench (`RVLLM_QWEN36_TIMING=1`):
-* N = 22:  token-major 449 ms → all 5 gates 254 ms (1.77×, −43%).
-* N = 293: token-major 6836 ms → all 5 gates 2539 ms (2.69×, −63%).
+Bench instrumentation: `RVLLM_QWEN36_TIMING=1` logs prefill_ms.
 
 Default for all 5 gates is OFF until the prod-flip is taken explicitly;
 single-line change.
@@ -194,10 +192,7 @@ landing. Recent perf landings on `rusty_sm121_qwen36_26b`:
   accepts M<128 via internal zero-pad to M_pad=128 + first-M-
   rows-copy back. Profile defaults dropped MIN_TOKENS 128 → 8
   across MLP/LINEAR/FULL after a byte-equivalence sweep.
-  **4.3× speedup at M=89 prefill** (16.95s → 3.94s on the
-  520-char Linux prompt + 40 decode) and **3.8× at M=19**
-  (3.36s → 0.88s on the short prompt); md5 byte-equivalent
-  across all tested prompts.
+  md5 byte-equivalent across all tested prompts.
 * `68c6dbb` — NVFP4 batched-prefill cu_seqlens populator switched
   to stream-ordered `cuMemsetD32Async`. 16 sync HtoDs/request
   eliminated.
@@ -296,7 +291,7 @@ Follow-on commit `bcdce94` adds cross-request graph cache reuse via
 a persistent workspace at worker bring-up + an inner RAII arena
 checkpoint+restore guard at decode_inner entry. The captured graph
 from request N is now valid for request N+1 (all device pointers
-stable). First request after worker startup pays the ≈600-700ms
+stable). First request after worker startup pays the
 capture+instantiate cost; every subsequent request skips it.
 
 Multi-step macro-replay + argmax+link fusion (commits `a14af12`,
@@ -421,11 +416,9 @@ reads change from raw `q_in`/`k_in` to shared-mem
 `s_normalized` (head_dim f32) populated by Phase 1. Both
 KV-dtype branches now retire the standalone Q/K-norm
 rmsnorm_inplace launches. Hardware-validated coherent on
-production NVFP4-KV (qwen3635b spec profile, NVFP4=1):
-1.650s for 150-token photosynthesis vs 1.654s baseline
-(within noise, consistent direction). Saves 2 launches per
-full-attn layer per decode token (~22/token at 11 layers)
-on the production path.
+production NVFP4-KV (qwen3635b spec profile, NVFP4=1).
+Saves 2 launches per full-attn layer per decode token
+(~22/token at 11 layers) on the production path.
 
 **Phase 2 QKV megakernel** (commits `fa48141` F16, `71fdf33` NVFP4,
 `b08774e` batched-prefill wiring). Single warp-cooperative kernel
