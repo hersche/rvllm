@@ -1264,23 +1264,47 @@ quantized K, OR a noise-compensation step on the drafter Q
 side. Neither is a code-edit. Production stays HADAMARD=0
 (accept_rate 1.056).
 
-### Phase 3 F16-shadow accept_rate gap — populate code suspect
+### Phase 3 F16-shadow accept_rate gap — **FIXED 2026-05-23** (commit `1449833`)
 
-2026-05-23 investigation. F16-shadow stores pre-rotation /
-pre-quantization F16 K/V for the drafter to cross-attend to.
-Logical expectation: should give the same accept_rate as the
-HADAMARD=0 baseline (1.056) because the drafter sees the same
-unrotated unquantized values. Today's A/B: F16-shadow gives
-0.200 — 5× worse than baseline.
+Root cause was confirmed: the legacy `populate_drafter_shadow_kv
+_with_rt` populated the drafter shadow via dequant-of-NVFP4 in the
+ROTATED frame (it inherits Hadamard rotation from the base K/V
+cache), so the drafter — whose Q-projection was trained against
+HF-native unrotated K — saw the wrong frame even with Stream-6b's
+drafter-Q rotation in place.
 
-The 0.200 result suggests the shadow buffer is populated with
-something other than the pre-rotation K (most likely the
-rotated-then-dequant K, which inherits the rotated-quant noise
-from `populate_shadow_kv_range_from_base`). Without walking
-that code path and validating what bytes land in the shadow
-region, we can't say more. Next-session work: dump the shadow
-buffer contents on each layer's populate and diff against the
-HADAMARD=0 KV cache contents.
+The fix is opt-in via `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` and has
+the base forward kernel `fused_rope_partial_nvfp4kv_bf16in_kernel`
+write POST-RoPE PRE-HADAMARD F16 K/V directly into the drafter's
+shadow buffer at the two spec source layers. The legacy populate
+path is short-circuited; `forward_drafter_layer_cross_attn` also
+skips drafter-Q rotation / un-rotation because Q and K are now
+both in HF-native frame.
+
+A/B (gemma-4-31b-it-nvfp4, 80-word quantum-entanglement prompt,
+greedy K=8, 90 emitted tokens, deterministic across 3 runs):
+
+| Cell                                       | accept_rate |
+|--------------------------------------------|-------------|
+| A: HADAMARD=0 + no shadow (baseline)       |   2.750     |
+| B: HADAMARD=0 + PRE_HAD_SHADOW=1           |   2.333     |
+| C: HADAMARD=1 + HADAMARD_V=1, no fix       |   0.000     |
+| C: HADAMARD=1 + HADAMARD_V=1 + fix         |   2.333     |
+
+Cell C without the fix collapses (drafter sees rotated K, rotated
+Q, but the cross-frame mismatch persists because base attention
+also reads from the same rotated cache). With the fix shipped
+here, HADAMARD=1 + spec lands at the same 2.333 as HADAMARD=0 +
+the shadow path — making the long-context-quality HADAMARD=1
+recipe viable with spec for the first time on Option B. Minor
+regression vs HADAMARD=0 + no shadow (2.75→2.33) is the cost of
+giving the drafter a slightly different KV view (zero quant noise,
+zero rotation) than the base sees (NVFP4-quant + Hadamard).
+
+Default-off; production stays on the HADAMARD=0 + no-shadow path
+(2.750). Recipe for HADAMARD=1 spec: set
+`RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
+_HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
 ### qwen36 decode profile — nsys 2025-05-23 (qwen3-6-35b-a3b NVFP4-KV)
 
