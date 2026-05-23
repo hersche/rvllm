@@ -1210,6 +1210,47 @@ path at M≥128 is unchanged.
 Production qwen3627b smoke ("Die Hauptstadt von Frankreich ist
 Paris.") verified after every restart.
 
+### qwen36 decode profile — nsys 2025-05-23 (qwen3-6-35b-a3b NVFP4-KV)
+
+Captured with `nsys profile -y 25 -d 20 -t cuda
+--cuda-trace-all-apis=true` wrapping rvllm-serve at startup; fired
+2 chat-completion requests (80 tokens each) inside the capture
+window. ~160 decode iterations, ~5s of measured GPU time, binary
+md5 `5eb81115...` (freshly built). Top kernels by total GPU time:
+
+  | Time% | Kernel                                                          | Instances | Per-call |
+  |-------|-----------------------------------------------------------------|-----------|----------|
+  | 30.9% | fp8_gemv_blockwise_wpr_native_f16in_kernel                      | 16,080    | 75 µs    |
+  | 19.8% | ..._dual_silu_indirect_kround_batched_kernel (MoE)              | 6,400     | 121 µs   |
+  | 12.6% | nvjet_sm121_qqhsh_mma_192x160x128_... (CUTLASS-like)            | 160       | 3074 µs  |
+  | 9.7%  | ..._indirect_scaled_add_kround_batched_kernel (MoE)             | 6,400     | 59 µs    |
+  | 8.8%  | gated_delta_rule_decode_f16_kernel (linear-attn)                | 4,740     | 72 µs    |
+  | 5.1%  | fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv_kernel     | 1,600     | 125 µs   |
+  | 3.3%  | flash_attention_2_decode_nvfp4kv_kernel                         | 1,580     | 81 µs    |
+  | 2.6%  | router_gemv_with_topk_f16_to_f32_kernel                         | 6,320     | 16 µs    |
+  | 2.6%  | ..._dual_silu_kernel                                            | 6,400     | 16 µs    |
+  | 1.3%  | ..._scaled_add_devw_kernel                                      | 6,320     | 8 µs     |
+
+Aggregated:
+- **FP8 GEMV family** (5 variants share inner reduction body):
+  **64.3% of GPU time** — THE bottleneck.
+- nvJet mma (CUTLASS-like GEMM, used at prefill / large-M sites):
+  12.6%.
+- Linear-attn decode kernel: 8.8%.
+- Full-attn QKV megakernel + FA2 decode: 8.4%.
+- Per-token launch overhead: 114,320 `cuLaunchKernel` calls
+  × 2.15 µs avg = ~245 ms over the 5-s window ≈ 5% of decode
+  time. Real but secondary to the FP8 GEMV cost.
+
+Implication: future perf work that doesn't touch the FP8 GEMV
+inner loop (warp-cooperative reduction, FP8 dequant, blockscale
+loads) caps at ~36% headroom. The highest-leverage attack is
+inside fp8_gemv itself: better dequant ILP, better K-dim
+pipelining, or replacing the GEMV with a CUTLASS-FP8 micro-GEMM
+that batches multiple output rows. Secondary attacks (saving
+more launches, fusing additional pairs) compete for the ~5%
+launch-overhead budget — diminishing returns.
+
 ### Phase 8 closer + last-block-residual_add fusion — SHIPPED 2026-05-23
 
 Commit `505e9ea` adds
