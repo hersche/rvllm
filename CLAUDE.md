@@ -1098,6 +1098,54 @@ Saves 40 launches per decode token at 40 MoE layers.
 Latency: 1.708s / 1.709s / 1.709s (deterministic, ≈10 ms
 faster than yesterday's 1.717s post-MoE-fusion baseline).
 
+### Phase 8 dual_silu k_round-batch + router+topk fusions — SHIPPED 2026-05-23
+
+Two more MoE-chain fusions on top of f0f79d5 + 8060834 + 99e6cde.
+
+**Dual_silu k_round-batch fusion (commit `442a72c`)**: new kernel
+`fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_kround_batched_kernel`
+adds `grid.z = top_k` to the existing dual_silu_indirect kernel.
+Each block reads its expert id from `top_idx[m*top_k + blockIdx.z]`
+and writes silu to `[k_round, m, n]` (k_round-major layout).
+Replaces the host-side loop of 8 separate dual_silu launches per
+MoE layer (both `apply_layer_moe_with_override` per-token decode
+AND `apply_layer_moe_batched` prefill path) with ONE launch.
+silu_region grows from `[M, N_int]` to `[top_k, M, N_int]`; the
+down loop stays as 8 launches because routed_sum accumulation
+must serialize across k_rounds (no atomic).
+
+Per layer per decode token: 8 dual_silu launches → 1.
+**2.4% decode speedup** (1.717s → 1.676s on 150-token
+photosynthesis; ~33 ms saved per request).
+
+**Router+topk fusion (commit `e049258`)**: new kernel
+`router_gemv_with_topk_f16_to_f32_kernel` uses the atomic-counter
+"last-block-does-topk" pattern. Every block computes one expert's
+logit (stage 1, same as standalone router_gemv); after
+`__threadfence + atomicAdd(counter)`, the block whose prev value
+== num_experts - 1 is LAST and proceeds to stage 2 (topk-softmax,
+same as standalone topk_softmax_f32). Last block self-resets the
+counter via atomicExch. Persistent counter region allocated once
+at worker bring-up + zeroed via 4-byte HtoD; no per-call memset
+needed. Eliminates 1 launch per MoE layer per token (~40 per
+decode token).
+
+Below-noise speedup measured (1.675s vs dual_silu-only 1.676s)
+— ~40 launches × 5 µs ≈ 200 µs/token ≈ 1.4%, expected to land
+below the ±5ms measurement noise on a 14ms/token decode. Real
+architectural improvement nonetheless (one less GPU-side
+synchronization point, eliminates the explicit logits_region
+write to global).
+
+Cumulative Phase 8 MoE-fusion stack progression on
+qwen3-6-35b-a3b 150-token photosynthesis:
+- Pre-fusion baseline: 2.140s
+- After per-token down+scaled_add (f0f79d5): 1.717s
+- After shared-expert down+scaled_add (99e6cde): 1.708s
+- After dual_silu kround-batch (442a72c): 1.676s
+- After router+topk (e049258): 1.675s
+- **Total ≈22% decode speedup** across today's MoE fusion stack.
+
 ### Phase 8 other-models fusion (qwen27b dense) — SHIPPED 2026-05-23
 
 Commit `39f7c1a` ports the same fusion pattern to the Qwen 3.5/3.6
