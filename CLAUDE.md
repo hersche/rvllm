@@ -1147,6 +1147,30 @@ qwen3-6-35b-a3b 150-token photosynthesis:
 - After down kround-batch (b1f221e): **1.644s**
 - **Total ≈23% decode speedup** across today's MoE fusion stack.
 
+### Phase 8 multi-step graph with persistent hidden — SHIPPED 2026-05-23
+
+Commit `eb26d86` builds on e13e2eb: the multi-step macro-graph
+capture body (try_capture_decode_steps_n + its eager fallback
++ the pure-eager branch of decode_steps_n_via_graph_or_eager)
+no longer re-allocates `hidden_region` via
+`arena.region("qwen36_pl_hidden", ...)` per iteration. With
+the hidden_dev_override path active, the decode-step body
+writes hidden state to `workspace.hidden_dev` (persistent
+above scratch_ck) and the fused closer reads from the SAME
+address — same-stream serial ordering keeps body-writes-then-
+closer-reads correct within each iteration.
+
+Result on qwen3-6-35b-a3b at N=8:
+- **Macro-graph node count: 14840 → 7160** (cut nearly in
+  half). The per-iter arena.region call + the captured-graph
+  bookkeeping it implied are gone from the kernel sequence.
+- **Multi-step replay latency: 2.188s → 1.727s** (≈21%
+  multi-step improvement; deterministic across 5 cached
+  replays). Still ~80 ms slower than single-step replay
+  (1.644s baseline) — likely per-node dispatch overhead at
+  7160 nodes; single-step remains the recommended path,
+  multi-step is operator-opt-in.
+
 ### Phase 8 hidden-state → workspace refactor — SHIPPED 2026-05-23
 
 Commit `e13e2eb` routes the hidden-state residual stream
