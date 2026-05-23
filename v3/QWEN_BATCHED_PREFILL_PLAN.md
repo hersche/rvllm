@@ -426,19 +426,33 @@ gamma*inv_norm in-place; Phase 2 standard rotation + KV-
 cache write. Each thread covers both halves of its
 (tid, tid+half_head) pair so the non-rotary tail
 [rotary_dim, head_dim) gets normalised without relying on
-the in-place trick the unfused kernel used. Wired for F16-KV
-branch only (NVFP4 RoPE kernel has fp8 K-quantisation +
-microscale internals that need a separate sibling). Saves 2
-launches per full-attn layer per token in F16-KV mode (~22
-launches/token at 11 layers). Hardware-validated coherent on
-qwen3-6-35b-a3b F16-KV + production NVFP4-KV regression-
+the in-place trick the unfused kernel used. F16-KV-only
+wiring; NVFP4 follow-on flagged. Hardware-validated coherent
+on qwen3-6-35b-a3b F16-KV + production NVFP4-KV regression-
 clean. F16-KV path is memory-bandwidth-bound (2.528s for 150-
 token decode vs NVFP4's 1.654s); the fusion's launch savings
-are below noise on this dominantly memory-bound path. Phase
-2 of the full megakernel — folding the 3 FP8 GEMV projection
-launches into the same kernel — is the substantial follow-on
-(~1000+ LOC of additional CUDA work with shared-memory tile
-management for the K-dim reduction across hidden=2048).
+are below noise on this dominantly memory-bound path.
+
+**NVFP4-KV sibling (commit `6f6a25a`)** — same 2-phase
+structure ported to the NVFP4 RoPE kernel:
+`fused_qnorm_knorm_rope_qwen_partial_nvfp4kv_kernel`. The
+fp8 K-quantisation + microscale + per-token Q-scale cache
+internals are preserved verbatim; only the rotation's input
+reads change from raw `q_in`/`k_in` to shared-mem
+`s_normalized` (head_dim f32) populated by Phase 1. Both
+KV-dtype branches now retire the standalone Q/K-norm
+rmsnorm_inplace launches. Hardware-validated coherent on
+production NVFP4-KV (qwen3635b spec profile, NVFP4=1):
+1.650s for 150-token photosynthesis vs 1.654s baseline
+(within noise, consistent direction). Saves 2 launches per
+full-attn layer per decode token (~22/token at 11 layers)
+on the production path.
+
+Phase 2 of the full megakernel — folding the 3 FP8 GEMV
+projection launches into the same kernel — is the
+substantial follow-on (~1000+ LOC of additional CUDA work
+with shared-memory tile management for the K-dim reduction
+across hidden=2048).
 
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
