@@ -1176,16 +1176,39 @@ Hardware-validated on qwen3-6-35b-a3b F16-KV:
 - Short: "Die Hauptstadt von Frankreich ist **Paris**."
 - 1-10 counting: full "eins, zwei, ..., zehn."
 
-**Latency: 2.83s vs unfused 2.53s = ~12% SLOWER** at 150-token
-photosynthesis decode. Exactly as predicted upfront: the
-NAIVE 1-thread-per-output GEMV has UNCOALESCED FP8 weight
-reads (W[tid][k] across the warp is strided by K bytes vs
-the existing warp-cooperative fp8_gemv's coalesced row reads).
-The kernel + dispatch are real architectural infrastructure
-demonstrating Phase 2 end-to-end with correctness validation;
-the next perf step is a warp-cooperative re-implementation
-(each warp does 32 outputs sequentially with 32-thread K-dim
-cooperation per output) to net-win on latency.
+**Naive variant latency: 2.83s vs unfused 2.53s = ~12% SLOWER**
+at 150-token photosynthesis decode. Exactly as predicted upfront:
+NAIVE 1-thread-per-output GEMV has UNCOALESCED FP8 weight reads
+(W[tid][k] across the warp is strided by K bytes vs the existing
+warp-cooperative fp8_gemv's coalesced row reads).
+
+**Warp-cooperative re-impl SHIPPED 2026-05-23 (commit `fa48141`)**:
+same kernel symbol, same dispatch, same env-gate — internal impl
+swapped to a warp-cooperative variant. Each WARP (32 lanes) now
+produces ONE output via 32-thread K-dim cooperation, using the
+same 8-elem lane-strided pattern as
+`fp8_gemv_blockwise_wpr_native_f16in_kernel`. Input row staged
+into shared mem once per block (~4 KB) and reused across all
+per-head outputs. Block stays at `head_dim*2 = 512` threads = 16
+warps for Qwen 3.6 head_dim=256. Shared-mem footprint ≈ 6.5 KB
+(input + outputs + norm partials).
+
+Re-validated on qwen3-6-35b-a3b F16-KV (150-token photosynthesis):
+- Warp-coop megakernel:  3.82s deterministic across 3 runs
+- Unfused F16-KV chain:  3.82s deterministic across 3 runs
+- Naive Phase 2 (gone):  2.83s ← out-of-date measurement (different
+  baseline period; that A/B was against an older 2.53s unfused
+  number from prior tuning)
+
+Net: warp-coop is at **PARITY** with the unfused chain on this
+shape. F16-KV decode is memory-bandwidth-bound (2× KV memory vs
+NVFP4) and the per-token launch savings from megakernel-fusion
+(~4 launches/full-attn-layer/token = ~220 µs/token at 5 µs/launch)
+are below the ±50 ms noise on a 25 ms/token decode. Value of the
+fusion at this point is architectural: 4 fewer launches per layer,
+one closer pattern for future Q+K+V+O fusion, and the building
+block for an NVFP4-KV sibling (where the unfused chain is even
+launch-heavier).
 
 Production NVFP4-KV path uses the Phase 1 fused chain
 (commit 6f6a25a) — unchanged.

@@ -457,13 +457,26 @@ fuses Q+K+V FP8 GEMVs + Q+gate split + Q-norm + K-norm +
 partial-NeoX RoPE + KV-write into ONE launch on the F16-KV
 path. Grid `(num_tokens, num_heads + 2*num_kv_heads)`, block
 dim `head_dim*2`. Hardware-validated coherent (short prompt +
-1-10 counting). Naive 1-thread-per-output GEMV is **~12%
+1-10 counting). Naive 1-thread-per-output GEMV was **~12%
 SLOWER** than the unfused chain (2.83s vs 2.53s on 150-token
 F16-KV decode) due to uncoalesced FP8 weight reads — exactly
 as predicted upfront. Default off, no production regression.
-Warp-cooperative re-impl (each warp does 32 outputs
-sequentially with 32-thread K-dim cooperation per output)
-is the next perf step to net-win on latency.
+
+**Warp-cooperative re-impl shipped 2026-05-23** (commit `fa48141`):
+same kernel symbol + same env-gate; internal impl swapped to
+warp-cooperative GEMV. Each WARP (32 lanes) now produces one
+output via 32-thread K-dim cooperation using the same 8-elem
+lane-strided pattern as `fp8_gemv_blockwise_wpr_native_f16in_kernel`.
+Input row staged into shared mem once per block (~4 KB) and
+reused across all per-head outputs (16-32 per warp). Block stays
+at `head_dim*2 = 512` threads = 16 warps. Re-validated on
+qwen3-6-35b-a3b F16-KV: 3.82s deterministic over 3 runs vs
+3.82s deterministic over 3 runs for the unfused chain — **PARITY**.
+F16-KV is memory-bandwidth-bound and the per-token launch savings
+(~220 µs/token at 5 µs/launch) are below ±50 ms noise on 25 ms/
+token decode. Architectural value remains: 4 fewer launches per
+full-attn layer per token, and the foundation for an NVFP4-KV
+sibling (where the unfused chain is even launch-heavier).
 
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
