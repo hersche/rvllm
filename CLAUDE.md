@@ -1170,11 +1170,14 @@ each thread writes BOTH halves of its pair (so the non-rotary
 tail [rotary_dim, head_dim) gets normalised even without the
 in-place trick the unfused kernel relied on).
 
-Wired for F16-KV branch only; NVFP4-KV keeps the standalone
-Q-norm/K-norm + existing NVFP4 RoPE kernel (extending the
-fusion to NVFP4 is the next step — the NVFP4 RoPE kernel has
-more complex internals: fp8 K-quantisation, per-block
-microscale, per-token Q-scale cache).
+Wired for F16-KV branch initially; NVFP4-KV follow-on shipped
+in commit `6f6a25a` — same 2-phase per-head structure with
+shared-mem `s_normalized` buffer to feed the rotation, then
+the unchanged FP8-Q quantise + NVFP4 K/V pack epilogue. Both
+KV-dtype branches now retire the standalone Q/K-norm
+launches. Hardware-validated coherent on NVFP4 production
+(qwen3635b NVFP4 spec profile) — 1.650s photosynthesis vs
+1.654s baseline (within noise, consistent direction).
 
 Saves 2 launches/layer in F16-KV mode (~22 launches/token at
 ~11 full-attn layers). Hardware-validated coherent on
