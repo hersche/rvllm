@@ -7843,6 +7843,21 @@ impl Qwen36Bringup {
             )?;
         }
 
+        // Phase 8 batched QKV megakernel (2026-05-23): when the
+        // env-gate is on AND the batch is small (< CUTLASS M
+        // threshold), the entire steps-2-through-5 chain (3 fp8_proj
+        // GEMVs + split_q_gate + Q-norm + K-norm + RoPE + KV-write
+        // and, on NVFP4, Q FP8 quant + K/V NVFP4 pack) collapses to
+        // ONE megakernel launch — same kernel as the per-token decode
+        // path (commit fa48141 / 71fdf33), which is M-agnostic at the
+        // block level (grid.x = num_tokens). Gated to num_tokens < 128
+        // because at M ≥ 128 the unfused path's `fp8_proj_dispatch`
+        // routes to CUTLASS SM120 blockwise FP8 GEMM, which is much
+        // faster than the warp-coop GEMV used by the megakernel —
+        // taking the megakernel above 128 would be a regression.
+        let qkv_megakernel_on =
+            std::env::var("RVLLM_QWEN36_QKV_MEGAKERNEL").as_deref() == Ok("1")
+                && num_tokens < 128;
         // 2. Q/K/V projections at m=num_tokens via dispatcher.
         let q_region = self
             .arena
@@ -7853,40 +7868,42 @@ impl Qwen36Bringup {
         let v_region = self
             .arena
             .region("qwen36_pfb_v", n * (v_n as usize) * 2, 16)?;
-        unsafe {
-            self.fp8_proj_dispatch(
-                kernel_gemv,
-                q_region.device_ptr(),
-                fl.q_proj.offset_bytes,
-                q_bs,
-                normed_region.device_ptr(),
-                num_tokens,
-                q_n,
-                hidden,
-                stream_raw,
-            )?;
-            self.fp8_proj_dispatch(
-                kernel_gemv,
-                k_region.device_ptr(),
-                fl.k_proj.offset_bytes,
-                k_bs,
-                normed_region.device_ptr(),
-                num_tokens,
-                k_n,
-                hidden,
-                stream_raw,
-            )?;
-            self.fp8_proj_dispatch(
-                kernel_gemv,
-                v_region.device_ptr(),
-                fl.v_proj.offset_bytes,
-                v_bs,
-                normed_region.device_ptr(),
-                num_tokens,
-                v_n,
-                hidden,
-                stream_raw,
-            )?;
+        if !qkv_megakernel_on {
+            unsafe {
+                self.fp8_proj_dispatch(
+                    kernel_gemv,
+                    q_region.device_ptr(),
+                    fl.q_proj.offset_bytes,
+                    q_bs,
+                    normed_region.device_ptr(),
+                    num_tokens,
+                    q_n,
+                    hidden,
+                    stream_raw,
+                )?;
+                self.fp8_proj_dispatch(
+                    kernel_gemv,
+                    k_region.device_ptr(),
+                    fl.k_proj.offset_bytes,
+                    k_bs,
+                    normed_region.device_ptr(),
+                    num_tokens,
+                    k_n,
+                    hidden,
+                    stream_raw,
+                )?;
+                self.fp8_proj_dispatch(
+                    kernel_gemv,
+                    v_region.device_ptr(),
+                    fl.v_proj.offset_bytes,
+                    v_bs,
+                    normed_region.device_ptr(),
+                    num_tokens,
+                    v_n,
+                    hidden,
+                    stream_raw,
+                )?;
+            }
         }
 
         // 3. split_q_gate batched: kernel grid is (num_heads, m, 1).
@@ -7894,40 +7911,42 @@ impl Qwen36Bringup {
         let qsize_us = q_size as usize;
         let q_split_region = self.arena.region("qwen36_pfb_qs", n * qsize_us * 2, 16)?;
         let gate_region = self.arena.region("qwen36_pfb_gt", n * qsize_us * 2, 16)?;
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let mut qo = q_split_region.device_ptr();
-            let mut go = gate_region.device_ptr();
-            let mut qi = q_region.device_ptr();
-            let mut nh: i32 = num_heads as i32;
-            let mut hd_i: i32 = head_dim as i32;
-            let args = [
-                (&mut qo) as *mut u64 as *mut core::ffi::c_void,
-                (&mut go) as *mut u64 as *mut core::ffi::c_void,
-                (&mut qi) as *mut u64 as *mut core::ffi::c_void,
-                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
-                (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let rc = cuLaunchKernel(
-                self.outside_kernels.fn_split_q_gate_f16.raw() as CUfunction,
-                num_heads,
-                num_tokens,
-                1,
-                head_dim,
-                1,
-                1,
-                0,
-                self.stream.raw() as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 full_attn_batched split_q_gate",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
+        if !qkv_megakernel_on {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut qo = q_split_region.device_ptr();
+                let mut go = gate_region.device_ptr();
+                let mut qi = q_region.device_ptr();
+                let mut nh: i32 = num_heads as i32;
+                let mut hd_i: i32 = head_dim as i32;
+                let args = [
+                    (&mut qo) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut go) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut qi) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_split_q_gate_f16.raw() as CUfunction,
+                    num_heads,
+                    num_tokens,
+                    1,
+                    head_dim,
+                    1,
+                    1,
+                    0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 full_attn_batched split_q_gate",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
         }
 
@@ -7935,29 +7954,31 @@ impl Qwen36Bringup {
         // grid.x rows of length hidden each; treating each (token,
         // head) as one row gives us the needed per-head normalisation
         // across all tokens in one launch each.
-        unsafe {
-            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: num_heads * num_tokens,
-                hidden: head_dim,
-                eps,
+        if !qkv_megakernel_on {
+            unsafe {
+                rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                    num_tokens: num_heads * num_tokens,
+                    hidden: head_dim,
+                    eps,
+                }
+                .launch(
+                    self.outside_kernels.fn_rmsnorm_inplace_f16,
+                    q_split_region.device_ptr(),
+                    fl.q_norm.offset_bytes,
+                    stream_raw,
+                )?;
+                rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                    num_tokens: num_kv_heads * num_tokens,
+                    hidden: head_dim,
+                    eps,
+                }
+                .launch(
+                    self.outside_kernels.fn_rmsnorm_inplace_f16,
+                    k_region.device_ptr(),
+                    fl.k_norm.offset_bytes,
+                    stream_raw,
+                )?;
             }
-            .launch(
-                self.outside_kernels.fn_rmsnorm_inplace_f16,
-                q_split_region.device_ptr(),
-                fl.q_norm.offset_bytes,
-                stream_raw,
-            )?;
-            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                num_tokens: num_kv_heads * num_tokens,
-                hidden: head_dim,
-                eps,
-            }
-            .launch(
-                self.outside_kernels.fn_rmsnorm_inplace_f16,
-                k_region.device_ptr(),
-                fl.k_norm.offset_bytes,
-                stream_raw,
-            )?;
         }
 
         // 5. RoPE + KV-cache write batched. Both Qwen RoPE kernels
@@ -7992,6 +8013,180 @@ impl Qwen36Bringup {
         };
         #[cfg(feature = "cuda")]
         match self.kv_dtype {
+            // Phase 8 batched QKV megakernel (F16-KV) — one launch
+            // replaces steps 2-5 entirely (3 GEMVs + split + Q-norm
+            // + K-norm + RoPE + KV-write). Same kernel as the per-
+            // token decode path (commit fa48141), launched with
+            // m = num_tokens. Gated to num_tokens < 128 above.
+            Qwen36KvDtype::F16 if qkv_megakernel_on => unsafe {
+                use cudarc::driver::sys::*;
+                let mut input_p = normed_region.device_ptr();
+                let mut w_q = fl.q_proj.offset_bytes;
+                let mut w_k = fl.k_proj.offset_bytes;
+                let mut w_v = fl.v_proj.offset_bytes;
+                let mut s_q = q_bs;
+                let mut s_k = k_bs;
+                let mut s_v = v_bs;
+                let mut q_out_p = q_split_region.device_ptr();
+                let mut gate_out_p = gate_region.device_ptr();
+                let mut kc = k_cache_layer_ptr;
+                let mut vc = v_cache_layer_ptr;
+                let mut cos_p = self.rope_cos;
+                let mut sin_p = self.rope_sin;
+                let mut qn_p = fl.q_norm.offset_bytes;
+                let mut kn_p = fl.k_norm.offset_bytes;
+                let mut pos_p = positions_dev_ptr;
+                let mut slot_p = positions_dev_ptr;
+                let mut nt: i32 = num_tokens as i32;
+                let mut nh: i32 = num_heads as i32;
+                let mut nkh: i32 = num_kv_heads as i32;
+                let mut hd_i: i32 = head_dim as i32;
+                let mut hi: i32 = hidden as i32;
+                let mut rd: i32 = rotary_dim as i32;
+                let mut ncb_q: i32 = (hidden as i32) / 128;
+                let mut ncb_kv: i32 = (hidden as i32) / 128;
+                let mut eps_f: f32 = eps;
+                let args = [
+                    (&mut input_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_q) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_k) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_v) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_q) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_k) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_v) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_out_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut gate_out_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut kc) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut vc) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut qn_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut kn_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hi) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb_q) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb_kv) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut eps_f) as *mut f32 as *mut core::ffi::c_void,
+                ];
+                let grid_y = num_heads + 2 * num_kv_heads;
+                let block_x: u32 = (head_dim * 2) as u32;
+                let rc = cuLaunchKernel(
+                    self.outside_kernels
+                        .fn_fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv
+                        .raw() as CUfunction,
+                    num_tokens, grid_y, 1,
+                    block_x, 1, 1,
+                    0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 full_attn_batched qkv_megakernel launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            },
+            // Phase 8 batched QKV megakernel (NVFP4-KV) — sibling of
+            // the F16 arm above (commit 71fdf33).
+            Qwen36KvDtype::Nvfp4 if qkv_megakernel_on => unsafe {
+                use cudarc::driver::sys::*;
+                let fn_mega = self
+                    .outside_kernels
+                    .fn_fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv
+                    .expect(
+                        "qwen36 NVFP4 QKV megakernel not loaded — \
+                         RVLLM_NVFP4_KV env gate inconsistency",
+                    );
+                let mut input_p = normed_region.device_ptr();
+                let mut w_q = fl.q_proj.offset_bytes;
+                let mut w_k = fl.k_proj.offset_bytes;
+                let mut w_v = fl.v_proj.offset_bytes;
+                let mut s_q = q_bs;
+                let mut s_k = k_bs;
+                let mut s_v = v_bs;
+                let mut q_fp8_out = q_fp8_ptr;
+                let mut gate_out_p = gate_region.device_ptr();
+                let mut kc_packed = k_cache_layer_ptr;
+                let mut vc_packed = v_cache_layer_ptr;
+                let mut kc_scale = k_scale_layer_ptr;
+                let mut vc_scale = v_scale_layer_ptr;
+                let mut cos_p = self.rope_cos;
+                let mut sin_p = self.rope_sin;
+                let mut qn_p = fl.q_norm.offset_bytes;
+                let mut kn_p = fl.k_norm.offset_bytes;
+                let mut pos_p = positions_dev_ptr;
+                let mut slot_p = positions_dev_ptr;
+                let mut q_scale_static = q_scale_cache_ptr;
+                let mut q_scale_dyn = q_scale_cache_ptr;
+                let mut nt: i32 = num_tokens as i32;
+                let mut nh: i32 = num_heads as i32;
+                let mut nkh: i32 = num_kv_heads as i32;
+                let mut hd_i: i32 = head_dim as i32;
+                let mut hi: i32 = hidden as i32;
+                let mut rd: i32 = rotary_dim as i32;
+                let mut ncb_q: i32 = (hidden as i32) / 128;
+                let mut ncb_kv: i32 = (hidden as i32) / 128;
+                let mut eps_f: f32 = eps;
+                let args = [
+                    (&mut input_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_q) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_k) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_v) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_q) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_k) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_v) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_fp8_out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut gate_out_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut kc_packed) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut vc_packed) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut kc_scale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut vc_scale) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut qn_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut kn_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_scale_static) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut q_scale_dyn) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hi) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb_q) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb_kv) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut eps_f) as *mut f32 as *mut core::ffi::c_void,
+                ];
+                let grid_y = num_heads + 2 * num_kv_heads;
+                let block_x: u32 = (head_dim * 2) as u32;
+                let rc = cuLaunchKernel(
+                    fn_mega.raw() as CUfunction,
+                    num_tokens, grid_y, 1,
+                    block_x, 1, 1,
+                    0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 full_attn_batched qkv_megakernel_nvfp4 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            },
             Qwen36KvDtype::F16 => unsafe {
                 use cudarc::driver::sys::*;
                 let mut q_in_p = q_split_region.device_ptr();
