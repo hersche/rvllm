@@ -291,6 +291,12 @@ pub struct Qwen36OutsideKernels {
     /// k-round (3 ker. * 8 = 24 launches per layer instead of N*8*3).
     pub fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk_mod: LoadedModule,
     pub fn_fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk: KernelFn,
+    /// Phase 8 MoE-fusion follow-on (2026-05-23): fused indirect
+    /// FP8 GEMV + scaled f32 accumulate, batched over num_tokens.
+    /// Drop-in for the (indirect_batched_topk + scaled_add_batched
+    /// _topk) pair in the qwen36 prefill / batched-decode path.
+    pub fp8_gemv_indirect_scaled_add_batched_topk_mod: LoadedModule,
+    pub fn_fp8_gemv_indirect_scaled_add_batched_topk: KernelFn,
     /// Phase 6b / Round-27: row-batched indirect FP8 dual-silu GEMV
     /// for the MoE gate+up-proj fused path.
     pub fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk_mod: LoadedModule,
@@ -1668,6 +1674,12 @@ impl Qwen36Bringup {
         let fn_fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk =
             fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk_mod
                 .get_function("fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk_kernel")?;
+        let fp8_gemv_indirect_scaled_add_batched_topk_mod = kernels.load_ptx(
+            "fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_batched_topk")?;
+        let fn_fp8_gemv_indirect_scaled_add_batched_topk = fp8_gemv_indirect_scaled_add_batched_topk_mod
+            .get_function(
+                "fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_batched_topk_kernel",
+            )?;
         let fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk_mod = kernels
             .load_ptx("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk")?;
         let fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk =
@@ -1816,6 +1828,8 @@ impl Qwen36Bringup {
             fn_topk_softmax_batched_f32,
             fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk_mod,
             fn_fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk,
+            fp8_gemv_indirect_scaled_add_batched_topk_mod,
+            fn_fp8_gemv_indirect_scaled_add_batched_topk,
             fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk_mod,
             fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk,
             scaled_add_f16_to_f32_devw_batched_topk_mod,
@@ -9201,15 +9215,25 @@ impl Qwen36Bringup {
                         ));
                     }
                 }
-                // (b) down_indirect_batched_topk: down[N, n_down]
+                // (b+c) Fused down_indirect_batched_topk +
+                // scaled_add_batched_topk (Phase 8 MoE-fusion
+                // follow-on, 2026-05-23). Single-kernel replacement
+                // for the back-to-back pair: writes f32-accumulated
+                // routed_sum[m*hidden + n] directly via lane 0,
+                // reads top_w[m*top_k + k_round] per row. Eliminates
+                // 1 launch + 1 f16 round-trip per k-round across
+                // the entire token batch — extends the f0f79d5 win
+                // from per-token decode to batched prefill /
+                // batched decode.
                 #[cfg(feature = "cuda")]
                 unsafe {
                     use cudarc::driver::sys::*;
-                    let mut out_p = down_b.device_ptr();
+                    let mut acc = rs_b.device_ptr();
                     let mut bw = moe.experts_down_proj_fused.offset_bytes;
                     let mut bs = down_bs;
                     let mut inp = silu_b.device_ptr();
                     let mut idx_p = topk_idx_base;
+                    let mut wp = topk_w_base;
                     let mut wstride: i64 = down_per_expert_w as i64;
                     let mut sstride: i64 = (down_per_expert_bs / 4) as i64;
                     let mut nn = n_down as i32;
@@ -9219,11 +9243,12 @@ impl Qwen36Bringup {
                     let mut kr = k_round as i32;
                     let mut nt = num_tokens as i32;
                     let args = [
-                        (&mut out_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut acc) as *mut u64 as *mut core::ffi::c_void,
                         (&mut bw) as *mut u64 as *mut core::ffi::c_void,
                         (&mut bs) as *mut u64 as *mut core::ffi::c_void,
                         (&mut inp) as *mut u64 as *mut core::ffi::c_void,
                         (&mut idx_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut wp) as *mut u64 as *mut core::ffi::c_void,
                         (&mut wstride) as *mut i64 as *mut core::ffi::c_void,
                         (&mut sstride) as *mut i64 as *mut core::ffi::c_void,
                         (&mut nn) as *mut i32 as *mut core::ffi::c_void,
@@ -9237,7 +9262,7 @@ impl Qwen36Bringup {
                     let grid_x: u32 = ((n_down + 7) / 8).max(1);
                     let rc = cuLaunchKernel(
                         self.outside_kernels
-                            .fn_fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk
+                            .fn_fp8_gemv_indirect_scaled_add_batched_topk
                             .raw() as CUfunction,
                         grid_x,
                         num_tokens,
@@ -9252,56 +9277,12 @@ impl Qwen36Bringup {
                     );
                     if rc != CUresult::CUDA_SUCCESS {
                         return Err(rvllm_core::RvllmError::cuda(
-                            "qwen36 moe_routed_batched down_indirect_batched_topk",
+                            "qwen36 moe_routed_batched fused indirect+scaled_add",
                             rvllm_core::CudaErrorKind::LaunchFailed,
                             rvllm_core::CudaCtx::setup(),
                         ));
                     }
-                }
-                // (c) scaled_add_devw_batched_topk: rs_b += top_w[t,k] * down_b
-                #[cfg(feature = "cuda")]
-                unsafe {
-                    use cudarc::driver::sys::*;
-                    let mut acc = rs_b.device_ptr();
-                    let mut inp = down_b.device_ptr();
-                    let mut wp = topk_w_base;
-                    let mut hd = hidden as i32;
-                    let mut tk = top_k as i32;
-                    let mut kr = k_round as i32;
-                    let mut nt = num_tokens as i32;
-                    let args = [
-                        (&mut acc) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut inp) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut wp) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut tk) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut kr) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
-                    ];
-                    let block: u32 = 256;
-                    let grid_x: u32 = ((hidden + block - 1) / block).max(1);
-                    let rc = cuLaunchKernel(
-                        self.outside_kernels
-                            .fn_scaled_add_f16_to_f32_devw_batched_topk
-                            .raw() as CUfunction,
-                        grid_x,
-                        num_tokens,
-                        1,
-                        block,
-                        1,
-                        1,
-                        0,
-                        self.stream.raw() as CUstream,
-                        args.as_ptr() as *mut *mut core::ffi::c_void,
-                        core::ptr::null_mut(),
-                    );
-                    if rc != CUresult::CUDA_SUCCESS {
-                        return Err(rvllm_core::RvllmError::cuda(
-                            "qwen36 moe_routed_batched scaled_add_devw_batched_topk",
-                            rvllm_core::CudaErrorKind::LaunchFailed,
-                            rvllm_core::CudaCtx::setup(),
-                        ));
-                    }
+                    let _ = down_b.device_ptr();  // suppress unused warning
                 }
             }
             rs_batched_ptr_opt = Some(rs_b.device_ptr());

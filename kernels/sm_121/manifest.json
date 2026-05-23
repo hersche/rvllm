@@ -236,6 +236,11 @@
       "path": "fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add.ptx",
       "sha256": "5cd456e4a291d34e99cbda960abf09ab49ca59a010704301c03f55d83eb83c86"
     },
+    "fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_batched_topk": {
+      "bytes": 27139,
+      "path": "fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_batched_topk.ptx",
+      "sha256": "ffdcd99c539be0e88db5ff7f0830a248c45653ea079cdf8b77e1da8613dd39c9"
+    },
     "fp8_gemv_f16in_residual_add": {
       "bytes": 23476,
       "path": "fp8_gemv_f16in_residual_add.ptx",
@@ -1037,5 +1042,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "390718a"
+  "revision": "ab0f9c4"
 }
