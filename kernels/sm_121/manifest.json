@@ -806,6 +806,11 @@
       "path": "router_gemv_f16_to_f32.ptx",
       "sha256": "6629a1c457fc931569e7b91f82a6a4b89ea3c77286d319902f921a73694aaa45"
     },
+    "router_gemv_with_topk_batched_f16_to_f32": {
+      "bytes": 14427,
+      "path": "router_gemv_with_topk_batched_f16_to_f32.ptx",
+      "sha256": "c4ab2ed2071cbc6d6495c5cef86ae15eddd69ead81200a0e29320f2880ce9589"
+    },
     "router_gemv_with_topk_f16_to_f32": {
       "bytes": 13298,
       "path": "router_gemv_with_topk_f16_to_f32.ptx",
@@ -1057,5 +1062,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "442a72c"
+  "revision": "d2ee6b2"
 }
