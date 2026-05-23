@@ -148,6 +148,19 @@ __global__ void fused_qnorm_knorm_rope_qwen_partial_f16kv_kernel(
 
             // Phase 2: write rotated (or passthrough) K to
             // key_cache, and passthrough V to value_cache.
+            //
+            // BUG FIX (2026-05-23): the original code had ELSE
+            // branch `tid >= half_rot` writing kn_lo to
+            // `key_cache[cache_off + tid]` for ALL tid in
+            // [half_rot, half_head). For tid in [half_rot, rotary_dim)
+            // this collided with the IF branch's tid_a=tid-half_rot
+            // write to the same index — both writes happened in
+            // different warps with no ordering guarantee, producing
+            // non-deterministic output run-to-run. Split the second
+            // branch so it only writes the first-index passthrough
+            // for tid in [rotary_dim, half_head). For tid in
+            // [half_rot, rotary_dim) the first index is already
+            // correctly written by the IF branch's rotated pair.
             if (tid < half_rot) {
                 float c = __half2float(cos_table[pos * half_rot + tid]);
                 float s = __half2float(sin_table[pos * half_rot + tid]);
@@ -157,13 +170,17 @@ __global__ void fused_qnorm_knorm_rope_qwen_partial_f16kv_kernel(
                 key_cache[cache_off + tid]            = __float2half(kn_lo * c - partner * s);
                 key_cache[cache_off + tid + half_rot] = __float2half(kn_lo * s + partner * c);
                 // Non-rotary high pair for THIS thread's (tid +
-                // half_head) — passthrough normalised. tid in
-                // [0, half_rot) writes index tid + half_head,
-                // covering K[half_head, half_head + half_rot).
+                // half_head) — passthrough normalised.
+                key_cache[cache_off + tid + half_head] = __float2half(kn_hi);
+            } else if (tid < rotary_dim) {
+                // tid in [half_rot, rotary_dim): first index is the
+                // rotated upper-half of the rotary pair (already
+                // written by the IF branch's tid_a=tid-half_rot).
+                // Only write the non-rotary high element here.
                 key_cache[cache_off + tid + half_head] = __float2half(kn_hi);
             } else {
-                // Non-rotary tail: write normalised lo + hi for
-                // this thread's (tid, tid + half_head) pair.
+                // tid >= rotary_dim: both lo and hi are in the
+                // non-rotary tail — write normalised passthrough.
                 key_cache[cache_off + tid]             = __float2half(kn_lo);
                 key_cache[cache_off + tid + half_head] = __float2half(kn_hi);
             }

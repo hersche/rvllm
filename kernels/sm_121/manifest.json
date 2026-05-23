@@ -342,9 +342,9 @@
       "sha256": "135186db2a8c88b6c4f80c091ab0e7c40d800a9a372b38f814ee9a4eacf8dfac"
     },
     "fused_qnorm_knorm_rope_qwen_partial_f16kv": {
-      "bytes": 12108,
+      "bytes": 12272,
       "path": "fused_qnorm_knorm_rope_qwen_partial_f16kv.ptx",
-      "sha256": "f17ea65a9d0aa40bff0889fba4297193bcce68e67bbefadc153cc82501c90127"
+      "sha256": "65bbd15cd13309c0940f37f4412a9e57ae69edd65503177b150a42718d725e7b"
     },
     "fused_qnorm_knorm_rope_qwen_partial_nvfp4kv": {
       "bytes": 20225,
@@ -1092,5 +1092,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "024bcba"
+  "revision": "029a47b"
 }

@@ -1164,17 +1164,21 @@ because the warp-cooperative reduction order is not the same as
 the unfused chain's per-step reductions, but the math is
 equivalent up to float-rounding.
 
-**943f8bb Phase 1 norm+RoPE fusion is NON-DETERMINISTIC on F16-KV
-(2026-05-23 finding).** A/B on qwen3-6-35b-a3b F16-KV (max_tokens=150,
-3 runs each, env-gate `RVLLM_QWEN36_NORM_ROPE_FUSED=0` added to
-restore the unfused chain):
-- FUSED (default): md5 differs across 3 runs (ac5e866f, 5279bba3,
-  16f59787 — non-deterministic output for same prompt)
-- UNFUSED (=0):    md5 stable (ac5e866f ×3, deterministic)
-- Latency: prefill 235.87 vs 236.71 ms = parity
-Real bug: the fused kernel introduces run-to-run non-determinism on
-identical inputs. Root cause not investigated. Workaround: set
-`RVLLM_QWEN36_NORM_ROPE_FUSED=0` to opt out.
+**943f8bb non-determinism FIXED 2026-05-23** (kernel race in K-side
+of `fused_qnorm_knorm_rope_qwen_partial_f16kv_kernel`). Pre-fix
+A/B on qwen3-6-35b-a3b F16-KV showed md5 differs across 3 runs
+(ac5e866f / 5279bba3 / 16f59787); post-fix md5 stable (16f59787 ×3).
+Root cause: the original ELSE branch (tid ≥ half_rot) wrote
+`kn_lo` passthrough to `key_cache[cache_off + tid]` for ALL tid in
+[half_rot, half_head); for tid in [half_rot, rotary_dim) this
+collided with the IF branch's tid_a=tid-half_rot rotated-upper-half
+write to the same index. Two warps writing the same slot with no
+ordering → run-to-run non-determinism.
+Fix: split the ELSE into `tid in [half_rot, rotary_dim) → only
+write high element` and `tid in [rotary_dim, half_head) → write
+both as passthrough`. The IF branch's rotated upper-half stays
+authoritative. Bit-coherent post-fix on F16-KV; no production
+impact (production uses NVFP4-KV).
 
 **39f7c1a qwen35 dense fp8_gemv+residual fusion: parity.** A/B on
 qwen3-6-27b dense (max_tokens=150, 3 runs each, env-gate
