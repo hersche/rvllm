@@ -1522,17 +1522,24 @@ adaptive `_max16` variant pattern documented in rule (3) above.
   `systemctl show-environment` and `systemctl unset-environment`
   if a behaviour persists across config changes.
 - **bf16 vision forward**: kernels are committed AND wired (env
-  `RVLLM_GEMMA4_VIT_USE_BF16=1`). **A/B verified 2026-05-23**
-  against fresh binary on gemma-4-31b-it-nvfp4 + /tmp/ball.png:
-    F16 (default): coherent caption x3, md5 eb6bfc64 stable
-    BF16:           run1 = coherent (different caption, md5 df22aaa3);
-                    runs 2-3 = "Sie haben kein Bild hochgeladen"
-                    (md5 6d243df0) — model thinks no image was sent
-  The bf16 ViT output is degraded enough that the multimodal
-  embedding splice produces a sequence the LLM interprets as
-  "no image". DO NOT enable in production. Per-sub-step debug
-  plan in `v3/GEMMA_VISION_AUDIT.md` still applies for a future
-  fix attempt.
+  `RVLLM_GEMMA4_VIT_USE_BF16=1`). **Bug found + fixed 2026-05-23**
+  on gemma-4-31b-it-nvfp4 (Option B). Pre-fix symptom: first
+  vision call produced a coherent caption; second + subsequent
+  calls degraded to NaN in the `standardized` buffer and the
+  LLM hallucinated "Sie haben kein Bild hochgeladen". Root cause:
+  `ensure_vit_bf16_weights` lazy-allocated the bf16 weights into
+  the arena BELOW `forward_checkpoint`, so every subsequent
+  vision request's `forward_scratch_guard::drop` restored the
+  arena past those weights — the cached pointers in
+  `vit_bf16_weights` mutex still pointed there, but the next
+  request's `arena.region(...)` scratch allocations overwrote
+  the bf16 weight memory. Fix: change `ensure_vit_bf16_weights`
+  + `forward_gemma_vision` to `&mut self`, and bump
+  `forward_checkpoint` to the post-weights arena top after
+  `convert_from_f16`. Post-fix: 5 consecutive bf16 vision calls
+  all produce the same coherent caption (md5 `df22aaa3` x5).
+  Production still defaults to f16 (env-gate is opt-in); the
+  bf16 path is now safe to enable for testing.
 
 ## Option B (Gemma 4 31B NVFP4) — production status + follow-up register
 

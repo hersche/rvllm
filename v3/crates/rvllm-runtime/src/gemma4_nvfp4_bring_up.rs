@@ -3059,7 +3059,7 @@ impl Gemma4Nvfp4Bringup {
     /// `forward_prompt_to_all_tokens_impl`.
     #[cfg(feature = "cuda")]
     pub fn forward_gemma_vision(
-        &self,
+        &mut self,
         image_bytes: &[u8],
     ) -> Result<crate::qwen36_bring_up::VisionForwardOutput> {
         if crate::gemma4_vision::gemma4_vit_use_bf16_enabled() {
@@ -3099,8 +3099,25 @@ impl Gemma4Nvfp4Bringup {
     /// Phase-3 bf16 vision support: lazy-populate
     /// `self.vit_bf16_weights` on first `forward_bf16` call.
     /// Mirror of `Gemma4Bringup::ensure_vit_bf16_weights`.
+    ///
+    /// BUG FIX (2026-05-23): originally took `&self`, allocated the
+    /// bf16 weights BELOW `self.forward_checkpoint`, then any
+    /// subsequent vision request's `forward_scratch_guard::drop`
+    /// restored the arena past those weights — the cached pointers
+    /// in `self.vit_bf16_weights` still pointed at those addresses,
+    /// but the next request's `arena.region(...)` calls happily
+    /// overwrote them with new scratch buffers, corrupting the
+    /// bf16 weights. Symptom: first request produced a coherent
+    /// caption; second + subsequent requests degraded to NaN in
+    /// the pooler-bridge `standardized` buffer, and the LLM
+    /// hallucinated "Sie haben kein Bild hochgeladen".
+    ///
+    /// Fix: take `&mut self` so we can bump `forward_checkpoint` up
+    /// past the freshly-allocated bf16 weights — the subsequent
+    /// `forward_scratch_guard::drop` then restores ONLY the per-
+    /// request scratch, not the persistent weight cache.
     #[cfg(feature = "cuda")]
-    fn ensure_vit_bf16_weights(&self) -> Result<()> {
+    fn ensure_vit_bf16_weights(&mut self) -> Result<()> {
         {
             let guard = self.vit_bf16_weights.lock().unwrap();
             if guard.is_some() {
@@ -3123,8 +3140,16 @@ impl Gemma4Nvfp4Bringup {
         })?;
         let conv = crate::gemma4_vision::Gemma4VisionBf16::convert_from_f16(
             &self.arena, vision, kernels, self.stream.raw() as u64)?;
-        let mut guard = self.vit_bf16_weights.lock().unwrap();
-        *guard = Some(conv);
+        {
+            let mut guard = self.vit_bf16_weights.lock().unwrap();
+            *guard = Some(conv);
+        }
+        // BUG FIX: pin the arena top above the bf16 weight regions
+        // so subsequent forward_scratch_guard::drop does not reclaim
+        // them. Without this bump, the weights live BELOW the
+        // existing forward_checkpoint and get clobbered by the next
+        // request's scratch allocations.
+        self.forward_checkpoint = self.arena.checkpoint();
         Ok(())
     }
 
