@@ -682,3 +682,57 @@ work.
 
 No regression to Phase 12 production default. Backward-compat smoke
 verified.
+
+
+## Phase 14: Grouped MMA down projection (task #98, 2026-05-24, +84% with both grouped)
+
+`fp8_mma_down_grouped_m16_w4_kernel` (commit `3e5c097`) extends the
+expert-sort + W=4 grouped MMA pattern to the down projection (27%
+of prefill GPU time per the 2026-05-23 nsys profile).
+
+Same kernel shape as the dual_silu grouped path (W=4, M=16, N=8 per
+warp tile, cooperative A-staging), with key differences:
+
+* Input: silu_b `[top_k, M_full, K_in]` k_round-major. Each (token,
+  k_round) row gathered via `silu_b + k_round*M_full*K_in + token*K_in`.
+* Per-row metadata broadcast via smem: token_idx, k_round, top_w.
+* Output: `acc_f32[token, n]` f32 via atomicAdd — each (token, n)
+  receives top_k=8 contributions from different (expert, k_round)
+  tiles. atomicAdd cost amortised by tile parallelism.
+
+Opt-in via `RVLLM_QWEN36_MOE_MMA_DOWN_GROUPED=1` (independent of
+MMA_GROUPED; works alone or paired). Independently re-runs the
+expert-sort pre-pass (~few µs/layer) using the same persistent
+scratch as #94 — duplicates work when dual_silu grouped is also
+on; cleanup follow-up parked.
+
+**Numerical fix**: per-K=128 a_scale must be folded INSIDE the
+inner accumulator per-kblk, not multiplied at write time only.
+Previous (smem_ascale[row] at write) used LAST kblk's a_scale,
+under-counting earlier kblks. For dual_silu input (RMSNormed →
+~constant per-K-block amax) invisible; for down input (silu_b
+SwiGLU output → varies substantially) produces `<ctrl47>` garbage
+on the 80-word quantum entanglement prompt. Fixed by computing
+`a_lo = smem_ascale[r_lo]` + `a_hi = smem_ascale[r_hi]` inside
+the K-loop and folding per-(row, kblk) a_scale into g_outer.
+
+A/B (qwen3-6-35b-a3b NVFP4, deterministic):
+
+  | Cell                                  | 1112 tok    | 4412 tok    |
+  |---------------------------------------|-------------|-------------|
+  | GEMV baseline (both legacy)           |   6020 ms   |  24775 ms   |
+  | Phase 12 dual_silu grouped only       |   2533 ms   |  10587 ms   |
+  | Phase 14 down grouped only            |   4524 ms   |  18520 ms   |
+  | **Phase 14 both grouped**             |   **955 ms**|  **4116 ms**|
+  | Win vs GEMV                           | **+84.1%**  | **+83.4%**  |
+  | Win vs dual_silu grouped only         |  +62.3%     |  +61.1%     |
+
+Output coherence verified: 80-word quantum entanglement gives
+coherent English (no NaN, no special tokens). Default-off
+regression-checked: legacy path runs at 6019-6039 ms matching
+GEMV baseline.
+
+Cumulative MoE-prefill speedup vs raw GEMV:
+* Phase 4-7 reference 6020 ms
+* Phase 12 dual_silu grouped: 2533 ms (+57.9%)
+* **Phase 14 both grouped:    955 ms (+84.1%)**

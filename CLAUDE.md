@@ -1306,6 +1306,44 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 MoE grouped MMA down projection — task #98 (2026-05-24, +84% with both grouped)
+
+`fp8_mma_down_grouped_m16_w4_kernel` (commit `3e5c097`) extends
+the expert-sort + W=4 grouped MMA pattern to the down kernel
+(previously 27% of prefill GPU time). Output goes to `acc_f32`
+via atomicAdd (each (token, n) receives top_k=8 contributions
+from different tiles).
+
+Opt-in via `RVLLM_QWEN36_MOE_MMA_DOWN_GROUPED=1` (independent of
+MMA_GROUPED). Independently re-runs the expert-sort pre-pass
+(~few µs/layer) using the same persistent scratch as #94.
+
+**Numerical fix included**: per-K=128 a_scale must be folded
+INSIDE the inner accumulator per-kblk, not multiplied at write
+time. Previous pattern (smem_ascale[row] at write only) uses the
+LAST kblk's a_scale instead of the per-kblk value. For dual_silu
+input (RMSNormed → ~constant per-K-block amax) this is invisible;
+for down input (silu_b SwiGLU output → per-K-block amax varies
+substantially) it produces garbage tokens. Fix: compute
+`a_lo = smem_ascale[r_lo]` + `a_hi = smem_ascale[r_hi]` inside
+the K-loop; fold per-(row, kblk) a_scale into g_outer.
+
+A/B (qwen3-6-35b-a3b NVFP4, deterministic, fresh binary
+md5 `80d02e7e` + new PTX):
+
+  | Cell                                  | 1112 tok    | 4412 tok    |
+  |---------------------------------------|-------------|-------------|
+  | GEMV baseline (both legacy)           |   6020 ms   |  24775 ms   |
+  | Dual_silu grouped only (#97)          |   2533 ms   |  10587 ms   |
+  | Down grouped only (#98)               |   4524 ms   |  18520 ms   |
+  | **Both grouped (#97 + #98)**          |   **955 ms**|  **4116 ms**|
+  | Win vs GEMV (both grouped)            | **+84.1%**  | **+83.4%**  |
+  | Win vs dual_silu grouped only         |  +62.3%     |  +61.1%     |
+
+Output coherence verified on 80-word quantum entanglement (coherent
+English) + 4k German + smoke. Default-off regression-checked at
+6019-6039 ms matching baseline.
+
 ### qwen36 MoE W=4 cooperative B-staging — task #97 (2026-05-24, parity, opt-in)
 
 `fp8_mma_dual_silu_grouped_m16_w4cb_kernel` (commit `5bb1c26`)
