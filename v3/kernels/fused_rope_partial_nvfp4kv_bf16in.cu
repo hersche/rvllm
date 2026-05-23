@@ -184,8 +184,21 @@ __global__ void fused_rope_partial_nvfp4kv_bf16in_kernel(
     __half*        __restrict__ debug_v_prequant,
     // === END CYCLE 29 ===
     // === CYCLE 31 STOCHASTIC ROUNDING (V only) ===
-    int            stoch_round_v
+    int            stoch_round_v,
     // === END CYCLE 31 ===
+    // === TASK #90 PRE-HADAMARD K/V SHADOW (2026-05-23) ===
+    // When non-null, the kernel writes the POST-RoPE PRE-HADAMARD
+    // (and pre-NVFP4-quantize) K and V values as f16 to these
+    // shadow buffers. Indexed identically to the primary KV
+    // cache: (slot * num_kv_heads + head) * head_dim + tid. This
+    // is the "true Phase 3 F16-shadow" that bypasses both the
+    // Hadamard rotation noise (which the drafter wasn't trained
+    // to handle) and the NVFP4 quantization noise. Callers
+    // outside the spec-source-layer paths pass nullptr to
+    // disable (no-op).
+    __half*        __restrict__ pre_hadamard_k_shadow,
+    __half*        __restrict__ pre_hadamard_v_shadow
+    // === END TASK #90 ===
 ) {
     const int token_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
@@ -355,11 +368,32 @@ __global__ void fused_rope_partial_nvfp4kv_bf16in_kernel(
             // re-prefills of the same prompt. V uses stochastic when
             // gate is set — under attention's weighted sum the unbiased
             // noise tends to average out across long contexts.
-            bool           stoch_round
+            bool           stoch_round,
             // === END CYCLE 31 ===
+            // === PRE-HADAMARD SHADOW (2026-05-23, Task #90 Phase 3 fix) ===
+            // When non-null, kernel writes the POST-RoPE PRE-HADAMARD
+            // (and pre-NVFP4-quantize) value as f16 to this buffer at
+            // the same per-(slot, kv_head, channel) indexing as the
+            // primary K cache. This is the "true Phase 3 F16-shadow":
+            // the value the drafter EXPECTS to see (pre-rotation
+            // pre-quant), bypassing both the Hadamard rotation noise
+            // and the NVFP4 quantization noise. Caller passes nullptr
+            // to disable (no-op).
+            __half*        pre_hadamard_shadow
         ) {
             float v = apply_rope ? rope_one(in, k_base)
                                  : __bfloat162float(in[k_base + tid]);
+
+            // === PRE-HADAMARD SHADOW WRITE ===
+            // Spill the post-RoPE pre-Hadamard pre-quant value BEFORE
+            // the rotation block below. This is what Task #90 Phase 3
+            // F16-shadow is supposed to capture (the existing
+            // `debug_prequant` captures POST-Hadamard, which is the
+            // wrong frame for the drafter).
+            if (pre_hadamard_shadow != nullptr) {
+                pre_hadamard_shadow[(slot * num_kv_heads + head_idx) * head_dim + tid]
+                    = __float2half(v);
+            }
 
             // === HADAMARD ROTATION ===
             // K rotation: same R as Q (orthogonal, so Q*K^T invariant).
@@ -471,11 +505,13 @@ __global__ void fused_rope_partial_nvfp4kv_bf16in_kernel(
         quant_and_write(k_in, key_cache_packed,   key_cache_scale,
                         /*apply_rope=*/true,  /*apply_rotation=*/hadamard_on,
                         scale_policy, /*debug_prequant=*/debug_k_prequant,
-                        /*stoch_round=*/false);
+                        /*stoch_round=*/false,
+                        /*pre_hadamard_shadow=*/pre_hadamard_k_shadow);
         quant_and_write(v_in, value_cache_packed, value_cache_scale,
                         /*apply_rope=*/false, /*apply_rotation=*/v_rotate_now,
                         v_scale_policy, /*debug_prequant=*/debug_v_prequant,
-                        /*stoch_round=*/(stoch_round_v != 0));
+                        /*stoch_round=*/(stoch_round_v != 0),
+                        /*pre_hadamard_shadow=*/pre_hadamard_v_shadow);
         // === END HADAMARD ROTATION ===
     }
 }

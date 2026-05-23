@@ -412,6 +412,18 @@ pub struct SpecSessionStats {
     pub n_accepted: usize,
 }
 
+/// Task #90: cached pointers into the drafter shadow KV for the two
+/// spec source layers. Populated by `ensure_drafter_nvfp4`.
+#[derive(Clone, Copy, Debug)]
+pub struct PreHadShadowCache {
+    pub sliding_li: usize,
+    pub full_li: usize,
+    pub sliding_k_ptr: u64,
+    pub sliding_v_ptr: u64,
+    pub full_k_ptr: u64,
+    pub full_v_ptr: u64,
+}
+
 pub struct Gemma4Nvfp4Bringup {
     /// Drop order matters: ctx must outlive every CUDA resource
     /// allocated under it. Rust drops fields in declaration
@@ -487,6 +499,21 @@ pub struct Gemma4Nvfp4Bringup {
     /// `Mutex<Option<_>>` so construction is at-most-once and
     /// thread-safe under the cuda_worker's single thread.
     pub drafter: std::sync::Mutex<Option<crate::gemma4_drafter::Gemma4DrafterRuntime>>,
+    /// Task #90 (Phase 3 F16-shadow accept_rate fix): cached pointers
+    /// into the drafter's shadow K/V buffers, indexed by base layer
+    /// id, populated lazily by `ensure_drafter_nvfp4`. The base
+    /// forward consults this from inside the kernel dispatch sites
+    /// (`forward_layer_attn_from_residual{,_dev}` +
+    /// `forward_layer_attn_batched_prefill_dev`) to pass non-null
+    /// `pre_hadamard_{k,v}_shadow` args to
+    /// `fused_rope_partial_nvfp4kv_bf16in_kernel` for the two spec
+    /// source layers (sliding, full). Result: drafter sees the
+    /// POST-RoPE PRE-HADAMARD F16 K/V (no quant noise, no rotation),
+    /// matching the existing Phase 3 F16-shadow path in
+    /// `Gemma4Bringup` but for the Option B NVFP4-weights path.
+    /// `None` = drafter not loaded yet; lookups return (0, 0).
+    pub pre_had_shadow_cache:
+        std::sync::RwLock<Option<crate::gemma4_nvfp4_bring_up::PreHadShadowCache>>,
     /// Stream-6b spec primitive #1: persistent f16 device buffer
     /// holding the BASE's post-final-norm hidden state for the
     /// last generated token. Drafter consumes this as
@@ -817,6 +844,7 @@ impl Gemma4Nvfp4Bringup {
             _hadamard_rotate_f16_mod: hadamard_rotate_f16_mod,
             _hadamard_unrotate_f16_mod: hadamard_unrotate_f16_mod,
             drafter: std::sync::Mutex::new(None),
+            pre_had_shadow_cache: std::sync::RwLock::new(None),
             base_last_hidden_ptr: std::sync::atomic::AtomicU64::new(0),
             decode_capture: std::sync::Mutex::new(None),
             embed_token_box: std::sync::Mutex::new(Box::new(0u32)),
@@ -2528,14 +2556,23 @@ impl Gemma4Nvfp4Bringup {
         let source_layer_idx = if is_global { full_src } else { sliding_src };
         let num_heads = drafter.arch.num_attention_heads as u32;
         let eff_hd = layer.effective_head_dim as u32;
+        // Task #90 Phase 3: when PRE_HAD_SHADOW=1, the base forward
+        // wrote pre-Hadamard (HF-native frame) K/V to the shadow, so
+        // the drafter Q must NOT be rotated — the cross-attn dot
+        // product runs directly in HF-native frame and attn_out is
+        // already in V-native frame, no un-rotation needed.
+        let skip_rot =
+            self.pre_hadamard_shadow_ptrs_for_layer(source_layer_idx).0 != 0;
         unsafe {
-            self.apply_hadamard_to_drafter_q(
-                workspace.q,
-                source_layer_idx as u32,
-                num_heads,
-                eff_hd,
-                stream as u64,
-            )?;
+            if !skip_rot {
+                self.apply_hadamard_to_drafter_q(
+                    workspace.q,
+                    source_layer_idx as u32,
+                    num_heads,
+                    eff_hd,
+                    stream as u64,
+                )?;
+            }
             if is_global {
                 drafter.launch_cross_attn_global(
                     workspace.attn_out,
@@ -2562,13 +2599,15 @@ impl Gemma4Nvfp4Bringup {
                     stream,
                 )?;
             }
-            self.apply_hadamard_unrotate_drafter_attn_out(
-                workspace.attn_out,
-                source_layer_idx as u32,
-                num_heads,
-                eff_hd,
-                stream as u64,
-            )?;
+            if !skip_rot {
+                self.apply_hadamard_unrotate_drafter_attn_out(
+                    workspace.attn_out,
+                    source_layer_idx as u32,
+                    num_heads,
+                    eff_hd,
+                    stream as u64,
+                )?;
+            }
         }
         Ok(())
     }
@@ -3499,6 +3538,21 @@ impl Gemma4Nvfp4Bringup {
             full_head_dim: full_hd,
         });
 
+        // Task #90 Phase 3 F16-shadow: cache shadow pointers for
+        // direct kernel-side population. The base forward kernel
+        // writes POST-RoPE PRE-HADAMARD K/V values directly into
+        // these buffers for the spec source layers, so the drafter
+        // sees zero-quant-noise K/V matching the HADAMARD=0 path
+        // even with HADAMARD=1 active on the base forward.
+        *self.pre_had_shadow_cache.write().unwrap() = Some(PreHadShadowCache {
+            sliding_li,
+            full_li,
+            sliding_k_ptr,
+            sliding_v_ptr,
+            full_k_ptr,
+            full_v_ptr,
+        });
+
         // Re-anchor scratch checkpoint so the shadow KV survives
         // forward scratch rewinds.
         self.forward_checkpoint = self.arena.checkpoint();
@@ -3563,6 +3617,39 @@ impl Gemma4Nvfp4Bringup {
     /// MutexGuard alive for other reads in the same critical
     /// section). Re-locking here would deadlock; use this entry
     /// point instead.
+    /// Task #90 Phase 3 F16-shadow (Option B path): return
+    /// `(k_ptr, v_ptr)` of the drafter shadow K/V for `layer_idx`
+    /// when `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` is set AND
+    /// `layer_idx` is one of the two spec source layers AND the
+    /// drafter shadow is allocated. Otherwise returns `(0, 0)` and
+    /// the kernel runs the default path (no shadow write).
+    ///
+    /// This bypasses the legacy dequant-of-rotated-NVFP4 path in
+    /// `populate_drafter_shadow_kv_with_rt` — the drafter sees the
+    /// POST-RoPE PRE-HADAMARD F16 K/V (no quant noise, no rotation)
+    /// regardless of `RVLLM_NVFP4_HADAMARD` and the NVFP4 V-scale
+    /// policy on the base forward. Matches what the fp8-block
+    /// `Gemma4Bringup`'s Phase 3 F16-shadow recipe achieves
+    /// (`RVLLM_NVFP4_SHADOW_F16=1` + `RVLLM_GEMMA4_SPEC_USE_F16
+    /// _SHADOW=1`) but landed via kernel-side direct write instead
+    /// of a separate shadow region the drafter has to load from.
+    pub fn pre_hadamard_shadow_ptrs_for_layer(&self, layer_idx: usize) -> (u64, u64) {
+        let on = std::env::var("RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW")
+            .ok().as_deref() == Some("1");
+        if !on {
+            return (0, 0);
+        }
+        let g = self.pre_had_shadow_cache.read().unwrap();
+        let Some(c) = g.as_ref() else { return (0, 0); };
+        if layer_idx == c.sliding_li {
+            (c.sliding_k_ptr, c.sliding_v_ptr)
+        } else if layer_idx == c.full_li {
+            (c.full_k_ptr, c.full_v_ptr)
+        } else {
+            (0, 0)
+        }
+    }
+
     pub fn populate_drafter_shadow_kv_with_rt(
         &self,
         drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
@@ -3570,6 +3657,20 @@ impl Gemma4Nvfp4Bringup {
         slot_start: u32,
         slot_count: u32,
     ) -> Result<()> {
+        // Task #90 Phase 3 F16-shadow: when the base forward kernel
+        // is writing pre-Hadamard K/V directly into this shadow
+        // (gates checked by `pre_hadamard_shadow_ptrs_for_layer`),
+        // the dequant-from-NVFP4 populate path would OVERWRITE
+        // those freshly-written values with the rotated+quantized
+        // dequant (defeating the whole point). Skip on probe — the
+        // helper returns non-zero ptrs only when ALL gates are on
+        // AND the layer is a spec source layer.
+        if self.pre_hadamard_shadow_ptrs_for_layer(
+            self.arch.assistant_shared_kv_sources()
+                .map(|(s, _)| s).unwrap_or(usize::MAX),
+        ).0 != 0 {
+            return Ok(());
+        }
         let shadow = drafter.shadow_kv.as_ref().ok_or_else(|| {
             corrupt_runtime_err(
                 "populate_drafter_shadow_kv: shadow KV not attached \
@@ -5132,6 +5233,7 @@ impl Gemma4Nvfp4Bringup {
         let k_scale = kv.k_scale_layer_ptrs[0];
         let v_scale = kv.v_scale_layer_ptrs[0];
         let stream_u64 = self.stream.raw();
+        let _pre_had_layer_idx: usize = 0;
 
         unsafe {
             let mut q_in: u64 = q_region.device_ptr();
@@ -5152,6 +5254,12 @@ impl Gemma4Nvfp4Bringup {
             let mut hadamard_k: u64 = 0;
             let mut debug_k_prequant: u64 = 0;
             let mut debug_v_prequant: u64 = 0;
+            // Task #90 Phase 3 F16-shadow: pass real shadow ptrs at
+            // spec source layers when gates on; (0, 0) otherwise.
+            let (k_shadow_init, v_shadow_init) =
+                self.pre_hadamard_shadow_ptrs_for_layer(_pre_had_layer_idx);
+            let mut pre_hadamard_k_shadow: u64 = k_shadow_init;
+            let mut pre_hadamard_v_shadow: u64 = v_shadow_init;
 
             let mut nt: i32 = 1;
             let mut nh: i32 = num_q_heads as i32;
@@ -5190,6 +5298,8 @@ impl Gemma4Nvfp4Bringup {
                 (&mut debug_k_prequant) as *mut u64 as *mut core::ffi::c_void,
                 (&mut debug_v_prequant) as *mut u64 as *mut core::ffi::c_void,
                 (&mut stoch_round_v) as *mut i32 as *mut core::ffi::c_void,
+                (&mut pre_hadamard_k_shadow) as *mut u64 as *mut core::ffi::c_void,
+                (&mut pre_hadamard_v_shadow) as *mut u64 as *mut core::ffi::c_void,
             ];
             let max_heads = num_q_heads.max(num_kv_heads) as u32;
             rvllm_fused::launch_raw(
@@ -5618,6 +5728,7 @@ impl Gemma4Nvfp4Bringup {
         let v_packed = kv.v_packed_layer_ptrs[layer_idx];
         let k_scale = kv.k_scale_layer_ptrs[layer_idx];
         let v_scale = kv.v_scale_layer_ptrs[layer_idx];
+        let _pre_had_layer_idx: usize = layer_idx;
         unsafe {
             let mut q_in: u64 = q_region.device_ptr();
             let mut k_in: u64 = k_region.device_ptr();
@@ -5637,6 +5748,12 @@ impl Gemma4Nvfp4Bringup {
             let mut hadamard_k: u64 = 0;
             let mut debug_k_prequant: u64 = 0;
             let mut debug_v_prequant: u64 = 0;
+            // Task #90 Phase 3 F16-shadow: pass real shadow ptrs at
+            // spec source layers when gates on; (0, 0) otherwise.
+            let (k_shadow_init, v_shadow_init) =
+                self.pre_hadamard_shadow_ptrs_for_layer(_pre_had_layer_idx);
+            let mut pre_hadamard_k_shadow: u64 = k_shadow_init;
+            let mut pre_hadamard_v_shadow: u64 = v_shadow_init;
 
             let mut nt: i32 = 1;
             let mut nh: i32 = num_q_heads as i32;
@@ -5675,6 +5792,8 @@ impl Gemma4Nvfp4Bringup {
                 (&mut debug_k_prequant) as *mut u64 as *mut core::ffi::c_void,
                 (&mut debug_v_prequant) as *mut u64 as *mut core::ffi::c_void,
                 (&mut stoch_round_v) as *mut i32 as *mut core::ffi::c_void,
+                (&mut pre_hadamard_k_shadow) as *mut u64 as *mut core::ffi::c_void,
+                (&mut pre_hadamard_v_shadow) as *mut u64 as *mut core::ffi::c_void,
             ];
             let max_heads = num_q_heads.max(num_kv_heads) as u32;
             rvllm_fused::launch_raw(
@@ -6443,6 +6562,7 @@ impl Gemma4Nvfp4Bringup {
         let v_packed = kv.v_packed_layer_ptrs[layer_idx];
         let k_scale = kv.k_scale_layer_ptrs[layer_idx];
         let v_scale = kv.v_scale_layer_ptrs[layer_idx];
+        let _pre_had_layer_idx: usize = layer_idx;
         unsafe {
             let mut q_in: u64 = q_region.device_ptr();
             let mut k_in: u64 = k_region.device_ptr();
@@ -6462,6 +6582,12 @@ impl Gemma4Nvfp4Bringup {
             let mut hadamard_k: u64 = 0;
             let mut debug_k_prequant: u64 = 0;
             let mut debug_v_prequant: u64 = 0;
+            // Task #90 Phase 3 F16-shadow: pass real shadow ptrs at
+            // spec source layers when gates on; (0, 0) otherwise.
+            let (k_shadow_init, v_shadow_init) =
+                self.pre_hadamard_shadow_ptrs_for_layer(_pre_had_layer_idx);
+            let mut pre_hadamard_k_shadow: u64 = k_shadow_init;
+            let mut pre_hadamard_v_shadow: u64 = v_shadow_init;
             let mut nt: i32 = 1;
             let mut nh: i32 = num_q_heads as i32;
             let mut nkvh: i32 = num_kv_heads as i32;
@@ -6498,6 +6624,8 @@ impl Gemma4Nvfp4Bringup {
                 (&mut debug_k_prequant) as *mut u64 as *mut core::ffi::c_void,
                 (&mut debug_v_prequant) as *mut u64 as *mut core::ffi::c_void,
                 (&mut stoch_round_v) as *mut i32 as *mut core::ffi::c_void,
+                (&mut pre_hadamard_k_shadow) as *mut u64 as *mut core::ffi::c_void,
+                (&mut pre_hadamard_v_shadow) as *mut u64 as *mut core::ffi::c_void,
             ];
             let max_heads = num_q_heads.max(num_kv_heads) as u32;
             rvllm_fused::launch_raw(
@@ -6931,6 +7059,7 @@ impl Gemma4Nvfp4Bringup {
         let v_packed = kv.v_packed_layer_ptrs[layer_idx];
         let k_scale = kv.k_scale_layer_ptrs[layer_idx];
         let v_scale = kv.v_scale_layer_ptrs[layer_idx];
+        let _pre_had_layer_idx: usize = layer_idx;
 
         // RoPE + KV write — kernel already takes num_tokens.
         unsafe {
@@ -6952,6 +7081,12 @@ impl Gemma4Nvfp4Bringup {
             let mut hadamard_k: u64 = 0;
             let mut debug_k_prequant: u64 = 0;
             let mut debug_v_prequant: u64 = 0;
+            // Task #90 Phase 3 F16-shadow: pass real shadow ptrs at
+            // spec source layers when gates on; (0, 0) otherwise.
+            let (k_shadow_init, v_shadow_init) =
+                self.pre_hadamard_shadow_ptrs_for_layer(_pre_had_layer_idx);
+            let mut pre_hadamard_k_shadow: u64 = k_shadow_init;
+            let mut pre_hadamard_v_shadow: u64 = v_shadow_init;
             let mut nt: i32 = num_tokens as i32;
             let mut nh: i32 = num_q_heads as i32;
             let mut nkvh: i32 = num_kv_heads as i32;
@@ -6988,6 +7123,8 @@ impl Gemma4Nvfp4Bringup {
                 (&mut debug_k_prequant) as *mut u64 as *mut core::ffi::c_void,
                 (&mut debug_v_prequant) as *mut u64 as *mut core::ffi::c_void,
                 (&mut stoch_round_v) as *mut i32 as *mut core::ffi::c_void,
+                (&mut pre_hadamard_k_shadow) as *mut u64 as *mut core::ffi::c_void,
+                (&mut pre_hadamard_v_shadow) as *mut u64 as *mut core::ffi::c_void,
             ];
             let max_heads = num_q_heads.max(num_kv_heads) as u32;
             rvllm_fused::launch_raw(
