@@ -511,8 +511,27 @@ spec with HADAMARD=HADAMARD_V=0 (default), OR enable the fused
 path via `RVLLM_GEMMA4_SPEC_FUSED_UNROTATE=1` +
 `RVLLM_GEMMA4_SPEC_UNROTATE_SHADOW=1`, OR use the Phase 3 F16-
 shadow recipe (`RVLLM_NVFP4_SHADOW_F16=1` +
-`RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1`) which is still the highest
-accept-rate path.
+`RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1`).
+
+**A/B re-verified 2026-05-23** (gemma-4-31b-it-nvfp4, 80-tok
+photosynthesis, 3 runs/leg, freshly-installed binary, per-leg
+profile edits to override sourced HADAMARD=0):
+
+  | HADAMARD config                                      | accept_rate | tok/s |
+  |------------------------------------------------------|-------------|-------|
+  | 0 (production default)                               | 1.056       | 4.51  |
+  | 1 + V=1 + ALLOW_HADAMARD (Stream-6b drafter Q)       | 0.000       | 4.43  |
+  | 1 + SHADOW_F16 + USE_F16_SHADOW (Phase 3)            | 0.200       | 4.23  |
+  | 1 + UNROTATE_SHADOW + FUSED_UNROTATE (#34 fused)     | 0.200       | 4.23  |
+  | 1 + UNROTATE_SHADOW (#34 separate post-pass)         | 0.200       | 4.23  |
+
+The fused vs separate unrotate paths give IDENTICAL accept_rate +
+tok/s + md5 — the fusion saves a launch but does not change quality
+or measurable speed. Phase 3 F16-shadow and both unrotate paths
+all converge to accept_rate=0.200, which is 5× worse than the
+HADAMARD=0 baseline at 1.056. Stream-6b drafter-Q rotation
+produces accept_rate=0.000 (output still coherent because base
+verify-fallback always wins).
 
 **Guard (this round)**: `ensure_drafter()` refuses to load the
 drafter when `(RVLLM_NVFP4_HADAMARD=1 || RVLLM_NVFP4_HADAMARD_V=1)`
@@ -1519,5 +1538,5 @@ batched prefill all wired. Task #38's "31B NVFP4 native weight loader
 | #5f-PRIME (unified NVFP4 prefill) | **DONE.** `forward_prompt_to_all_tokens_impl` (gemma4_nvfp4_bring_up.rs:7780) is the device-resident batched-prefill path — residual lives as `[N, hidden]` bf16 across all 60 layers; unified-prefill kernel runs ONCE per layer. Long-prompt TTFT now scales with prefill throughput, not N decode launches. |
 | Stream-6a — cuda_worker spec gate | **DONE.** `cuda_worker.rs:116` accepts `RVLLM_GEMMA4_SPEC_DECODE=1` for `ModelFamily::Gemma4Nvfp4` as well as `Gemma4` (fp8-block). Production NVFP4 spec session runs via `run_spec_session_nvfp4_greedy_k` (gemma4_nvfp4_bring_up.rs:1056). |
 | Stream-6a — BaseKvSource trait | **DONE 2026-05-22**. Trait already existed (gemma4_drafter.rs:64). Both bringups now have BaseKvSource adapters: `Gemma4Nvfp4BaseKvSource` (gemma4_nvfp4_bring_up.rs:8359) + `Fp8BlockBaseKvSource` (`4c6a927`). Stream-6a deeper unification (`5d2a36a`) retires the inline `shadow_view_for_layer` / `compute_view` / `effective_kv_dtype` closures at the top of `run_generate_speculative_batched` (≈80 LOC) in favor of a `ShadowOverrideBaseKvSource<'_, B>` decorator that wraps any `BaseKvSource` and swaps in F16-shadow pointers + `KvDtype::F16` for the two source layers when `RVLLM_GEMMA4_SPEC_USE_F16_SHADOW=1`. Call site pulls pointers + dtype from `DrafterBaseKvView`s. Validated byte-equivalent on HADAMARD=0 and coherent multi-token on HADAMARD=1+USE_F16_SHADOW=1. |
-| Stream-6b (Hadamard drafter Q for Option B) | **DONE 2026-05-22** (`6ab88d4` primitives + `d75067c` wiring). Drafter Q rotation by R = H·diag(D) wraps the cross-attn launch in `forward_drafter_layer_cross_attn`; attn_out un-rotation by R^T follows. Per-base-layer signs lazy-uploaded in `ensure_drafter_nvfp4` via `build_nvfp4_hadamard_signs(num_layers, max_head_dim, arena)` on first drafter load. Hardware-validated: HADAMARD=1 + HADAMARD_V=1 produces coherent multi-token output on 31B NVFP4 spec without needing the F16-shadow buffer. Both helpers are no-ops on HADAMARD=0 — production default unchanged. |
+| Stream-6b (Hadamard drafter Q for Option B) | **CODE SHIPPED 2026-05-22** (`6ab88d4` primitives + `d75067c` wiring). Drafter Q rotation by R = H·diag(D) wraps the cross-attn launch in `forward_drafter_layer_cross_attn`; attn_out un-rotation by R^T follows. Per-base-layer signs lazy-uploaded in `ensure_drafter_nvfp4`. Both helpers are no-ops on HADAMARD=0 — production default unchanged. **A/B re-verified 2026-05-23 against fresh binary: HADAMARD=1 + HADAMARD_V=1 + ALLOW_HADAMARD=1 gives accept_rate=0.000 on gemma-4-31b-it-nvfp4 (80-tok photosynthesis); the prior "coherent without F16-shadow" claim only verified output coherence (which the BASE verify-fallback always provides regardless of drafter acceptance), NOT actual drafter acceptance. Real recommendation: stay HADAMARD=0 (accept_rate 1.056) or use Phase 3 F16-shadow if HADAMARD=1 is required (accept_rate 0.200).** |
 | Stream-7 (Option B vision splice + spec+vision) | **SHIPPED.** Vision splice landed via commits `cd4d7b8` (A: extract `forward_gemma_vision` into `crate::gemma4_vision::Gemma4VisionRuntime`) + `b2b20f5` (B: wire `Gemma4Nvfp4Bringup::forward_gemma_vision` + `forward_prompt_to_token_with_vision` + remove `vision_not_supported_on_gemma4_nvfp4` rejection). Vision + spec coexistence landed 2026-05-23 via commit `2b54b2d`: new `run_spec_session_nvfp4_greedy_k{1,}_with_vision` siblings thread `vision_splice` into the spec prefill; the drafter inherits vision-spliced base tokens via shared shadow K/V (no drafter ViT needed — drafter operates in token space). Hardware-validated on `gemma-4-31b-it-nvfp4` + `/tmp/ball.png`: coherent German captions, no rejection, both spec-on and spec-off paths. |
