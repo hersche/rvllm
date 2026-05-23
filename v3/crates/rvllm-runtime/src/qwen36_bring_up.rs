@@ -9033,73 +9033,153 @@ impl Qwen36Bringup {
                 // Phase 8 QKV-megakernel Phase 1: Q-norm + K-norm
                 // FUSED into the RoPE+KV-write kernel via two
                 // extra arg pointers (q_norm_weight, k_norm_weight)
-                // + eps. Block geometry unchanged from the unfused
-                // RoPE kernel. Per-head block-reduces sum-of-
-                // squares across head_dim, computes inverse rms,
-                // applies gamma-scaled normalisation, then the
-                // existing partial-NeoX rotation.
+                // + eps. Default-on. Opt-out via
+                // `RVLLM_QWEN36_NORM_ROPE_FUSED=0` runs the
+                // pre-943f8bb unfused chain (2 rmsnorm_inplace_f16
+                // launches + the 15-arg fused_rope_qwen_partial_f16kv
+                // without qn/kn/eps).
                 use cudarc::driver::sys::*;
-                let mut q_in_p = q_split_region.device_ptr();
-                let mut k_in_p = k_region.device_ptr();
-                let mut v_in_p = v_region.device_ptr();
-                let mut q_out_p = q_split_region.device_ptr(); // in-place ok
-                let mut kc = k_cache_layer_ptr;
-                let mut vc = v_cache_layer_ptr;
-                let mut cos_p = self.rope_cos;
-                let mut sin_p = self.rope_sin;
-                let mut qn_p = fl.q_norm.offset_bytes;
-                let mut kn_p = fl.k_norm.offset_bytes;
-                let mut pos_p = pos_dev_ptr;
-                let mut slot_p = slot_dev_ptr;
-                let mut nt: i32 = m as i32;
-                let mut nh: i32 = num_heads as i32;
-                let mut nkh: i32 = num_kv_heads as i32;
-                let mut hd_i: i32 = head_dim as i32;
-                let mut rd: i32 = rotary_dim as i32;
-                let mut eps_f: f32 = eps;
-                let args = [
-                    (&mut q_in_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut k_in_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut v_in_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut q_out_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut kc) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut vc) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut qn_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut kn_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut nt) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut rd) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut eps_f) as *mut f32 as *mut core::ffi::c_void,
-                ];
-                let max_h = num_heads.max(num_kv_heads);
-                let block_x: u32 = (head_dim / 2) as u32;
-                let rc = cuLaunchKernel(
-                    self.outside_kernels
-                        .fn_fused_qnorm_knorm_rope_qwen_partial_f16kv
-                        .raw() as CUfunction,
-                    m as u32,
-                    max_h,
-                    1,
-                    block_x,
-                    1,
-                    1,
-                    0,
-                    self.stream.raw() as CUstream,
-                    args.as_ptr() as *mut *mut core::ffi::c_void,
-                    core::ptr::null_mut(),
-                );
-                if rc != CUresult::CUDA_SUCCESS {
-                    return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 full_attn fused_rope_qwen launch",
-                        rvllm_core::CudaErrorKind::LaunchFailed,
-                        rvllm_core::CudaCtx::setup(),
-                    ));
+                let norm_rope_fused = std::env::var("RVLLM_QWEN36_NORM_ROPE_FUSED")
+                    .map(|s| s != "0")
+                    .unwrap_or(true);
+                let stream_raw = self.stream.raw() as u64;
+                if !norm_rope_fused {
+                    // Unfused legacy chain (pre-943f8bb).
+                    rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                        num_tokens: num_heads * (m as u32),
+                        hidden: head_dim,
+                        eps,
+                    }
+                    .launch(
+                        self.outside_kernels.fn_rmsnorm_inplace_f16,
+                        q_split_region.device_ptr(),
+                        fl.q_norm.offset_bytes,
+                        stream_raw,
+                    )?;
+                    rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                        num_tokens: num_kv_heads * (m as u32),
+                        hidden: head_dim,
+                        eps,
+                    }
+                    .launch(
+                        self.outside_kernels.fn_rmsnorm_inplace_f16,
+                        k_region.device_ptr(),
+                        fl.k_norm.offset_bytes,
+                        stream_raw,
+                    )?;
+                    let mut q_in_p = q_split_region.device_ptr();
+                    let mut k_in_p = k_region.device_ptr();
+                    let mut v_in_p = v_region.device_ptr();
+                    let mut q_out_p = q_split_region.device_ptr();
+                    let mut kc = k_cache_layer_ptr;
+                    let mut vc = v_cache_layer_ptr;
+                    let mut cos_p = self.rope_cos;
+                    let mut sin_p = self.rope_sin;
+                    let mut pos_p = pos_dev_ptr;
+                    let mut slot_p = slot_dev_ptr;
+                    let mut nt: i32 = m as i32;
+                    let mut nh: i32 = num_heads as i32;
+                    let mut nkh: i32 = num_kv_heads as i32;
+                    let mut hd_i: i32 = head_dim as i32;
+                    let mut rd: i32 = rotary_dim as i32;
+                    let args = [
+                        (&mut q_in_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut k_in_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut v_in_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut q_out_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut kc) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut vc) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let max_h = num_heads.max(num_kv_heads);
+                    let block_x: u32 = (head_dim / 2) as u32;
+                    let rc = cuLaunchKernel(
+                        self.outside_kernels.fn_fused_rope_qwen_partial_f16kv.raw() as CUfunction,
+                        m as u32, max_h, 1,
+                        block_x, 1, 1,
+                        0,
+                        self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 full_attn unfused_rope (NORM_ROPE_FUSED=0)",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                } else {
+                    let mut q_in_p = q_split_region.device_ptr();
+                    let mut k_in_p = k_region.device_ptr();
+                    let mut v_in_p = v_region.device_ptr();
+                    let mut q_out_p = q_split_region.device_ptr(); // in-place ok
+                    let mut kc = k_cache_layer_ptr;
+                    let mut vc = v_cache_layer_ptr;
+                    let mut cos_p = self.rope_cos;
+                    let mut sin_p = self.rope_sin;
+                    let mut qn_p = fl.q_norm.offset_bytes;
+                    let mut kn_p = fl.k_norm.offset_bytes;
+                    let mut pos_p = pos_dev_ptr;
+                    let mut slot_p = slot_dev_ptr;
+                    let mut nt: i32 = m as i32;
+                    let mut nh: i32 = num_heads as i32;
+                    let mut nkh: i32 = num_kv_heads as i32;
+                    let mut hd_i: i32 = head_dim as i32;
+                    let mut rd: i32 = rotary_dim as i32;
+                    let mut eps_f: f32 = eps;
+                    let args = [
+                        (&mut q_in_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut k_in_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut v_in_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut q_out_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut kc) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut vc) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut qn_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut kn_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut eps_f) as *mut f32 as *mut core::ffi::c_void,
+                    ];
+                    let max_h = num_heads.max(num_kv_heads);
+                    let block_x: u32 = (head_dim / 2) as u32;
+                    let rc = cuLaunchKernel(
+                        self.outside_kernels
+                            .fn_fused_qnorm_knorm_rope_qwen_partial_f16kv
+                            .raw() as CUfunction,
+                        m as u32,
+                        max_h,
+                        1,
+                        block_x,
+                        1,
+                        1,
+                        0,
+                        self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 full_attn fused_rope_qwen launch",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
                 }
             },
             Qwen36KvDtype::Nvfp4 if qkv_megakernel_on => unsafe {

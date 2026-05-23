@@ -2343,49 +2343,95 @@ impl Qwen35Bringup {
         // (10-11) Fused o_proj + post-attn residual add (Phase 8
         // other-models fusion, 2026-05-23). Single-kernel
         // replacement for the back-to-back Fp8GemvF16In →
-        // vector_add_f16 pair: computes the FP8 GEMV exactly as
-        // before, then in the same launch on lane 0 reads
-        // h_residual[n] f16 → f32, adds the GEMV's f32 acc,
-        // narrows back to f16, writes back. Per-element accumulator
-        // touched by exactly one thread → no atomic. Eliminates 1
-        // launch + 1 f16 round-trip per layer per token (post-attn
-        // residual).
+        // vector_add_f16 pair. Default-on. Opt-out via
+        // `RVLLM_QWEN35_FP8_GEMV_RESIDUAL_FUSED=0` runs the
+        // pre-39f7c1a unfused chain (fp8_gemv into scratch +
+        // vector_add_f16).
         let o_n = hidden as u32;
         let o_k = (n_q_heads * head_dim) as u32;
+        let fused = std::env::var("RVLLM_QWEN35_FP8_GEMV_RESIDUAL_FUSED")
+            .map(|s| s != "0")
+            .unwrap_or(true);
         unsafe {
             use cudarc::driver::sys::*;
-            let mut h_resid = scr.h_residual_ptr;
-            let mut w_ptr = full.o_proj.offset_bytes;
-            let mut s_ptr = full.o_proj.blockscale_ptr.unwrap_or(0);
-            let mut x_ptr = scr.attn_out_ptr;
-            let mut m_i: i32 = 1;
-            let mut n_i: i32 = o_n as i32;
-            let mut k_i: i32 = o_k as i32;
-            let mut ncb: i32 = ((o_k as i32) + 127) / 128;
-            let args = [
-                (&mut h_resid) as *mut u64 as *mut core::ffi::c_void,
-                (&mut w_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut s_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut x_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
-                (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
-                (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
-                (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let grid = ((o_n + 7) / 8, 1u32, 1u32);
-            let rc = cuLaunchKernel(
-                ker.fn_fp8_gemv_f16in_residual_add.raw() as CUfunction,
-                grid.0, grid.1, grid.2,
-                256, 1, 1, 0,
-                stream_raw as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen35 fp8_gemv_f16in_residual_add (o_proj+resid) launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup()));
+            if fused {
+                let mut h_resid = scr.h_residual_ptr;
+                let mut w_ptr = full.o_proj.offset_bytes;
+                let mut s_ptr = full.o_proj.blockscale_ptr.unwrap_or(0);
+                let mut x_ptr = scr.attn_out_ptr;
+                let mut m_i: i32 = 1;
+                let mut n_i: i32 = o_n as i32;
+                let mut k_i: i32 = o_k as i32;
+                let mut ncb: i32 = ((o_k as i32) + 127) / 128;
+                let args = [
+                    (&mut h_resid) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut x_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let grid = ((o_n + 7) / 8, 1u32, 1u32);
+                let rc = cuLaunchKernel(
+                    ker.fn_fp8_gemv_f16in_residual_add.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    256, 1, 1, 0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 fp8_gemv_f16in_residual_add (o_proj+resid) launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup()));
+                }
+            } else {
+                let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+                    self.paths.model_dir.clone(),
+                    "qwen35 unfused o_proj+resid: arena unset".into()))?;
+                let temp = arena.region("qwen35_oproj_unfused_temp",
+                                        (o_n as usize) * 2, 16)?;
+                let gemv_fn = ker.fn_fp8_gemv_wpr_native_f16in.ok_or_else(|| corrupt(
+                    self.paths.model_dir.clone(),
+                    "qwen35 unfused o_proj+resid: fn_fp8_gemv_wpr_native_f16in unloaded".into()))?;
+                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                    m: 1, n: o_n, k: o_k,
+                }.launch(
+                    gemv_fn,
+                    temp.device_ptr(),
+                    full.o_proj.offset_bytes,
+                    full.o_proj.blockscale_ptr.unwrap_or(0),
+                    scr.attn_out_ptr,
+                    stream_raw,
+                )?;
+                let mut dst = scr.h_residual_ptr;
+                let mut src = temp.device_ptr();
+                let mut n_elem: i32 = o_n as i32;
+                let v_args = [
+                    (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut n_elem) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let v_block: u32 = 256;
+                let v_grid: u32 = ((o_n + v_block - 1) / v_block).max(1);
+                let rc = cuLaunchKernel(
+                    ker.fn_vector_add_f16.raw() as CUfunction,
+                    v_grid, 1, 1,
+                    v_block, 1, 1,
+                    0,
+                    stream_raw as CUstream,
+                    v_args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 unfused o_proj+resid vector_add launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup()));
+                }
             }
         }
         Ok(())
@@ -4206,51 +4252,97 @@ impl Qwen35Bringup {
             }
         }
 
-        // (9-10) Fused out_proj + residual add (Phase 8
-        // other-models fusion, 2026-05-23). Single-kernel
-        // replacement for the back-to-back FP8 GEMV →
-        // vector_add_f16 pair: writes directly into
-        // `scr.h_residual_ptr` instead of materializing a temp
-        // `out_region`.
+        // (9-10) Fused out_proj + residual add (Phase 8 other-models
+        // fusion, 2026-05-23). Default-on; opt-out via
+        // `RVLLM_QWEN35_FP8_GEMV_RESIDUAL_FUSED=0`.
         let out_n = la.out_proj.shape[0] as u32;
         let out_k = la.out_proj.shape[1] as u32;
         let out_bs = la.out_proj.blockscale_ptr.ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
             "apply_linear_attn_layer: out_proj blockscale missing".into()))?;
+        let fused = std::env::var("RVLLM_QWEN35_FP8_GEMV_RESIDUAL_FUSED")
+            .map(|s| s != "0")
+            .unwrap_or(true);
         unsafe {
             use cudarc::driver::sys::*;
-            let mut h_resid = scr.h_residual_ptr;
-            let mut w_ptr = la.out_proj.offset_bytes;
-            let mut s_ptr = out_bs;
-            let mut x_ptr = gated_region.device_ptr();
-            let mut m_i: i32 = 1;
-            let mut n_i: i32 = out_n as i32;
-            let mut k_i: i32 = out_k as i32;
-            let mut ncb: i32 = ((out_k as i32) + 127) / 128;
-            let args = [
-                (&mut h_resid) as *mut u64 as *mut core::ffi::c_void,
-                (&mut w_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut s_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut x_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
-                (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
-                (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
-                (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let grid = ((out_n + 7) / 8, 1u32, 1u32);
-            let rc = cuLaunchKernel(
-                ker.fn_fp8_gemv_f16in_residual_add.raw() as CUfunction,
-                grid.0, grid.1, grid.2,
-                256, 1, 1, 0,
-                stream_raw as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen35 fp8_gemv_f16in_residual_add (la out_proj+resid) launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup()));
+            if fused {
+                let mut h_resid = scr.h_residual_ptr;
+                let mut w_ptr = la.out_proj.offset_bytes;
+                let mut s_ptr = out_bs;
+                let mut x_ptr = gated_region.device_ptr();
+                let mut m_i: i32 = 1;
+                let mut n_i: i32 = out_n as i32;
+                let mut k_i: i32 = out_k as i32;
+                let mut ncb: i32 = ((out_k as i32) + 127) / 128;
+                let args = [
+                    (&mut h_resid) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut x_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let grid = ((out_n + 7) / 8, 1u32, 1u32);
+                let rc = cuLaunchKernel(
+                    ker.fn_fp8_gemv_f16in_residual_add.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    256, 1, 1, 0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 fp8_gemv_f16in_residual_add (la out_proj+resid) launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup()));
+                }
+            } else {
+                let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+                    self.paths.model_dir.clone(),
+                    "qwen35 unfused la out_proj+resid: arena unset".into()))?;
+                let temp = arena.region("qwen35_la_outproj_unfused_temp",
+                                        (out_n as usize) * 2, 16)?;
+                let gemv_fn = ker.fn_fp8_gemv_wpr_native_f16in.ok_or_else(|| corrupt(
+                    self.paths.model_dir.clone(),
+                    "qwen35 unfused la out_proj+resid: fn_fp8_gemv_wpr_native_f16in unloaded".into()))?;
+                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                    m: 1, n: out_n, k: out_k,
+                }.launch(
+                    gemv_fn,
+                    temp.device_ptr(),
+                    la.out_proj.offset_bytes,
+                    out_bs,
+                    gated_region.device_ptr(),
+                    stream_raw,
+                )?;
+                let mut dst = scr.h_residual_ptr;
+                let mut src = temp.device_ptr();
+                let mut n_elem: i32 = out_n as i32;
+                let v_args = [
+                    (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut n_elem) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let v_block: u32 = 256;
+                let v_grid: u32 = ((out_n + v_block - 1) / v_block).max(1);
+                let rc = cuLaunchKernel(
+                    ker.fn_vector_add_f16.raw() as CUfunction,
+                    v_grid, 1, 1,
+                    v_block, 1, 1,
+                    0,
+                    stream_raw as CUstream,
+                    v_args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 unfused la out_proj+resid vector_add launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup()));
+                }
             }
         }
         Ok(())
@@ -5881,44 +5973,89 @@ impl Qwen35Bringup {
         // temp buffer is no longer consumed by anyone after this
         // fusion (kept allocated for arena address stability).
         let _ = cublaslt;
+        let fused = std::env::var("RVLLM_QWEN35_FP8_GEMV_RESIDUAL_FUSED")
+            .map(|s| s != "0")
+            .unwrap_or(true);
         unsafe {
             use cudarc::driver::sys::*;
-            let mut h_resid = scr.h_residual_ptr;
-            let mut w_ptr = layer.mlp.down_proj.offset_bytes;
-            let mut s_ptr = layer.mlp.down_proj.blockscale_ptr.unwrap_or(0);
-            let mut x_ptr = scr.silu_mid_ptr;
-            let mut m_i: i32 = 1;
-            let mut n_i: i32 = hidden;
-            let mut k_i: i32 = intermediate as i32;
-            let mut ncb: i32 = (intermediate as i32 + 127) / 128;
-            let args = [
-                (&mut h_resid) as *mut u64 as *mut core::ffi::c_void,
-                (&mut w_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut s_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut x_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
-                (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
-                (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
-                (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let grid = (((hidden as u32) + 7) / 8, 1u32, 1u32);
-            let rc = cuLaunchKernel(
-                ker.fn_fp8_gemv_f16in_residual_add.raw() as CUfunction,
-                grid.0, grid.1, grid.2,
-                256, 1, 1, 0,
-                stream_raw as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen35 fp8_gemv_f16in_residual_add (dense FFN down+resid) launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
+            if fused {
+                let mut h_resid = scr.h_residual_ptr;
+                let mut w_ptr = layer.mlp.down_proj.offset_bytes;
+                let mut s_ptr = layer.mlp.down_proj.blockscale_ptr.unwrap_or(0);
+                let mut x_ptr = scr.silu_mid_ptr;
+                let mut m_i: i32 = 1;
+                let mut n_i: i32 = hidden;
+                let mut k_i: i32 = intermediate as i32;
+                let mut ncb: i32 = (intermediate as i32 + 127) / 128;
+                let args = [
+                    (&mut h_resid) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut x_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let grid = (((hidden as u32) + 7) / 8, 1u32, 1u32);
+                let rc = cuLaunchKernel(
+                    ker.fn_fp8_gemv_f16in_residual_add.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    256, 1, 1, 0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 fp8_gemv_f16in_residual_add (dense FFN down+resid) launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            } else {
+                let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+                    self.paths.model_dir.clone(),
+                    "qwen35 unfused dense ffn down+resid: arena unset".into()))?;
+                let temp = arena.region("qwen35_ffn_down_unfused_temp",
+                                        (hidden as usize) * 2, 16)?;
+                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                    m: 1, n: hidden as u32, k: intermediate as u32,
+                }.launch(
+                    fp8_gemv_fn,
+                    temp.device_ptr(),
+                    layer.mlp.down_proj.offset_bytes,
+                    layer.mlp.down_proj.blockscale_ptr.unwrap_or(0),
+                    scr.silu_mid_ptr,
+                    stream_raw,
+                )?;
+                let mut dst = scr.h_residual_ptr;
+                let mut src = temp.device_ptr();
+                let mut n_elem: i32 = hidden;
+                let v_args = [
+                    (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut n_elem) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let v_block: u32 = 256;
+                let v_grid: u32 = ((hidden as u32 + v_block - 1) / v_block).max(1);
+                let rc = cuLaunchKernel(
+                    ker.fn_vector_add_f16.raw() as CUfunction,
+                    v_grid, 1, 1,
+                    v_block, 1, 1,
+                    0,
+                    stream_raw as CUstream,
+                    v_args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen35 unfused dense ffn down+resid vector_add launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup()));
+                }
             }
         }
-        let _ = fp8_gemv_fn;
         Ok(())
     }
 

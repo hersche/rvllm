@@ -1145,6 +1145,26 @@ because the warp-cooperative reduction order is not the same as
 the unfused chain's per-step reductions, but the math is
 equivalent up to float-rounding.
 
+**943f8bb Phase 1 norm+RoPE fusion is NON-DETERMINISTIC on F16-KV
+(2026-05-23 finding).** A/B on qwen3-6-35b-a3b F16-KV (max_tokens=150,
+3 runs each, env-gate `RVLLM_QWEN36_NORM_ROPE_FUSED=0` added to
+restore the unfused chain):
+- FUSED (default): md5 differs across 3 runs (ac5e866f, 5279bba3,
+  16f59787 — non-deterministic output for same prompt)
+- UNFUSED (=0):    md5 stable (ac5e866f ×3, deterministic)
+- Latency: prefill 235.87 vs 236.71 ms = parity
+Real bug: the fused kernel introduces run-to-run non-determinism on
+identical inputs. Root cause not investigated. Workaround: set
+`RVLLM_QWEN36_NORM_ROPE_FUSED=0` to opt out.
+
+**39f7c1a qwen35 dense fp8_gemv+residual fusion: parity.** A/B on
+qwen3-6-27b dense (max_tokens=150, 3 runs each, env-gate
+`RVLLM_QWEN35_FP8_GEMV_RESIDUAL_FUSED=0` added at all 3 sites):
+- FUSED (default): 5.94 tok/s deterministic, md5 524ccfe7 ×3
+- UNFUSED (=0):    5.94 tok/s deterministic, md5 7f35ee87 ×3
+Decode throughput parity. Both legs internally deterministic; md5
+differs ON vs OFF (different MAC ordering produces different tokens).
+
 Re-verified A/B on qwen3-6-35b-a3b NVFP4-KV (max_tokens=150,
 deterministic across 3 runs each, freshly-installed symlinked
 binary, profile = mobile-qwen3635b-rvllm-nvfp4-spec):
