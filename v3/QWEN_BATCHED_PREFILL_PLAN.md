@@ -213,11 +213,11 @@ fallback — closing the perf cliff that lived at M=128.
 ## Phase 8: Decode-step CUDA Graph capture — SHIPPED 2026-05-22
 
 The captured-graph decode path landed across a chain of commits
-from `793ddf0` through `4f083f8`. The replay path is now
-hardware-validated producing byte-correct multi-step output and
-runs ≈7% faster than eager at 150-token decode. Production
-default remains `RVLLM_QWEN36_DECODE_GRAPH` unset (legacy
-eager); captured path is opt-in.
+from `793ddf0` through `4f083f8`. The replay path is hardware-
+validated producing byte-correct multi-step output. Latency
+impact unverified — see ⚠️ header below. Production default
+remains `RVLLM_QWEN36_DECODE_GRAPH` unset (legacy eager);
+captured path is opt-in.
 
 Final commit chain (see `CLAUDE.md` "Phase 8" section for the
 detailed catalog):
@@ -291,9 +291,8 @@ of state on the capture step.
 
 The shipped path satisfies this contract (validated on three
 sequential qwen3-6-35b-a3b requests, full 1-10 counting + 80-token
-photosynthesis output byte-identical to eager). Latency A/B at
-max_tokens=150: eager 2.315s vs replay 2.158s — replay ≈7%
-faster.
+photosynthesis output byte-identical to eager). Latency impact
+unverified — see ⚠️ header below.
 
 Follow-on commit `bcdce94` adds cross-request graph cache reuse via
 a persistent workspace at worker bring-up + an inner RAII arena
@@ -307,15 +306,33 @@ Multi-step macro-replay + argmax+link fusion (commits `a14af12`,
 real, latency within noise of single-step replay (the per-step
 host overhead is small relative to kernel work).
 
-**MoE expert kernel fusion (commit `f0f79d5`) — first Phase 8
-optimization with a real measurable speedup**. The fused
+### ⚠️ Phase 8 A/B numbers — UNVERIFIED (binary-install bug, 2026-05-23)
+
+All Phase 8 latency A/B numbers in the entries below were measured
+during sessions that did NOT verify the served binary was the
+freshly-built one. `cargo build` writes to `v3/target/release/`;
+the systemd unit reads from `/home/r00t/.rvllm/bin/` and requires
+a manual `cp` to take effect for Rust dispatch changes. PTX is
+loaded fresh on every restart so kernel-only changes do take
+effect, but env-gate / fusion-selection changes silently keep
+running the old code path until the binary is `cp`'d. Re-test
+procedure for any future perf claim:
+  1. cargo build --release --bin rvllm-server --features cuda,gb10
+  2. sudo systemctl stop rvllm-serve
+  3. cp v3/target/release/rvllm-server /home/r00t/.rvllm/bin/rvllm-server
+  4. md5sum both — must match
+  5. sudo systemctl start rvllm-serve, wait for /v1/models
+  6. A/B with `RVLLM_QWEN36_TIMING=1` for prefill_ms; 3 runs/leg
+
+Architectural facts (kernel names, launch-count deltas,
+dispatch wiring) below are reliable. Latency numbers are not.
+
+**MoE expert kernel fusion (commit `f0f79d5`)**. The fused
 `fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_kernel`
 collapses the per-k-round (down-projection FP8 GEMV +
 scaled-add accumulator) pair into ONE launch. Saves 320 kernel
 launches + 320 f16 round-trips per decode token on Qwen 3.6
-35B-A3B. Latency: 2.140s → **1.717s** for a 150-token
-photosynthesis decode (≈20-25% speedup). The CLAUDE.md
-"Phase 8 MoE-fusion — SHIPPED" section has the full A/B table.
+35B-A3B. Latency impact unverified.
 
 **Other-models fusion (commit `39f7c1a`)** — same pattern
 ported to Qwen 3.5/3.6 27B DENSE decode via new kernel
@@ -323,39 +340,34 @@ ported to Qwen 3.5/3.6 27B DENSE decode via new kernel
 Three per-layer M=1 sites in qwen35_bring_up.rs (full-attn
 o_proj, linear-attn out_proj, dense MLP ffn_down) fuse with
 the subsequent vector_add_f16 residual. 120 launches saved per
-decode token. Hardware-validated correct on qwen3-6-27b but
-latency win is below noise (~14.68s for 150-token decode) —
-the 27B dense path is kernel-work-bound, not launch-overhead-
-bound; the fusion's value is architectural. The fused kernel
-infrastructure is now available for Mistral 3.5 / Gemma 4 31B
-dense paths but the latency win on those would also be below
-noise.
+decode token. Hardware-validated correct on qwen3-6-27b.
+Latency impact unverified. The fused kernel infrastructure is
+now available for Mistral 3.5 / Gemma 4 31B dense paths.
 
 **Batched-prefill fusion follow-on (commit `8060834`)** — new
 kernel `..._indirect_scaled_add_batched_topk_kernel` extends the
 f0f79d5 pattern to `apply_layer_moe_batched`'s prefill k_round
 loop. Saves 1 launch + 1 f16 round-trip per k-round across the
-entire prompt. ~4.5% prefill speedup (2.66s → 2.54s baseline
-toggled via `RVLLM_QWEN36_BATCH_MOE_PREFILL`).
+entire prompt. Latency impact unverified. Gated via
+`RVLLM_QWEN36_BATCH_MOE_PREFILL`.
 
 **Shared-expert fusion (commit `99e6cde`)** — new kernel
 `fp8_gemv_blockwise_wpr_native_f16in_scaled_add_devw_kernel`
 fuses the shared-expert down + scaled_add into one launch.
 Saves 40 launches/decode token at 40 MoE layers. Latency
-1.708s deterministic.
+impact unverified.
 
 **Dual_silu k_round-batch fusion (commit `442a72c`)** — new
 kernel `..._dual_silu_indirect_kround_batched_kernel` batches
 the 8-k_round host loop into ONE launch via `grid.z = top_k`.
 silu_region grows to `[top_k, M, N_int]`; down loop still
-serial. 7 launches saved per MoE layer per token.
-**2.4% additional decode speedup** (1.717s → 1.676s).
+serial. 7 launches saved per MoE layer per token. Latency
+impact unverified.
 
 **Router+topk fusion (commit `e049258`)** — new kernel
 `router_gemv_with_topk_f16_to_f32_kernel` uses atomic-counter
 last-block-does-topk pattern. Saves 1 launch per MoE layer
-per token (~40 per decode token). Latency 1.675s
-(below-noise additional speedup as predicted).
+per token (~40 per decode token). Latency impact unverified.
 
 **Batched router+topk fusion (commit `314dbe6`)** — same
 pattern ported to the prefill batched path with per-token
@@ -376,12 +388,6 @@ has each warp own one (m, n) output slot and sequentially
 process all top_k k_rounds — no atomic, single global RMW at
 the end. Saves 280 launches/decode token.
 
-**Cumulative MoE-fusion stack** on qwen3-6-35b-a3b 150-token
-photosynthesis: 2.140s baseline → 1.717s (f0f79d5) → 1.708s
-(99e6cde) → 1.676s (442a72c) → 1.675s (e049258) → **1.644s
-(b1f221e)**. **Total ≈23% decode speedup** across today's
-stack.
-
 **Hidden-state → workspace refactor (commit `e13e2eb`)** — adds
 `hidden_dev_override: Option<u64>` to
 `forward_qwen36_decode_inner_with_workspace_overrides_v2`;
@@ -396,9 +402,9 @@ four closer fns (`outside_closer`, `_device_argmax`,
 survives the inner-ckpt restore + is address-stable across
 requests, so the captured graph's hidden-state references stay
 valid forever — unlocks broader closer/post-attn fusion
-patterns. Hardware-validated coherent under
-DECODE_WORKSPACE=1 (1.648-1.652s, within noise of 1.654s
-eager) and DECODE_GRAPH=1 + REPLAY=1 (short + 1-10 counting).
+patterns. Hardware-validated coherent under DECODE_WORKSPACE=1
+and DECODE_GRAPH=1 + REPLAY=1 (short + 1-10 counting). Latency
+impact unverified.
 
 **Multi-step graph with persistent hidden (commit `eb26d86`)**
 — exploits e13e2eb to retire the per-iteration
@@ -408,11 +414,9 @@ body + eager fallback + the pure-eager branch of
 `decode_steps_n_via_graph_or_eager`). The fused closer reads
 hidden state directly from `workspace.hidden_dev` (which the
 decode-step body already writes to). Result on qwen3-6-35b-a3b
-at N=8: macro-graph node count **14840 → 7160** (cut nearly
-in half), multi-step replay latency **2.188s → 1.727s** (≈21%
-multi-step improvement; deterministic across 5 cached replays).
-Still ~80ms slower than single-step replay (1.644s); multi-
-step stays operator-opt-in via `RVLLM_QWEN36_DECODE_MULTI_STEP`.
+at N=8: macro-graph node count drops roughly in half. Latency
+impact unverified. Multi-step stays operator-opt-in via
+`RVLLM_QWEN36_DECODE_MULTI_STEP`.
 
 **Q-norm + K-norm + RoPE + KV megakernel Phase 1 (commit
 `943f8bb`)** — first step toward the QKV+norm+RoPE+KV
@@ -429,9 +433,7 @@ cache write. Each thread covers both halves of its
 the in-place trick the unfused kernel used. F16-KV-only
 wiring; NVFP4 follow-on flagged. Hardware-validated coherent
 on qwen3-6-35b-a3b F16-KV + production NVFP4-KV regression-
-clean. F16-KV path is memory-bandwidth-bound (2.528s for 150-
-token decode vs NVFP4's 1.654s); the fusion's launch savings
-are below noise on this dominantly memory-bound path.
+clean. Latency impact unverified.
 
 **NVFP4-KV sibling (commit `6f6a25a`)** — same 2-phase
 structure ported to the NVFP4 RoPE kernel:
