@@ -793,7 +793,7 @@ impl Qwen36Bringup {
     #[cfg(feature = "cuda")]
     fn forward_qwen36_outside_closer_device_argmax_with_link(
         &self,
-        hidden_region: &rvllm_mem::Region<'_>,
+        hidden_dev_ptr: u64,
         num_tokens: u32,
         hidden: u32,
         vocab: u32,
@@ -817,7 +817,7 @@ impl Qwen36Bringup {
             self.arena.region("qwen36_pl_logits_argl", logits_bytes, 16)?;
         let stream_raw = self.stream.raw() as u64;
         let last_hidden_row_ptr =
-            hidden_region.device_ptr() + (last_idx as u64) * (hidden as u64) * 2;
+            hidden_dev_ptr + (last_idx as u64) * (hidden as u64) * 2;
         unsafe {
             rvllm_fused::FusedRmsnormFp8QuantLaunch {
                 num_tokens: 1,
@@ -1012,7 +1012,7 @@ impl Qwen36Bringup {
                         let argmax_dst = base_argmax + (i as u64) * 4;
                         let do_link = if i + 1 < n_steps { 1 } else { 0 };
                         self.forward_qwen36_outside_closer_device_argmax_with_link(
-                            &hidden_region,
+                            hidden_region.device_ptr(),
                             /* num_tokens */ 1,
                             hidden,
                             vocab,
@@ -1060,7 +1060,7 @@ impl Qwen36Bringup {
                     let argmax_dst = base_argmax + (i as u64) * 4;
                     let do_link = if i + 1 < n_steps { 1 } else { 0 };
                     self.forward_qwen36_outside_closer_device_argmax_with_link(
-                        &hidden_region,
+                        hidden_region.device_ptr(),
                         1, hidden, vocab, 0,
                         argmax_dst,
                         workspace.token_dev,
@@ -1196,7 +1196,7 @@ impl Qwen36Bringup {
                 let argmax_dst = base_argmax + (i as u64) * 4;
                 let do_link = if i + 1 < n_steps { 1 } else { 0 };
                 self.forward_qwen36_outside_closer_device_argmax_with_link(
-                    &hidden_region,
+                    hidden_region.device_ptr(),
                     1, hidden, vocab, 0,
                     argmax_dst,
                     workspace.token_dev,
@@ -1376,6 +1376,12 @@ impl Qwen36Bringup {
             // step-0's scalar.
             Some(workspace.pos_dev),
             Some(workspace.ctx_dev),
+            // Phase 8 hidden-state→workspace: route the residual
+            // stream through the persistent `workspace.hidden_dev`
+            // slot so the captured-graph references survive the
+            // inner-checkpoint restore + stay address-stable
+            // across requests.
+            Some(workspace.hidden_dev),
         )?;
         Ok(())
     }
@@ -1411,6 +1417,9 @@ impl Qwen36Bringup {
             Some(workspace.argmax_token_dev),
             Some(workspace.pos_dev),
             Some(workspace.ctx_dev),
+            // Phase 8 hidden-state→workspace: route the residual
+            // stream through the persistent workspace slot.
+            Some(workspace.hidden_dev),
         )?;
         Ok(())
     }
@@ -5613,6 +5622,7 @@ impl Qwen36Bringup {
             tok_device_override, closer_argmax_dev,
             /* pos_dev_override */ None,
             /* ctx_dev_override */ None,
+            /* hidden_dev_override */ None,
         )
     }
 
@@ -5641,6 +5651,18 @@ impl Qwen36Bringup {
         closer_argmax_dev: Option<u64>,
         pos_dev_override: Option<u64>,
         ctx_dev_override: Option<u64>,
+        // Phase 8 hidden-state→workspace refactor (2026-05-23):
+        // when `Some`, the per-call `hidden_region` arena
+        // allocation is BYPASSED and ALL hidden-state reads /
+        // writes inside the function (embed_gather, residual
+        // stream, vision splice, layer loop, closer) use this
+        // pointer instead. Caller must guarantee the buffer is
+        // at least `num_tokens * hidden * 2` bytes. Used by
+        // the workspace forward path so the captured graph
+        // references the persistent `workspace.hidden_dev` slot
+        // (stable across requests) instead of an arena-bumped
+        // address (stable only within one request).
+        hidden_dev_override: Option<u64>,
     ) -> Result<i32> {
         if token_ids.is_empty() {
             return Err(rvllm_core::RvllmError::cuda(
@@ -5701,6 +5723,24 @@ impl Qwen36Bringup {
         };
         let hidden_bytes = (num_tokens as usize) * (hidden as usize) * 2;
         let hidden_region = self.arena.region("qwen36_pl_hidden", hidden_bytes, 16)?;
+        // Phase 8 hidden-state→workspace refactor (2026-05-23):
+        // every read/write of the hidden residual stream below
+        // goes through `hidden_dev_ptr` rather than
+        // `hidden_region.device_ptr()` directly. When the caller
+        // passes `Some(workspace.hidden_dev)`, the persistent
+        // workspace slot replaces the per-call arena address —
+        // captured graphs end up referencing a buffer that
+        // SURVIVES the inner-checkpoint restore + stays at the
+        // same address across requests.
+        //
+        // The arena `hidden_region` allocation above is kept
+        // unconditionally (cheap; bumps arena by hidden_bytes)
+        // so the rest of the function's arena layout stays
+        // identical between override-on and override-off paths.
+        // The unused fallback allocation costs ~4 KB at
+        // hidden=2048 — trivial.
+        let hidden_dev_ptr: u64 = hidden_dev_override
+            .unwrap_or(hidden_region.device_ptr());
         unsafe {
             rvllm_fused::EmbeddingGatherLaunch {
                 num_tokens,
@@ -5709,7 +5749,7 @@ impl Qwen36Bringup {
             }
             .launch(
                 self.outside_kernels.fn_embedding_gather_f16,
-                hidden_region.device_ptr(),
+                hidden_dev_ptr,
                 self.model.outside.embed_tokens.offset_bytes,
                 token_dev_ptr,
                 stream_raw,
@@ -5743,7 +5783,7 @@ impl Qwen36Bringup {
                 unsafe {
                     use cudarc::driver::sys::*;
                     let r = cuMemcpyHtoDAsync_v2(
-                        hidden_region.device_ptr() + dst_off,
+                        hidden_dev_ptr + dst_off,
                         emb_bytes.as_ptr() as *const _,
                         len,
                         self.stream.raw() as _,
@@ -5958,7 +5998,7 @@ impl Qwen36Bringup {
                     for t in 0..num_tokens {
                         let mut buf = vec![0u8; last_hidden_bytes];
                         let row_ptr =
-                            hidden_region.device_ptr() + (t as u64) * (last_hidden_bytes as u64);
+                            hidden_dev_ptr + (t as u64) * (last_hidden_bytes as u64);
                         #[cfg(feature = "cuda")]
                         unsafe {
                             use cudarc::driver::sys::*;
@@ -6010,7 +6050,7 @@ impl Qwen36Bringup {
                             .unwrap_or(false);
                         if host_loop_only {
                             for t in 0..num_tokens {
-                                let tok_ptr = hidden_region.device_ptr()
+                                let tok_ptr = hidden_dev_ptr
                                     + (t as u64) * (last_hidden_bytes as u64);
                                 let inner_ck = self.arena.checkpoint();
                                 self.apply_layer_linear_attn(
@@ -6029,7 +6069,7 @@ impl Qwen36Bringup {
                             self.apply_layer_linear_attn_batched(
                                 la,
                                 linear_seq,
-                                hidden_region.device_ptr(),
+                                hidden_dev_ptr,
                                 num_tokens,
                                 kernel_gemv,
                                 hidden,
@@ -6070,7 +6110,7 @@ impl Qwen36Bringup {
                             self.apply_layer_full_attn_batched(
                                 fl,
                                 full_seq,
-                                hidden_region.device_ptr(),
+                                hidden_dev_ptr,
                                 num_tokens,
                                 kernel_gemv,
                                 hidden,
@@ -6085,7 +6125,7 @@ impl Qwen36Bringup {
                         } else {
                             for t in 0..num_tokens {
                                 let tok_pos = start_position + t;
-                                let tok_ptr = hidden_region.device_ptr()
+                                let tok_ptr = hidden_dev_ptr
                                     + (t as u64) * (last_hidden_bytes as u64);
                                 let pos_p = positions_region.device_ptr() + (t as u64) * 4;
                                 let cl_p = context_lens_region.device_ptr() + (t as u64) * 4;
@@ -6116,7 +6156,7 @@ impl Qwen36Bringup {
                     for t in 0..num_tokens {
                         let mut buf = vec![0u8; last_hidden_bytes];
                         let row_ptr =
-                            hidden_region.device_ptr() + (t as u64) * (last_hidden_bytes as u64);
+                            hidden_dev_ptr + (t as u64) * (last_hidden_bytes as u64);
                         #[cfg(feature = "cuda")]
                         unsafe {
                             use cudarc::driver::sys::*;
@@ -6148,7 +6188,7 @@ impl Qwen36Bringup {
                     self.apply_layer_moe_batched(
                         &self.model.layers[layer_idx].moe,
                         post_attn_norm_ptr,
-                        hidden_region.device_ptr(),
+                        hidden_dev_ptr,
                         num_tokens,
                         kernel_gemv,
                         hidden,
@@ -6161,7 +6201,7 @@ impl Qwen36Bringup {
                 } else {
                     for t in 0..num_tokens {
                         let tok_ptr =
-                            hidden_region.device_ptr() + (t as u64) * (last_hidden_bytes as u64);
+                            hidden_dev_ptr + (t as u64) * (last_hidden_bytes as u64);
                         let inner_ck = self.arena.checkpoint();
                         self.apply_layer_moe(
                             &self.model.layers[layer_idx].moe,
@@ -6183,7 +6223,7 @@ impl Qwen36Bringup {
                     for t in 0..num_tokens {
                         let mut buf = vec![0u8; last_hidden_bytes];
                         let row_ptr =
-                            hidden_region.device_ptr() + (t as u64) * (last_hidden_bytes as u64);
+                            hidden_dev_ptr + (t as u64) * (last_hidden_bytes as u64);
                         #[cfg(feature = "cuda")]
                         unsafe {
                             use cudarc::driver::sys::*;
@@ -6277,7 +6317,7 @@ impl Qwen36Bringup {
             // writes through `tok_ptr` directly, eliminating two
             // launches per token.
             let tok_ptr =
-                hidden_region.device_ptr() + (tok_local as u64) * (last_hidden_bytes as u64);
+                hidden_dev_ptr + (tok_local as u64) * (last_hidden_bytes as u64);
 
             // Phase 5e: optional per-layer activation dump for
             // numerical-correctness audit vs vLLM. Set
@@ -6456,7 +6496,7 @@ impl Qwen36Bringup {
                 #[cfg(feature = "cuda")]
                 {
                     self.forward_qwen36_outside_closer_all(
-                        &hidden_region,
+                        hidden_dev_ptr,
                         num_tokens,
                         hidden,
                         vocab,
@@ -6473,7 +6513,7 @@ impl Qwen36Bringup {
                 out.reserve(num_tokens as usize);
                 for i in 0..(num_tokens as usize) {
                     let t = self.forward_qwen36_outside_closer(
-                        &hidden_region,
+                        hidden_dev_ptr,
                         num_tokens,
                         hidden,
                         vocab,
@@ -6504,15 +6544,15 @@ impl Qwen36Bringup {
                     ));
                 }
                 self.forward_qwen36_outside_closer_device_argmax(
-                    &hidden_region, num_tokens, hidden, vocab,
+                    hidden_dev_ptr, num_tokens, hidden, vocab,
                     last_idx, argmax_dev)?;
                 0i32
             } else {
                 let base = self.forward_qwen36_outside_closer(
-                    &hidden_region, num_tokens, hidden, vocab, last_idx)?;
+                    hidden_dev_ptr, num_tokens, hidden, vocab, last_idx)?;
                 if let Some(out) = mtp_shadow_out {
                     let last_hidden_row_ptr =
-                        hidden_region.device_ptr() + (last_idx as u64) * (hidden as u64) * 2;
+                        hidden_dev_ptr + (last_idx as u64) * (hidden as u64) * 2;
                     *out = Some(self.forward_qwen36_mtp_from_hidden_ptr(
                         last_hidden_row_ptr,
                         base,
@@ -10993,7 +11033,7 @@ impl Qwen36Bringup {
     #[cfg(feature = "cuda")]
     fn forward_qwen36_outside_closer_device_argmax(
         &self,
-        hidden_region: &rvllm_mem::Region<'_>,
+        hidden_dev_ptr: u64,
         num_tokens: u32,
         hidden: u32,
         vocab: u32,
@@ -11013,7 +11053,7 @@ impl Qwen36Bringup {
             self.arena.region("qwen36_pl_logits_devarg", logits_bytes, 16)?;
         let stream_raw = self.stream.raw() as u64;
         let last_hidden_row_ptr =
-            hidden_region.device_ptr() + (last_idx as u64) * (hidden as u64) * 2;
+            hidden_dev_ptr + (last_idx as u64) * (hidden as u64) * 2;
         unsafe {
             rvllm_fused::FusedRmsnormFp8QuantLaunch {
                 num_tokens: 1,
@@ -11096,7 +11136,7 @@ impl Qwen36Bringup {
 
     fn forward_qwen36_outside_closer(
         &self,
-        hidden_region: &rvllm_mem::Region<'_>,
+        hidden_dev_ptr: u64,
         num_tokens: u32,
         hidden: u32,
         vocab: u32,
@@ -11120,9 +11160,11 @@ impl Qwen36Bringup {
         let logits_region = self.arena.region("qwen36_pl_logits", logits_bytes, 16)?;
         let stream_raw = self.stream.raw() as u64;
         // Pointer to the last token's hidden row inside the full
-        // [num_tokens, hidden] f16 region.
+        // [num_tokens, hidden] f16 buffer (caller passes the buffer
+        // base — either an arena `hidden_region.device_ptr()` or the
+        // persistent workspace `hidden_dev` slot).
         let last_hidden_row_ptr =
-            hidden_region.device_ptr() + (last_idx as u64) * (hidden as u64) * 2;
+            hidden_dev_ptr + (last_idx as u64) * (hidden as u64) * 2;
         unsafe {
             rvllm_fused::FusedRmsnormFp8QuantLaunch {
                 num_tokens: 1,
@@ -11331,7 +11373,7 @@ impl Qwen36Bringup {
     #[cfg(feature = "cuda")]
     fn forward_qwen36_outside_closer_all(
         &self,
-        hidden_region: &rvllm_mem::Region<'_>,
+        hidden_dev_ptr: u64,
         rows: u32,
         hidden: u32,
         vocab: u32,
@@ -11370,7 +11412,7 @@ impl Qwen36Bringup {
                 self.outside_kernels.fn_fused_rmsnorm_fp8_quant,
                 hidden_fp8_region.device_ptr(),
                 hidden_scale_region.device_ptr(),
-                hidden_region.device_ptr(),
+                hidden_dev_ptr,
                 self.model.outside.final_norm.offset_bytes,
                 stream_raw,
             )?;
