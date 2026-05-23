@@ -391,8 +391,8 @@ impact unverified. Multi-step stays operator-opt-in via
 `RVLLM_QWEN36_DECODE_MULTI_STEP`.
 
 **Q-norm + K-norm + RoPE + KV megakernel Phase 1 (commit
-`943f8bb`)** — first step toward the QKV+norm+RoPE+KV
-megakernel goal. New kernel
+`943f8bb`, K-side race fixed in commit `33145a6`)** — first
+step toward the QKV+norm+RoPE+KV megakernel goal. New kernel
 `fused_qnorm_knorm_rope_qwen_partial_f16kv_kernel` folds the
 two standalone `rmsnorm_inplace_f16` launches (Q-norm + K-
 norm per full-attn layer) into the existing partial-NeoX
@@ -403,7 +403,11 @@ cache write. Each thread covers both halves of its
 (tid, tid+half_head) pair so the non-rotary tail
 [rotary_dim, head_dim) gets normalised without relying on
 the in-place trick the unfused kernel used. F16-KV-only
-wiring; NVFP4 follow-on flagged. Hardware-validated coherent
+wiring; NVFP4 follow-on flagged. **Original commit had a
+K-side race for tid in [half_rot, rotary_dim) (two warps
+writing the same key_cache slot, non-deterministic md5
+run-to-run); fixed in `33145a6` by splitting the else
+branch.** Hardware-validated coherent
 on qwen3-6-35b-a3b F16-KV + production NVFP4-KV regression-
 clean.
 
