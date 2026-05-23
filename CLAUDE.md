@@ -1306,6 +1306,31 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 MoE W=4 cooperative A-staging — task #96 (2026-05-23, +57.9%)
+
+`fp8_mma_dual_silu_grouped_m16_w4c_kernel` (commit `41892e9`)
+distributes A-tile staging across all 128 threads instead of
+warp-0 serial. Per K=32: 1 cooperative pass (each thread writes
+4 bytes via aligned u32 store) vs 16 serial iterations. Per-row
+`token_idx` broadcast via `smem_token_idx[16]` (+64 B smem).
+
+Dispatched by default when GROUPED+W4 are on. Opt-out via
+`RVLLM_QWEN36_MOE_MMA_GROUPED_W4_COOP=0`.
+
+A/B (qwen3-6-35b-a3b NVFP4, deterministic, fresh binary
+md5 `6e29deb9`):
+
+  | Cell                          | 1112 tok    | 4412 tok    |
+  |-------------------------------|-------------|-------------|
+  | GEMV baseline                 |   6020 ms   |  24775 ms   |
+  | MMA W=1  (#94)                |   3265 ms   |  13674 ms   |
+  | MMA W=4 serial (#95)          |   2627 ms   |  11062 ms   |
+  | **MMA W=4 coop (#96)**        | **2533 ms** | **10587 ms**|
+  | Win vs GEMV                   | **+57.9%**  | **+57.3%**  |
+  | Win vs W=4 serial             |  +3.6%      |  +4.3%      |
+
+W=4 serial regression-checked (COOP=0): parity with #95.
+
 ### qwen36 MoE W=4 multi-warp + persistent sort scratch — task #95 (2026-05-23, +56%)
 
 Two follow-ons to #94 in one commit (`618efb2`):

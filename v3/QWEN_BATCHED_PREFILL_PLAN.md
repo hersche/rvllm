@@ -625,3 +625,35 @@ Cumulative MoE-prefill speedup vs raw GEMV across all phases:
 Next-step follow-up parked: same expert-sort foundation feeding a
 grouped MMA `down` projection sibling (27% of remaining prefill
 GPU time).
+
+
+## Phase 12: Cooperative A-staging in W=4 grouped MMA (task #96, 2026-05-23, +57.9% vs GEMV)
+
+`fp8_mma_dual_silu_grouped_m16_w4c_kernel` (commit `41892e9`) replaces
+the W=4 serial A-staging (warp 0 lanes 0..15 each writing 32 bytes
+through a 32-iter inner loop) with a single cooperative pass: all
+128 threads write 4 contiguous bytes each via aligned u32 store. Per-
+row token_idx broadcast through a new `smem_token_idx[16]` slot
+(+64 B smem). Default-on when GROUPED+W4 are on; opt-out via
+`RVLLM_QWEN36_MOE_MMA_GROUPED_W4_COOP=0`.
+
+A/B (qwen3-6-35b-a3b NVFP4, deterministic, fresh binary):
+
+  | Cell                          | 1112 tok    | 4412 tok    |
+  |-------------------------------|-------------|-------------|
+  | GEMV baseline                 |   6020 ms   |  24775 ms   |
+  | Phase 10 MMA W=1              |   3265 ms   |  13674 ms   |
+  | Phase 11 MMA W=4 serial       |   2627 ms   |  11062 ms   |
+  | **Phase 12 MMA W=4 coop**     | **2533 ms** | **10587 ms**|
+  | Win vs GEMV                   | **+57.9%**  | **+57.3%**  |
+  | Win vs Phase 11               |  +3.6%      |  +4.3%      |
+
+Regression-checked: COOP=0 falls back to Phase 11 (within noise).
+Backward-compat smoke verified post-restore.
+
+Cumulative MoE-prefill speedup vs GEMV:
+* Phase 4-7 reference 6020 ms
+* Phase 9 MMA first-cut: 5738 ms (+4.9%)
+* Phase 10 MMA grouped M=16: 3265 ms (+45.8%)
+* Phase 11 MMA W=4: 2627 ms (+56.4%)
+* **Phase 12 MMA W=4 coop: 2533 ms (+57.9%)**
