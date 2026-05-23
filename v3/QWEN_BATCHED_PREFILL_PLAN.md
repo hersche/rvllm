@@ -580,3 +580,48 @@ Follow-up parked (not blocking production rollout):
   projection sibling (27% of prefill GPU time per nsys profile).
 * Persistent sort buffer alloc reuse across layers.
 * Multi-warp tiling per block (currently 1 warp/block).
+
+
+## Phase 11: W=4 multi-warp + persistent scratch (task #95, 2026-05-23, +56% vs GEMV)
+
+Two follow-ons to Phase 10's grouped MMA in one commit (`618efb2`).
+
+* **W=4 kernel** `fp8_mma_dual_silu_grouped_m16_w4_kernel`: 4 warps
+  per block share one A tile + cover N=32 cols per block (vs N=8 in
+  Phase 10). Amortises per-row amax + A staging across warps; grid.x
+  drops 4×. Default-on when N % 32 == 0 (qwen36 moe_int=512). Opt-out
+  via `RVLLM_QWEN36_MOE_MMA_GROUPED_W4=0`.
+* **Persistent sort scratch** (`Qwen36Bringup.mma_sort_scratch`):
+  sorted_per_expert + counts + tile_descriptors + tile_count pre-
+  allocated at load() sized for M_MAX_FOR_PERSISTENT=16384 (32 MB).
+  Per-call dispatch consults capacity; falls back to arena.region
+  when oversized.
+
+A/B (qwen3-6-35b-a3b NVFP4, deterministic):
+
+  | Cell                          | 1112 tok    | 4412 tok    |
+  |-------------------------------|-------------|-------------|
+  | GEMV baseline                 |   6020 ms   |  24775 ms   |
+  | Phase 10 MMA W=1              |   3265 ms   |  13674 ms   |
+  | **Phase 11 MMA W=4**          | **2627 ms** | **11062 ms**|
+  | Phase 11 + persistent         |   2631 ms   |  11146 ms   |
+  | Win vs GEMV                   | **+56.4%**  | **+55.4%**  |
+  | Win vs W=1                    |  +19.5%     |  +19.1%     |
+
+Persistent scratch shows parity with per-call allocation —
+arena.region overhead was negligible. The win is architectural
+(fewer Bringup-state mutations per request).
+
+Output coherence verified on 2k + 4k German prompts. Backward-compat
+verified post-restore: legacy GEMV path unchanged.
+
+Cumulative MoE-prefill speedup vs raw GEMV across all phases:
+* Phase 4-7 baseline batched MoE (commits 8060834..b1f221e):
+  reference 6020 ms
+* Phase 9 MMA first-cut: 5738 ms (+4.9%)
+* Phase 10 MMA grouped M=16: 3265 ms (+45.8%)
+* **Phase 11 MMA W=4: 2627 ms (+56.4%)**
+
+Next-step follow-up parked: same expert-sort foundation feeding a
+grouped MMA `down` projection sibling (27% of remaining prefill
+GPU time).

@@ -1306,6 +1306,37 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 MoE W=4 multi-warp + persistent sort scratch — task #95 (2026-05-23, +56%)
+
+Two follow-ons to #94 in one commit (`618efb2`):
+
+* **W=4 multi-warp tiling** — `fp8_mma_dual_silu_grouped_m16_w4_kernel`.
+  4 warps per block share ONE A tile + cover 4× N cols per block;
+  amortises per-row amax + A staging across warps. Grid.x drops 4×.
+  Dispatched by default when N divisible by 32 (qwen36 moe_int=512
+  qualifies). Opt-out via `RVLLM_QWEN36_MOE_MMA_GROUPED_W4=0`.
+* **Persistent sort scratch** — `Qwen36Bringup.mma_sort_scratch` pre-
+  allocates `sorted_per_expert` + `expert_counts` + `tile_descriptors`
+  + `tile_count` once at `load()` sized for M_MAX_FOR_PERSISTENT=16384
+  (32 MB sorted + 99 KB tiles). Dispatch uses persistent ptrs when
+  this prefill fits; falls back to per-call `arena.region` otherwise.
+
+A/B (qwen3-6-35b-a3b NVFP4, deterministic, fresh binary
+md5 `de341522`):
+
+  | Cell                          | 1112 tok    | 4412 tok    |
+  |-------------------------------|-------------|-------------|
+  | GEMV baseline                 |   6020 ms   |  24775 ms   |
+  | MMA W=1  (#94)                |   3265 ms   |  13674 ms   |
+  | **MMA W=4 (#95)**             | **2627 ms** | **11062 ms**|
+  | MMA W=4 + persistent (#95)    |   2631 ms   |  11146 ms   |
+  | Win vs GEMV                   | **+56.4%**  | **+55.4%**  |
+  | Win vs W=1                    |  +19.5%     |  +19.1%     |
+  | Persistent vs per-call alloc  | parity      | parity      |
+
+Persistent buffer parity confirms the per-call arena.region overhead
+was negligible — the change is architectural, not a perf win.
+
 ### qwen36 MoE expert-sort + grouped MMA — task #94 (2026-05-23, +45%)
 
 Recovers the M-direction MMA reuse the task #93 first-cut sacrificed.
