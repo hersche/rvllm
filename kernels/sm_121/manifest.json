@@ -221,6 +221,11 @@
       "path": "fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk.ptx",
       "sha256": "ba1a06b70da2c0e7fe159d344d9275ff7ca832429f0f6e4b69ef03c700ff653b"
     },
+    "fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_kround_batched": {
+      "bytes": 34064,
+      "path": "fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_kround_batched.ptx",
+      "sha256": "e5dc801dc1188cf200c8251a381de85f9fe7f82bad03bc19ed49b1c55e47064f"
+    },
     "fp8_gemv_blockwise_wpr_native_f16in_indirect": {
       "bytes": 25107,
       "path": "fp8_gemv_blockwise_wpr_native_f16in_indirect.ptx",
@@ -1047,5 +1052,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "8060834"
+  "revision": "d2f6704"
 }

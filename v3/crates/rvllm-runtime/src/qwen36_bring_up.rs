@@ -194,6 +194,15 @@ pub struct Qwen36OutsideKernels {
     /// captureable (Phase 4b-prep iter34).
     pub fp8_gemv_dual_silu_indirect_mod: LoadedModule,
     pub fn_fp8_gemv_dual_silu_indirect: KernelFn,
+    /// Phase 8 dual_silu k_round-batch fusion (2026-05-23):
+    /// `grid.z=top_k` batches the per-token MoE host-side loop
+    /// over k_rounds into ONE launch. Output `silu` is now
+    /// k_round-major [top_k, M, N]; subsequent down launches read
+    /// their slice via offset addition. Same numerical contract
+    /// as the unfused dual_silu_indirect kernel (byte-identical
+    /// inner reduction).
+    pub fp8_gemv_dual_silu_indirect_kround_batched_mod: LoadedModule,
+    pub fn_fp8_gemv_dual_silu_indirect_kround_batched: KernelFn,
     pub fp8_gemv_indirect_mod: LoadedModule,
     pub fn_fp8_gemv_indirect: KernelFn,
     /// Phase 8 MoE-fusion (2026-05-23): fused FP8 GEMV (indirect-
@@ -1625,6 +1634,12 @@ impl Qwen36Bringup {
         let fn_topk_softmax_f32 = topk_softmax_f32_mod.get_function("topk_softmax_f32_kernel")?;
         let fp8_gemv_dual_silu_indirect_mod =
             kernels.load_ptx("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect")?;
+        let fp8_gemv_dual_silu_indirect_kround_batched_mod = kernels
+            .load_ptx("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_kround_batched")?;
+        let fn_fp8_gemv_dual_silu_indirect_kround_batched =
+            fp8_gemv_dual_silu_indirect_kround_batched_mod.get_function(
+                "fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_kround_batched_kernel",
+            )?;
         let fn_fp8_gemv_dual_silu_indirect = fp8_gemv_dual_silu_indirect_mod
             .get_function("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_kernel")?;
         let fp8_gemv_indirect_mod =
@@ -1808,6 +1823,8 @@ impl Qwen36Bringup {
             fn_topk_softmax_f32,
             fp8_gemv_dual_silu_indirect_mod,
             fn_fp8_gemv_dual_silu_indirect,
+            fp8_gemv_dual_silu_indirect_kround_batched_mod,
+            fn_fp8_gemv_dual_silu_indirect_kround_batched,
             fp8_gemv_indirect_mod,
             fn_fp8_gemv_indirect,
             fp8_gemv_indirect_scaled_add_mod,
@@ -9142,7 +9159,13 @@ impl Qwen36Bringup {
                 Some(p) => p,
                 None => return Ok(()),
             };
-            let silu_b_bytes = n * n_int_us * 2;
+            // Phase 8 dual_silu k_round-batch fusion (2026-05-23):
+            // silu_b grows to [top_k, num_tokens, N_int] f16. The
+            // single k_round-batched dual_silu launch below fills
+            // all k_rounds in one go; the per-k_round down loop
+            // reads slices via `k_round * (num_tokens * N_int) * 2`
+            // offset.
+            let silu_b_bytes = top_k * n * n_int_us * 2;
             let down_b_bytes = n * n_down_us * 2;
             let rs_b_bytes = n * h_us * 4;
             let silu_b = self.arena.region("qwen36_pmb_silu", silu_b_bytes, 16)?;
@@ -9167,68 +9190,67 @@ impl Qwen36Bringup {
             }
             let num_col_blocks_int = (k_in as i32) / 128;
             let num_col_blocks_down = (k_down as i32) / 128;
-            for k_round in 0..top_k {
-                // (a) dual_silu_indirect_batched_topk: silu[N, n_int]
-                #[cfg(feature = "cuda")]
-                unsafe {
-                    use cudarc::driver::sys::*;
-                    let mut out_p = silu_b.device_ptr();
-                    let mut bwg = moe.experts_gate_proj_fused.offset_bytes;
-                    let mut bwu = moe.experts_up_proj_fused.offset_bytes;
-                    let mut bsg = gate_bs;
-                    let mut bsu = up_bs;
-                    let mut inp = normed_region.device_ptr();
-                    let mut idx_p = topk_idx_base;
-                    let mut wstride: i64 = int_per_expert_w as i64;
-                    let mut sstride: i64 = (int_per_expert_bs / 4) as i64;
-                    let mut nn = n_int as i32;
-                    let mut kk = k_in as i32;
-                    let mut ncb = num_col_blocks_int;
-                    let mut tk = top_k as i32;
-                    let mut kr = k_round as i32;
-                    let mut nt = num_tokens as i32;
-                    let args = [
-                        (&mut out_p) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut bwg) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut bwu) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut bsg) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut bsu) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut inp) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut idx_p) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut wstride) as *mut i64 as *mut core::ffi::c_void,
-                        (&mut sstride) as *mut i64 as *mut core::ffi::c_void,
-                        (&mut nn) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut kk) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut tk) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut kr) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
-                    ];
-                    let block: u32 = 256;
-                    let grid_x: u32 = ((n_int + 7) / 8).max(1);
-                    let rc = cuLaunchKernel(
-                        self.outside_kernels
-                            .fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk
-                            .raw() as CUfunction,
-                        grid_x,
-                        num_tokens,
-                        1,
-                        block,
-                        1,
-                        1,
-                        0,
-                        self.stream.raw() as CUstream,
-                        args.as_ptr() as *mut *mut core::ffi::c_void,
-                        core::ptr::null_mut(),
-                    );
-                    if rc != CUresult::CUDA_SUCCESS {
-                        return Err(rvllm_core::RvllmError::cuda(
-                            "qwen36 moe_routed_batched dual_silu_indirect_batched_topk",
-                            rvllm_core::CudaErrorKind::LaunchFailed,
-                            rvllm_core::CudaCtx::setup(),
-                        ));
-                    }
+            // Phase 8 dual_silu k_round-batch (2026-05-23): one
+            // launch computes silu_b[k_round, m, n] for ALL
+            // k_rounds. Replaces top_k separate batched_topk
+            // launches.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut out_p = silu_b.device_ptr();
+                let mut bwg = moe.experts_gate_proj_fused.offset_bytes;
+                let mut bwu = moe.experts_up_proj_fused.offset_bytes;
+                let mut bsg = gate_bs;
+                let mut bsu = up_bs;
+                let mut inp = normed_region.device_ptr();
+                let mut idx_b = topk_idx_base;
+                let mut wstride: i64 = int_per_expert_w as i64;
+                let mut sstride: i64 = (int_per_expert_bs / 4) as i64;
+                let mut m_i = num_tokens as i32;
+                let mut n_i = n_int as i32;
+                let mut k_i = k_in as i32;
+                let mut ncb = num_col_blocks_int;
+                let mut tk_i = top_k as i32;
+                let args = [
+                    (&mut out_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut bwg) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut bwu) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut bsg) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut bsu) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut idx_b) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut wstride) as *mut i64 as *mut core::ffi::c_void,
+                    (&mut sstride) as *mut i64 as *mut core::ffi::c_void,
+                    (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut tk_i) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let grid = (((n_int + 7) / 8).max(1), num_tokens, top_k as u32);
+                let block: u32 = 256;
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_fp8_gemv_dual_silu_indirect_kround_batched
+                        .raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block, 1, 1,
+                    0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 moe_routed_batched dual_silu_kround_batched",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
                 }
+            }
+            let silu_b_slice_bytes = (n * n_int_us * 2) as u64;
+            for k_round in 0..top_k {
+                let silu_kround_ptr = silu_b.device_ptr()
+                    + (k_round as u64) * silu_b_slice_bytes;
                 // (b+c) Fused down_indirect_batched_topk +
                 // scaled_add_batched_topk (Phase 8 MoE-fusion
                 // follow-on, 2026-05-23). Single-kernel replacement
@@ -9245,7 +9267,10 @@ impl Qwen36Bringup {
                     let mut acc = rs_b.device_ptr();
                     let mut bw = moe.experts_down_proj_fused.offset_bytes;
                     let mut bs = down_bs;
-                    let mut inp = silu_b.device_ptr();
+                    // Phase 8 dual_silu k_round-batch: read this
+                    // iteration's silu slice from the k_round-major
+                    // silu_b layout.
+                    let mut inp = silu_kround_ptr;
                     let mut idx_p = topk_idx_base;
                     let mut wp = topk_w_base;
                     let mut wstride: i64 = down_per_expert_w as i64;
@@ -9730,7 +9755,13 @@ impl Qwen36Bringup {
         let down_bytes = (n_down as usize) * 2;
         let _gate_region = self.arena.region("qwen36_pm_g", mid_bytes, 16)?;
         let _up_region = self.arena.region("qwen36_pm_u", mid_bytes, 16)?;
-        let silu_region = self.arena.region("qwen36_pm_s", mid_bytes, 16)?;
+        // Phase 8 dual_silu k_round-batch (2026-05-23): silu_region
+        // grows to [top_k, M, N_int] f16 so all k_rounds' silu
+        // outputs live concurrently. Subsequent down launches read
+        // their slice at offset `k_round * (M * N_int) * 2`. For
+        // per-token decode (M=1), that's `k_round * mid_bytes`.
+        let silu_region = self.arena.region(
+            "qwen36_pm_s", (top_k as usize) * mid_bytes, 16)?;
         let down_region = self.arena.region("qwen36_pm_d", down_bytes, 16)?;
         let int_per_expert_w = (n_int as u64) * (k_in as u64);
         let int_per_expert_bs = ((n_int as u64) / 128) * ((k_in as u64) / 128) * 4;
@@ -9800,9 +9831,15 @@ impl Qwen36Bringup {
         let topk_idx_base = route_idx_ptr;
         let topk_w_base = route_w_ptr;
         let skip_routed_ffn = rs_seed.is_some();
-        for i in 0..(if skip_routed_ffn { 0 } else { top_k }) {
-            let idx_ptr_i = topk_idx_base + (i as u64) * 4;
-            let w_ptr_i = topk_w_base + (i as u64) * 4;
+        // Phase 8 dual_silu k_round-batch (2026-05-23): one launch
+        // computes silu_region[k_round, m, n] for ALL k_rounds in
+        // grid.z. Replaces the 8 host-loop dual_silu_indirect
+        // launches with ONE. The subsequent down loop (below) still
+        // runs 8 launches each reading silu_region at its
+        // `k_round * mid_bytes` slice, because the accumulation to
+        // routed_sum needs to be SEQUENTIAL across k_rounds (no
+        // atomic, no per-k_round accumulator).
+        if !skip_routed_ffn && top_k > 0 {
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
@@ -9812,13 +9849,14 @@ impl Qwen36Bringup {
                 let mut bsg = gate_bs;
                 let mut bsu = up_bs;
                 let mut inp = normed_region.device_ptr();
-                let mut idx_p = idx_ptr_i;
+                let mut idx_b = topk_idx_base;
                 let mut w_stride = int_per_expert_w as i64;
-                let mut s_stride_elems = (int_per_expert_bs / 4) as i64; // f32 elements
+                let mut s_stride_elems = (int_per_expert_bs / 4) as i64;
                 let mut m_i = m as i32;
                 let mut n_i = n_int as i32;
                 let mut k_i = k_in as i32;
                 let mut ncb = ((k_in + 127) / 128) as i32;
+                let mut tk_i = top_k as i32;
                 let args = [
                     (&mut osi) as *mut u64 as *mut core::ffi::c_void,
                     (&mut bwg) as *mut u64 as *mut core::ffi::c_void,
@@ -9826,24 +9864,22 @@ impl Qwen36Bringup {
                     (&mut bsg) as *mut u64 as *mut core::ffi::c_void,
                     (&mut bsu) as *mut u64 as *mut core::ffi::c_void,
                     (&mut inp) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut idx_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut idx_b) as *mut u64 as *mut core::ffi::c_void,
                     (&mut w_stride) as *mut i64 as *mut core::ffi::c_void,
                     (&mut s_stride_elems) as *mut i64 as *mut core::ffi::c_void,
                     (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
                     (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
                     (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
                     (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut tk_i) as *mut i32 as *mut core::ffi::c_void,
                 ];
-                let grid = ((n_int + 7) / 8, m, 1u32);
+                let grid = ((n_int + 7) / 8, m, top_k as u32);
                 let block = (256u32, 1u32, 1u32);
                 let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_fp8_gemv_dual_silu_indirect.raw() as CUfunction,
-                    grid.0,
-                    grid.1,
-                    grid.2,
-                    block.0,
-                    block.1,
-                    block.2,
+                    self.outside_kernels.fn_fp8_gemv_dual_silu_indirect_kround_batched
+                        .raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block.0, block.1, block.2,
                     0,
                     stream_raw as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -9851,12 +9887,20 @@ impl Qwen36Bringup {
                 );
                 if rc != CUresult::CUDA_SUCCESS {
                     return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 fp8_gemv_dual_silu_indirect launch",
+                        "qwen36 fp8_gemv_dual_silu_indirect_kround_batched launch",
                         rvllm_core::CudaErrorKind::LaunchFailed,
                         rvllm_core::CudaCtx::setup(),
                     ));
                 }
             }
+        }
+        for i in 0..(if skip_routed_ffn { 0 } else { top_k }) {
+            let idx_ptr_i = topk_idx_base + (i as u64) * 4;
+            let w_ptr_i = topk_w_base + (i as u64) * 4;
+            // silu slice for this k_round: [m, n_int] at offset
+            // `i * mid_bytes` from silu_region base.
+            let silu_kround_ptr = silu_region.device_ptr()
+                + (i as u64) * (mid_bytes as u64);
             // Phase 8 MoE-fusion (2026-05-23): fused indirect-
             // down-GEMV + scaled f32 accumulate. Replaces the
             // separate (fp8_gemv_indirect → down_region f16 →
@@ -9879,7 +9923,10 @@ impl Qwen36Bringup {
                 let mut acc_f32 = routed_sum_region.device_ptr();
                 let mut bw = moe.experts_down_proj_fused.offset_bytes;
                 let mut bs = down_bs;
-                let mut inp = silu_region.device_ptr();
+                // Phase 8 dual_silu k_round-batch: read this
+                // iteration's silu slice from the k_round-batched
+                // silu_region layout.
+                let mut inp = silu_kround_ptr;
                 let mut idx_p = idx_ptr_i;
                 let mut devw = w_ptr_i;
                 let mut w_stride = down_per_expert_w as i64;
