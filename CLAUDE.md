@@ -839,23 +839,23 @@ with prompt_tokens + prefill_ms + per-gate state.
   between two valid German jokes. Post-fix the same canary is
   byte-stable.
 
-### Binary install procedure (REQUIRED for any A/B test)
+### Binary install procedure
 
+`/home/r00t/.rvllm/bin/rvllm-server` is a symlink to
+`/home/r00t/workspace/upstream/rvllm-serve/v3/target/release/rvllm-server`.
 `cargo build --release --bin rvllm-server --features cuda,gb10`
-writes to `v3/target/release/rvllm-server`. The systemd unit
-reads from `/home/r00t/.rvllm/bin/rvllm-server`. Rust-side
-changes do NOT take effect on `systemctl restart` alone — the
-binary must be `cp`'d across first:
+followed by `sudo systemctl restart rvllm-serve` is sufficient
+to pick up Rust-side changes. PTX is loaded fresh per restart
+from `kernels/sm_121/`.
 
-  cargo build --release --bin rvllm-server --features cuda,gb10
+If the symlink ever gets clobbered back to a regular file
+(e.g. someone runs a deploy script that `cp`'s over it),
+restore with:
+
   sudo systemctl stop rvllm-serve
-  cp v3/target/release/rvllm-server /home/r00t/.rvllm/bin/rvllm-server
-  md5sum v3/target/release/rvllm-server /home/r00t/.rvllm/bin/rvllm-server
+  rm /home/r00t/.rvllm/bin/rvllm-server
+  ln -s /home/r00t/workspace/upstream/rvllm-serve/v3/target/release/rvllm-server /home/r00t/.rvllm/bin/rvllm-server
   sudo systemctl start rvllm-serve
-
-PTX is loaded fresh per restart from `kernels/sm_121/`, so
-kernel-only changes take effect without the cp. Env-gate /
-dispatch / fusion-selection changes do not.
 
 ### Phase 8 — SHIPPED 2026-05-22
 Decode-step CUDA Graph capture is parked as Phase 8 in
