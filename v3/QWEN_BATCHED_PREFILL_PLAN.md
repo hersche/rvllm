@@ -535,3 +535,48 @@ scatter output back to `[k_round, M, N]` via permutation. ~500-800
 LOC. Expected 4-8× on the dual_silu portion = 30-50% overall
 prefill speedup once landed.
 
+
+
+## Phase 10: Expert-sort + grouped MMA (task #94, 2026-05-23, +45%)
+
+Recovers the M-direction MMA reuse the Phase 9 first-cut sacrificed.
+Three new kernels (commit `74eeade`):
+
+* `qwen36_moe_expert_sort_kernel` — atomicAdd-based bucketing of
+  (token, k_round) pairs into per-expert lists.
+* `qwen36_moe_tile_table_kernel` — one thread per expert; emits
+  ceil(C[e]/16) tile descriptors (expert_id, m_off, tile_size).
+* `fp8_mma_dual_silu_grouped_m16_kernel` — grouped MMA. Per block
+  (1 warp) processes one [M=16, N=8] tile sharing ONE expert,
+  inline FP8 quant of input, dual MMAs for gate + up, per-row
+  a_scale folded at scatter-write.
+
+Pipeline: zero counters → sort → tile_table → DtoH tile_count →
+grouped MMA. Opt-in via `RVLLM_QWEN36_MOE_MMA_GROUPED=1` (precedence
+over Phase 9's `RVLLM_QWEN36_MOE_MMA_DUAL_SILU`). Diagnostic env
+`RVLLM_QWEN36_MOE_MMA_GROUPED_DEBUG=1` adds per-pre-pass
+cuStreamSynchronize so failures surface with their own op label.
+
+A/B (qwen3-6-35b-a3b NVFP4, fresh binary, deterministic):
+
+  | Cell                        | 1112 tok | 4412 tok |
+  |-----------------------------|----------|----------|
+  | GEMV baseline               |  6020 ms | 24775 ms |
+  | Phase 9 MMA first-cut (M=1) |  5738 ms | 23636 ms |
+  | **Phase 10 grouped (M=16)** | **3265 ms** | **13674 ms** |
+  | Win vs GEMV                 | **+45.8%** | **+45.0%** |
+
+Output coherence verified on 2k + 4k German prompts. Backward-compat
+verified: gate unset → GEMV path produces correct German.
+
+`max_per_expert` sizing learned the hard way: 8× sigma over even-
+distribution mean was insufficient (one expert exceeded 278 at
+M=1112 → silent OOB → cuStreamSynchronize trap). Set to
+`(typical*32).max(256).min(total_assign)` — ~2.3 MB per layer at
+M=1112, fits the worst routing skew observed.
+
+Follow-up parked (not blocking production rollout):
+* Same expert-sort foundation could feed a grouped MMA `down`
+  projection sibling (27% of prefill GPU time per nsys profile).
+* Persistent sort buffer alloc reuse across layers.
+* Multi-warp tiling per block (currently 1 warp/block).
