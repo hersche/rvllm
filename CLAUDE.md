@@ -1306,6 +1306,48 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 prefill profile — nsys 2026-05-23 (qwen3-6-35b-a3b NVFP4-KV, task #91)
+
+Captured against fresh binary md5 `63122454` with the production
+profile (`mobile-qwen3635b-rvllm-nvfp4-spec.env`: QKV megakernel ON,
+unified-NVFP4-prefill ON, batched MoE ON, all fusions live). Single
+~4k-token prompt fired inside a 25 s nsys window. Top kernels by
+total GPU time during prefill:
+
+  | Time% | Kernel                                                          | Instances | Per-call |
+  |-------|-----------------------------------------------------------------|-----------|----------|
+  | 62.0% | ..._dual_silu_indirect_kround_batched_kernel (MoE up+gate)      |    24     | 397 ms   |
+  | 26.9% | ..._indirect_scaled_add_kround_batched_kernel (MoE down)        |    23     | 180 ms   |
+  |  3.6% | gated_delta_rule_prefill_f16_kernel (linear-attn)               |    18     |  30 ms   |
+  |  2.7% | flash_attention_2_prefill_nvfp4kv_unified_kernel                |     6     |  70 ms   |
+  |  1.4% | router_gemv_with_topk_batched_f16_to_f32_kernel                 |    24     |   9 ms   |
+  |  0.9% | ..._dual_silu_kernel (shared-expert)                            |    23     |   6 ms   |
+  |  0.8% | ..._wpr_native_f16in_kernel (FP8 GEMV M=1 sites)                |    23     |   5 ms   |
+
+Aggregated:
+- **MoE routed FFN: 88.9% of prefill GPU time** (dual_silu 62.0% +
+  down_scaled_add 26.9%). The same FP8 GEMV inner reduction body that
+  dominates DECODE (64.3% of GPU time per the 2026-05-23 decode
+  nsys) is also the prefill bottleneck because each (token, expert)
+  pair is independent and the kernel is per-warp scalar reduction,
+  not TensorCore MMA.
+- Unified NVFP4 attention prefill: 2.7% — the unified-prefill kernel
+  is doing its job. The earlier "long prompts (>8k) are slow because
+  batched-NVFP4-prefill not wired" caveat referred to the
+  per-token fallback path before commit `3bf9eac` flipped the master
+  gate default-on (2026-05-22).
+- A/B `RVLLM_QWEN36_NVFP4_UNIFIED_BATCH_FULL_PREFILL=1` vs `=0` at
+  1112 tokens: 185 t/s vs 65 t/s = **2.83× prefill speedup** from the
+  unified path alone.
+
+Throughput at the current state: 185 t/s prefill (1112 tok / 6020 ms)
+and 178 t/s at 4412 tok — scales linearly, attention is not the cap.
+Path forward for further gains: the 88.9% MoE GEMV is the same
+TensorCore MMA rewrite item parked in CLAUDE.md's
+"fp8_gemv optimization attempts" section (multi-week scope). The
+smem-staging optimization attempted on the decode side was a no-op
+(L1 absorbs redundant loads) and the same finding applies here.
+
 ### qwen36 decode profile — nsys 2025-05-23 (qwen3-6-35b-a3b NVFP4-KV)
 
 Captured with `nsys profile -y 25 -d 20 -t cuda
