@@ -499,3 +499,39 @@ measurable wall-clock win.
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
 desired.
+
+
+## Phase 9: TensorCore MMA dual_silu — first cut (task #93, 2026-05-23)
+
+**First TensorCore-MMA-based FP8 kernel** (commit `443d77b`):
+`fp8_mma_dual_silu_indirect_kround_batched_kernel` uses
+`mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32`
+via existing helpers in `kernels/fp8_mma_frag_pack.cuh`. Replaces
+the per-warp scalar-reduction GEMV with TensorCore m16n8k32 tiles.
+Opt-in: `RVLLM_QWEN36_MOE_MMA_DUAL_SILU=1` (default GEMV path
+unchanged).
+
+First-cut scope deliberately conservative — 1 warp per block,
+1 token per block, MMA tile [M=16, N=8] with only row 0 active
+(rows 1..15 zero-staged). 15/16 of MMA throughput wasted; this
+exists to validate the FP8×FP8 MMA path on sm_121 against real
+qwen36 weights and stand as the foundation for follow-up work.
+
+A/B (qwen3-6-35b-a3b NVFP4, deterministic, fresh binary
+md5 `6b9bd230`):
+
+  | Cell        | 1112 tok prefill | 4412 tok prefill |
+  |-------------|------------------|------------------|
+  | GEMV (def.) |      6020 ms     |     24775 ms     |
+  | MMA (=1)    |      5738 ms     |     23636 ms     |
+  | Speedup     |      +4.9%       |      +4.8%       |
+
+Output coherence byte-checked on smoke + 4412-tok German prompt.
+
+**Follow-up (parked, task #94)**: GPU pre-pass that sorts
+(token, k_round) assignments by routed expert id; new MMA kernel
+processes M=16 sorted-contiguous tile sharing one expert;
+scatter output back to `[k_round, M, N]` via permutation. ~500-800
+LOC. Expected 4-8× on the dual_silu portion = 30-50% overall
+prefill speedup once landed.
+
