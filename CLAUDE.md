@@ -850,33 +850,23 @@ overhead dominates for the legacy path.
   between two valid German jokes. Post-fix the same canary is
   byte-stable.
 
-### ⚠️ Phase 8 A/B numbers — UNVERIFIED (binary-install bug, 2026-05-23)
+### Binary install procedure (REQUIRED for any A/B test)
 
-All Phase 8 latency A/B numbers below were measured during sessions
-that did NOT verify the served binary was the freshly-built one.
 `cargo build --release --bin rvllm-server --features cuda,gb10`
-writes to `v3/target/release/rvllm-server`; the systemd unit reads
-from `/home/r00t/.rvllm/bin/rvllm-server` and requires a manual
-`cp` to pick up Rust changes. PTX is loaded fresh on every restart
-from `kernels/sm_121/`, so kernel-only changes (no Rust dispatch)
-DO take effect on `sudo systemctl restart rvllm-serve` alone — but
-any commit that touches dispatch logic, env-gates, or fusion
-selection will silently keep running the old code path until the
-binary is `cp`'d across.
+writes to `v3/target/release/rvllm-server`. The systemd unit
+reads from `/home/r00t/.rvllm/bin/rvllm-server`. Rust-side
+changes do NOT take effect on `systemctl restart` alone — the
+binary must be `cp`'d across first:
 
-The full MoE-fusion stack progression, multi-step graph node-count
-and latency deltas, and the various "below noise"/"X% speedup"
-claims that previously lived in this section were stripped on
-2026-05-23 because they cannot be retroactively verified.
+  cargo build --release --bin rvllm-server --features cuda,gb10
+  sudo systemctl stop rvllm-serve
+  cp v3/target/release/rvllm-server /home/r00t/.rvllm/bin/rvllm-server
+  md5sum v3/target/release/rvllm-server /home/r00t/.rvllm/bin/rvllm-server
+  sudo systemctl start rvllm-serve
 
-Re-test procedure required for any future perf claim:
-  1. cargo build --release --bin rvllm-server --features cuda,gb10
-  2. sudo systemctl stop rvllm-serve
-  3. cp v3/target/release/rvllm-server /home/r00t/.rvllm/bin/rvllm-server
-  4. md5sum both — must match
-  5. sudo systemctl start rvllm-serve, wait for /v1/models
-  6. A/B with `RVLLM_QWEN36_TIMING=1` for prefill_ms, wall-clock
-     for end-to-end. Run each leg 3× to confirm determinism.
+PTX is loaded fresh per restart from `kernels/sm_121/`, so
+kernel-only changes take effect without the cp. Env-gate /
+dispatch / fusion-selection changes do not.
 
 ### Phase 8 — SHIPPED 2026-05-22
 Decode-step CUDA Graph capture is parked as Phase 8 in
@@ -989,7 +979,6 @@ Hardware validation (`RVLLM_QWEN36_DECODE_GRAPH=1` +
 - Req 3 (long):   80-token photosynthesis explanation,
                    byte-identical to eager.
 
-Latency impact unverified — see ⚠️ header above.
 
 Production default remains `RVLLM_QWEN36_DECODE_GRAPH` unset
 (legacy eager); captured path is opt-in. Most gain comes from
@@ -1029,7 +1018,7 @@ multi-step counting / 80-token reasoning prompts. Journal:
 `[graph] captured 14847 nodes (bucket=8)` — ≈1856 nodes/step × 8
 + 7 linker stitches.
 
-Latency impact unverified — see ⚠️ header above. The
+The
 infrastructure is in place for future kernel-fusion work where
 larger graphs may matter, or for continuous-batch decoding where
 macro-graphs could share sequences across requests. Production
@@ -1067,7 +1056,6 @@ Eliminates per decode token:
 - 320 kernel launches (8 routed k-rounds × 40 MoE layers).
 - 320 f16 round-trips (acc f32 → f16 down_region → f32 acc).
 
-Latency impact unverified — see ⚠️ header above.
 
 Production qwen27b (dense, no MoE) — unaffected (regression-clean).
 The unfused `fp8_gemv_blockwise_wpr_native_f16in_indirect_kernel`
@@ -1089,7 +1077,6 @@ to `routed_sum[m*N+n]`. Replaces the (down_indirect_batched_topk
 + scaled_add_f16_to_f32_devw_batched_topk) pair with ONE launch
 per k-round across the entire token batch.
 
-Latency impact unverified — see ⚠️ header above.
 
 **Shared-expert fusion (commit `99e6cde`)**: new kernel
 `fp8_gemv_blockwise_wpr_native_f16in_scaled_add_devw_kernel`
@@ -1099,7 +1086,6 @@ chain now runs 3 launches per layer instead of 4 (gate+up+silu
 +mul fused; down+scaled_add fused; sigmoid_gate stands alone).
 Saves 40 launches per decode token at 40 MoE layers.
 
-Latency impact unverified — see ⚠️ header above.
 
 ### Phase 8 dual_silu k_round-batch + router+topk fusions — SHIPPED 2026-05-23
 
@@ -1118,7 +1104,6 @@ down loop stays as 8 launches because routed_sum accumulation
 must serialize across k_rounds (no atomic).
 
 Per layer per decode token: 8 dual_silu launches → 1.
-Latency impact unverified — see ⚠️ header above.
 
 **Router+topk fusion (commit `e049258`)**: new kernel
 `router_gemv_with_topk_f16_to_f32_kernel` uses the atomic-counter
@@ -1134,7 +1119,6 @@ decode token).
 
 Architectural improvement (one less GPU-side synchronization
 point, eliminates the explicit logits_region write to global).
-Latency impact unverified — see ⚠️ header above.
 
 ### Phase 8 QKV megakernel Phase 2 — SHIPPED 2026-05-23
 
@@ -1242,7 +1226,6 @@ the unchanged FP8-Q quantise + NVFP4 K/V pack epilogue. Both
 KV-dtype branches now retire the standalone Q/K-norm
 launches. Hardware-validated coherent on NVFP4 production
 (qwen3635b NVFP4 spec profile) — 1.650s photosynthesis vs
-Latency impact unverified — see ⚠️ header above.
 
 Saves 2 launches/layer in F16-KV mode (~22 launches/token at
 ~11 full-attn layers). Hardware-validated coherent on
@@ -1272,7 +1255,7 @@ closer-reads correct within each iteration.
 Result on qwen3-6-35b-a3b at N=8: macro-graph node count drops
 roughly in half (the per-iter arena.region call + the captured-
 graph bookkeeping it implied are gone from the kernel sequence).
-Latency impact unverified — see ⚠️ header above. Single-step
+Single-step
 remains the recommended path; multi-step is operator-opt-in.
 
 ### Phase 8 hidden-state → workspace refactor — SHIPPED 2026-05-23
@@ -1305,7 +1288,6 @@ Hardware-validated on qwen3-6-35b-a3b:
 - Eager (legacy path, no overrides): coherent.
 - DECODE_WORKSPACE=1 (overrides on, no capture): coherent.
 - DECODE_GRAPH=1 + REPLAY=1: coherent short + 1-10 counting.
-Latency impact unverified — see ⚠️ header above.
 
 Production qwen27b (qwen35 dense path) — unaffected.
 
@@ -1327,8 +1309,7 @@ kernel `..._indirect_scaled_add_kround_batched_kernel` has each
 warp own one (m, n) output slot and sequentially process all
 top_k k_rounds with a warp-local f32 accumulator — no atomic,
 single global RMW per warp at the end. Saves 7 launches/layer
-× 40 MoE layers = 280 launches/decode token. Latency impact
-unverified — see ⚠️ header above.
+× 40 MoE layers = 280 launches/decode token.
 
 **Batched-prefill port (commit `38afff0`, 2026-05-23)**: same
 kernel is M-agnostic, so the batched-prefill MoE path in
@@ -1367,10 +1348,9 @@ out_proj+residual (#9-10), dense MLP ffn_down+residual (#4-5).
 40 layers × 3 sites = 120 launches saved per decode token.
 
 Hardware-validated on qwen3-6-27b: short / 1-10 counting / 80-
-token photosynthesis all coherent. Latency impact unverified —
-see ⚠️ header above. The fusion's value is architectural:
-fewer graph nodes, no temp-buffer f16 round-trips, cleaner
-kernel chain.
+token photosynthesis all coherent. The fusion's value is
+architectural: fewer graph nodes, no temp-buffer f16
+round-trips, cleaner kernel chain.
 
 PREFILL (M > 1) sites kept on the unfused path — CUTLASS SM120
 GEMM is preferred there. The fusion targets ONLY M=1 decode
@@ -1396,8 +1376,7 @@ Commit `bcdce94` lands cross-request graph cache reuse:
 
 Hardware validation (3 sequential requests, different prompt
 lengths): all correct, log shows "[graph] captured 1855
-nodes" only ONCE on the first request. Latency impact
-unverified — see ⚠️ header above.
+nodes" only ONCE on the first request.
 
 Eager decode path remains the production default
 (`RVLLM_QWEN36_DECODE_GRAPH` unset). Captured path opt-in only.

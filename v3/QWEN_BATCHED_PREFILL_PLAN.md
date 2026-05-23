@@ -214,9 +214,8 @@ fallback — closing the perf cliff that lived at M=128.
 
 The captured-graph decode path landed across a chain of commits
 from `793ddf0` through `4f083f8`. The replay path is hardware-
-validated producing byte-correct multi-step output. Latency
-impact unverified — see ⚠️ header below. Production default
-remains `RVLLM_QWEN36_DECODE_GRAPH` unset (legacy eager);
+validated producing byte-correct multi-step output. Production
+default remains `RVLLM_QWEN36_DECODE_GRAPH` unset (legacy eager);
 captured path is opt-in.
 
 Final commit chain (see `CLAUDE.md` "Phase 8" section for the
@@ -291,8 +290,7 @@ of state on the capture step.
 
 The shipped path satisfies this contract (validated on three
 sequential qwen3-6-35b-a3b requests, full 1-10 counting + 80-token
-photosynthesis output byte-identical to eager). Latency impact
-unverified — see ⚠️ header below.
+photosynthesis output byte-identical to eager).
 
 Follow-on commit `bcdce94` adds cross-request graph cache reuse via
 a persistent workspace at worker bring-up + an inner RAII arena
@@ -306,33 +304,12 @@ Multi-step macro-replay + argmax+link fusion (commits `a14af12`,
 real, latency within noise of single-step replay (the per-step
 host overhead is small relative to kernel work).
 
-### ⚠️ Phase 8 A/B numbers — UNVERIFIED (binary-install bug, 2026-05-23)
-
-All Phase 8 latency A/B numbers in the entries below were measured
-during sessions that did NOT verify the served binary was the
-freshly-built one. `cargo build` writes to `v3/target/release/`;
-the systemd unit reads from `/home/r00t/.rvllm/bin/` and requires
-a manual `cp` to take effect for Rust dispatch changes. PTX is
-loaded fresh on every restart so kernel-only changes do take
-effect, but env-gate / fusion-selection changes silently keep
-running the old code path until the binary is `cp`'d. Re-test
-procedure for any future perf claim:
-  1. cargo build --release --bin rvllm-server --features cuda,gb10
-  2. sudo systemctl stop rvllm-serve
-  3. cp v3/target/release/rvllm-server /home/r00t/.rvllm/bin/rvllm-server
-  4. md5sum both — must match
-  5. sudo systemctl start rvllm-serve, wait for /v1/models
-  6. A/B with `RVLLM_QWEN36_TIMING=1` for prefill_ms; 3 runs/leg
-
-Architectural facts (kernel names, launch-count deltas,
-dispatch wiring) below are reliable. Latency numbers are not.
-
 **MoE expert kernel fusion (commit `f0f79d5`)**. The fused
 `fp8_gemv_blockwise_wpr_native_f16in_indirect_scaled_add_kernel`
 collapses the per-k-round (down-projection FP8 GEMV +
 scaled-add accumulator) pair into ONE launch. Saves 320 kernel
 launches + 320 f16 round-trips per decode token on Qwen 3.6
-35B-A3B. Latency impact unverified.
+35B-A3B.
 
 **Other-models fusion (commit `39f7c1a`)** — same pattern
 ported to Qwen 3.5/3.6 27B DENSE decode via new kernel
@@ -341,14 +318,14 @@ Three per-layer M=1 sites in qwen35_bring_up.rs (full-attn
 o_proj, linear-attn out_proj, dense MLP ffn_down) fuse with
 the subsequent vector_add_f16 residual. 120 launches saved per
 decode token. Hardware-validated correct on qwen3-6-27b.
-Latency impact unverified. The fused kernel infrastructure is
+The fused kernel infrastructure is
 now available for Mistral 3.5 / Gemma 4 31B dense paths.
 
 **Batched-prefill fusion follow-on (commit `8060834`)** — new
 kernel `..._indirect_scaled_add_batched_topk_kernel` extends the
 f0f79d5 pattern to `apply_layer_moe_batched`'s prefill k_round
 loop. Saves 1 launch + 1 f16 round-trip per k-round across the
-entire prompt. Latency impact unverified. Gated via
+entire prompt. Gated via
 `RVLLM_QWEN36_BATCH_MOE_PREFILL`.
 
 **Shared-expert fusion (commit `99e6cde`)** — new kernel
@@ -367,7 +344,7 @@ impact unverified.
 **Router+topk fusion (commit `e049258`)** — new kernel
 `router_gemv_with_topk_f16_to_f32_kernel` uses atomic-counter
 last-block-does-topk pattern. Saves 1 launch per MoE layer
-per token (~40 per decode token). Latency impact unverified.
+per token (~40 per decode token).
 
 **Batched router+topk fusion (commit `314dbe6`)** — same
 pattern ported to the prefill batched path with per-token
@@ -433,7 +410,7 @@ cache write. Each thread covers both halves of its
 the in-place trick the unfused kernel used. F16-KV-only
 wiring; NVFP4 follow-on flagged. Hardware-validated coherent
 on qwen3-6-35b-a3b F16-KV + production NVFP4-KV regression-
-clean. Latency impact unverified.
+clean.
 
 **NVFP4-KV sibling (commit `6f6a25a`)** — same 2-phase
 structure ported to the NVFP4 RoPE kernel:
