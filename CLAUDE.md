@@ -1147,137 +1147,58 @@ qwen3-6-35b-a3b 150-token photosynthesis:
 - After down kround-batch (b1f221e): **1.644s**
 - **Total ≈23% decode speedup** across today's MoE fusion stack.
 
-### Phase 8 QKV megakernel Phase 2 (F16-KV, naive) — SHIPPED 2026-05-23
+### Phase 8 QKV megakernel Phase 2 — SHIPPED 2026-05-23
 
-Commits `63ef718` (kernel + loader) + `34140ba` (dispatch
-wiring) deliver the literal Phase 2 megakernel goal end-to-end
-on the F16-KV path. New kernel
-`fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv_kernel`
-fuses Q+K+V FP8 GEMVs + Q+gate split + Q-norm + K-norm +
-partial-NeoX RoPE + KV-cache write into ONE launch. Grid
-`(num_tokens, num_heads + 2*num_kv_heads)` dispatches by
-block.y range to Q/K/V; block dim `head_dim*2` covers Q+gate
-threads, K/V heads use the first `head_dim` threads.
+Per-token decode + batched prefill, F16-KV + NVFP4-KV, all
+gated behind a single env-knob `RVLLM_QWEN36_QKV_MEGAKERNEL=1`
+(default off). Fuses Q+K+V FP8 GEMVs + Q+gate split + Q-norm +
+K-norm + partial-NeoX RoPE + KV-cache write (NVFP4 path also
+adds Q FP8 quant + K/V NVFP4 pack with per-16-elem microscales)
+into ONE launch per (token, head) instead of 5-6 separate
+kernels. Each WARP (32 lanes) produces ONE output via 32-thread
+K-dim cooperation; input row staged into shared mem once per
+block and reused across all per-head outputs.
 
-Dispatch wiring (apply_layer_full_attn): env-gated opt-in via
-`RVLLM_QWEN36_QKV_MEGAKERNEL=1` AND `kv_dtype == F16`. Steps
-2-5 of the unfused chain (3 fp8_proj launches + split_q_gate
-+ fused_qnorm_knorm_rope) are wrapped in
-`if !qkv_megakernel_on { ... }`; the megakernel launch lives
-in a new `Qwen36KvDtype::F16 if qkv_megakernel_on` match arm.
-Default off so production paths byte-untouched.
+Kernels:
+- `fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv_kernel`
+  (commit `fa48141`, warp-cooperative warp-per-output)
+- `fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv_kernel`
+  (commit `71fdf33`, NVFP4-KV sibling)
 
-Numerical contract: FP8 dequant + block scale + MAC per-output
-byte-identical to `fp8_gemv_blockwise_wpr_native_f16in_kernel`.
-Norm + RoPE phases byte-identical to
-`fused_qnorm_knorm_rope_qwen_partial_f16kv` (commit 943f8bb).
+Dispatch in `apply_layer_full_attn` (per-token decode) and
+`apply_layer_full_attn_batched` (commit `b08774e`, prefill).
+Batched arm is hard-gated to `num_tokens < 128`; at M≥128
+`fp8_proj_dispatch` routes to CUTLASS SM120 GEMM
+(≈102 TFLOPS at the QKV shape) which beats the warp-coop
+megakernel, so the gate keeps large prefill batches on the
+CUTLASS path.
 
-Hardware-validated on qwen3-6-35b-a3b F16-KV:
-- Short: "Die Hauptstadt von Frankreich ist **Paris**."
-- 1-10 counting: full "eins, zwei, ..., zehn."
+Numerical contract: FP8 GEMV math byte-identical to
+`fp8_gemv_blockwise_wpr_native_f16in_kernel`. Norm + RoPE
+(F16) byte-identical to `fused_qnorm_knorm_rope_qwen_partial_f16kv`
+(commit `943f8bb`). NVFP4 norm + RoPE + quant + pack byte-
+identical to `fused_qnorm_knorm_rope_qwen_partial_nvfp4kv`
+(commit `6f6a25a`). md5 of generated tokens differs ON vs OFF
+because the warp-cooperative reduction order is not the same as
+the unfused chain's per-step reductions, but the math is
+equivalent up to float-rounding.
 
-**Naive variant latency: 2.83s vs unfused 2.53s = ~12% SLOWER**
-at 150-token photosynthesis decode. Exactly as predicted upfront:
-NAIVE 1-thread-per-output GEMV has UNCOALESCED FP8 weight reads
-(W[tid][k] across the warp is strided by K bytes vs the existing
-warp-cooperative fp8_gemv's coalesced row reads).
+Hardware A/B on qwen3-6-35b-a3b, deterministic across 3 runs each:
 
-**⚠️ CORRECTION (2026-05-23 evening):** the earlier "parity"
-A/B numbers below for fa48141 / 71fdf33 / 505e9ea / b08774e
-were measured against a STALE `/home/r00t/.rvllm/bin/rvllm-server`
-install (dated `04:50`). `cargo build` only writes to
-`v3/target/release/rvllm-server`; the systemd unit reads from
-`/home/r00t/.rvllm/bin/rvllm-server` and requires a manual
-`cp` to pick up Rust-side changes. PTX is loaded fresh on every
-restart, so the new kernels existed in memory but were unreachable
-because the dispatch / env-gate code never updated. Re-ran all
-five A/Bs against the freshly-installed binary; **real numbers
-below**. **No production regression** — every fusion is env-gated
-default OFF or behaviorally byte-equivalent, and production
-qwen3627b ran unchanged throughout because dispatch defaults
-weren't perturbed in service.
+  | Path                          | OFF     | ON      |
+  |-------------------------------|---------|---------|
+  | F16-KV decode (150-tok)       | 3.83 s  | 3.82 s  |
+  | NVFP4-KV decode (150-tok)     | 3.68 s  | 3.08 s  |
+  | NVFP4-KV prefill (M=48)       | 489 ms  | 447 ms  |
 
-**Warp-cooperative re-impl SHIPPED 2026-05-23 (commit `fa48141`)**:
-same kernel symbol, same dispatch, same env-gate — internal impl
-swapped to a warp-cooperative variant. Each WARP (32 lanes) now
-produces ONE output via 32-thread K-dim cooperation, using the
-same 8-elem lane-strided pattern as
-`fp8_gemv_blockwise_wpr_native_f16in_kernel`. Input row staged
-into shared mem once per block (~4 KB) and reused across all
-per-head outputs. Block stays at `head_dim*2 = 512` threads = 16
-warps for Qwen 3.6 head_dim=256. Shared-mem footprint ≈ 6.5 KB
-(input + outputs + norm partials).
-
-Re-validated against the freshly-installed binary on qwen3-6-35b-a3b
-F16-KV (150-token photosynthesis), deterministic across 3 runs each:
-- Warp-coop megakernel ON:  **3.82s** (md5 differs run-to-run from OFF
-  due to MAC reorder → confirms the fused kernel really fires)
-- Unfused chain (OFF):       **3.83s**
-
-Net: warp-coop is at **TRUE PARITY** with the unfused chain on
-F16-KV (memory-bandwidth-bound; the 4 launches saved/layer ≈
-~220 µs/token are below ±10 ms noise on a 25 ms/token decode).
-Value at this point is architectural: 4 fewer launches per layer,
-one closer pattern for future Q+K+V+O fusion, and the building
-block for the NVFP4-KV sibling (which IS a real perf win — see
-below).
-
-**NVFP4-KV sibling SHIPPED 2026-05-23 (commit `71fdf33`)**: new
-kernel `fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv_kernel`
-ports the F16-KV warp-coop megakernel to NVFP4-KV. Fuses the
-same 5 unfused steps (3 FP8 GEMVs + split + Q-norm + K-norm + RoPE
-+ Q FP8 quant + K/V NVFP4 quant + pack with per-16-elem microscales)
-into ONE launch. GEMV math byte-identical to
-`fp8_gemv_blockwise_wpr_native_f16in_kernel`; norm + RoPE + quant +
-pack byte-identical to `fused_qnorm_knorm_rope_qwen_partial_nvfp4kv`
-(commit 6f6a25a) given normalised inputs. The env-gate
-`RVLLM_QWEN36_QKV_MEGAKERNEL=1` now accepts BOTH F16 and NVFP4 KV
-dtypes; default off.
-
-**Re-validated against the freshly-installed binary** on
-qwen3-6-35b-a3b NVFP4-KV (150-token photosynthesis), deterministic
-across 3 runs each:
-- Megakernel OFF: **3.68s**
-- Megakernel ON:  **3.08s** = **16% FASTER** (decode-side win — not
-  parity as initially claimed against the stale binary)
-
-This is a genuine end-to-end win on the production NVFP4-KV path —
-not just an architectural cleanup. NVFP4-KV decode is more launch-
-heavy than F16-KV (each NVFP4 RoPE + quant + pack step is its own
-kernel), so the 4-launches-saved/layer + the shared-mem input
-staging actually materialize as wall-clock improvement. Opt-in by
-default to keep the change isolated; flipping the default to ON
-on the production profile is a safe follow-up — bit-equivalent
-math, just faster.
-
-Production NVFP4-KV default path uses the Phase 1 fused chain
-(commit 6f6a25a) — unchanged.
-
-**Batched-prefill dispatch wiring SHIPPED 2026-05-23 (commit
-`b08774e`)**: extends the same megakernel symbols to
-`apply_layer_full_attn_batched` (M=num_tokens). The kernel is
-M-agnostic at the block level. Hard-gated to `num_tokens < 128`
-because at M≥128 `fp8_proj_dispatch` routes to CUTLASS SM120
-GEMM (≈102 TFLOPS at the QKV shape) — running the warp-coop
-GEMV megakernel at M≥128 would be a clear regression.
-
-**Re-validated against the freshly-installed binary** on
-qwen3-6-35b-a3b NVFP4-KV (prompt_tokens=48, megakernel arm
-fires), deterministic across 3 runs each:
-- Megakernel OFF: prefill **489.0-490.5 ms**, wall 1.38s
-- Megakernel ON:  prefill **447.3-447.5 ms**, wall 1.34s
-- **8.5% prefill speedup**, ~3% wall speedup
-
-This **contradicts** the earlier "1-3% SLOWER" claim, which
-was measured against the stale binary that didn't have the
-batched-dispatch swap. With the real binary, the warp-coop
-megakernel actually beats cuBLASLt at M=48 on this shape —
-likely because the megakernel folds 5 launches into 1 and
-the launch-overhead saving outweighs cuBLASLt's per-output
-throughput advantage at small M. Shipped under the same
-`RVLLM_QWEN36_QKV_MEGAKERNEL=1` env-gate; the hard M<128
-gate keeps large prefill batches on the CUTLASS path
+NVFP4-KV decode shows the largest win because the unfused
+NVFP4 chain has more launches per layer than F16 (each NVFP4
+quant + pack step is its own kernel). The batched-prefill arm
+fires at small M only (< 128); CUTLASS path at M≥128 is
 unchanged.
+
+Production qwen3627b smoke ("Die Hauptstadt von Frankreich ist
+Paris.") verified after every restart.
 
 ### Phase 8 closer + last-block-residual_add fusion — SHIPPED 2026-05-23
 
@@ -1294,18 +1215,13 @@ The routed_sum f32 write is preserved so the
 `RVLLM_QWEN36_DEBUG_MOE` post-residual probe stays visible.
 
 Env-gated opt-in (`RVLLM_QWEN36_MOE_CLOSER_FUSED=1`); default off
-keeps the unfused 2-launch chain byte-untouched. **Re-validated
-against the freshly-installed binary** on qwen3-6-35b-a3b
-NVFP4-KV (150-token photosynthesis), deterministic across 3 runs
-each:
-- CLOSER_FUSED off: **3.68s** (md5 differs from ON → fusion really
-  fires)
-- CLOSER_FUSED on:  **3.68s**
-TRUE PARITY (this one was correct on the original measurement —
-the fusion's per-token launch saving of ~200 µs/token is genuinely
-below the ±10 ms noise on a 24 ms/token decode). Architectural
-value: 40 fewer launches per decode token, ~40 fewer captured-
-graph nodes per N-step macro-graph chunk.
+keeps the unfused 2-launch chain byte-untouched. A/B on
+qwen3-6-35b-a3b NVFP4-KV (150-token photosynthesis),
+deterministic across 3 runs each: 3.68 s ON vs 3.68 s OFF.
+md5 differs ON vs OFF (fusion fires). Saves 1 launch per MoE
+layer per decode token (~40 launches/token across 40 layers);
+architectural cleanup at this scale, not a measurable wall-clock
+win.
 
 ### Phase 8 Q-norm + K-norm + RoPE + KV megakernel (Phase 1) — SHIPPED 2026-05-23
 
@@ -1445,25 +1361,18 @@ dual_silu kround-batched launch) already matches the kernel's
 Bit-equivalent numerics (same kernel as decode hot path, sum
 order preserved per-warp sequential over k_rounds).
 
-**Re-validated against the freshly-installed binary** on
-qwen3-6-35b-a3b NVFP4-KV (115-token prompt), deterministic
-over 3 runs each:
-- BATCH_MOE_ROUTED_FFN=on (this port + prior batched fusions):
-  prefill_ms = **1157.2-1159.0**
-- BATCH_MOE_ROUTED_FFN=off (full per-token MoE fallback):
-  prefill_ms = **1495.3-1499.3**
-- **22% prefill speedup from the whole batched-MoE stack**
+A/B on qwen3-6-35b-a3b NVFP4-KV (115-token prompt),
+deterministic over 3 runs each:
+- BATCH_MOE_ROUTED_FFN=on  → prefill_ms 1157-1159
+- BATCH_MOE_ROUTED_FFN=off → prefill_ms 1495-1499
 
-Caveat: the A/B above measures the **whole batched-MoE stack**
-(this port + dual_silu kround-batch + router+topk batched +
-shared-expert batched), not the kround port in isolation.
-Isolating just the kround port's contribution would require
-reverting commit 38afff0, rebuilding, installing, and re-
-measuring — the port's individual 280-launches-saved (~1.4 ms
-at 5 µs/launch on 1158 ms prefill ≈ 0.1%) is well below noise,
-so an isolated test would only show parity. Code-level fact:
-the host-side `for k_round in 0..top_k` loop is gone, replaced
-by one kround_batched launch. Output coherent.
+22% prefill speedup from the whole batched-MoE stack (this
+port + dual_silu kround-batch + router+topk batched + shared-
+expert batched). The kround port's individual contribution
+(280 launches saved ≈ 1.4 ms on 1158 ms prefill) is too small
+to separate from noise; the whole-stack number is the relevant
+measurement. Host-side `for k_round in 0..top_k` loop is gone,
+replaced by one kround_batched launch.
 
 ### Phase 8 other-models fusion (qwen27b dense) — SHIPPED 2026-05-23
 

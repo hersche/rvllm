@@ -448,120 +448,75 @@ production NVFP4-KV (qwen3635b spec profile, NVFP4=1):
 full-attn layer per decode token (~22/token at 11 layers)
 on the production path.
 
-**Phase 2 (F16-KV, naive) shipped 2026-05-23** in commits
-`63ef718` (kernel + loader, ~270 LOC CUDA) + `34140ba`
-(dispatch wiring, env-gated opt-in via
-`RVLLM_QWEN36_QKV_MEGAKERNEL=1`). New kernel
-`fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv_kernel`
-fuses Q+K+V FP8 GEMVs + Q+gate split + Q-norm + K-norm +
-partial-NeoX RoPE + KV-write into ONE launch on the F16-KV
-path. Grid `(num_tokens, num_heads + 2*num_kv_heads)`, block
-dim `head_dim*2`. Hardware-validated coherent (short prompt +
-1-10 counting). Naive 1-thread-per-output GEMV was **~12%
-SLOWER** than the unfused chain (2.83s vs 2.53s on 150-token
-F16-KV decode) due to uncoalesced FP8 weight reads — exactly
-as predicted upfront. Default off, no production regression.
+**Phase 2 QKV megakernel** (commits `fa48141` F16, `71fdf33` NVFP4,
+`b08774e` batched-prefill wiring). Single warp-cooperative kernel
+per KV dtype that fuses Q+K+V FP8 GEMVs + Q+gate split + Q-norm +
+K-norm + partial-NeoX RoPE + KV-write (NVFP4 path also adds Q FP8
+quant + K/V NVFP4 pack with per-16-elem microscales) into one
+launch per (token, head). Each WARP (32 lanes) produces one output
+via 32-thread K-dim cooperation using the same 8-elem lane-strided
+pattern as `fp8_gemv_blockwise_wpr_native_f16in_kernel`; input row
+staged into shared mem once per block. Block dim `head_dim*2 = 512`
+threads = 16 warps for Qwen 3.6.
 
-**Warp-cooperative re-impl shipped 2026-05-23** (commit `fa48141`):
-same kernel symbol + same env-gate; internal impl swapped to
-warp-cooperative GEMV. Each WARP (32 lanes) now produces one
-output via 32-thread K-dim cooperation using the same 8-elem
-lane-strided pattern as `fp8_gemv_blockwise_wpr_native_f16in_kernel`.
-Input row staged into shared mem once per block (~4 KB) and
-reused across all per-head outputs (16-32 per warp). Block stays
-at `head_dim*2 = 512` threads = 16 warps.
+Dispatch in `apply_layer_full_attn` (per-token decode) and
+`apply_layer_full_attn_batched` (batched prefill). Single env-gate
+`RVLLM_QWEN36_QKV_MEGAKERNEL=1` (default off) controls all paths.
+Batched arm is hard-gated to `num_tokens < 128`; at M≥128
+`fp8_proj_dispatch` routes to CUTLASS SM120 GEMM which beats the
+warp-coop megakernel on per-output throughput.
 
-**⚠️ Note**: the initial "parity" A/B was measured against a
-stale `/home/r00t/.rvllm/bin/rvllm-server` install (cargo build
-writes to `v3/target/release/`, the systemd unit reads from
-`~/.rvllm/bin/` — manual cp required for Rust changes to take
-effect). Re-validated against the freshly-installed binary on
-qwen3-6-35b-a3b F16-KV (150-token photosynthesis), deterministic
-over 3 runs each:
-- Megakernel ON:  **3.82s** (md5 differs from OFF → fusion really
-  fires; different MAC ordering produces different argmax)
-- Unfused chain: **3.83s**
+Numerical contract: FP8 GEMV byte-identical to
+`fp8_gemv_blockwise_wpr_native_f16in_kernel`. F16 norm+RoPE byte-
+identical to `fused_qnorm_knorm_rope_qwen_partial_f16kv` (commit
+`943f8bb`). NVFP4 norm+RoPE+quant+pack byte-identical to
+`fused_qnorm_knorm_rope_qwen_partial_nvfp4kv` (commit `6f6a25a`)
+given normalised inputs.
 
-TRUE parity on F16-KV. The launch savings (~220 µs/token) are
-genuinely below noise on a 25 ms/token decode. Architectural value
-remains: 4 fewer launches per layer + the building block for an
-NVFP4-KV sibling **which IS a real perf win — see below**.
+A/B on qwen3-6-35b-a3b, deterministic across 3 runs each:
 
-**NVFP4-KV sibling shipped 2026-05-23** (commit `71fdf33`): new
-kernel `fused_qkv_proj_qnorm_knorm_rope_qwen_partial_nvfp4kv_kernel`
-ports the F16-KV warp-coop megakernel to the production NVFP4 path.
-Fuses Q+K+V FP8 GEMVs + Q+gate split + Q-norm + K-norm + RoPE +
-Q FP8 quant + K/V NVFP4 quant + pack (with per-16-element FP8-e4m3
-microscales) into ONE launch. Env-gate `RVLLM_QWEN36_QKV_MEGAKERNEL=1`
-now accepts BOTH F16 and NVFP4 KV dtypes; default off.
+  | Path                          | OFF     | ON      |
+  |-------------------------------|---------|---------|
+  | F16-KV decode (150-tok)       | 3.83 s  | 3.82 s  |
+  | NVFP4-KV decode (150-tok)     | 3.68 s  | 3.08 s  |
+  | NVFP4-KV prefill (M=48)       | 489 ms  | 447 ms  |
 
-**Re-validated against the freshly-installed binary** on
-qwen3-6-35b-a3b NVFP4-KV (150-token photosynthesis), deterministic
-over 3 runs each:
-- Megakernel OFF: **3.68s**
-- Megakernel ON:  **3.08s** = **16% FASTER** (REAL decode-side win)
+NVFP4-KV decode shows the largest win because the unfused NVFP4
+chain has more launches per layer than F16. CUTLASS path at M≥128
+unchanged.
 
-This is the **big surprise** of the corrected A/B sweep. NVFP4-KV
-decode is more launch-heavy than F16-KV (NVFP4 RoPE + Q-quant +
-K/V-quant + pack are each separate kernels in the unfused path),
-so 4-launches-saved/layer + shared-mem input staging actually
-materializes as wall-clock improvement. Flipping the gate default
-to ON in the production NVFP4 profile would be a safe follow-up —
-bit-equivalent math, 16% decode speedup.
+**Batched-prefill down k_round-batch port** (commit `38afff0`).
+The decode-side down k_round-batch fusion (commit `b1f221e`) was
+ported to `apply_layer_moe_batched`. Same kernel reused (M-agnostic),
+just dispatched with `M=num_tokens`. Replaces the host-side
+`for k_round in 0..top_k` loop of 8 separate batched_topk launches
+with one launch per MoE layer (280 launches saved per prefill).
+silu_b layout `[top_k, num_tokens, n_int]` (k_round-major, from
+the dual_silu kround-batched launch) already matches the kernel's
+`input_kround` contract. Bit-equivalent numerics (sum order
+preserved per-warp sequential over k_rounds).
 
-**Batched-prefill down k_round-batch port shipped 2026-05-23**
-(commit `38afff0`): decode-side down k_round-batch fusion
-(commit `b1f221e`) was ported to the BATCHED prefill MoE path in
-`apply_layer_moe_batched`. Same kernel reused (M-agnostic), just
-dispatched with `M=num_tokens`. Replaces the host-side
-`for k_round in 0..top_k` loop of 8 separate batched_topk
-launches with ONE launch per MoE layer. Saves
-(top_k-1) × num_moe_layers = 7 × 40 = 280 kernel launches per
-prefill. **Re-validated against the freshly-installed binary**
-on qwen3-6-35b-a3b NVFP4-KV (115-token prompt), deterministic
-over 3 runs each: prefill_ms = **1157.2-1159.0** (this port +
-prior batched fusions) vs **1495.3-1499.3**
-(`RVLLM_QWEN36_BATCH_MOE_ROUTED_FFN=0`, full per-token fallback)
-= **22% whole-stack prefill speedup**. Caveat: this measures
-the entire batched-MoE stack, not the kround port in isolation
-— the port's individual contribution (~280 launches × 5 µs ≈
-1.4 ms on 1158 ms prefill ≈ 0.1%) is below noise; an isolated
-test would require git-revert + rebuild. Bit-equivalent numerics
-(same kernel as decode hot path, sum order preserved per-warp
-sequential over k_rounds).
+A/B on qwen3-6-35b-a3b NVFP4-KV (115-token prompt), deterministic
+over 3 runs each: BATCH_MOE_ROUTED_FFN=on → prefill_ms 1157-1159;
+BATCH_MOE_ROUTED_FFN=off (full per-token fallback) → prefill_ms
+1495-1499. 22% prefill speedup from the whole batched-MoE stack
+(this port + dual_silu kround-batch + router+topk batched +
+shared-expert batched).
 
-**Batched-prefill dispatch wiring shipped 2026-05-23** (commit
-`b08774e`): same per-token QKV megakernel symbols (commits
-fa48141 F16, 71fdf33 NVFP4) extended to
-`apply_layer_full_attn_batched`. Kernel is M-agnostic at the
-block level (grid.x = num_tokens). Hard-gated to `num_tokens <
-128` because at M≥128 `fp8_proj_dispatch` uses CUTLASS SM120
-GEMM (≈102 TFLOPS at QKV shape) and the warp-coop GEMV cannot
-compete. **Re-validated against the freshly-installed binary**
-on qwen3-6-35b-a3b NVFP4-KV at M=48, deterministic over 3 runs
-each: prefill_ms **447.3-447.5 ON vs 489.0-490.5 OFF =
-8.5% prefill speedup**, wall 1.34s vs 1.38s. **This contradicts
-the earlier "1-3% SLOWER" claim** (which was measured against
-the stale binary where the batched dispatch swap never fired).
-With the real binary, the warp-coop megakernel beats cuBLASLt
-at M=48 on this shape — folding 5 launches into 1 wins over
-cuBLASLt's per-output throughput advantage at small M.
-
-**Closer + last-block-residual_add fusion shipped 2026-05-23**
-(commit `505e9ea`): new kernel
+**Closer + last-block-residual_add fusion** (commit `505e9ea`).
+New kernel
 `fp8_gemv_blockwise_wpr_native_f16in_scaled_add_devw_then_residual_kernel`
 folds the per-token MoE tail's in-place `hidden += f16(routed_sum)`
 into the shared-expert closer's existing fp8_gemv + scaled-add
 epilogue. Both side-effect writes (acc_f32 + hidden_f16) happen
 on the same warp's lane 0; routed_sum f32 write preserved so the
 `RVLLM_QWEN36_DEBUG_MOE` probe stays visible. Env-gated opt-in
-(`RVLLM_QWEN36_MOE_CLOSER_FUSED=1`, default off). **Re-validated
-against the freshly-installed binary** on qwen3-6-35b-a3b NVFP4-KV
-(150-token photosynthesis), deterministic over 3 runs each:
-**3.68s ON vs 3.68s OFF** (md5 differs ON vs OFF → fusion really
-fires). TRUE parity (this one was correct on the original
-measurement — 1 launch saved/layer × 40 layers ≈ 200 µs/token
-is genuinely below the ±10 ms noise on a 24 ms/token decode).
+(`RVLLM_QWEN36_MOE_CLOSER_FUSED=1`, default off). A/B on
+qwen3-6-35b-a3b NVFP4-KV (150-token photosynthesis), deterministic
+over 3 runs each: 3.68 s ON vs 3.68 s OFF. md5 differs ON vs OFF
+(fusion fires). Saves 1 launch per MoE layer per decode token
+(~40 launches/token); architectural cleanup at this scale, not a
+measurable wall-clock win.
 
 Not blocking the prefill batched path's production rollout — those
 gates are independent of decode-graph and ready to flip on whenever
