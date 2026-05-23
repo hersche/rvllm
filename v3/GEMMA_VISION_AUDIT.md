@@ -87,12 +87,35 @@ For now the f16-everywhere path is acceptable: model reads text
 correctly, residual cosine drift is well below the threshold where
 text-recognition tasks degrade.
 
-## Phase 3 status — bf16 vision path (SHIPPED 2026-05-22)
+## Phase 3 status — bf16 vision path (SHIPPED 2026-05-22; lifetime BUG FIXED 2026-05-23)
 
 **Decision**: production runs on the f16 + f32-pooler path. bf16
-opt-in via `RVLLM_GEMMA4_VIT_USE_BF16=1` since `797a019` —
-hardware-validated working on first try (prior `blk0_out
-cos=0.76` failure is resolved). Production default unchanged.
+opt-in via `RVLLM_GEMMA4_VIT_USE_BF16=1` since `797a019`.
+Production default unchanged.
+
+**Cross-request lifetime bug found + fixed 2026-05-23** (commit
+`9394019`, Option B `Gemma4Nvfp4Bringup`). The original 2026-05-22
+"works on first try" claim only validated the FIRST request after
+restart. Second + subsequent requests degraded to NaN in the
+pooler-bridge `standardized` buffer; the LLM hallucinated
+"Sie haben kein Bild hochgeladen". Root cause: lazy
+`ensure_vit_bf16_weights` allocated the converted bf16 weight
+regions BELOW `forward_checkpoint`. Every subsequent request's
+`forward_scratch_guard::drop` reclaimed those regions; cached
+pointers in `self.vit_bf16_weights` mutex still pointed there
+but the next request's `arena.region(...)` scratch allocations
+overwrote the weights. Fix: change `ensure_vit_bf16_weights` +
+`forward_gemma_vision` to `&mut self`, bump
+`self.forward_checkpoint = self.arena.checkpoint()` after
+`convert_from_f16`. Validated post-fix: 5 consecutive bf16
+vision calls produce identical coherent caption (md5 `df22aaa3`
+×5) on gemma-4-31b-it-nvfp4 + /tmp/ball.png.
+
+Fp8-block `Gemma4Bringup` has the same lazy-init pattern at
+`gemma4_bring_up.rs::ensure_vit_bf16_weights` — not fixed in
+this commit (production uses NVFP4-KV / Option B; fp8-block
+fix can be a follow-up if anyone enables fp8-block vision
+testing).
 
 ### `797a019` — forward_bf16 body landed
 
