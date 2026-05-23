@@ -1306,6 +1306,56 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 prefill nsys post-#98+#99 — task #100 (2026-05-24)
+
+Captured against fresh binary md5 `65cb2a35` with the production
+profile + both grouped MMA paths active (MMA_GROUPED=1 +
+MMA_DOWN_GROUPED=1). Single 4412-token prompt fired inside a 25 s
+nsys window. Top kernels by total GPU time:
+
+  | Time% | Kernel                                                          | Instances | Notes |
+  |-------|-----------------------------------------------------------------|-----------|-------|
+  | 15.8% | gated_delta_rule_prefill_f16_kernel                             |    30     | **NEW TOP — linear-attn** |
+  | 12.5% | fp8_mma_dual_silu_grouped_m16_w4c_kernel                        |    40     | #96 path |
+  | 12.3% | flash_attention_2_prefill_nvfp4kv_unified_kernel                |    10     | full-attn |
+  | 10.5% | fp8_mma_down_grouped_m16_w4_kernel                              |    40     | #98 path |
+  |  6.4% | router_gemv_with_topk_batched_f16_to_f32_kernel                 |    40     | |
+  |  6.2% | fp8_gemv_blockwise_wpr_native_f16in_kernel                      |  1940     | per-token GEMV (shared expert + per-token sites) |
+  |  4.6% | fp8_gemv_dual_silu_kernel                                       |   800     | shared-expert dual_silu |
+  |  1.9% | cutlass GEMM (M≥128 path)                                       |   130     | |
+  |  1.4% | dual_silu_indirect_kround_batched_kernel                        |   760     | legacy / per-token decode mix |
+
+Aggregated:
+- **MoE routed FFN (grouped MMA dual_silu + down): 23.0%** — was
+  88.9% pre-fix. **5.7× reduction in relative + absolute time**
+  (the prefill walltime also dropped from 24775 ms to 4116 ms at
+  M=4412, ~6× wallclock improvement).
+- **Linear-attn `gated_delta_rule_prefill_f16` is now the single
+  biggest kernel (15.8%)** — 30 instances (per linear-attn layer).
+  Was 3.6% pre-fix in relative terms but absolute time similar
+  (~900 ms then vs ~900 ms now); just a much larger SHARE of the
+  smaller wall.
+- **Full-attn unified prefill (12.3%)** — ~10 layers × 1 launch =
+  10 instances. Already MMA-based (CUTLASS NVFP4); not a clear
+  optimization target.
+- **Shared-expert path** (`fp8_gemv_dual_silu` 4.6% +
+  `fp8_gemv_blockwise_wpr_native_f16in` part of the 6.2% +
+  cutlass 1.9%): 8-12% combined. Doesn't use the grouped MMA
+  pattern — same expert-sort foundation could apply here.
+
+Path forward (in roughly descending expected impact):
+1. **Linear-attn `gated_delta_rule_prefill_f16` optimization** —
+   biggest single hotspot. Investigate fusion / vectorisation /
+   memory pattern. Would need familiarity with the Gated-DeltaNet
+   recurrence math.
+2. **Apply grouped MMA pattern to shared-expert dual_silu** — same
+   pattern as #94-#97 but without the routing indirection (single
+   "expert" applied to all tokens). Expected ~5-8% additional
+   speedup.
+3. **Apply grouped MMA pattern to other models** — Gemma 4 31B-NVFP4,
+   Qwen 3.5 27B dense, Mistral 3.5 — each would need per-model
+   adaptation since shapes/layouts differ.
+
 ### qwen36 MoE shared sort + per-kblk a_scale fix — task #99 (2026-05-24)
 
 Two paired cleanups (commit `81b4b21`):
