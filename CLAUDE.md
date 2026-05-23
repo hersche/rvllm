@@ -1521,9 +1521,18 @@ adaptive `_max16` variant pattern documented in rule (3) above.
   rvllm-serve even when unit + profile are clean. Check
   `systemctl show-environment` and `systemctl unset-environment`
   if a behaviour persists across config changes.
-- **bf16 vision forward**: kernels are committed, wiring is not.
-  Don't enable until the per-sub-step debug plan in
-  `v3/GEMMA_VISION_AUDIT.md` is run through.
+- **bf16 vision forward**: kernels are committed AND wired (env
+  `RVLLM_GEMMA4_VIT_USE_BF16=1`). **A/B verified 2026-05-23**
+  against fresh binary on gemma-4-31b-it-nvfp4 + /tmp/ball.png:
+    F16 (default): coherent caption x3, md5 eb6bfc64 stable
+    BF16:           run1 = coherent (different caption, md5 df22aaa3);
+                    runs 2-3 = "Sie haben kein Bild hochgeladen"
+                    (md5 6d243df0) — model thinks no image was sent
+  The bf16 ViT output is degraded enough that the multimodal
+  embedding splice produces a sequence the LLM interprets as
+  "no image". DO NOT enable in production. Per-sub-step debug
+  plan in `v3/GEMMA_VISION_AUDIT.md` still applies for a future
+  fix attempt.
 
 ## Option B (Gemma 4 31B NVFP4) — production status + follow-up register
 
