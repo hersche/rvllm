@@ -148,6 +148,17 @@ pub struct Qwen36OutsideKernels {
     /// Replaces the host-cached f32 matvec (Phase 4b-prep iter17).
     pub router_gemv_f16_to_f32_mod: LoadedModule,
     pub fn_router_gemv_f16_to_f32: KernelFn,
+    /// Phase 8 router+topk fusion (2026-05-23): fused router GEMV
+    /// + topk-softmax via last-block-does-topk pattern. Eliminates
+    /// the standalone topk_softmax launch per MoE layer per token.
+    pub router_gemv_with_topk_f16_to_f32_mod: LoadedModule,
+    pub fn_router_gemv_with_topk_f16_to_f32: KernelFn,
+    /// Persistent device counter u32[1] for the fused router+topk
+    /// kernel's atomic last-block detection. Zeroed once at worker
+    /// bring-up (lives above scratch_ck); the fused kernel resets
+    /// to 0 via atomicExch in the last block, so subsequent calls
+    /// find it at zero.
+    pub router_topk_counter_dev: u64,
     /// Per-expert weighted accumulator into f32 routed_sum:
     /// `acc[i] += weight * f16_to_f32(in[i])`. Replaces the host
     /// pipeline (fence + DtoH down + CPU scaled-add) per expert
@@ -1609,6 +1620,11 @@ impl Qwen36Bringup {
         let silu_mul_f16_mod = kernels.load_ptx("silu_mul_f16")?;
         let fn_silu_mul_f16 = silu_mul_f16_mod.get_function("silu_mul_f16_kernel")?;
         let router_gemv_f16_to_f32_mod = kernels.load_ptx("router_gemv_f16_to_f32")?;
+        let router_gemv_with_topk_f16_to_f32_mod =
+            kernels.load_ptx("router_gemv_with_topk_f16_to_f32")?;
+        let fn_router_gemv_with_topk_f16_to_f32 =
+            router_gemv_with_topk_f16_to_f32_mod
+                .get_function("router_gemv_with_topk_f16_to_f32_kernel")?;
         let fn_router_gemv_f16_to_f32 =
             router_gemv_f16_to_f32_mod.get_function("router_gemv_f16_to_f32_kernel")?;
         let scaled_add_f16_to_f32_mod = kernels.load_ptx("scaled_add_f16_to_f32")?;
@@ -1807,6 +1823,11 @@ impl Qwen36Bringup {
             fn_silu_mul_f16,
             router_gemv_f16_to_f32_mod,
             fn_router_gemv_f16_to_f32,
+            router_gemv_with_topk_f16_to_f32_mod,
+            fn_router_gemv_with_topk_f16_to_f32,
+            router_topk_counter_dev: 0u64,  // populated post-construct
+                                              // via dedicated arena
+                                              // alloc before scratch_ck
             scaled_add_f16_to_f32_mod,
             fn_scaled_add_f16_to_f32,
             f16_plus_f32_inplace_f16_mod,
@@ -2255,6 +2276,27 @@ impl Qwen36Bringup {
                 bt_region.copy_from_host(&bt_host)?;
             }
             bringup.bt_persistent_ptr = bt_region.device_ptr();
+        }
+        // Phase 8 router+topk fusion: allocate the persistent u32[1]
+        // counter the fused kernel uses for atomic last-block
+        // detection. Zeroed via a 4-byte HtoD; the kernel self-
+        // resets to 0 in the last block, so this single zero
+        // suffices for the entire worker lifetime.
+        {
+            let counter_region = bringup.arena.region(
+                "qwen36_router_topk_counter", 4, 4)?;
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let zero: u32 = 0;
+                let _ = cuMemcpyHtoD_v2(
+                    counter_region.device_ptr(),
+                    &zero as *const u32 as *const _,
+                    4,
+                );
+            }
+            bringup.outside_kernels.router_topk_counter_dev =
+                counter_region.device_ptr();
         }
         // Build per-linear-attn-layer host f32 weight caches BEFORE
         // any probe / smoke runs (some of those reach into
@@ -9668,72 +9710,44 @@ impl Qwen36Bringup {
         let (route_idx_ptr, route_w_ptr) = if let Some((idx, w)) = route_override {
             (idx, w)
         } else {
+            // Phase 8 router+topk fusion (2026-05-23): ONE kernel
+            // does the router GEMV + topk-softmax via the last-
+            // block-does-topk atomic pattern. Replaces the back-
+            // to-back (router_gemv + topk_softmax) launches with
+            // a single launch.
             let logits_bytes = num_experts * 4;
             let logits_region = self.arena.region("qwen36_pm_logits", logits_bytes, 16)?;
-            #[cfg(feature = "cuda")]
-            unsafe {
-                use cudarc::driver::sys::*;
-                let mut out = logits_region.device_ptr();
-                let mut router_ptr = moe.router.offset_bytes;
-                let mut input_ptr = normed_region.device_ptr();
-                let mut nx = num_experts as i32;
-                let mut hh = hidden as i32;
-                let args = [
-                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut router_ptr) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut input_ptr) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut nx) as *mut i32 as *mut core::ffi::c_void,
-                    (&mut hh) as *mut i32 as *mut core::ffi::c_void,
-                ];
-                let block: u32 = 256;
-                let grid: u32 = num_experts as u32;
-                let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_router_gemv_f16_to_f32.raw() as CUfunction,
-                    grid,
-                    1,
-                    1,
-                    block,
-                    1,
-                    1,
-                    0,
-                    stream_raw as CUstream,
-                    args.as_ptr() as *mut *mut core::ffi::c_void,
-                    core::ptr::null_mut(),
-                );
-                if rc != CUresult::CUDA_SUCCESS {
-                    return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 router_gemv launch",
-                        rvllm_core::CudaErrorKind::LaunchFailed,
-                        rvllm_core::CudaCtx::setup(),
-                    ));
-                }
-            }
             let topk_idx_region = self.arena.region("qwen36_pm_topk_idx", top_k * 4, 16)?;
             let topk_w_region = self.arena.region("qwen36_pm_topk_w", top_k * 4, 16)?;
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
-                let mut logits_ptr = logits_region.device_ptr();
                 let mut idx_ptr = topk_idx_region.device_ptr();
                 let mut w_ptr = topk_w_region.device_ptr();
+                let mut logits_ptr = logits_region.device_ptr();
+                let mut router_ptr = moe.router.offset_bytes;
+                let mut input_ptr = normed_region.device_ptr();
+                let mut counter_ptr = self.outside_kernels.router_topk_counter_dev;
                 let mut nx = num_experts as i32;
+                let mut hh = hidden as i32;
                 let mut kk = top_k as i32;
                 let args = [
-                    (&mut logits_ptr) as *mut u64 as *mut core::ffi::c_void,
                     (&mut idx_ptr) as *mut u64 as *mut core::ffi::c_void,
                     (&mut w_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut logits_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut router_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut input_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut counter_ptr) as *mut u64 as *mut core::ffi::c_void,
                     (&mut nx) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hh) as *mut i32 as *mut core::ffi::c_void,
                     (&mut kk) as *mut i32 as *mut core::ffi::c_void,
                 ];
                 let block: u32 = num_experts as u32;
+                let grid: u32 = num_experts as u32;
                 let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_topk_softmax_f32.raw() as CUfunction,
-                    1,
-                    1,
-                    1,
-                    block,
-                    1,
-                    1,
+                    self.outside_kernels.fn_router_gemv_with_topk_f16_to_f32.raw() as CUfunction,
+                    grid, 1, 1,
+                    block, 1, 1,
                     0,
                     stream_raw as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
@@ -9741,7 +9755,7 @@ impl Qwen36Bringup {
                 );
                 if rc != CUresult::CUDA_SUCCESS {
                     return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 topk_softmax_f32 launch",
+                        "qwen36 router_gemv_with_topk_f16_to_f32 launch",
                         rvllm_core::CudaErrorKind::LaunchFailed,
                         rvllm_core::CudaCtx::setup(),
                     ));
