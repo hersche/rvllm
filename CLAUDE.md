@@ -1339,6 +1339,22 @@ single global RMW per warp at the end. Saves 7 launches/layer
 × 40 MoE layers = 280 launches/decode token. Latency 1.644s
 deterministic (~30 ms faster than 1.675s post-router+topk).
 
+**Batched-prefill port (commit `38afff0`, 2026-05-23)**: same
+kernel is M-agnostic, so the batched-prefill MoE path in
+`apply_layer_moe_batched` was rewired to launch
+`fp8_gemv_indirect_scaled_add_kround_batched` once per layer
+with `M=num_tokens` instead of running the 8-launch
+`fp8_gemv_indirect_scaled_add_batched_topk` host loop. silu_b
+layout `[top_k, num_tokens, n_int]` (k_round-major, from the
+dual_silu kround-batched launch) already matches the kernel's
+`input_kround` contract. 280 launches saved per prefill batch.
+Hardware-validated on qwen3-6-35b-a3b NVFP4-KV (115-token
+prompt): prefill_ms = 1160 with this fix vs 1497 with
+`RVLLM_QWEN36_BATCH_MOE_ROUTED_FFN=0` (full fallback) —
+deterministic over 3 runs each. Bit-equivalent numerics (same
+kernel as decode hot path, sum order preserved per-warp
+sequential over k_rounds).
+
 ### Phase 8 other-models fusion (qwen27b dense) — SHIPPED 2026-05-23
 
 Commit `39f7c1a` ports the same fusion pattern to the Qwen 3.5/3.6
