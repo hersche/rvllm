@@ -381,6 +381,17 @@ pub struct Qwen36OutsideKernels {
     /// per token. Kernel: kernels/gated_delta_rule_prefill_f16.cu.
     pub gated_delta_rule_prefill_f16_mod: LoadedModule,
     pub fn_gated_delta_rule_prefill_f16: KernelFn,
+    // Task #101: optimized prefill kernel — unrolled inner loops +
+    // vectorised state I/O. Opt-in via
+    // `RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V2=1` (default-off; same
+    // numerical contract).
+    pub gated_delta_rule_prefill_f16_v2_mod: LoadedModule,
+    pub fn_gated_delta_rule_prefill_f16_v2: KernelFn,
+    // Task #101 v3: drops the inner-loop f16 round-trip on s_row
+    // (accept fp32 accumulation across recurrence). Opt-in via
+    // `RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V3=1` (default-off).
+    pub gated_delta_rule_prefill_f16_v3_mod: LoadedModule,
+    pub fn_gated_delta_rule_prefill_f16_v3: KernelFn,
     /// Round-26: device-side fill of per-token `positions` and
     /// `context_lens` arrays. Replaces the legacy per-token
     /// `pos_cl_region.copy_from_host(...)` HtoD that raced with
@@ -1920,6 +1931,14 @@ impl Qwen36Bringup {
         let gated_delta_rule_prefill_f16_mod = kernels.load_ptx("gated_delta_rule_prefill_f16")?;
         let fn_gated_delta_rule_prefill_f16 =
             gated_delta_rule_prefill_f16_mod.get_function("gated_delta_rule_prefill_f16_kernel")?;
+        let gated_delta_rule_prefill_f16_v2_mod =
+            kernels.load_ptx("gated_delta_rule_prefill_f16_v2")?;
+        let fn_gated_delta_rule_prefill_f16_v2 = gated_delta_rule_prefill_f16_v2_mod
+            .get_function("gated_delta_rule_prefill_f16_v2_kernel")?;
+        let gated_delta_rule_prefill_f16_v3_mod =
+            kernels.load_ptx("gated_delta_rule_prefill_f16_v3")?;
+        let fn_gated_delta_rule_prefill_f16_v3 = gated_delta_rule_prefill_f16_v3_mod
+            .get_function("gated_delta_rule_prefill_f16_v3_kernel")?;
         let conv_state_advance_batched_f16_mod =
             kernels.load_ptx("conv_state_advance_batched_f16")?;
         let fn_conv_state_advance_batched_f16 = conv_state_advance_batched_f16_mod
@@ -2127,6 +2146,10 @@ impl Qwen36Bringup {
             fn_gated_delta_rule_decode_f16,
             gated_delta_rule_prefill_f16_mod,
             fn_gated_delta_rule_prefill_f16,
+            gated_delta_rule_prefill_f16_v2_mod,
+            fn_gated_delta_rule_prefill_f16_v2,
+            gated_delta_rule_prefill_f16_v3_mod,
+            fn_gated_delta_rule_prefill_f16_v3,
             conv_state_advance_batched_f16_mod,
             fn_conv_state_advance_batched_f16,
             qwen_fill_pos_slots_i32_mod,
@@ -7757,8 +7780,24 @@ impl Qwen36Bringup {
                 (&mut hkd_i) as *mut i32 as *mut core::ffi::c_void,
             ];
             let smem = (2 * head_k_dim + head_v_dim) * 4;
+            // Task #101: opt-in v2 kernel (unrolled inner loops +
+            // vectorised state I/O). Default-off keeps the prior
+            // path unchanged.
+            let use_v2 = std::env::var("RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V2")
+                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
+                .unwrap_or(false);
+            let use_v3 = std::env::var("RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V3")
+                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
+                .unwrap_or(false);
+            let kfn = if use_v3 {
+                self.outside_kernels.fn_gated_delta_rule_prefill_f16_v3.raw() as CUfunction
+            } else if use_v2 {
+                self.outside_kernels.fn_gated_delta_rule_prefill_f16_v2.raw() as CUfunction
+            } else {
+                self.outside_kernels.fn_gated_delta_rule_prefill_f16.raw() as CUfunction
+            };
             let rc = cuLaunchKernel(
-                self.outside_kernels.fn_gated_delta_rule_prefill_f16.raw() as CUfunction,
+                kfn,
                 num_v_heads,
                 1,
                 1,
