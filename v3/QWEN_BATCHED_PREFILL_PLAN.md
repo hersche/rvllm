@@ -657,3 +657,28 @@ Cumulative MoE-prefill speedup vs GEMV:
 * Phase 10 MMA grouped M=16: 3265 ms (+45.8%)
 * Phase 11 MMA W=4: 2627 ms (+56.4%)
 * **Phase 12 MMA W=4 coop: 2533 ms (+57.9%)**
+
+
+## Phase 13: Cooperative B-staging in W=4 (task #97, 2026-05-24, parity — opt-in)
+
+`fp8_mma_dual_silu_grouped_m16_w4cb_kernel` (commit `5bb1c26`) adds
+u64-vector B-staging on top of #96's coop-A. B_g/B_u staging
+refactored from 8 unrolled byte iterations to 1 pass via 32 lanes ×
+8-byte u64 loads. Lane mapping (n_row, k_chunk) = (lane/4, lane%4),
+aligned LDG + STS per lane. Same total bytes moved, same coalescing.
+
+A/B (qwen3-6-35b-a3b NVFP4, deterministic 3 runs):
+
+  | Cell                            | 1112 tok    | 4412 tok    |
+  |---------------------------------|-------------|-------------|
+  | Phase 12 coop A (production)    |   2533 ms   |  10587 ms   |
+  | Phase 13 coop A + coop B        |   2517 ms   |  10647 ms   |
+
+Parity — within ~0.5% noise. The existing 8-iter byte-load loop
+already gets compiler-vectorised on sm_121. Default-off (opt-in via
+`RVLLM_QWEN36_MOE_MMA_GROUPED_W4_COOP_B=1`); preserved as foundation
+for follow-on B-side cp.async pipelining or cross-warp B-distribution
+work.
+
+No regression to Phase 12 production default. Backward-compat smoke
+verified.

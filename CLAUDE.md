@@ -1306,6 +1306,25 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 MoE W=4 cooperative B-staging — task #97 (2026-05-24, parity, opt-in)
+
+`fp8_mma_dual_silu_grouped_m16_w4cb_kernel` (commit `5bb1c26`)
+adds u64-vector B-staging on top of #96's coop-A. Within each
+warp, B_g/B_u staging refactored from 8 unrolled 32-lane byte
+iterations to 1 pass: 32 lanes × 8 bytes (u64) each.
+
+A/B (qwen3-6-35b-a3b NVFP4, deterministic 3 runs):
+
+  | Cell                            | 1112 tok    | 4412 tok    |
+  |---------------------------------|-------------|-------------|
+  | #96 coop A only (production)    |   2533 ms   |  10587 ms   |
+  | #97 coop A + coop B (opt-in)    |   2517 ms   |  10647 ms   |
+
+PARITY — within ~0.5% run-to-run noise. The existing 8-iter
+byte-load loop already gets vectorised by the compiler. Default-
+off (opt-in via `RVLLM_QWEN36_MOE_MMA_GROUPED_W4_COOP_B=1`);
+kernel kept loaded as foundation for follow-on tuning.
+
 ### qwen36 MoE W=4 cooperative A-staging — task #96 (2026-05-23, +57.9%)
 
 `fp8_mma_dual_silu_grouped_m16_w4c_kernel` (commit `41892e9`)
