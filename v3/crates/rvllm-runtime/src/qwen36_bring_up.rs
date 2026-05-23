@@ -91,6 +91,16 @@ pub struct Qwen36OutsideKernels {
     /// cost in `apply_layer_full_attn` (Phase 4b prep).
     pub fused_rope_qwen_partial_f16kv_mod: LoadedModule,
     pub fn_fused_rope_qwen_partial_f16kv: KernelFn,
+    /// Phase 8 QKV-megakernel Phase 2 (2026-05-23, naive F16-KV):
+    /// fuses Q-proj + K-proj + V-proj + Q-norm + K-norm + RoPE +
+    /// KV-cache write into ONE launch. Each thread computes one
+    /// output element via sequential K-dim FP8 GEMV reduction
+    /// (slower than the warp-cooperative `fp8_gemv` pattern due to
+    /// uncoalesced row reads, but correct and bounded). Opt-in via
+    /// `RVLLM_QWEN36_QKV_MEGAKERNEL=1`; default off to avoid
+    /// regression on production paths.
+    pub fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv_mod: LoadedModule,
+    pub fn_fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv: KernelFn,
     /// Phase 8 QKV-megakernel Phase 1 (2026-05-23): fuses Q-norm +
     /// K-norm into the RoPE + KV-write kernel. Each block already
     /// handles one (token, head), so adding a block-reduced
@@ -1624,6 +1634,13 @@ impl Qwen36Bringup {
         let fn_fused_qnorm_knorm_rope_qwen_partial_f16kv =
             fused_qnorm_knorm_rope_qwen_partial_f16kv_mod
                 .get_function("fused_qnorm_knorm_rope_qwen_partial_f16kv_kernel")?;
+        let fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv_mod =
+            kernels.load_ptx(
+                "fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv")?;
+        let fn_fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv =
+            fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv_mod
+                .get_function(
+                    "fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv_kernel")?;
         // NVFP4 commit 2: load the Qwen NVFP4 RoPE + paged decode
         // kernels only when the same `RVLLM_NVFP4_KV=1` gate that
         // drives the packed-K/V allocator is on, so the resident set
@@ -1878,6 +1895,8 @@ impl Qwen36Bringup {
             fn_fused_rope_qwen_partial_f16kv,
             fused_qnorm_knorm_rope_qwen_partial_f16kv_mod,
             fn_fused_qnorm_knorm_rope_qwen_partial_f16kv,
+            fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv_mod,
+            fn_fused_qkv_proj_qnorm_knorm_rope_qwen_partial_f16kv,
             fused_rope_qwen_partial_nvfp4kv_mod,
             fused_qnorm_knorm_rope_qwen_partial_nvfp4kv_mod,
             fn_fused_qnorm_knorm_rope_qwen_partial_nvfp4kv,
