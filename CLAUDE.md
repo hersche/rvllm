@@ -1306,6 +1306,45 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### Mistral 3.5 W4A16 MMA_V8 + Gemma 4 ViT bf16 — tasks #104/#105 (2026-05-24)
+
+Two negative-result rollout decisions documented (both keep current
+defaults; no code change).
+
+**Task #104 — Mistral 3.5 `RVLLM_MISTRAL35_W4A16_FUSED_MMA_V8`**:
+Same kernel family as Gemma 4 NVFP4 (#102 = 14.6× win there). Hardware
+A/B (mistral-3.5-nvfp4 production, 1024-tok prefill, max_tokens=1
+deterministic 3 runs):
+
+  | Cell    | wall avg  |
+  |---------|-----------|
+  | V8=OFF  | 25754 ms  |
+  | V8=ON   | 34424 ms  |
+  | Δ       | **-34%**  |
+
+Mistral V8 REGRESSES. Opposite of Gemma — same kernel template but
+Mistral's matrix shapes don't fit V8's tile layout. **Keep default
+OFF on Mistral.** Operators experimenting with V8 should be aware
+it slows Mistral down 34%.
+
+**Task #105 — Gemma 4 ViT bf16 forward** (`RVLLM_GEMMA4_VIT_USE_BF16`):
+Wired + lifetime bug fixed (2026-05-23, `df22aaa3 × 5 stable`).
+Hardware A/B (gemma-4-31b-it-nvfp4 + `/tmp/ball.png`, deterministic
+5 runs):
+
+  | Cell    | wall avg  | caption stem                  |
+  |---------|-----------|-------------------------------|
+  | f16     |  8672 ms  | "...minimalistische Darste..."|
+  | bf16    |  8976 ms  | "...vereinfachte Darstellu..."|
+  | Δ       | -3.5%     | both coherent German          |
+
+bf16 is consistently ~3.5% slower and produces slightly different
+word choice (both valid German for "minimalist/simplified"). No perf
+win, marginal quality variance. **Keep f16 default-on; bf16 stays
+env-opt-in** for future tuning + debugging. The earlier lifetime
+fix that made bf16 SAFE was the critical work; the rollout-decision
+follow-up is now "no, stay on f16".
+
 ### qwen36 shared-expert dual_silu grouped MMA — task #103 (2026-05-24, +4% / +84.9% cumulative)
 
 `fp8_mma_shared_dual_silu_m16_w4c_kernel` (commit `84625d2`)
