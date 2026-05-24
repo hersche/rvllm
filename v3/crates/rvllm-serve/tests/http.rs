@@ -493,15 +493,22 @@ async fn chat_frequency_penalty_returns_400() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chat_stream_options_returns_400() {
-    let model = match model_dir() {
-        Some(d) => d.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-        None => return,
-    };
+async fn chat_stream_options_include_usage_accepted() {
+    // Phase C (2026-05-24): stream_options.include_usage is honoured;
+    // it must NOT 400. The full SSE round-trip (final usage chunk
+    // appearing before [DONE]) is covered by direct hardware tests —
+    // this assertion just guards against the rejection regressing.
+    let (state, _join) = need_model!();
+    let model = state.config.model_id.clone();
+    let router = build_router(state);
     let body = format!(
         r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"stream":true,"stream_options":{{"include_usage":true}}}}"#
     );
-    assert_chat_400(body, "stream_options", "stream_options_unsupported").await;
+    let (status, _h, _body) = send(router, Method::POST, "/v1/chat/completions", body).await;
+    assert_ne!(
+        status, StatusCode::BAD_REQUEST,
+        "stream_options.include_usage must be accepted (Phase C)",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

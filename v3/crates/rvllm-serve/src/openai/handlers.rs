@@ -282,7 +282,8 @@ use crate::openai::types::{
     Role, ToolCall, ToolCallFunction, Usage,
 };
 use crate::tool_parser::{
-    parse_gemma4_tool_calls, strip_tool_markup,
+    parse_gemma4_tool_calls, parse_tool_calls, strip_tool_markup,
+    strip_tool_markup_for, tool_call_opener_for, ToolDialect,
     THOUGHT_BLOCK_OPENERS, TOOL_CALL_OPENER,
 };
 use crate::router::AppState;
@@ -925,6 +926,7 @@ pub async fn chat_completions(
             .as_ref()
             .and_then(|o| o.include_usage)
             .unwrap_or(false);
+        let dialect = dialect_for(state.vision_arch);
         Ok(ChatCompletionsResponse::Stream(chat_stream_sse(
             model_id,
             tokenizer,
@@ -935,12 +937,14 @@ pub async fn chat_completions(
             request_id,
             Some(_admission),
             include_usage,
+            dialect,
         )))
     } else {
         let _cancel_guard = CancelOnDrop(cancelled.clone());
+        let dialect = dialect_for(state.vision_arch);
         let (body, accept_rate) = chat_collect(
             &model_id, &tokenizer, events_rx, cancelled, remaining,
-            request_id, &stop_text,
+            request_id, &stop_text, dialect,
         )
         .await?;
         match accept_rate {
@@ -988,6 +992,7 @@ async fn chat_collect(
     request_timeout: std::time::Duration,
     request_id: Uuid,
     stop_text: &[String],
+    dialect: ToolDialect,
 ) -> ApiResult<(ChatCompletionResponse, Option<f32>)> {
     let mut token_ids: Vec<u32> = Vec::new();
     let mut finish: Option<FinishReason> = None;
@@ -1097,7 +1102,7 @@ async fn chat_collect(
         "full_raw_text": &text,
     }));
 
-    let (message, finish_reason) = shape_assistant_message(text, finish);
+    let (message, finish_reason) = shape_assistant_message(text, finish, dialect);
     let body = ChatCompletionResponse {
         id: new_chat_completion_id(),
         object: "chat.completion",
@@ -1213,16 +1218,27 @@ mod stop_truncation_tests {
     }
 }
 
+/// Pick the tool-call dialect from the loaded vision arch. Gemma 4 and
+/// Mistral 3.5 share the Gemma-4 `<|tool_call>call:NAME{...}` format;
+/// Qwen 3.5/3.6 (VisionArch::Qwen36) uses XML `<tool_call>{json}</tool_call>`.
+fn dialect_for(arch: crate::router::VisionArch) -> ToolDialect {
+    match arch {
+        crate::router::VisionArch::Qwen36 => ToolDialect::Qwen36,
+        _ => ToolDialect::Gemma4,
+    }
+}
+
 fn shape_assistant_message(
     text: String,
     model_finish: Option<FinishReason>,
+    dialect: ToolDialect,
 ) -> (ChatAssistantMessage, Option<FinishReason>) {
-    let parsed = parse_gemma4_tool_calls(&text);
+    let parsed = parse_tool_calls(&text, dialect);
     if parsed.is_empty() {
         // No tool call — but the raw decode still contains reasoning /
         // control markup (`<|channel>thought\n…<channel|>`, stray
         // `<turn|>`, etc.) that must be stripped from user content.
-        let cleaned = strip_tool_markup(&text);
+        let cleaned = strip_tool_markup_for(&text, dialect);
         let content = if cleaned.is_empty() { None } else { Some(cleaned) };
         return (
             ChatAssistantMessage { role: Role::Assistant, content, tool_calls: None },
@@ -1239,7 +1255,7 @@ fn shape_assistant_message(
         .collect();
     // Preserve any prose the model emitted before the first call so
     // clients that show reasoning alongside the call still get it.
-    let prefix = strip_tool_markup(&text);
+    let prefix = strip_tool_markup_for(&text, dialect);
     let content = if prefix.is_empty() { None } else { Some(prefix) };
     (
         ChatAssistantMessage { role: Role::Assistant, content, tool_calls: Some(calls) },
@@ -1266,6 +1282,10 @@ fn chat_stream_sse(
     // one extra chunk with `choices: []` and `usage: {...}` after the
     // final finish_reason chunk and before `[DONE]`.
     include_usage: bool,
+    // Which tool-call dialect to parse + strip from the streamed text
+    // (Gemma 4 special-token form vs Qwen3-VL XML form). Picked once at
+    // the handler level from the loaded VisionArch.
+    dialect: ToolDialect,
 ) -> axum::response::Response {
     let id = new_chat_completion_id();
     let created = unix_now_secs();
@@ -1352,6 +1372,10 @@ fn chat_stream_sse(
         /// Whether the caller asked for a final usage chunk via
         /// `stream_options.include_usage = true`.
         include_usage: bool,
+        /// Which tool-call dialect (Gemma 4 special-token form vs
+        /// Qwen3-VL XML form) governs parsing / stripping on this
+        /// stream — picked from the loaded VisionArch.
+        dialect: ToolDialect,
         /// Set by the Done arm when transitioning through
         /// FlushToolCalls so the resulting Finish state can still
         /// carry the captured usage tuple.
@@ -1387,6 +1411,7 @@ fn chat_stream_sse(
         deadline,
         request_id,
         include_usage,
+        dialect,
         pending_usage_after: None,
         _admission: admission,
     };
@@ -1472,7 +1497,7 @@ fn chat_stream_sse(
                                     let mut prefix_chunk: Option<String> = None;
                                     if !in_tool {
                                         let (chunk_opt, latched) =
-                                            detect_tool_call_latch(&accum, emitted);
+                                            detect_tool_call_latch_for(&accum, emitted, ctx.dialect);
                                         if latched {
                                             in_tool = true;
                                             if let Some(chunk_text) = chunk_opt {
@@ -1508,11 +1533,11 @@ fn chat_stream_sse(
                                     // strip control markup to get the
                                     // visible view, then ship only the
                                     // new visible suffix.
-                                    let safe_end = safe_content_emit_end(
-                                        &accum, 0, in_tool,
+                                    let safe_end = safe_content_emit_end_for(
+                                        &accum, 0, in_tool, ctx.dialect,
                                     );
                                     if safe_end > 0 {
-                                        let visible = strip_tool_markup(&accum[..safe_end]);
+                                        let visible = strip_tool_markup_for(&accum[..safe_end], ctx.dialect);
                                         if visible.len() > emitted {
                                             let chunk_text =
                                                 visible[emitted..].to_string();
@@ -1592,7 +1617,7 @@ fn chat_stream_sse(
                             } else {
                                 None
                             };
-                            let parsed = parse_gemma4_tool_calls(&accum);
+                            let parsed = parse_tool_calls(&accum, ctx.dialect);
                             if !parsed.is_empty() {
                                 let calls = parsed
                                     .into_iter()
@@ -1621,7 +1646,7 @@ fn chat_stream_sse(
                             // strip_tool_markup to the FULL accum (no
                             // tail-keep at finalisation) and emit the
                             // suffix beyond what was already streamed.
-                            let visible_full = strip_tool_markup(&accum);
+                            let visible_full = strip_tool_markup_for(&accum, ctx.dialect);
                             if visible_full.len() > emitted {
                                 let tail = visible_full[emitted..].to_string();
                                 let chunk = ChatCompletionChunk {
@@ -1802,6 +1827,75 @@ pub(crate) fn detect_tool_call_latch(
             } else {
                 (None, true)
             }
+        }
+    }
+}
+
+/// Dialect-aware wrapper around [`detect_tool_call_latch`]. Gemma 4
+/// delegates to the original (handles tier-1 + tier-2 + thought-block
+/// drains). Qwen3-VL only needs the XML opener — there are no
+/// thought-blocks or tier-2 bare-call equivalents in that family.
+pub(crate) fn detect_tool_call_latch_for(
+    accum: &str,
+    emitted: usize,
+    dialect: ToolDialect,
+) -> (Option<String>, bool) {
+    match dialect {
+        ToolDialect::Gemma4 => detect_tool_call_latch(accum, emitted),
+        ToolDialect::Qwen36 => {
+            let opener = tool_call_opener_for(ToolDialect::Qwen36);
+            match accum.find(opener) {
+                None => (None, false),
+                Some(mark) => {
+                    let visible = strip_tool_markup_for(&accum[..mark], ToolDialect::Qwen36);
+                    if visible.len() > emitted {
+                        (Some(visible[emitted..].to_string()), true)
+                    } else {
+                        (None, true)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Dialect-aware wrapper around [`safe_content_emit_end`]. Gemma 4 keeps
+/// its existing tier-1 + tier-2 + thought-block hold logic. Qwen3-VL
+/// only needs to hold back from a partial `<tool_call>` opener (no
+/// thought-blocks, no tier-2 bare form, no nested close markers to
+/// reason about).
+fn safe_content_emit_end_for(
+    accum: &str,
+    raw_offset: usize,
+    in_tool: bool,
+    dialect: ToolDialect,
+) -> usize {
+    match dialect {
+        ToolDialect::Gemma4 => safe_content_emit_end(accum, raw_offset, in_tool),
+        ToolDialect::Qwen36 => {
+            if in_tool {
+                return raw_offset;
+            }
+            let raw_offset = if accum.is_char_boundary(raw_offset) { raw_offset } else { 0 };
+            let opener = tool_call_opener_for(ToolDialect::Qwen36);
+            let opener_pos = accum[raw_offset..]
+                .find(opener)
+                .map(|r| raw_offset + r);
+            // Hold back `opener.len() - 1` bytes in case the opener is
+            // straddling chunks.
+            let keep_back = opener.len().saturating_sub(1);
+            let ceiling_by_tail = accum.len().saturating_sub(keep_back);
+            let cand = match opener_pos {
+                Some(p) => p.min(ceiling_by_tail),
+                None => ceiling_by_tail,
+            };
+            // Snap to a UTF-8 char boundary so the slice `accum[..cand]`
+            // never lands mid-codepoint when prose contains umlauts.
+            let mut cand = cand.max(raw_offset);
+            while cand > raw_offset && !accum.is_char_boundary(cand) {
+                cand -= 1;
+            }
+            cand
         }
     }
 }
@@ -3307,7 +3401,7 @@ mod shape_assistant_message_tests {
     #[test]
     fn single_bare_tool_call_becomes_structured() {
         let raw = "<|tool_call>call:weather{city:<|\"|>Bern<|\"|>}<tool_call|>";
-        let (msg, finish) = shape_assistant_message(raw.into(), None);
+        let (msg, finish) = shape_assistant_message(raw.into(), None, ToolDialect::Gemma4);
         assert_eq!(finish, Some(FinishReason::ToolCalls));
         assert!(matches!(msg.role, Role::Assistant));
         assert!(msg.content.is_none(), "content should be empty, got {:?}", msg.content);
@@ -3324,7 +3418,7 @@ mod shape_assistant_message_tests {
     fn thought_channel_does_not_leak_into_content() {
         let raw = "<|channel>thought\nMaybe rainy, ~11°C.<channel|>\
                    <|tool_call>call:weather{city:<|\"|>Bern<|\"|>}<tool_call|>";
-        let (msg, finish) = shape_assistant_message(raw.into(), None);
+        let (msg, finish) = shape_assistant_message(raw.into(), None, ToolDialect::Gemma4);
         assert_eq!(finish, Some(FinishReason::ToolCalls));
         assert!(msg.content.is_none(), "thought block must not reach content, got {:?}", msg.content);
         assert_eq!(msg.tool_calls.as_ref().unwrap()[0].function.name, "weather");
@@ -3335,7 +3429,7 @@ mod shape_assistant_message_tests {
     fn tool_response_channel_does_not_leak_into_content() {
         let raw = "<|tool_response>thought\ndraft answer goes here<channel|>\
                    <|tool_call>call:weather{city:<|\"|>Bern<|\"|>}<tool_call|>";
-        let (msg, _) = shape_assistant_message(raw.into(), None);
+        let (msg, _) = shape_assistant_message(raw.into(), None, ToolDialect::Gemma4);
         assert!(msg.content.is_none(), "got {:?}", msg.content);
     }
     /// The literal `<thought …<channel|>` fragment is what Gemma emits when
@@ -3346,7 +3440,7 @@ mod shape_assistant_message_tests {
     fn hallucinated_thought_fragment_is_stripped() {
         let raw = "<thought\nmaybe 14°C<channel|>\
                    <|tool_call>call:weather{city:<|\"|>Bern<|\"|>}<tool_call|>";
-        let (msg, _) = shape_assistant_message(raw.into(), None);
+        let (msg, _) = shape_assistant_message(raw.into(), None, ToolDialect::Gemma4);
         assert!(msg.content.is_none(), "got {:?}", msg.content);
     }
     /// After the tool round-trip the model usually replies in plain German
@@ -3358,7 +3452,7 @@ mod shape_assistant_message_tests {
         let raw = "<|channel>thought\n<channel|>\
                    Das Wetter in Bern ist heute bewölkt mit einer Temperatur von 14°C.\
                    <turn|>";
-        let (msg, finish) = shape_assistant_message(raw.into(), Some(FinishReason::Stop));
+        let (msg, finish) = shape_assistant_message(raw.into(), Some(FinishReason::Stop), ToolDialect::Gemma4);
         assert_eq!(finish, Some(FinishReason::Stop));
         assert!(msg.tool_calls.is_none());
         assert_eq!(
@@ -3371,7 +3465,7 @@ mod shape_assistant_message_tests {
     #[test]
     fn plain_text_reply_is_pass_through() {
         let raw = "Paris ist die Hauptstadt von Frankreich.";
-        let (msg, finish) = shape_assistant_message(raw.into(), Some(FinishReason::Stop));
+        let (msg, finish) = shape_assistant_message(raw.into(), Some(FinishReason::Stop), ToolDialect::Gemma4);
         assert_eq!(finish, Some(FinishReason::Stop));
         assert_eq!(msg.content.as_deref(), Some(raw));
         assert!(msg.tool_calls.is_none());
@@ -3383,7 +3477,7 @@ mod shape_assistant_message_tests {
     #[test]
     fn bare_call_tier2_still_produces_structured_call() {
         let raw = "call:weather{city:<|\"|>Bern<|\"|>}";
-        let (msg, finish) = shape_assistant_message(raw.into(), None);
+        let (msg, finish) = shape_assistant_message(raw.into(), None, ToolDialect::Gemma4);
         assert_eq!(finish, Some(FinishReason::ToolCalls));
         let tc = msg.tool_calls.as_ref().unwrap();
         assert_eq!(tc[0].function.name, "weather");
@@ -3395,7 +3489,7 @@ mod shape_assistant_message_tests {
     fn multiple_tool_calls_survive() {
         let raw = "<|tool_call>call:a{x:<|\"|>1<|\"|>}<tool_call|>\
                    <|tool_call>call:b{y:<|\"|>2<|\"|>}<tool_call|>";
-        let (msg, _) = shape_assistant_message(raw.into(), None);
+        let (msg, _) = shape_assistant_message(raw.into(), None, ToolDialect::Gemma4);
         let tc = msg.tool_calls.as_ref().unwrap();
         assert_eq!(tc.len(), 2);
         assert_eq!(tc[0].function.name, "a");
@@ -3405,7 +3499,7 @@ mod shape_assistant_message_tests {
     /// crash and NOT invent a tool call.
     #[test]
     fn empty_generation_does_not_invent_tool_calls() {
-        let (msg, finish) = shape_assistant_message(String::new(), Some(FinishReason::Stop));
+        let (msg, finish) = shape_assistant_message(String::new(), Some(FinishReason::Stop), ToolDialect::Gemma4);
         assert_eq!(finish, Some(FinishReason::Stop));
         assert!(msg.tool_calls.is_none());
         assert!(msg.content.is_none());
@@ -3416,7 +3510,7 @@ mod shape_assistant_message_tests {
     #[test]
     fn stray_sweep_leaves_non_token_brackets_intact() {
         let raw = "Winkel < 90° hier.";
-        let (msg, _) = shape_assistant_message(raw.into(), Some(FinishReason::Stop));
+        let (msg, _) = shape_assistant_message(raw.into(), Some(FinishReason::Stop), ToolDialect::Gemma4);
         assert_eq!(msg.content.as_deref(), Some("Winkel < 90° hier."));
     }
     /// Regression for the very first bug that kicked off this whole
@@ -3431,7 +3525,7 @@ mod shape_assistant_message_tests {
     #[test]
     fn python_kwargs_style_is_not_misparsed_as_native_call() {
         let raw = "brain(action=\"web_fetch\", name=\"https://example.com\")";
-        let (msg, finish) = shape_assistant_message(raw.into(), Some(FinishReason::Stop));
+        let (msg, finish) = shape_assistant_message(raw.into(), Some(FinishReason::Stop), ToolDialect::Gemma4);
         assert!(msg.tool_calls.is_none(), "must not be misparsed, got {:?}", msg.tool_calls);
         assert_eq!(msg.content.as_deref(), Some(raw));
         assert_eq!(finish, Some(FinishReason::Stop));

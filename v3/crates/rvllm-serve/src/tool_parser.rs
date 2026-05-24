@@ -440,6 +440,243 @@ fn strip_stray_control_markers(text: &str) -> String {
     out
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// Qwen3-VL family (XML-style tool calls)
+// ═════════════════════════════════════════════════════════════════════
+//
+// Qwen 3.5 / 3.6 emit tool calls as XML blocks:
+//   <tool_call>
+//   {"name": "foo", "arguments": {"a": 1}}
+//   </tool_call>
+// Tool results return in matching `<tool_response>...</tool_response>`
+// blocks. The inner payload is a single JSON object per call with
+// `name` (string) and `arguments` (object). The chat template in
+// `qwen3-6-35b-a3b-fp8/tokenizer_config.json` confirms this exact shape.
+
+const QWEN_TOOL_OPEN: &str = "<tool_call>";
+const QWEN_TOOL_CLOSE: &str = "</tool_call>";
+const QWEN_RESPONSE_OPEN: &str = "<tool_response>";
+const QWEN_RESPONSE_CLOSE: &str = "</tool_response>";
+
+/// Extract all Qwen3-VL tool calls from decoded text. Returns an empty
+/// vec when no markup is present — the SSE / non-streaming caller then
+/// treats the text as a plain content reply.
+///
+/// Tolerates surrounding whitespace, missing closing tag (the model
+/// occasionally truncates), and multiple calls in one assistant turn.
+/// Skips blocks whose inner payload doesn't parse as JSON with a
+/// `name` field.
+pub fn parse_qwen36_tool_calls(text: &str) -> Vec<ParsedToolCall> {
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let Some(rel) = text[cursor..].find(QWEN_TOOL_OPEN) else { break };
+        let payload_start = cursor + rel + QWEN_TOOL_OPEN.len();
+        let after = &text[payload_start..];
+        // Closing tag may be absent (mid-stream cutoff or model truncation).
+        // In that case consume up to end-of-string and try to parse.
+        let (payload, advance) = match after.find(QWEN_TOOL_CLOSE) {
+            Some(end_rel) => {
+                let p = &after[..end_rel];
+                (p, end_rel + QWEN_TOOL_CLOSE.len())
+            }
+            None => (after, after.len()),
+        };
+        if let Some(call) = qwen_payload_to_call(payload) {
+            out.push(call);
+        }
+        cursor = payload_start + advance;
+    }
+    out
+}
+
+/// Parse the inner payload of a single `<tool_call>...</tool_call>`
+/// block. Qwen 3.5 / 3.6 ship with two different training-data formats
+/// in the wild — we accept either:
+///
+/// (a) **Canonical JSON** (matches `tokenizer_config.json` chat template
+///     prose): `{"name": "...", "arguments": {...}}`. Also tolerates
+///     `arguments` as a JSON string (double-encoded).
+///
+/// (b) **OpenManus-style DSL** (what qwen3-6-35b-a3b actually emits on
+///     this hardware, regardless of what the template prose says):
+///     ```
+///     <function=NAME>
+///     <parameter=KEY>
+///     VALUE
+///     </parameter>
+///     ...
+///     </function>
+///     ```
+///     Re-serialised into JSON-string `arguments` so the OpenAI
+///     `tool_calls[].function.arguments` contract holds for clients.
+///
+/// Returns `None` if neither shape parses.
+fn qwen_payload_to_call(payload: &str) -> Option<ParsedToolCall> {
+    let trimmed = payload.trim();
+    // (a) JSON form
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(obj) = v.as_object() {
+            if let Some(name) = obj.get("name").and_then(|n| n.as_str()) {
+                let args_value = obj
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(Value::Object(Map::new()));
+                let arguments = match args_value {
+                    Value::String(s) => match serde_json::from_str::<Value>(&s) {
+                        Ok(parsed) => serde_json::to_string(&parsed).ok()?,
+                        Err(_) => serde_json::to_string(&s).ok()?,
+                    },
+                    other => serde_json::to_string(&other).ok()?,
+                };
+                return Some(ParsedToolCall { name: name.to_string(), arguments });
+            }
+        }
+    }
+    // (b) OpenManus-style DSL form
+    qwen_dsl_payload_to_call(trimmed)
+}
+
+/// Parse the `<function=NAME>...<parameter=KEY>VALUE</parameter>...</function>`
+/// DSL into a [`ParsedToolCall`] with JSON-serialised arguments.
+fn qwen_dsl_payload_to_call(payload: &str) -> Option<ParsedToolCall> {
+    let func_open_pat = "<function=";
+    let func_open_idx = payload.find(func_open_pat)?;
+    let after_eq = func_open_idx + func_open_pat.len();
+    let name_end = payload[after_eq..].find('>')?;
+    let name = payload[after_eq..after_eq + name_end].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let body_start = after_eq + name_end + 1;
+    let body_end = payload[body_start..]
+        .find("</function>")
+        .map(|r| body_start + r)
+        .unwrap_or(payload.len());
+    let body = &payload[body_start..body_end];
+
+    let mut args = Map::new();
+    let mut cursor = 0;
+    let param_open = "<parameter=";
+    let param_close = "</parameter>";
+    while cursor < body.len() {
+        let Some(rel) = body[cursor..].find(param_open) else { break };
+        let abs = cursor + rel + param_open.len();
+        let Some(key_end_rel) = body[abs..].find('>') else { break };
+        let key = body[abs..abs + key_end_rel].trim().to_string();
+        let value_start = abs + key_end_rel + 1;
+        let value_end = match body[value_start..].find(param_close) {
+            Some(r) => value_start + r,
+            None => break,
+        };
+        let raw = body[value_start..value_end].trim();
+        // Coerce parameter VALUE to the most natural JSON type so the
+        // OpenAI `arguments` payload looks idiomatic: parse as JSON
+        // first (handles numbers / bools / null / nested objects),
+        // otherwise keep as a string.
+        let v: Value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+        if !key.is_empty() {
+            args.insert(key, v);
+        }
+        cursor = value_end + param_close.len();
+    }
+    Some(ParsedToolCall {
+        name,
+        arguments: serde_json::to_string(&Value::Object(args)).ok()?,
+    })
+}
+
+/// Strip Qwen3-VL tool-call and tool-response markup so the streaming
+/// content path sees a clean prose view (mirrors Gemma 4's
+/// [`strip_tool_markup`] for that family). The opener is also kept
+/// publicly accessible via [`QWEN_TOOL_CALL_OPENER`] so the SSE
+/// `safe_content_emit_end` machinery can hold back content when an
+/// opener is in flight without its closer.
+pub const QWEN_TOOL_CALL_OPENER: &str = QWEN_TOOL_OPEN;
+
+pub fn strip_qwen36_tool_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if text.is_char_boundary(i) {
+            for (open, close) in [
+                (QWEN_TOOL_OPEN, QWEN_TOOL_CLOSE),
+                (QWEN_RESPONSE_OPEN, QWEN_RESPONSE_CLOSE),
+            ] {
+                if text[i..].starts_with(open) {
+                    let rest = &text[i + open.len()..];
+                    let skip = match rest.find(close) {
+                        Some(rel) => open.len() + rel + close.len(),
+                        // Same posture as Gemma's strip path: when the
+                        // opener has no closer, drop only the opener so
+                        // the following prose still surfaces — visible
+                        // bug beats silent swallow.
+                        None => open.len(),
+                    };
+                    i += skip;
+                    // Re-enter the outer loop to handle back-to-back
+                    // blocks without an intervening prose char.
+                    continue;
+                }
+            }
+            let _ = bytes; // silence stale-binding lint if loop above continues
+        }
+        if let Some(ch) = text[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            i += 1;
+        }
+    }
+    out.trim().to_string()
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Arch-aware dispatch
+// ═════════════════════════════════════════════════════════════════════
+
+/// Which tool-call dialect to parse. Picked by the OpenAI handler from
+/// the loaded `VisionArch`. Kept as a small enum (instead of taking a
+/// full `VisionArch`) so the tool_parser module stays free of the
+/// router type cycle and unit-testable from this crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolDialect {
+    /// Gemma 4 (31B / E4B): `<|tool_call>call:NAME{ARGS}<tool_call|>`.
+    Gemma4,
+    /// Qwen 3.5 / 3.6: `<tool_call>{"name":"...","arguments":{...}}</tool_call>`.
+    Qwen36,
+}
+
+/// Parse the assistant text into a list of tool calls using the dialect
+/// for the loaded model family. Returns an empty vec when no calls are
+/// detected — callers then treat the text as a plain content reply.
+pub fn parse_tool_calls(text: &str, dialect: ToolDialect) -> Vec<ParsedToolCall> {
+    match dialect {
+        ToolDialect::Gemma4 => parse_gemma4_tool_calls(text),
+        ToolDialect::Qwen36 => parse_qwen36_tool_calls(text),
+    }
+}
+
+/// Strip all tool-call / thought / control markup for the chosen
+/// dialect — returns the visible prose. Mirrors the dispatch shape of
+/// [`parse_tool_calls`].
+pub fn strip_tool_markup_for(text: &str, dialect: ToolDialect) -> String {
+    match dialect {
+        ToolDialect::Gemma4 => strip_tool_markup(text),
+        ToolDialect::Qwen36 => strip_qwen36_tool_markup(text),
+    }
+}
+
+/// Opener token for the dialect — the SSE path holds back content past
+/// this marker while the closer hasn't arrived yet.
+pub fn tool_call_opener_for(dialect: ToolDialect) -> &'static str {
+    match dialect {
+        ToolDialect::Gemma4 => TOOL_CALL_OPENER,
+        ToolDialect::Qwen36 => QWEN_TOOL_CALL_OPENER,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,5 +949,153 @@ mod tests {
         let calls = parse_gemma4_tool_calls(s);
         assert_eq!(calls.len(), 1);
         assert!(calls[0].arguments.contains("München"));
+    }
+
+    // ─── Qwen3-VL XML tool-call parser ─────────────────────────────
+
+    #[test]
+    fn qwen36_single_call_round_trips() {
+        let s = r#"<tool_call>
+{"name": "get_weather", "arguments": {"city": "Bern", "units": "celsius"}}
+</tool_call>"#;
+        let calls = parse_qwen36_tool_calls(s);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].arguments).expect("valid json");
+        assert_eq!(args["city"], "Bern");
+        assert_eq!(args["units"], "celsius");
+    }
+
+    #[test]
+    fn qwen36_inline_compact_call() {
+        // No surrounding newlines — the chat template doesn't require any.
+        let s = r#"<tool_call>{"name":"ping","arguments":{}}</tool_call>"#;
+        let calls = parse_qwen36_tool_calls(s);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "ping");
+        assert_eq!(calls[0].arguments, "{}");
+    }
+
+    #[test]
+    fn qwen36_multiple_calls_one_turn() {
+        let s = r#"<tool_call>{"name":"a","arguments":{"x":1}}</tool_call>some prose<tool_call>{"name":"b","arguments":{"y":2}}</tool_call>"#;
+        let calls = parse_qwen36_tool_calls(s);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "a");
+        assert_eq!(calls[1].name, "b");
+    }
+
+    #[test]
+    fn qwen36_arguments_as_double_encoded_string() {
+        // Some upstream Qwen training data emits arguments as a JSON
+        // string instead of a nested object. Re-parse + re-serialise.
+        let s = r#"<tool_call>{"name":"f","arguments":"{\"k\":\"v\"}"}</tool_call>"#;
+        let calls = parse_qwen36_tool_calls(s);
+        assert_eq!(calls.len(), 1);
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].arguments).expect("valid json");
+        assert_eq!(args["k"], "v");
+    }
+
+    #[test]
+    fn qwen36_missing_close_tag_recovers_payload() {
+        // Model truncated mid-stream; still try to parse what we have.
+        let s = r#"<tool_call>{"name":"foo","arguments":{"a":1}}"#;
+        let calls = parse_qwen36_tool_calls(s);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "foo");
+    }
+
+    #[test]
+    fn qwen36_malformed_payload_yields_no_call() {
+        let s = "<tool_call>not json at all</tool_call>";
+        assert!(parse_qwen36_tool_calls(s).is_empty());
+    }
+
+    #[test]
+    fn qwen36_no_markup_returns_empty() {
+        assert!(parse_qwen36_tool_calls("just a plain reply").is_empty());
+        assert!(parse_qwen36_tool_calls("").is_empty());
+    }
+
+    #[test]
+    fn qwen36_strip_removes_call_and_response_blocks() {
+        let s = "before<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>middle<tool_response>{\"ok\":true}</tool_response>after";
+        let stripped = strip_qwen36_tool_markup(s);
+        assert_eq!(stripped, "beforemiddleafter");
+    }
+
+    #[test]
+    fn qwen36_strip_handles_unterminated_block() {
+        // Only the opener token is dropped; tail prose survives.
+        let stripped = strip_qwen36_tool_markup("hi <tool_call>{}");
+        assert!(stripped.contains("hi"));
+        assert!(stripped.contains("{}"));
+        assert!(!stripped.contains("<tool_call>"));
+    }
+
+    #[test]
+    fn qwen36_dsl_form_round_trips() {
+        // Captured verbatim from qwen3-6-35b-a3b on the rvllm webhook
+        // path (2026-05-24); represents the OpenManus-style DSL that the
+        // model actually emits regardless of the JSON-prose chat template.
+        let s = "<tool_call>\n<function=brain>\n<parameter=action>\nsearch\n</parameter>\n<parameter=query>\nVinz\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_qwen36_tool_calls(s);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "brain");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].arguments).expect("valid json");
+        assert_eq!(args["action"], "search");
+        assert_eq!(args["query"], "Vinz");
+    }
+
+    #[test]
+    fn qwen36_dsl_with_numeric_parameter_value() {
+        let s = "<tool_call><function=set_limit><parameter=limit>42</parameter></function></tool_call>";
+        let calls = parse_qwen36_tool_calls(s);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "set_limit");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].arguments).expect("valid json");
+        // Number coerced via serde JSON parse, not left as a string.
+        assert_eq!(args["limit"], serde_json::json!(42));
+    }
+
+    #[test]
+    fn qwen36_dsl_no_parameters() {
+        let s = "<tool_call><function=ping></function></tool_call>";
+        let calls = parse_qwen36_tool_calls(s);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "ping");
+        assert_eq!(calls[0].arguments, "{}");
+    }
+
+    #[test]
+    fn qwen36_strip_preserves_plain_prose() {
+        assert_eq!(strip_qwen36_tool_markup("hello world"), "hello world");
+    }
+
+    #[test]
+    fn dispatch_routes_dialects_correctly() {
+        let gemma_in = r#"<|tool_call>call:get_weather{"city":"X"}<tool_call|>"#;
+        let qwen_in = r#"<tool_call>{"name":"get_weather","arguments":{"city":"X"}}</tool_call>"#;
+
+        // Wrong-dialect routing must return empty (so the runtime
+        // gracefully degrades to plain content rather than mis-parsing).
+        assert!(parse_tool_calls(gemma_in, ToolDialect::Qwen36).is_empty());
+        assert!(parse_tool_calls(qwen_in, ToolDialect::Gemma4).is_empty());
+
+        // Correct routing extracts the call.
+        let g = parse_tool_calls(gemma_in, ToolDialect::Gemma4);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].name, "get_weather");
+        let q = parse_tool_calls(qwen_in, ToolDialect::Qwen36);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].name, "get_weather");
+
+        // Opener token differs.
+        assert_eq!(tool_call_opener_for(ToolDialect::Gemma4), "<|tool_call>");
+        assert_eq!(tool_call_opener_for(ToolDialect::Qwen36), "<tool_call>");
     }
 }
