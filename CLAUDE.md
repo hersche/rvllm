@@ -2289,6 +2289,107 @@ single-default bumping would have created a Gemma 4 / Qwen
 register-pressure risk. Resolved 2026-05-22 (task #1) via the
 adaptive `_max16` variant pattern documented in rule (3) above.
 
+## Tool calls + brain search + sampling — fixed 2026-05-24 (Phases #1-#5)
+
+Follow-on to the Phases A-D OpenAI-compat work below. The user
+reported "Rusty can't find entities, tool calls hang, conversations
+break" after the truncation fix landed. Five independent bugs
+surfaced under the longer-running webhook turns the bigger
+`max_tokens` made possible:
+
+**#1+#2 — Qwen3-VL tool calls were never parsed (rvllm-serve commit
+`e0bf635`).** `tool_parser.rs` was hardcoded to Gemma 4's
+`<|tool_call>call:NAME{...}<tool_call|>` form. Qwen 3.5 / 3.6 emit
+either canonical JSON (`<tool_call>{"name":"...","arguments":{...}}
+</tool_call>`) or an OpenManus-style DSL (`<tool_call>\n<function=NAME>\n
+<parameter=KEY>\nVALUE\n</parameter>\n...\n</function>\n</tool_call>`,
+which is what `qwen3-6-35b-a3b` actually emits on hardware
+regardless of the chat-template prose). The parser now exposes:
+
+  * `parse_qwen36_tool_calls` — accepts BOTH formats. JSON path
+    handles double-encoded `arguments`. DSL path parses
+    `<parameter=KEY>VALUE</parameter>` and JSON-coerces values
+    (numbers / bools / null / nested objects round-trip naturally).
+  * `strip_qwen36_tool_markup` — drops both `<tool_call>...</tool_call>`
+    and `<tool_response>...</tool_response>` blocks.
+  * `ToolDialect { Gemma4, Qwen36 }` enum + `parse_tool_calls` /
+    `strip_tool_markup_for` / `tool_call_opener_for` dispatchers.
+
+Handler integration (`openai/handlers.rs`): `dialect_for(VisionArch)`
+maps `Qwen36 → ToolDialect::Qwen36`, all other arches → `Gemma4`.
+`shape_assistant_message`, `chat_collect`, and `chat_stream_sse`
+take the dialect; SSE Ctx carries it and routes through new
+`detect_tool_call_latch_for` / `safe_content_emit_end_for`
+(Qwen has no thought-blocks / tier-2 bare form, so its hold-back
+rule is much simpler — just the opener-straddle guard).
+
+Hardware-verified on qwen3-6-35b-a3b NVFP4 with `tools` +
+`tool_choice: auto`: `finish_reason: "tool_calls"`, structured
+`tool_calls[].function.{name, arguments}` populated. Pre-fix the
+exact same request returned `content: "<tool_call>..."` text with
+`finish_reason: "stop"` and no `tool_calls` array.
+
+**#3 — brain search SQL crashed on every NONE embedding (brain
+commit `a0e4a64`).** SurrealDB 3.0.5 evaluates SELECT projections
+during ORDER BY sort across the full pre-WHERE row set, so a
+`vector::similarity::cosine(embedding, $vec)` projection crashed
+the engine when any row in the target table had `embedding=NONE` —
+even when a `WHERE embedding IS NOT NONE` clause would later
+filter it out. Symptom on every qwen tool call:
+
+    Error: Incorrect arguments for function vector::similarity::cosine().
+    Argument 1 was the wrong type. Expected `array<number>` but found `NONE`
+
+This blocked every entity / task / tool / bookmark / credential /
+location / snippet / ha-* / generic search in the steady state
+(freshly-created rows are NONE-embedded until the async embed_queue
+catches up; queue drops leave them permanently un-embedded).
+
+Fix: wrap every cosine call in
+`IF $col IS NONE THEN 0 ELSE vector::similarity::cosine($col, $bind) END`.
+Touched 18 SQL sites across 16 files (5 brain-core + 11 brain CLI).
+Also normalised every `<col> IS NOT NULL` in the CLI to
+`<col> IS NOT NONE` — they're distinct values in SurrealDB 3 and
+the `NULL` form does not filter out unset embedding fields (which
+is why this bug hid behind seemingly-correct WHERE clauses).
+
+**#4 — backfill embeddings (operational, not a code change).**
+Pre-fix `brain stats` showed `entities: 5 (0 embedded)`,
+`tasks: 30 (0 embedded)`, etc — the embed_queue worker had been
+dropping work for months. `brain update-embeddings --table <T>
+--missing-only` was used to backfill the priority tables:
+entity (5), task (30), tool (13), memory (42), bookmark (7),
+project (1), ha_device (17), ha_sensor (82) — 197 rows total.
+`news_article` (15727 rows ≈ ~30 min of embeds) deliberately
+skipped — it's not on the chat-history hot path. Result:
+`brain entity search Vinz` returns `Vinz [0.717]` at the top,
+`brain task search "fix"` returns 5 relevant tasks, etc.
+
+**#5 — non-greedy sampling on greedy-only arches no longer 400s
+(rvllm-serve commit `a9ab61f`).** When zeroclaw's SSE deadline
+fires, its reliable-provider retry uses its own default `temperature
+> 0` instead of the per-model `default_temperature=0` config. The
+retry then hit a hard 400 on `qwen3-6 path is greedy-only`,
+reliable-provider marked it non-retryable, and the channel turn
+ended with NO reply at all — a second user-visible failure on
+top of the first (timeout). Renamed
+`reject_unsupported_sampling_for_arch` →
+`coerce_sampling_for_arch`: instead of 400'ing, log a one-shot
+WARN line in journalctl and coerce the sampling to greedy. Callers
+get a correct (greedy) reply, operators see the WARN, and the
+timeout-retry cascade no longer leaves the turn empty. Affects
+`Qwen36` and `Mistral35` (no logits-out variant); `Gemma4` /
+`E4B` still take stochastic natively.
+
+E2E verification (webhook to qwen3-6-35b-a3b with 16 k Rusty
+persona + brain tool registered): `"Wer ist Vinz? Nutze brain."`
+→ 3-iteration tool loop (15759 → 15846 → 15968 tokens as tool
+messages accumulate) → final reply `"Vinz ist der Nutzer, mit dem
+ich gerade spreche. Discord: herrchen1312, Telegram: herrchen1312."`
+in 97 s wall. Pre-all-fixes the same request produced a literal
+`<tool_call>` string in content, no structured tool calls, no
+brain lookup, no useful reply.
+
 ## OpenAI API compat — fixed 2026-05-24 (Phases A-D)
 
 End-to-end fix for the "answer is incomplete" zeroclaw webhook
