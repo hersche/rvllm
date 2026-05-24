@@ -392,6 +392,11 @@ pub struct Qwen36OutsideKernels {
     // `RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V3=1` (default-off).
     pub gated_delta_rule_prefill_f16_v3_mod: LoadedModule,
     pub fn_gated_delta_rule_prefill_f16_v3: KernelFn,
+    // Task #103: grouped MMA for the shared-expert dual_silu
+    // (no routing — single per-layer weight matrix, all tokens).
+    // Opt-in via `RVLLM_QWEN36_MOE_SHARED_MMA=1`.
+    pub fp8_mma_shared_dual_silu_m16_w4c_mod: LoadedModule,
+    pub fn_fp8_mma_shared_dual_silu_m16_w4c: KernelFn,
     /// Round-26: device-side fill of per-token `positions` and
     /// `context_lens` arrays. Replaces the legacy per-token
     /// `pos_cl_region.copy_from_host(...)` HtoD that raced with
@@ -1939,6 +1944,10 @@ impl Qwen36Bringup {
             kernels.load_ptx("gated_delta_rule_prefill_f16_v3")?;
         let fn_gated_delta_rule_prefill_f16_v3 = gated_delta_rule_prefill_f16_v3_mod
             .get_function("gated_delta_rule_prefill_f16_v3_kernel")?;
+        let fp8_mma_shared_dual_silu_m16_w4c_mod =
+            kernels.load_ptx("fp8_mma_shared_dual_silu_m16_w4c")?;
+        let fn_fp8_mma_shared_dual_silu_m16_w4c = fp8_mma_shared_dual_silu_m16_w4c_mod
+            .get_function("fp8_mma_shared_dual_silu_m16_w4c_kernel")?;
         let conv_state_advance_batched_f16_mod =
             kernels.load_ptx("conv_state_advance_batched_f16")?;
         let fn_conv_state_advance_batched_f16 = conv_state_advance_batched_f16_mod
@@ -2150,6 +2159,8 @@ impl Qwen36Bringup {
             fn_gated_delta_rule_prefill_f16_v2,
             gated_delta_rule_prefill_f16_v3_mod,
             fn_gated_delta_rule_prefill_f16_v3,
+            fp8_mma_shared_dual_silu_m16_w4c_mod,
+            fn_fp8_mma_shared_dual_silu_m16_w4c,
             conv_state_advance_batched_f16_mod,
             fn_conv_state_advance_batched_f16,
             qwen_fill_pos_slots_i32_mod,
@@ -11036,17 +11047,34 @@ impl Qwen36Bringup {
                     (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
                     (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
                 ];
-                let grid_x = (n_int + 7) / 8;
-                let block: u32 = 256;
+                // Task #103: opt-in W=4 grouped MMA path. Same arg
+                // signature as the GEMV variant; covers [M=16, N=32]
+                // per block instead of (m=1, n=8). Default-off.
+                let use_mma = (n_int % 32 == 0)
+                    && std::env::var("RVLLM_QWEN36_MOE_SHARED_MMA")
+                        .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
+                        .unwrap_or(false);
+                let (gx, gy, blk, smem_bytes, kfn): (u32, u32, u32, u32, CUfunction) =
+                    if use_mma {
+                        (((n_int + 31) / 32) as u32,
+                         ((num_tokens + 15) / 16) as u32,
+                         128u32, 2624u32,
+                         self.outside_kernels
+                             .fn_fp8_mma_shared_dual_silu_m16_w4c
+                             .raw() as CUfunction)
+                    } else {
+                        (((n_int + 7) / 8) as u32, num_tokens, 256u32, 0u32,
+                         self.outside_kernels.fn_fp8_gemv_dual_silu.raw() as CUfunction)
+                    };
                 let rc = cuLaunchKernel(
-                    self.outside_kernels.fn_fp8_gemv_dual_silu.raw() as CUfunction,
-                    grid_x,
-                    num_tokens,
+                    kfn,
+                    gx,
+                    gy,
                     1,
-                    block,
+                    blk,
                     1,
                     1,
-                    0,
+                    smem_bytes,
                     self.stream.raw() as CUstream,
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
