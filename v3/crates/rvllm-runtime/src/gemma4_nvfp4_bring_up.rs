@@ -5310,6 +5310,8 @@ impl Gemma4Nvfp4Bringup {
             let (mut scale_policy, mut v_scale_policy) = read_nvfp4_kv_policies();
             let mut rotate_v: i32 = 0;
             let mut stoch_round_v: i32 = 0;
+            // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
+            let mut sliding_window: i32 = 0;
 
             let args = [
                 (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
@@ -5341,6 +5343,7 @@ impl Gemma4Nvfp4Bringup {
                 (&mut stoch_round_v) as *mut i32 as *mut core::ffi::c_void,
                 (&mut pre_hadamard_k_shadow) as *mut u64 as *mut core::ffi::c_void,
                 (&mut pre_hadamard_v_shadow) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sliding_window) as *mut i32 as *mut core::ffi::c_void,
             ];
             let max_heads = num_q_heads.max(num_kv_heads) as u32;
             rvllm_fused::launch_raw(
@@ -5804,6 +5807,8 @@ impl Gemma4Nvfp4Bringup {
             let (mut scale_policy, mut v_scale_policy) = read_nvfp4_kv_policies();
             let mut rotate_v: i32 = 0;
             let mut stoch_round_v: i32 = 0;
+            // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
+            let mut sliding_window: i32 = 0;
 
             let args = [
                 (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
@@ -5835,6 +5840,7 @@ impl Gemma4Nvfp4Bringup {
                 (&mut stoch_round_v) as *mut i32 as *mut core::ffi::c_void,
                 (&mut pre_hadamard_k_shadow) as *mut u64 as *mut core::ffi::c_void,
                 (&mut pre_hadamard_v_shadow) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sliding_window) as *mut i32 as *mut core::ffi::c_void,
             ];
             let max_heads = num_q_heads.max(num_kv_heads) as u32;
             rvllm_fused::launch_raw(
@@ -6637,6 +6643,8 @@ impl Gemma4Nvfp4Bringup {
             let (mut scale_policy, mut v_scale_policy) = read_nvfp4_kv_policies();
             let mut rotate_v: i32 = 0;
             let mut stoch_round_v: i32 = 0;
+            // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
+            let mut sliding_window: i32 = 0;
             let args = [
                 (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
                 (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
@@ -6667,6 +6675,7 @@ impl Gemma4Nvfp4Bringup {
                 (&mut stoch_round_v) as *mut i32 as *mut core::ffi::c_void,
                 (&mut pre_hadamard_k_shadow) as *mut u64 as *mut core::ffi::c_void,
                 (&mut pre_hadamard_v_shadow) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sliding_window) as *mut i32 as *mut core::ffi::c_void,
             ];
             let max_heads = num_q_heads.max(num_kv_heads) as u32;
             rvllm_fused::launch_raw(
@@ -7136,6 +7145,8 @@ impl Gemma4Nvfp4Bringup {
             let (mut scale_policy, mut v_scale_policy) = read_nvfp4_kv_policies();
             let mut rotate_v: i32 = 0;
             let mut stoch_round_v: i32 = 0;
+            // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
+            let mut sliding_window: i32 = 0;
             let args = [
                 (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
                 (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
@@ -7166,6 +7177,7 @@ impl Gemma4Nvfp4Bringup {
                 (&mut stoch_round_v) as *mut i32 as *mut core::ffi::c_void,
                 (&mut pre_hadamard_k_shadow) as *mut u64 as *mut core::ffi::c_void,
                 (&mut pre_hadamard_v_shadow) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sliding_window) as *mut i32 as *mut core::ffi::c_void,
             ];
             let max_heads = num_q_heads.max(num_kv_heads) as u32;
             rvllm_fused::launch_raw(

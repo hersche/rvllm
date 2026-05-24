@@ -247,6 +247,14 @@ pub struct FusedRopePartialFp8KvLaunch {
     pub num_kv_heads: u32,
     pub head_dim: u32,
     pub rotary_dim: u32,
+    /// aa01001ringbuf0: when > 0, the kernel wraps the K/V write slot
+    /// by `slot % sliding_window` so sliding-window layers reuse a
+    /// ring of `sliding_window/block_size` physical blocks. Callers
+    /// pass 0 for global / full layers and for any caller that has not
+    /// opted into the per-layer ring-buffer dispatch. The companion
+    /// host-side block_tables remap belongs to the runtime — the rope
+    /// kernel only needs the modulus.
+    pub sliding_window: u32,
 }
 
 impl FusedRopePartialFp8KvLaunch {
@@ -337,6 +345,8 @@ impl FusedRopePartialFp8KvLaunch {
         let mut num_kv_heads = self.num_kv_heads as i32;
         let mut head_dim = self.head_dim as i32;
         let mut rotary_dim = self.rotary_dim as i32;
+        // aa01001ringbuf0: last positional arg on the new ABI.
+        let mut sliding_window = self.sliding_window as i32;
         let args = [
             (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
             (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
@@ -357,6 +367,7 @@ impl FusedRopePartialFp8KvLaunch {
             (&mut num_kv_heads) as *mut i32 as *mut core::ffi::c_void,
             (&mut head_dim) as *mut i32 as *mut core::ffi::c_void,
             (&mut rotary_dim) as *mut i32 as *mut core::ffi::c_void,
+            (&mut sliding_window) as *mut i32 as *mut core::ffi::c_void,
         ];
         let max_heads = self.num_heads.max(self.num_kv_heads);
         let grid = (self.num_tokens, max_heads, 1);
@@ -1251,6 +1262,7 @@ mod tests {
             num_kv_heads: 4,
             head_dim: 256,
             rotary_dim: 512,
+            sliding_window: 0,
         };
         assert!(l.validate().is_err());
     }
@@ -1263,6 +1275,22 @@ mod tests {
             num_kv_heads: 16,
             head_dim: 256,
             rotary_dim: 128,
+            sliding_window: 0,
+        };
+        assert!(l.validate().is_ok());
+    }
+
+    #[test]
+    fn partial_rope_accepts_ring_buffer_window() {
+        // aa01001ringbuf0: a non-zero sliding_window must pass validate(); the
+        // kernel handles the modulo, the host-side builder just plumbs the int.
+        let l = FusedRopePartialFp8KvLaunch {
+            num_tokens: 1,
+            num_heads: 16,
+            num_kv_heads: 16,
+            head_dim: 256,
+            rotary_dim: 128,
+            sliding_window: 1024,
         };
         assert!(l.validate().is_ok());
     }

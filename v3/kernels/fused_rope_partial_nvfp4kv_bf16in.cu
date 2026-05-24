@@ -197,8 +197,10 @@ __global__ void fused_rope_partial_nvfp4kv_bf16in_kernel(
     // outside the spec-source-layer paths pass nullptr to
     // disable (no-op).
     __half*        __restrict__ pre_hadamard_k_shadow,
-    __half*        __restrict__ pre_hadamard_v_shadow
+    __half*        __restrict__ pre_hadamard_v_shadow,
     // === END TASK #90 ===
+    // aa01001ringbuf0 — see fused_rope_partial_fp8kv.cu for semantics.
+    int            sliding_window
 ) {
     const int token_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
@@ -337,8 +339,12 @@ __global__ void fused_rope_partial_nvfp4kv_bf16in_kernel(
     // ---- K, V: NVFP4-packed cache write. ----
     if (head_idx < num_kv_heads) {
         const int k_base = (token_idx * num_kv_heads + head_idx) * head_dim;
-        const int slot   = slot_mapping[token_idx];
+        int slot   = slot_mapping[token_idx];
         if (slot < 0) return;
+        // aa01001ringbuf0 ring-buffer wrap.
+        if (sliding_window > 0) {
+            slot = slot % sliding_window;
+        }
 
         const int cache_off_bytes  = (slot * num_kv_heads + head_idx) * (head_dim >> 1);
         const int cache_off_scales = (slot * num_kv_heads + head_idx) * groups_per_head;

@@ -3581,6 +3581,8 @@ unsafe fn rope_f16kv(
     let mut nkvh = dims.num_kv_heads as i32;
     let mut hd = dims.head_dim as i32;
     let mut rd = dims.rotary_dim as i32;
+    // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
+    let mut sliding_window: i32 = 0;
     let args = [
         (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
         (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
@@ -3597,6 +3599,7 @@ unsafe fn rope_f16kv(
         (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
         (&mut hd) as *mut i32 as *mut core::ffi::c_void,
         (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+        (&mut sliding_window) as *mut i32 as *mut core::ffi::c_void,
     ];
     let max_heads = dims.num_heads.max(dims.num_kv_heads);
     let grid = (dims.num_tokens, max_heads, 1);
@@ -3644,6 +3647,8 @@ unsafe fn rope_f16kv_shadow(
     let mut nkvh = dims.num_kv_heads as i32;
     let mut hd = dims.head_dim as i32;
     let mut rd = dims.rotary_dim as i32;
+    // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
+    let mut sliding_window: i32 = 0;
     let args = [
         (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
         (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
@@ -3660,6 +3665,7 @@ unsafe fn rope_f16kv_shadow(
         (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
         (&mut hd) as *mut i32 as *mut core::ffi::c_void,
         (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+        (&mut sliding_window) as *mut i32 as *mut core::ffi::c_void,
     ];
     let max_heads = dims.num_heads.max(dims.num_kv_heads);
     let grid = (dims.num_tokens, max_heads, 1);
@@ -3703,6 +3709,10 @@ unsafe fn rope_fp8kv(
         num_kv_heads: dims.num_kv_heads,
         head_dim: dims.head_dim,
         rotary_dim: dims.rotary_dim,
+        // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
+        // The per-layer ring-buffer dispatch wiring lands in a follow-up
+        // commit alongside the host-side per-layer block_tables remap.
+        sliding_window: 0,
     }
     .launch(
         rope_kernel,
@@ -3888,6 +3898,8 @@ unsafe fn rope_nvfp4kv(
         if crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_STOCH_ROUND_V")
             .unwrap_or(false) { 1 } else { 0 };
     // === END CYCLE 31 ===
+    // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
+    let mut sliding_window: i32 = 0;
     let mut nt = dims.num_tokens as i32;
     let mut nh = dims.num_heads as i32;
     let mut nkvh = dims.num_kv_heads as i32;
@@ -3955,6 +3967,8 @@ unsafe fn rope_nvfp4kv(
         // === CYCLE 31 STOCHASTIC V ROUNDING ===
         (&mut stoch_round_v) as *mut i32 as *mut core::ffi::c_void,
         // === END CYCLE 31 ===
+        // aa01001ringbuf0 Stage 1: byte-equivalent — 0 = no wrap.
+        (&mut sliding_window) as *mut i32 as *mut core::ffi::c_void,
     ];
     let max_heads = dims.num_heads.max(dims.num_kv_heads);
     let grid = (dims.num_tokens, max_heads, 1);

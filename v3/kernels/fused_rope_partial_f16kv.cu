@@ -20,7 +20,9 @@ __global__ void fused_rope_partial_f16kv_kernel(
     int num_heads,
     int num_kv_heads,
     int head_dim,
-    int rotary_dim
+    int rotary_dim,
+    // aa01001ringbuf0 — see fused_rope_partial_fp8kv.cu for semantics.
+    int sliding_window
 ) {
     const int token_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
@@ -52,6 +54,10 @@ __global__ void fused_rope_partial_f16kv_kernel(
     if (head_idx < num_kv_heads) {
         int k_base = (token_idx * num_kv_heads + head_idx) * head_dim;
         int slot = slot_mapping[token_idx];
+        // aa01001ringbuf0 ring-buffer wrap.
+        if (slot >= 0 && sliding_window > 0) {
+            slot = slot % sliding_window;
+        }
 
         if (slot >= 0) {
             int cache_offset = (slot * num_kv_heads + head_idx) * head_dim;

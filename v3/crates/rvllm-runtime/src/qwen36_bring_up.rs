@@ -3742,6 +3742,8 @@ impl Qwen36Bringup {
             let mut nkvh = num_kv_heads as i32;
             let mut hd = head_dim as i32;
             let mut rd = rotary_dim as i32;
+            // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
+            let mut sliding_window: i32 = 0;
             let args = [
                 (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
                 (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
@@ -3758,6 +3760,7 @@ impl Qwen36Bringup {
                 (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
                 (&mut hd) as *mut i32 as *mut core::ffi::c_void,
                 (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut sliding_window) as *mut i32 as *mut core::ffi::c_void,
             ];
             let max_heads = num_heads.max(num_kv_heads);
             let grid = (num_tokens, max_heads, 1);

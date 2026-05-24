@@ -70,7 +70,14 @@ __global__ void fused_rope_partial_fp8kv_kernel(
     int num_heads,
     int num_kv_heads,
     int head_dim,
-    int rotary_dim
+    int rotary_dim,
+    // aa01001ringbuf0: when > 0, the kernel wraps each K/V write slot
+    // by `slot % sliding_window` so sliding-window layers can reuse a
+    // ring of `sliding_window/block_size` physical blocks instead of
+    // holding the full prompt-length KV. `0` = no wrap = legacy
+    // behaviour (callers pass 0 from global / full layers and from any
+    // caller that hasn't opted into the ring-buffer dispatch).
+    int sliding_window
 ) {
     const int token_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
@@ -158,6 +165,10 @@ __global__ void fused_rope_partial_fp8kv_kernel(
         int v_base = (token_idx * num_kv_heads + head_idx) * head_dim;
         int slot   = slot_mapping[token_idx];
         if (slot < 0) return;
+        // aa01001ringbuf0 — see kernel-signature comment.
+        if (sliding_window > 0) {
+            slot = slot % sliding_window;
+        }
         int cache_offset = (slot * num_kv_heads + head_idx) * head_dim;
         int scale_idx    = slot * num_kv_heads + head_idx;
 
