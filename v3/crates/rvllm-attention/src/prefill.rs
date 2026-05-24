@@ -47,10 +47,7 @@ fn require_nonnull(
         if *p == 0 {
             eprintln!("[attn] required device ptr {name:?} == 0 at {op}");
             return Err(RvllmError::Attention {
-                err: AttentionError::FeatureNotAvailable {
-                    backend: "host-validation",
-                    op,
-                },
+                err: AttentionError::NullDevicePointer { name, op },
                 ctx: AttnCtx { op, stream, num_seqs, head_dim },
                 bt: std::backtrace::Backtrace::capture(),
             });
@@ -1383,5 +1380,36 @@ mod tests {
             window_size_left: -1,
         };
         assert!(p.validate().is_ok());
+    }
+
+    // aa01001attnstab: lock the prefill-side null-pointer guard. Mirror
+    // of the decode.rs tests — both helpers share the same shape.
+    #[test]
+    fn prefill_require_nonnull_emits_typed_null_pointer_variant() {
+        let res = require_nonnull(
+            &[("q_fp8", 1), ("k_cache_packed", 0), ("v_cache_packed", 1)],
+            "paged_prefill_test", 0, 1, 128,
+        );
+        match res {
+            Ok(_) => panic!("expected NullDevicePointer rejection"),
+            Err(rvllm_core::RvllmError::Attention {
+                err: AttentionError::NullDevicePointer { name, op },
+                ..
+            }) => {
+                assert_eq!(name, "k_cache_packed");
+                assert_eq!(op, "paged_prefill_test");
+            }
+            Err(other) => panic!("expected NullDevicePointer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefill_require_nonnull_accepts_all_nonzero() {
+        let r = require_nonnull(
+            &[("a", 0x10), ("b", 0x20)],
+            "paged_prefill_test",
+            0, 1, 128,
+        );
+        assert!(r.is_ok());
     }
 }

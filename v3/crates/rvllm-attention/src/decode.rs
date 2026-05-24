@@ -97,11 +97,14 @@ fn require_nonnull(
 ) -> Result<()> {
     for (name, p) in ptrs {
         if *p == 0 {
+            // aa01001attnstab #1: typed `NullDevicePointer` carries the
+            // offending pointer name so callers + tests can match on it
+            // and operators see a distinct host-validation failure from
+            // a backend-capability shortfall. The eprintln stays for
+            // human-readable journal output during a live incident.
+            eprintln!("[attn] required device ptr {name:?} == 0 at {op}");
             return Err(RvllmError::Attention {
-                err: AttentionError::FeatureNotAvailable {
-                    backend: "host-validation",
-                    op,
-                },
+                err: AttentionError::NullDevicePointer { name, op },
                 ctx: AttnCtx {
                     op,
                     stream,
@@ -109,9 +112,6 @@ fn require_nonnull(
                     head_dim,
                 },
                 bt: std::backtrace::Backtrace::capture(),
-            }).map_err(|e| {
-                eprintln!("[attn] required device ptr {name:?} == 0 at {op}");
-                e
             });
         }
     }
@@ -1792,5 +1792,73 @@ mod tests {
         p.head_dim = 512;
         p.scale = 1.0 / (512f32).sqrt();
         assert!(p.validate().is_ok());
+    }
+
+    // aa01001attnstab: lock the host-validation contract for the
+    // pre-launch null-pointer guard. The decode.rs::require_nonnull
+    // helper is private; its semantics are exercised here through the
+    // public error variant so callers (and the runtime tests) can
+    // match `RvllmError::Attention { err: AttentionError::NullDevicePointer
+    // { name, op }, .. }` reliably.
+
+    fn check_null_rejected(
+        ptrs: &[(&'static str, u64)],
+        op: &'static str,
+        expected_name: &'static str,
+    ) {
+        let res = require_nonnull(ptrs, op, 0, 1, 128);
+        match res {
+            Ok(_) => panic!("expected NullDevicePointer rejection for {expected_name}"),
+            Err(rvllm_core::RvllmError::Attention {
+                err: AttentionError::NullDevicePointer { name, op: got_op },
+                ..
+            }) => {
+                assert_eq!(name, expected_name);
+                assert_eq!(got_op, op);
+            }
+            Err(other) => panic!("expected NullDevicePointer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_nonnull_emits_typed_null_pointer_variant() {
+        // First-position null
+        check_null_rejected(
+            &[("q", 0), ("k", 1), ("v", 1)],
+            "paged_decode_test",
+            "q",
+        );
+        // Mid-position null
+        check_null_rejected(
+            &[("q", 1), ("k", 0), ("v", 1)],
+            "paged_decode_test",
+            "k",
+        );
+        // Last-position null
+        check_null_rejected(
+            &[("q", 1), ("k", 1), ("v", 0)],
+            "paged_decode_test",
+            "v",
+        );
+    }
+
+    #[test]
+    fn require_nonnull_accepts_all_nonzero() {
+        let r = require_nonnull(
+            &[("a", 0x10), ("b", 0x20), ("c", 0x30)],
+            "paged_decode_test",
+            0,
+            1,
+            128,
+        );
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn require_nonnull_accepts_empty() {
+        // Some launchers have arch-conditional pointer lists; an empty
+        // slice must short-circuit cleanly.
+        let r = require_nonnull(&[], "paged_decode_test", 0, 1, 128);
+        assert!(r.is_ok());
     }
 }

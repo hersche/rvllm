@@ -168,6 +168,15 @@ pub enum AttentionError {
     /// FP8-KV paged-decode / paged-prefill — those translate from
     /// FA3's parameter set and will land in a follow-up PR.
     FeatureNotAvailable { backend: &'static str, op: &'static str },
+    /// A required device-side pointer was zero at host validation time.
+    /// `name` identifies which one (e.g. `"q_fp8"`, `"block_tables"`).
+    /// aa01001attnstab task closeout — pre-this-variant the `require_nonnull`
+    /// helper conflated null-pointer rejection with `FeatureNotAvailable`,
+    /// hiding host-validation failures behind a backend-capability error.
+    /// Callers that match on the typed error can now distinguish a caller-
+    /// side bug (`NullDevicePointer`) from a runtime-side limitation
+    /// (`FeatureNotAvailable`).
+    NullDevicePointer { name: &'static str, op: &'static str },
 }
 
 #[derive(Debug)]
