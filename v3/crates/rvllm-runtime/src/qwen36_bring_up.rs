@@ -392,6 +392,13 @@ pub struct Qwen36OutsideKernels {
     // `RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V3=1` (default-off).
     pub gated_delta_rule_prefill_f16_v3_mod: LoadedModule,
     pub fn_gated_delta_rule_prefill_f16_v3: KernelFn,
+    // Task #108 v4: 8-wide accumulator split to break the serial
+    // FMA dependency chain through v_corr/o_acc. Same numerical
+    // contract as v3 (no inner f16 RTNE; only boundary state
+    // rounding). Opt-in via `RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V4=1`
+    // (takes precedence over V3 when both set).
+    pub gated_delta_rule_prefill_f16_v4_mod: LoadedModule,
+    pub fn_gated_delta_rule_prefill_f16_v4: KernelFn,
     // Task #103: grouped MMA for the shared-expert dual_silu
     // (no routing — single per-layer weight matrix, all tokens).
     // Opt-in via `RVLLM_QWEN36_MOE_SHARED_MMA=1`.
@@ -1948,6 +1955,10 @@ impl Qwen36Bringup {
             kernels.load_ptx("gated_delta_rule_prefill_f16_v3")?;
         let fn_gated_delta_rule_prefill_f16_v3 = gated_delta_rule_prefill_f16_v3_mod
             .get_function("gated_delta_rule_prefill_f16_v3_kernel")?;
+        let gated_delta_rule_prefill_f16_v4_mod =
+            kernels.load_ptx("gated_delta_rule_prefill_f16_v4")?;
+        let fn_gated_delta_rule_prefill_f16_v4 = gated_delta_rule_prefill_f16_v4_mod
+            .get_function("gated_delta_rule_prefill_f16_v4_kernel")?;
         let fp8_mma_shared_dual_silu_m16_w4c_mod =
             kernels.load_ptx("fp8_mma_shared_dual_silu_m16_w4c")?;
         let fn_fp8_mma_shared_dual_silu_m16_w4c = fp8_mma_shared_dual_silu_m16_w4c_mod
@@ -2167,6 +2178,8 @@ impl Qwen36Bringup {
             fn_gated_delta_rule_prefill_f16_v2,
             gated_delta_rule_prefill_f16_v3_mod,
             fn_gated_delta_rule_prefill_f16_v3,
+            gated_delta_rule_prefill_f16_v4_mod,
+            fn_gated_delta_rule_prefill_f16_v4,
             fp8_mma_shared_dual_silu_m16_w4c_mod,
             fn_fp8_mma_shared_dual_silu_m16_w4c,
             fp8_mma_shared_down_m16_w4c_mod,
@@ -7811,7 +7824,15 @@ impl Qwen36Bringup {
             let use_v3 = std::env::var("RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V3")
                 .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE"))
                 .unwrap_or(true);
-            let kfn = if use_v3 {
+            // Task #108 v4: takes precedence when set. Default-ON
+            // after hardware A/B (+5.6%/+4.8% over v3, same numerical
+            // contract). Opt-out=0.
+            let use_v4 = std::env::var("RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V4")
+                .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE"))
+                .unwrap_or(true);
+            let kfn = if use_v4 {
+                self.outside_kernels.fn_gated_delta_rule_prefill_f16_v4.raw() as CUfunction
+            } else if use_v3 {
                 self.outside_kernels.fn_gated_delta_rule_prefill_f16_v3.raw() as CUfunction
             } else if use_v2 {
                 self.outside_kernels.fn_gated_delta_rule_prefill_f16_v2.raw() as CUfunction
