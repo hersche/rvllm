@@ -352,7 +352,13 @@ impl Gemma4Bringup {
              num_blocks_total, identity_bt_ptr, identity_bt_len,
              block_size): (u64, u64,
              Vec<u64>, Vec<u64>, u32, u64, u32, u32) = {
-            let guard = self.prefix_cache.lock().unwrap();
+            // P2 #9 (codex audit, task aa01001srvbug2): poison-recover
+            // pattern so a panicked sibling worker doesn't cascade
+            // every future spec-decode request into a 500. The recover
+            // helper clears the cache slot to None on poison, so the
+            // None branch below fires and returns a clean Config error
+            // pointing at init_prefix_cache.
+            let guard = self.lock_prefix_cache_recover();
             match guard.as_ref() {
                 Some(pc) => (
                     pc.kv_cache_ptr,

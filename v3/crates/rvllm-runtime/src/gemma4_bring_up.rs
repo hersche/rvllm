@@ -1370,6 +1370,12 @@ pub struct Gemma4Bringup {
     /// `run_generate` call; kept across subsequent calls so the
     /// KV cache survives the worker's scratch-checkpoint restore.
     pub prefix_cache: std::sync::Mutex<Option<PrefixCacheState>>,
+    /// Bumped on every prefix-cache poison recovery so callers can
+    /// flag operator + clear stale cache state. Defaults to 0;
+    /// `take_prefix_cache_or_recover()` is the canonical accessor that
+    /// returns a healthy guard regardless of whether the mutex was
+    /// previously poisoned by a panic in another worker thread.
+    pub prefix_cache_poison_recoveries: std::sync::atomic::AtomicU64,
     // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
     /// Ground-truth F16 shadow KV region for the instrumented layer set.
     /// Populated on first run_generate when RVLLM_NVFP4_SHADOW_F16=1.
@@ -2349,6 +2355,7 @@ impl Gemma4Bringup {
             spec_logits_capture_active:
                 std::sync::atomic::AtomicBool::new(false),
             prefix_cache: std::sync::Mutex::new(None),
+            prefix_cache_poison_recoveries: std::sync::atomic::AtomicU64::new(0),
             // (assistant_kv_sources is set above; drafter slot stays
             // empty until commit 7 calls `ensure_drafter` from the
             // spec-decode loop. Backward-compat: with spec_decode=false
@@ -2733,10 +2740,48 @@ impl Gemma4Bringup {
     /// so subsequent `arena.restore(scratch_ck)` calls won't clobber
     /// the persistent KV data.
     ///
+    /// Lock `prefix_cache` with explicit poison recovery. If another
+    /// worker thread panicked while holding the lock, the cache
+    /// contents are presumed corrupt (a partial write may have left
+    /// an arena pointer dangling). Recover the inner `MutexGuard`
+    /// via `PoisonError::into_inner`, clear the cache slot to `None`
+    /// so subsequent reads cold-start, bump the recovery counter,
+    /// and emit one WARN line per recovery for operator visibility.
+    /// Returns the now-healthy guard.
+    ///
+    /// P2 #9 from the codex audit (task aa01001srvbug2): pre-this-helper
+    /// every prefix_cache call site did `lock().unwrap()`, so a single
+    /// panic in any code path holding the mutex cascaded into every
+    /// future request 500'ing on the same `unwrap` site.
+    pub fn lock_prefix_cache_recover(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<PrefixCacheState>> {
+        match self.prefix_cache.lock() {
+            Ok(g) => g,
+            Err(poison) => {
+                let count = self
+                    .prefix_cache_poison_recoveries
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                tracing::warn!(
+                    recoveries = count,
+                    "prefix_cache mutex was poisoned (a worker thread \
+                     panicked while holding the lock) — clearing cache \
+                     slot to None and continuing. Subsequent requests \
+                     cold-start their KV layout. Investigate the panic \
+                     in the journal preceding this line.",
+                );
+                let mut g = poison.into_inner();
+                *g = None;
+                g
+            }
+        }
+    }
+
     /// Safe to call multiple times; becomes a no-op after the first
     /// successful init.
     pub fn init_prefix_cache(&self) -> Result<()> {
-        let mut guard = self.prefix_cache.lock().unwrap();
+        let mut guard = self.lock_prefix_cache_recover();
         if guard.is_some() {
             return Ok(());
         }
@@ -4742,7 +4787,7 @@ impl Gemma4Bringup {
             block_size,
             max_blocks_per_seq,
         ) = {
-            let pc_guard = self.prefix_cache.lock().unwrap();
+            let pc_guard = self.lock_prefix_cache_recover();
             let pc = pc_guard.as_ref().ok_or_else(|| {
                 rvllm_core::RvllmError::Attention {
                     err: rvllm_core::AttentionError::FeatureNotAvailable {
@@ -5486,7 +5531,7 @@ impl Gemma4Bringup {
             // Save the pre-call last_tokens so we can restore on exit
             // (preserving cross-request cache semantics).
             let saved_last_tokens: Vec<u32> = {
-                let mut guard = self.prefix_cache.lock().unwrap();
+                let mut guard = self.lock_prefix_cache_recover();
                 if let Some(pc) = guard.as_mut() {
                     let saved = pc.last_tokens.clone();
                     // Replace with session.tokens (the committed prefix).
@@ -5537,7 +5582,7 @@ impl Gemma4Bringup {
             // whether subsequent restore-on-error happens. This keeps
             // cross-request cache semantics intact.
             {
-                let mut guard = self.prefix_cache.lock().unwrap();
+                let mut guard = self.lock_prefix_cache_recover();
                 if let Some(pc) = guard.as_mut() {
                     pc.last_tokens = saved_last_tokens.clone();
                 }
@@ -5953,7 +5998,7 @@ impl Gemma4Bringup {
         let (kv_base_ptr, kv_scale_base_ptr,
              kv_layer_offsets, kv_scale_layer_offsets,
              num_blocks_total, block_size) = {
-            let pc_guard = self.prefix_cache.lock().unwrap();
+            let pc_guard = self.lock_prefix_cache_recover();
             let pc = pc_guard.as_ref().ok_or_else(|| {
                 rvllm_core::RvllmError::Attention {
                     err: rvllm_core::AttentionError::FeatureNotAvailable {
@@ -7050,7 +7095,7 @@ impl Gemma4Bringup {
         let (kv_base_ptr, kv_scale_base_ptr,
              kv_layer_offsets, kv_scale_layer_offsets,
              num_blocks_total, block_size, max_blocks_per_seq) = {
-            let pc_guard = self.prefix_cache.lock().unwrap();
+            let pc_guard = self.lock_prefix_cache_recover();
             let pc = pc_guard.as_ref().ok_or_else(|| rvllm_core::RvllmError::Attention {
                 err: rvllm_core::AttentionError::FeatureNotAvailable {
                     op: "run_generate_speculative: prefix cache not \
@@ -10469,7 +10514,7 @@ impl Gemma4Bringup {
         let (kv_cache_ptr, kv_scale_ptr, kv_layer_offsets, kv_scale_layer_offsets,
              kv_total_bytes, kv_scale_total_bytes, common_prefix_len_raw,
              persistent_identity_bt_ptr, persistent_identity_bt_len) = {
-            let guard = self.prefix_cache.lock().unwrap();
+            let guard = self.lock_prefix_cache_recover();
             match &*guard {
                 Some(pc) => {
                     let mut prefix = 0usize;
