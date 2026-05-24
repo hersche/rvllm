@@ -102,6 +102,22 @@ pub struct Gemma4Nvfp4KvState {
     /// `[max_query_tokens]` i32 slot mapping. Where K/V are
     /// written in the cache.
     pub slot_mapping_ptr: u64,
+    /// ringbuf0 Phase 4: parallel `[max_pos]` i32 block_tables holding
+    /// `i % sliding_blocks` ring pattern. Sliding-attention layers
+    /// rebind block_tables to this ptr at meta-binding time so
+    /// attention reads land on the bounded physical-slot range that
+    /// the mod-sliding slot_mapping writes into. Zero when
+    /// `RVLLM_KV_RING_BUFFER` is unset.
+    pub block_tables_sliding_ptr: u64,
+    /// ringbuf0 Phase 4: parallel `[max_query_tokens]` i32 buffer.
+    /// Holds `slot_mapping[t] % sliding_window` derived after each
+    /// `fill_pos_slots` via `g4n_slot_mapping_mod_sliding_i32_kernel`.
+    /// Allocated only when `RVLLM_KV_RING_BUFFER=1`; zero otherwise.
+    /// Sliding-attention layers swap to this ptr at meta-binding
+    /// time so prefill RoPE+KV-write lands on bounded physical slots
+    /// matching the block_tables_sliding ring pattern that attention
+    /// reads from on subsequent steps.
+    pub slot_mapping_sliding_ptr: u64,
     /// `[1]` f32 fallback scalar Q scale (RVLLM_Q_SCALE; 2.0 in
     /// the production NVFP4 profile). The RoPE+KV-write kernel
     /// uses this when per-token Q scale is off.
@@ -159,6 +175,17 @@ impl Gemma4Nvfp4KvState {
         let context_lens_region = arena.region("gemma4_nvfp4_kv_context_lens", meta_bytes, 16)?;
         let positions_region = arena.region("gemma4_nvfp4_kv_positions", meta_bytes, 16)?;
         let slot_mapping_region = arena.region("gemma4_nvfp4_kv_slot_mapping", meta_bytes, 16)?;
+        // ringbuf0 Phase 4: parallel slot_mapping buffer holding the
+        // mod-sliding_window-wrapped slots. Allocated only when
+        // RVLLM_KV_RING_BUFFER=1 to keep env-off byte-equivalent.
+        let slot_mapping_sliding_ptr: u64 =
+            if crate::gemma4_bring_up::kv_ring_buffer_enabled() {
+                arena
+                    .region("gemma4_nvfp4_kv_slot_mapping_sliding", meta_bytes, 16)?
+                    .device_ptr()
+            } else {
+                0
+            };
         let q_scale_region = arena.region("gemma4_nvfp4_kv_q_scale", 4, 16)?;
         // CUDA-Graph foundation: stable 4-byte slots for the indirect
         // fill_pos_slots kernel. Address is captured into the graph;
@@ -175,6 +202,31 @@ impl Gemma4Nvfp4KvState {
             bt_host.extend_from_slice(&(i as i32).to_le_bytes());
         }
         unsafe { block_tables_region.copy_from_host(&bt_host)? };
+
+        // ringbuf0 Phase 4: parallel block_tables holding ring pattern
+        // (i % sliding_blocks) — alloc + populate when env on. Sliding
+        // attention reads via this table; global layers keep using the
+        // identity-mapped table.
+        let block_tables_sliding_ptr: u64 =
+            if crate::gemma4_bring_up::kv_ring_buffer_enabled() {
+                let bts_region = arena.region(
+                    "gemma4_nvfp4_block_tables_sliding",
+                    (max_pos as usize) * 4,
+                    256,
+                )?;
+                let sliding_blocks = (((arch.sliding_window_size as u64) + (block_size as u64) - 1)
+                    / (block_size as u64))
+                    .max(1) as u32;
+                let mut bts_host = Vec::<u8>::with_capacity((max_pos as usize) * 4);
+                for i in 0..max_pos {
+                    let phys = (i as i32) % (sliding_blocks as i32);
+                    bts_host.extend_from_slice(&phys.to_le_bytes());
+                }
+                unsafe { bts_region.copy_from_host(&bts_host)? };
+                bts_region.device_ptr()
+            } else {
+                0
+            };
 
         // q_scale default = 2.0f (matches production
         // RVLLM_Q_SCALE on the fp8-block spec profile).
@@ -228,9 +280,11 @@ impl Gemma4Nvfp4KvState {
             block_size,
             max_query_tokens,
             block_tables_ptr: block_tables_region.device_ptr(),
+            block_tables_sliding_ptr,
             context_lens_ptr: context_lens_region.device_ptr(),
             positions_ptr: positions_region.device_ptr(),
             slot_mapping_ptr: slot_mapping_region.device_ptr(),
+            slot_mapping_sliding_ptr,
             q_scale_ptr: q_scale_region.device_ptr(),
             graph_pos_off_ptr: graph_pos_off_region.device_ptr(),
             graph_start_slot_ptr: graph_start_slot_region.device_ptr(),
@@ -300,6 +354,14 @@ struct ForwardKernels {
     /// device memory at replay time).
     _fill_pos_slots_indirect_mod: LoadedModule,
     fn_fill_pos_slots_i32_indirect: KernelFn,
+    /// `g4n_slot_mapping_mod_sliding_i32_kernel` — ringbuf0 Phase 4.
+    /// Derives a per-sliding-layer slot_mapping by wrapping the
+    /// canonical slot_mapping mod `sliding_window`. Used when
+    /// `RVLLM_KV_RING_BUFFER=1` so prefill writes (and decode writes)
+    /// for sliding-attention layers land on physically-bounded
+    /// slots that the ring-pattern block_tables read back from.
+    _slot_mapping_mod_sliding_mod: LoadedModule,
+    fn_slot_mapping_mod_sliding_i32: KernelFn,
     /// `f32_to_bf16_kernel` — device-side narrow of f32 → bf16.
     /// Replaces per-call DtoH + host RTNE-narrow + HtoD trios
     /// after every cublasLt GEMM output. Single launch per
@@ -646,6 +708,13 @@ impl Gemma4Nvfp4Bringup {
             loader.load_ptx("g4n_fill_pos_slots_i32_indirect")?;
         let fn_fill_pos_slots_i32_indirect = fill_pos_slots_indirect_mod
             .get_function("g4n_fill_pos_slots_i32_indirect_kernel")?;
+        // ringbuf0 Phase 4: slot_mapping mod sliding_window for the
+        // per-sliding-layer slot buffer. Loaded unconditionally;
+        // launched only when `RVLLM_KV_RING_BUFFER=1`.
+        let slot_mapping_mod_sliding_mod =
+            loader.load_ptx("g4n_slot_mapping_mod_sliding_i32")?;
+        let fn_slot_mapping_mod_sliding_i32 = slot_mapping_mod_sliding_mod
+            .get_function("g4n_slot_mapping_mod_sliding_i32_kernel")?;
 
         // Floor commit 4 / Stream 5a: load device-side narrow +
         // parameter-free V-RMSNorm so the per-layer attention
@@ -770,6 +839,8 @@ impl Gemma4Nvfp4Bringup {
             fn_fill_pos_slots_i32,
             _fill_pos_slots_indirect_mod: fill_pos_slots_indirect_mod,
             fn_fill_pos_slots_i32_indirect,
+            _slot_mapping_mod_sliding_mod: slot_mapping_mod_sliding_mod,
+            fn_slot_mapping_mod_sliding_i32,
             _f32_to_bf16_mod: f32_to_bf16_mod,
             fn_f32_to_bf16,
             _vnorm_bf16_mod: vnorm_bf16_mod,
@@ -2020,7 +2091,72 @@ impl Gemma4Nvfp4Bringup {
                 &args,
             )?;
         }
+        // ringbuf0 Phase 4: populate the per-sliding-layer wrapped
+        // slot_mapping in lockstep with the canonical fill. Both
+        // launches run on the same engine stream; the mod kernel reads
+        // slot_mapping_in[t] after the fill kernel has written it.
+        if kv.slot_mapping_sliding_ptr != 0 {
+            let mut sm_in: u64 = kv.slot_mapping_ptr;
+            let mut sm_out: u64 = kv.slot_mapping_sliding_ptr;
+            let mut sw_arg: i32 = self.arch.sliding_window_size as i32;
+            let mut n_arg: i32 = num_tokens;
+            let mod_args: [*mut core::ffi::c_void; 4] = [
+                (&mut sm_in) as *mut u64 as *mut _,
+                (&mut sm_out) as *mut u64 as *mut _,
+                (&mut sw_arg) as *mut i32 as *mut _,
+                (&mut n_arg) as *mut i32 as *mut _,
+            ];
+            unsafe {
+                rvllm_fused::launch_raw(
+                    self.forward_kernels.fn_slot_mapping_mod_sliding_i32,
+                    (grid_x, 1, 1),
+                    (BLOCK, 1, 1),
+                    0,
+                    self.stream.raw(),
+                    &mod_args,
+                )?;
+            }
+        }
         Ok(())
+    }
+
+    /// ringbuf0 Phase 4 helper: pick the slot_mapping ptr to pass to
+    /// a per-layer launch. Returns the wrapped buffer for sliding-
+    /// attention layers when ring-buffer is on; the canonical buffer
+    /// otherwise. Used by the four NVFP4 rope launch sites so prefill
+    /// writes wrap into the same bounded slot range that decode and
+    /// attention reads consume.
+    #[inline]
+    fn slot_mapping_ptr_for_layer(&self, kv: &Gemma4Nvfp4KvState, layer_idx: usize) -> u64 {
+        if kv.slot_mapping_sliding_ptr != 0
+            && matches!(
+                self.arch.layer_types[layer_idx],
+                rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention
+            )
+        {
+            kv.slot_mapping_sliding_ptr
+        } else {
+            kv.slot_mapping_ptr
+        }
+    }
+
+    /// ringbuf0 Phase 4 helper: pick the block_tables ptr to pass to
+    /// a per-layer attention launch. Returns the ring-pattern table
+    /// for sliding-attention layers when ring-buffer is on; identity
+    /// table otherwise. Companion to `slot_mapping_ptr_for_layer` so
+    /// rope WRITE slot == attention READ slot for sliding layers.
+    #[inline]
+    fn block_tables_ptr_for_layer(&self, kv: &Gemma4Nvfp4KvState, layer_idx: usize) -> u64 {
+        if kv.block_tables_sliding_ptr != 0
+            && matches!(
+                self.arch.layer_types[layer_idx],
+                rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention
+            )
+        {
+            kv.block_tables_sliding_ptr
+        } else {
+            kv.block_tables_ptr
+        }
     }
 
     /// Indirect-args variant of `fill_pos_slots`. All three scalar
@@ -5288,7 +5424,7 @@ impl Gemma4Nvfp4Bringup {
             let mut cos_ptr_local: u64 = cos_ptr;
             let mut sin_ptr_local: u64 = sin_ptr;
             let mut positions_ptr: u64 = kv.positions_ptr;
-            let mut slot_ptr: u64 = kv.slot_mapping_ptr;
+            let mut slot_ptr: u64 = self.slot_mapping_ptr_for_layer(kv, _pre_had_layer_idx);
             let mut q_scale_ptr: u64 = kv.q_scale_ptr;
             let mut q_scale_cache_ptr: u64 = 0; // no per-token Q scale
             let mut hadamard_q: u64 = 0;
@@ -5381,7 +5517,7 @@ impl Gemma4Nvfp4Bringup {
             let mut ks: u64 = k_scale;
             let mut vs: u64 = v_scale;
             let mut q_scale_cache_ptr: u64 = 0;
-            let mut block_tables: u64 = kv.block_tables_ptr;
+            let mut block_tables: u64 = self.block_tables_ptr_for_layer(kv, _pre_had_layer_idx);
             let mut context_lens: u64 = kv.context_lens_ptr;
             let mut q_descale: u64 = kv.q_scale_ptr;
 
@@ -5801,7 +5937,7 @@ impl Gemma4Nvfp4Bringup {
             let mut cos_ptr_local: u64 = cos_table_dev;
             let mut sin_ptr_local: u64 = sin_table_dev;
             let mut positions_ptr: u64 = kv.positions_ptr;
-            let mut slot_ptr: u64 = kv.slot_mapping_ptr;
+            let mut slot_ptr: u64 = self.slot_mapping_ptr_for_layer(kv, _pre_had_layer_idx);
             let mut q_scale_ptr: u64 = kv.q_scale_ptr;
             let mut q_scale_cache_ptr: u64 = 0;
             let mut hadamard_q: u64 = 0;
@@ -5894,7 +6030,7 @@ impl Gemma4Nvfp4Bringup {
             let mut ks: u64 = k_scale;
             let mut vs: u64 = v_scale;
             let mut q_scale_cache_ptr: u64 = 0;
-            let mut block_tables: u64 = kv.block_tables_ptr;
+            let mut block_tables: u64 = self.block_tables_ptr_for_layer(kv, _pre_had_layer_idx);
             let mut context_lens: u64 = kv.context_lens_ptr;
             let mut q_descale: u64 = kv.q_scale_ptr;
 
@@ -6654,7 +6790,7 @@ impl Gemma4Nvfp4Bringup {
             let mut cos_p: u64 = cos_table_dev;
             let mut sin_p: u64 = sin_table_dev;
             let mut positions_ptr: u64 = kv.positions_ptr;
-            let mut slot_ptr: u64 = kv.slot_mapping_ptr;
+            let mut slot_ptr: u64 = self.slot_mapping_ptr_for_layer(kv, _pre_had_layer_idx);
             let mut q_scale_ptr: u64 = kv.q_scale_ptr;
             let mut q_scale_cache_ptr: u64 = 0;
             let mut hadamard_q: u64 = 0;
@@ -6744,7 +6880,7 @@ impl Gemma4Nvfp4Bringup {
             let mut ks: u64 = k_scale;
             let mut vs: u64 = v_scale;
             let mut q_scale_cache_ptr: u64 = 0;
-            let mut block_tables: u64 = kv.block_tables_ptr;
+            let mut block_tables: u64 = self.block_tables_ptr_for_layer(kv, _pre_had_layer_idx);
             let mut context_lens: u64 = kv.context_lens_ptr;
             let mut q_descale: u64 = kv.q_scale_ptr;
             let mut scale: f32 = 1.0;
@@ -7172,7 +7308,7 @@ impl Gemma4Nvfp4Bringup {
             let mut cos_p: u64 = cos_table_dev;
             let mut sin_p: u64 = sin_table_dev;
             let mut positions_ptr: u64 = kv.positions_ptr;
-            let mut slot_ptr: u64 = kv.slot_mapping_ptr;
+            let mut slot_ptr: u64 = self.slot_mapping_ptr_for_layer(kv, _pre_had_layer_idx);
             let mut q_scale_ptr: u64 = kv.q_scale_ptr;
             let mut q_scale_cache_ptr: u64 = 0;
             let mut hadamard_q: u64 = 0;
@@ -7289,7 +7425,7 @@ impl Gemma4Nvfp4Bringup {
                 k_scale,
                 v_scale,
                 0, // q_scale_cache (none)
-                kv.block_tables_ptr,
+                self.block_tables_ptr_for_layer(kv, _pre_had_layer_idx),
                 cu_seqlens_region.device_ptr(),
                 kv.context_lens_ptr,
                 kv.q_scale_ptr, // q_descale fallback

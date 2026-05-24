@@ -407,29 +407,29 @@
       "sha256": "d1ebe91d011e6a99a50405b426809c8de16d10cce1cec11a0d08f12998ab38b8"
     },
     "fused_rope_partial_f16kv": {
-      "bytes": 7009,
+      "bytes": 7310,
       "path": "fused_rope_partial_f16kv.ptx",
-      "sha256": "a5a9b151d505379401f756867f61931795d53b6bbcdbed76de074d02f3a74a72"
+      "sha256": "062b2f1d67d7ebf445cc61203375593f2fe1a9de5d43e2118203cd9be1436cc5"
     },
     "fused_rope_partial_fp8kv": {
-      "bytes": 15322,
+      "bytes": 15546,
       "path": "fused_rope_partial_fp8kv.ptx",
-      "sha256": "58d6efc0bf14898ae3346087189474e371e065fdb939dd8cf72e9cb9a5ac7e31"
+      "sha256": "329301029b00e758898dac15fb8ebc27de7a276c4fc886018f05c0cdbce3f23e"
     },
     "fused_rope_partial_fp8kv_bf16in": {
-      "bytes": 15658,
+      "bytes": 15896,
       "path": "fused_rope_partial_fp8kv_bf16in.ptx",
-      "sha256": "6de6d4e75b01780380fbe71e6392964e7becf19f77a811c8fb1e846feac9be20"
+      "sha256": "c2006451bcdbb27c3dd937212330448c196ceb5a32d8c99585fb67dd4b284f22"
     },
     "fused_rope_partial_nvfp4kv": {
-      "bytes": 50990,
+      "bytes": 51230,
       "path": "fused_rope_partial_nvfp4kv.ptx",
-      "sha256": "f55b0e8bbb753505dd1156acc931b48f1c2ff1e48f5a8d15d5ca99529b0b620a"
+      "sha256": "081724d1bcc32a344ac4bff84e07a10ddb7590c2f61f457ede6c5f03246d82a4"
     },
     "fused_rope_partial_nvfp4kv_bf16in": {
-      "bytes": 52598,
+      "bytes": 52854,
       "path": "fused_rope_partial_nvfp4kv_bf16in.ptx",
-      "sha256": "84284cd7640f2a2ca16932ffc70eacc5054a45bcefe38b29774204fdeaa18b3d"
+      "sha256": "43c7d2dfa168feffd45b10f63b7b431bbf0332e75e8bfc4f7cb1897220f68e97"
     },
     "fused_rope_qwen_partial_f16kv": {
       "bytes": 7193,
@@ -465,6 +465,11 @@
       "bytes": 1672,
       "path": "g4n_scaled_add_bf16.ptx",
       "sha256": "c54624b1e7728a4265d574d9f5e852d3cbf705b04b3bcf68d6a07674cd46e6be"
+    },
+    "g4n_slot_mapping_mod_sliding_i32": {
+      "bytes": 1738,
+      "path": "g4n_slot_mapping_mod_sliding_i32.ptx",
+      "sha256": "f617e9ee560300a7cdd25ed110845645f145213b0a0ddf016bd45b71e1c44954"
     },
     "gated_delta_rule_decode_f16": {
       "bytes": 16857,
@@ -1157,5 +1162,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "d3ba93d"
+  "revision": "7d27482"
 }
