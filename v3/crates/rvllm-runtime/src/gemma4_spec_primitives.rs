@@ -739,6 +739,9 @@ impl Gemma4Bringup {
                 cos, sin,
                 block_tables: identity_bt_ptr,
                 context_lens: s.context_lens,
+                // aa01001ringbuf0: spec primitives use the identity bt;
+                // sliding ring buffer only applies to base forward path.
+                block_tables_sliding: 0,
             };
             crate::gemma4_layer_exec::gemma4_forward_phase(
                 dims, &kernels, &w, &scratch, &meta,
