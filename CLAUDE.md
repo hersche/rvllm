@@ -1306,6 +1306,47 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 large-M perf validation 16k/32k — task #110 (2026-05-24)
+
+End-to-end Phase 1-5 validation that the session-#94..#108 grouped-MMA +
+linear-attn V4 stack (all default-on after #109 fix) actually wins at
+production-scale prompts (16k zeroclaw persona, 32k stress test).
+
+Pre-test setup: stopped support services (chatterbox, whisper-fast,
+vllm-embedding, zeroclaw) freeing ~22 GB host RAM. Bumped
+`RVLLM_ARENA_GB=80` in the mobile profile to guarantee headroom for
+32k per-call scratch. Profile state otherwise canonical.
+
+A/B (qwen3-6-35b-a3b NVFP4, direct API, 3-run deterministic, fresh
+binary md5 `00969a8d`):
+
+  | M       | Phase 1 baseline (all OFF) | Phase 2 all-on        | Speedup |
+  |---------|----------------------------|-----------------------|---------|
+  | 1112    | n/a (#108 baseline 817 ms) | 818-819 ms            | held    |
+  | 16000   | 203961-204134 (avg 204042) | 60886-61304 (avg 61019)| **3.34×** |
+  | 32000   | 489879-489993 (avg 489920) | 204596-205190 (avg 204832)| **2.39×** |
+
+All-on cells coherent multi-sentence German across all runs (no
+repetition loops, sensible quantum-entanglement explanations). No
+quality regression observed at any M.
+
+Phase 5c — full zeroclaw webhook end-to-end (16k persona prompt
++ "who are you"):
+  > "Ich bin **Rusty**. Ich bin kein freundlicher Assistent, der
+  >  dir immer zustimmt. Ich bin ein Partner — ich argumentiere,
+  >  ich hinterfrage, und ich bin nicht hier, um dir einfach nur
+  >  zuzustimmen..."
+Persona-grounded multi-paragraph German, no garbage. Compare to
+pre-#109 state where it returned `</think>` / `- User: Rusty.`.
+
+Wins scale with M (3.34× at 16k vs 2.39× at 32k) — fixed costs
+amortise better at smaller prompts. The grouped-MMA stack reduces
+overall per-token prefill cost meaningfully across the full prompt-
+size range, not just the ≤4412 range tested earlier.
+
+`RVLLM_ARENA_GB=80` kept in mobile profile (was 50 canonical) so
+production handles 32k prompts headroom-free.
+
 ### qwen36 router_topk_batched counter unit-bug fix — task #109 (2026-05-24)
 
 Pre-existing bug surfaced when production zeroclaw mobile profile
