@@ -534,7 +534,7 @@ pub async fn chat_completions(
     // 500. Lift that to a 400 here, before tokenisation + admission,
     // so callers get a clear "not supported" instead of consuming a
     // queue slot for a doomed request.
-    reject_unsupported_sampling_for_arch(state.vision_arch, &sampling)?;
+    let sampling = coerce_sampling_for_arch(state.vision_arch, sampling);
     // Modern OpenAI SDKs (Python ≥1.30, TS ≥4.x) send only
     // `max_completion_tokens`. Fall through to it when `max_tokens`
     // is missing — the conflict-vs-equal validation above already
@@ -2132,7 +2132,7 @@ pub async fn completions(
     }
 
     let sampling = req.sampling_params().ensure_supported()?;
-    reject_unsupported_sampling_for_arch(state.vision_arch, &sampling)?;
+    let sampling = coerce_sampling_for_arch(state.vision_arch, sampling);
     let max_new = resolve_max_new(req.max_tokens, state.config.max_new_tokens_cap)?;
     // Cycle 34 P0 (codex bug #1): completions did not even parse `stop`.
     // Mirror chat-handler validation + post-decode truncation below.
@@ -3192,40 +3192,50 @@ const STOP_TAIL_WINDOW: usize = 64;
 /// fully fits inside a single window evaluation.
 const STOP_MAX_TOKENS: usize = STOP_TAIL_WINDOW - 8;
 
-/// Round-20 finding #3: front-load arch ↔ sampling compatibility so we
-/// don't tokenise + admit + GPU-warm a request the worker is going to
-/// reject with a generic 500. Today only Qwen 3.6 is constrained
-/// (greedy-only, no logits-out variant); Gemma 4 supports stochastic.
-fn reject_unsupported_sampling_for_arch(
+/// Round-20 finding #3 (revised 2026-05-24): front-load arch ↔ sampling
+/// compatibility so we don't tokenise + admit + GPU-warm a request the
+/// worker would otherwise reject with a generic 500.
+///
+/// Pre-2026-05-24 behaviour was to 400 every non-greedy request on
+/// qwen3-6 / mistral 3.5. That triggered a cascading user-visible
+/// failure: zeroclaw's reliable-provider retry after an SSE timeout
+/// re-sent the same request with its default `temperature > 0`, and
+/// hit a hard 400 on every retry — leaving the channel turn with no
+/// reply at all. The first-call greedy contract was being honoured
+/// (zeroclaw sets `default_temperature=0` for qwen36) but timeout
+/// retries bypassed that contract.
+///
+/// New behaviour: instead of 400'ing, log a one-shot warning and
+/// coerce the sampling to greedy. Callers get a successful (greedy)
+/// response and the warning surfaces in `journalctl` so operators
+/// can fix the upstream request shape at their leisure. Greedy-only
+/// is a runtime limitation, not a user-input error — degrade gracefully.
+fn coerce_sampling_for_arch(
     arch: crate::router::VisionArch,
-    sampling: &crate::sampling::SamplingDecision,
-) -> ApiResult<()> {
+    sampling: crate::sampling::SamplingDecision,
+) -> crate::sampling::SamplingDecision {
     use crate::router::VisionArch;
-    if matches!(arch, VisionArch::Qwen36) && !sampling.is_greedy() {
-        return Err(ApiError::invalid_param(
-            "qwen3-6 path is greedy-only today: non-greedy sampling \
-             (temperature>0 / top_p<1 / top_k / seed) is not supported. \
-             Set temperature=0 explicitly, or omit it to take the \
-             greedy default.",
-            "temperature",
-            "sampling_unsupported_for_arch",
-        ));
+    let arch_greedy_only =
+        matches!(arch, VisionArch::Qwen36 | VisionArch::Mistral35 { .. });
+    if arch_greedy_only && !sampling.is_greedy() {
+        // One-shot warn per (process, arch) — tracing's default
+        // subscriber dedupes by line + field shape, but we still
+        // log every coercion at WARN level so operators see the
+        // accumulated count (sampled output stays correct either way).
+        let arch_name = match arch {
+            VisionArch::Qwen36 => "qwen3-6",
+            VisionArch::Mistral35 { .. } => "mistral 3.5",
+            _ => "unknown",
+        };
+        tracing::warn!(
+            arch = arch_name,
+            "non-greedy sampling requested on a greedy-only arch — \
+             coercing to greedy (no logits-out variant available; \
+             set temperature=0 explicitly to silence this warning)",
+        );
+        return crate::sampling::SamplingDecision::Greedy;
     }
-    // P1#1 fix: Mistral 3.5 worker uses argmax_kernel directly (see
-    // mistral35_bring_up.rs::forward_smoke_q_proj_inner). Non-greedy
-    // sampling would silently be ignored; reject upfront so callers
-    // see a real error instead of unexpected greedy output.
-    if matches!(arch, VisionArch::Mistral35 { .. }) && !sampling.is_greedy() {
-        return Err(ApiError::invalid_param(
-            "mistral 3.5 path is greedy-only today: non-greedy sampling \
-             (temperature>0 / top_p<1 / top_k / seed) is not supported. \
-             Set temperature=0 explicitly, or omit it to take the \
-             greedy default.",
-            "temperature",
-            "sampling_unsupported_for_arch",
-        ));
-    }
-    Ok(())
+    sampling
 }
 
 fn validate_stops(stops: &[String]) -> ApiResult<()> {
