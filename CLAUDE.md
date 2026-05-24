@@ -2289,6 +2289,62 @@ single-default bumping would have created a Gemma 4 / Qwen
 register-pressure risk. Resolved 2026-05-22 (task #1) via the
 adaptive `_max16` variant pattern documented in rule (3) above.
 
+## OpenAI API compat — fixed 2026-05-24 (Phases A-D)
+
+End-to-end fix for the "answer is incomplete" zeroclaw webhook
+regression. Four related issues across rvllm-serve and zeroclaw:
+
+**Phase A — root cause confirmed.** Direct A/B on qwen3-6-35b-a3b:
+`max_tokens=1024` → `finish_reason=length`, output cut mid-sentence
+("...in Russland"). `max_tokens=2048` → `finish_reason=stop`, clean
+final period. Truncation was real, not a tokenizer or chat-template
+issue.
+
+**Phase B — default max_tokens floor (rvllm-serve commit `1a70b18`).**
+`resolve_max_new()` in `crates/rvllm-serve/src/openai/handlers.rs`
+defaulted to `cap.min(1024)` when the caller omitted `max_tokens`.
+On every long-context profile (`RVLLM_MAX_TOKENS_CAP` ≥ 65 k) this
+silently capped completions at 1024 tokens regardless of the
+configured cap. zeroclaw's OpenAI provider does not send
+`max_tokens`, so every chat turn ran into the floor mid-sentence.
+Default is now `cap.min(DEFAULT_MAX_NEW_TOKENS)` where
+`DEFAULT_MAX_NEW_TOKENS = 8192`. Hardware-verified post-fix:
+`submitting to worker prompt_tokens=15772 max_new=8192`
+(was 1024).
+
+**Phase C — `stream_options.include_usage` honoured (rvllm-serve commit
+`1a70b18`).** Pre-fix the server 400'd with
+`stream_options_unsupported`, causing zeroclaw to retry every
+streaming turn as non-streaming (extra RTT, lost live UX).
+`crates/rvllm-serve/src/openai/{chat.rs,completions.rs}` now expose
+a typed `StreamOptions { include_usage: Option<bool> }`;
+`ChatCompletionChunk` / `CompletionChunk` grow an
+`Option<Usage>` field (omitted via `skip_serializing_if`).
+`chat_stream_sse` / `completion_stream_sse` plumb `include_usage`
+into an `EmitUsage` state that emits one extra
+`{"choices":[],"usage":{...}}` chunk between the finish-reason
+chunk and `[DONE]` — exactly the OpenAI 2024 spec. Validated
+on qwen3-6-35b-a3b: with `include_usage=true` the stream produces
+role + content + finish + usage + `[DONE]`; without it the usage
+chunk is suppressed (no regression).
+
+**Phase D — precheck timeout under long prefill (zeroclaw commit
+`aa8063e3`).** `crates/zeroclaw-config/src/scattered_types.rs ::
+default_precheck_timeout_secs` raised from 5 s to 60 s. The
+reply-intent precheck forwards the full system prompt + history
+to the route model; on a 16 k Rusty persona the prefill alone is
+~20 s, so the 5 s ceiling always tripped and the orchestrator
+fail-opened to REPLY — wasting the precheck's cost and adding
+a 5 s wall-time penalty per turn. Operators on fast cloud APIs
+are unaffected (classifier still returns in < 1 s). Operators can
+override via `agent.precheck.timeout_secs` in `config.toml`.
+
+E2E verified post-all-fixes (webhook to qwen3-6-35b-a3b NVFP4 with
+16 k persona): single rvllm submission, 20 s total wall, complete
+"Ich bin Rusty." reply, no `stream_options_unsupported` 400, no
+`provider streaming failed, falling back to non-streaming chat`
+warning, no `Reply-intent precheck timed out` warning.
+
 ## Known pitfalls
 
 - **`cargo` cwd**: every cargo invocation must be from `v3/`, not
