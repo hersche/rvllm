@@ -476,6 +476,11 @@
       "path": "gated_delta_rule_decode_f16.ptx",
       "sha256": "4008181da23b9fae274b6cc1725e60ee1d2af5889e2978d72d9a368f5e59e668"
     },
+    "gated_delta_rule_decode_f16_v4": {
+      "bytes": 30040,
+      "path": "gated_delta_rule_decode_f16_v4.ptx",
+      "sha256": "e96e94150d156adbe215c405f736b791114a6e4110bad6a42a4468116770d850"
+    },
     "gated_delta_rule_prefill_f16": {
       "bytes": 38412,
       "path": "gated_delta_rule_prefill_f16.ptx",
@@ -1162,5 +1167,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "7d27482"
+  "revision": "9f06c3b"
 }

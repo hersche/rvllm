@@ -374,6 +374,16 @@ pub struct Qwen36OutsideKernels {
     /// Replaces the host-side delta-rule loop in apply_layer_linear_attn.
     pub gated_delta_rule_decode_f16_mod: LoadedModule,
     pub fn_gated_delta_rule_decode_f16: KernelFn,
+    // Task #131 (sibling of #108 for the decode path): 8-wide
+    // accumulator split to break the v_corr / o_acc serial FMA
+    // dependency chain. Same per-thread inner-loop structure as
+    // the v1 decode kernel; tree-reduce 8 partials at end-of-loop.
+    // Numerical contract: pairwise-tree reduction order differs
+    // from v1's strict sequential order — within f32 reduction
+    // noise. Opt-in via `RVLLM_QWEN36_LINEAR_ATTN_DECODE_V4=1`
+    // (default-off until A/B confirms the win on hardware).
+    pub gated_delta_rule_decode_f16_v4_mod: LoadedModule,
+    pub fn_gated_delta_rule_decode_f16_v4: KernelFn,
     /// Batched-prefill counterpart of `gated_delta_rule_decode_f16`.
     /// Processes `num_tokens` Q/K/V/alpha/beta inputs sequentially
     /// with the recurrent state carried inside the kernel — one
@@ -1943,6 +1953,11 @@ impl Qwen36Bringup {
         let gated_delta_rule_decode_f16_mod = kernels.load_ptx("gated_delta_rule_decode_f16")?;
         let fn_gated_delta_rule_decode_f16 =
             gated_delta_rule_decode_f16_mod.get_function("gated_delta_rule_decode_f16_kernel")?;
+        // Task #131: v4 decode sibling (ILP accumulator split, opt-in).
+        let gated_delta_rule_decode_f16_v4_mod =
+            kernels.load_ptx("gated_delta_rule_decode_f16_v4")?;
+        let fn_gated_delta_rule_decode_f16_v4 = gated_delta_rule_decode_f16_v4_mod
+            .get_function("gated_delta_rule_decode_f16_v4_kernel")?;
         // Phase 4b/Linear: prefill-batched delta-rule + conv-state-advance.
         let gated_delta_rule_prefill_f16_mod = kernels.load_ptx("gated_delta_rule_prefill_f16")?;
         let fn_gated_delta_rule_prefill_f16 =
@@ -2172,6 +2187,8 @@ impl Qwen36Bringup {
             fn_gated_delta_state_update_f16,
             gated_delta_rule_decode_f16_mod,
             fn_gated_delta_rule_decode_f16,
+            gated_delta_rule_decode_f16_v4_mod,
+            fn_gated_delta_rule_decode_f16_v4,
             gated_delta_rule_prefill_f16_mod,
             fn_gated_delta_rule_prefill_f16,
             gated_delta_rule_prefill_f16_v2_mod,
@@ -7289,8 +7306,20 @@ impl Qwen36Bringup {
             // Block = head_v_dim threads, one per output row.
             // Shared mem = (2*head_k_dim + head_v_dim) * 4 bytes.
             let smem = (2 * head_k_dim + head_v_dim) * 4;
+            // Task #131: opt-in ILP-split decode kernel. ABI matches
+            // the v1 kernel byte-for-byte; only the per-thread inner
+            // loop differs (8-wide accumulator split + pairwise tree
+            // reduce). Default-off until A/B confirms the win on
+            // hardware.
+            let use_v4 = std::env::var("RVLLM_QWEN36_LINEAR_ATTN_DECODE_V4")
+                .ok().as_deref() == Some("1");
+            let decode_fn = if use_v4 {
+                self.outside_kernels.fn_gated_delta_rule_decode_f16_v4.raw()
+            } else {
+                self.outside_kernels.fn_gated_delta_rule_decode_f16.raw()
+            };
             let rc = cuLaunchKernel(
-                self.outside_kernels.fn_gated_delta_rule_decode_f16.raw() as CUfunction,
+                decode_fn as CUfunction,
                 num_v_heads,
                 1,
                 1,
