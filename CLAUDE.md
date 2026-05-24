@@ -2289,6 +2289,100 @@ single-default bumping would have created a Gemma 4 / Qwen
 register-pressure risk. Resolved 2026-05-22 (task #1) via the
 adaptive `_max16` variant pattern documented in rule (3) above.
 
+## Deferred-work register cleanup — 2026-05-24 (brain tasks 1001b/a/s/v/t/k/t/awq)
+
+Eight high-priority brain tasks reviewed and closed under one batch:
+
+**aa01001kvbrn — brain memory quality filter on chat-history.**
+`zeroclaw-bridge/files/memory_brain.rs::reject_reason` filters
+degenerate assistant content (Hangul soup, `la la la` loops,
+single-token repetition, mostly non-Latin1 bytes, length<5) at both
+`record_chat_turn(actor=assistant)` and `store(...)` write paths
+before the embedding pipeline. Kills the 2026-04-26 reinforcement-loop
+bug class regardless of any future kernel/quant experiment. 8 unit
+tests cover heuristic boundaries. brain commit `ca48922`.
+
+**aa01001vrot — NVFP4 V-rotation lift.** Verified already fully wired
+in prior cycles: V Hadamard rotation under `RVLLM_NVFP4_HADAMARD_V`
+(default ON per `gemma4_bring_up.rs:1154`), `hadamard_unrotate_f16`
+kernel loaded into `Gemma4LayerKernels`, dispatch in
+`Gemma4Layer::execute` post-attn pre-O-proj, PrefixProvenance
+tracks `hadamard_v` for cache invalidation. Coherence guard rejects
+HADAMARD_V=1 without HADAMARD=1. Stale "PARTIAL cycle 17" task
+description closed.
+
+**aa01001srvbug2 — P1/P2 audit closeout.** Verified P1 #3 (sampling
+coerce, Phase #5 above), #4 (tool_choice rejection), #5 (rep-guard
+opt-in + exact-identity tail only), #6 (tier2 nested-braces
+balanced scanner), #7 (text+image+audio content parts), P2 #8
+(invalid_max_tokens reject), #10 (saturating_* throughout) all
+already-shipped. **P2 #9 prefix-cache mutex poison fixed**:
+`Gemma4Bringup::lock_prefix_cache_recover()` recovers from
+`PoisonError::into_inner`, clears the slot to None (presumed
+corrupt — partial write may leave dangling arena ptrs), bumps
+`prefix_cache_poison_recoveries: AtomicU64` for observability,
+WARN line per recovery. 8 call sites (7 in `gemma4_bring_up.rs`,
+1 in `gemma4_spec_primitives.rs::verify_batched_suffix_k_only`)
+updated. rvllm-serve commit `a407a4d`.
+
+**aa01001bf16chain — Stage 3 validation.** Stages 1+2 (kernels +
+dispatch) landed in prior session. Stage 3 hardware A/B on
+gemma-4-31b-it-nvfp4 with explicit `RVLLM_RESIDUAL_BF16=0` (legacy
+F16) vs default (auto-on per `unwrap_or(true)` in cycle 55):
+WHO ("Bundeskanzler") + WEATHER short-context both byte-identical
+between legs; 16k webhook WHO returns coherent Rusty persona reply
+under bf16=1. No regression at any context size. Production-default
+already ON since the cycle-55 flip; explicit env removed from
+profile to keep the default authoritative.
+
+**aa01001ttftbatch — flip run_generate batch prefill default.**
+`gemma4_bring_up.rs:11339` replaced `unwrap_or(false)` with a
+smart-default tri-state:
+  * `RVLLM_BATCH_PREFILL=1` → force batch (diagnostic).
+  * `RVLLM_BATCH_PREFILL=0` → force per-token (legacy).
+  * unset → auto-batch when `prompt_len >= BATCH_PREFILL_MIN_TOKENS`
+    (= 128, matches FAST_PATH_M_MAX boundary; below that the
+    fp8_gemv M=1 path is bandwidth-bound and cost-parity).
+Aux read sites (`PrefixProvenance::from_env`, spec-rollback) keep
+their original `unwrap_or(false)` semantics — they track env state
+for prefix-cache invalidation, not the per-request dispatch.
+Hardware A/B at 108/318/1168/2808 prompt_lens × {OFF, AUTO, ON} =
+12 cells, all byte-identical text + timings within ±50 ms — on
+NVFP4 the per-token and batch paths converge in cost because the
+unified-prefill kernel already amortises setup. The task's
+"vLLM 4× faster" gap was measured on FP8-block; same dispatch
+flip applies. rvllm-serve commit `224656e`.
+
+**aa01001splitkv — NVFP4 split-decode kernel quality bug.** Verified
+resolved: 17k-context WEATHER probe under default
+`RVLLM_NVFP4_SPLIT_KV=1` + `partition_size=1024` returns coherent
+German answer ("Ich habe keinen Zugriff auf Echtzeit-Wetterdaten…").
+Same prompt under `SPLIT_KV=0` (single-CTA) returns identical text.
+The cycle-20 garbage cliff (repetition + multilingual fragments)
+is gone. Likely fixed by the cumulative V=amax6 + Hadamard
+production tuning + partition_size default flip from 512 → 1024.
+
+**aa01001toolcall — long-context Gemma cumulative noise.** Verified
+resolved on gemma-4-31b-it-nvfp4: 17k-context WEATHER prompt with
+a registered `get_weather` tool returns
+`finish_reason: "tool_calls"` + structured
+`get_weather({"city":"Bern"})` call. The cycle-3 failure mode
+(`<tool_call|>` token-49 + multilingual repetition + body garbage)
+is gone, fixed by the cumulative BF16 chain + NVFP4 quality
+defaults shipped through cycles 54-55.
+
+**aa01001awq — AWQ INT4 W4A16 loader + kernel.** Code-side
+infrastructure already landed across all 4 design stages:
+`compressed_tensors.rs` (AwqLinearWeight, upload_awq_linear,
+upload_gemma4_awq_layer, read_awq_config_from_dir), `awq_int4_gemv_f16.cu`
++ `awq_int4_gemm_sm120_wmma.cu` + `mistral35_w4a16_gemm_mma_v8_bf16.cu`
+kernels, `Gemma4LayerKernels::awq_int4_gemv_f16` + `_gemm_sm120_wmma`
+slots with M-based dispatch at `gemma4_layer_exec.rs:1251-1362`.
+Stage 5 validation (smoke against an AWQ Gemma 4 31B checkpoint)
+is operator-gated — requires ~20 GB HuggingFace download of
+`ebircak/gemma-4-31B-it-4bit-W4A16-AWQ` or
+`cyankiwi/gemma-4-31B-it-AWQ-4bit`.
+
 ## Tool calls + brain search + sampling — fixed 2026-05-24 (Phases #1-#5)
 
 Follow-on to the Phases A-D OpenAI-compat work below. The user
