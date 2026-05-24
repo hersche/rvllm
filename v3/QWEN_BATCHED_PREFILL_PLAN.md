@@ -959,3 +959,39 @@ Cumulative progression vs raw GEMV (single linked summary):
 * Phase 19 all 4 (+ shared down): 873 ms (+85.5%)
 * Phase 20 default-flip (V3): 861-880 ms (+85.7%)
 * **Phase 21 V4 default-on: 817-834 ms (+86.4%)**
+
+
+## Phase 22: Router_topk_batched counter unit-bug fix (task #109, 2026-05-24)
+
+Pre-existing Phase-8-era bug surfaced when production zeroclaw
+mobile profile hit its ~16k token persona prompt: garbage replies
+("</think>", "- User: Rusty.") to "who are you", or CUDA
+`AllocFailed` from subsequent HtoD calls.
+
+Root cause: `router_gemv_with_topk_batched_kernel` persistent
+counter region (one i32 per token-slot) was sized by
+`kv_cache_num_blocks` (8192) instead of
+`kv_cache_num_blocks × kv_cache_block_size` (131072). The kernel
+writes per-token; at M > 8192 it OOB-wrote past the 32 KB buffer.
+Subsequent context corruption made all further requests fail.
+
+Bisect path: ALL session-#94..#108 grouped-MMA opts disabled still
+reproduced the failure → ruled out those optimizations. Threshold
+test M=8000 OK, M=12000 FAIL — exactly at the 8192 block boundary
+→ grepped for buffers sized by `kv_cache_num_blocks` → one match
+at `qwen36_bring_up.rs:2627`.
+
+Fix in commit `dbe7bbf`: change `max_tokens` sizing to
+`kv_cache_num_blocks * kv_cache_block_size`.
+
+Verified post-fix (clean profile, all defaults ON, fresh binary
+md5 `00969a8d`):
+* M=15000 direct API → "Hello" (correct first token).
+* 16k webhook ("who are you") → "Ich bin **Rusty**. Ich bin dein
+  Peer, kein Assistent." (persona-grounded German reply, was
+  garbage before).
+
+Important: all #94..#108 A/B numbers stay VALID. Those tests
+maxed at 4412 tokens, well under the 8192 threshold — the bug
+didn't affect them. This fix UNBLOCKS production usability at
+long prompts; it doesn't change perf.
