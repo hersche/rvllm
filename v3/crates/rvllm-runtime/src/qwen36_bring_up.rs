@@ -2618,13 +2618,24 @@ impl Qwen36Bringup {
                 counter_region.device_ptr();
         }
         // Phase 8 batched router+topk fusion: per-token counter
-        // slots sized by `kv_cache_num_blocks` (the per-worker
-        // upper bound on prefill token count). Zeroed once via
-        // a single cuMemsetD8Async; the kernel resets each
-        // token's slot after use, so the region stays at all-
-        // zeros across requests.
+        // slots, ONE i32 per token. Sized by max prefill token
+        // count = kv_cache_num_blocks × kv_cache_block_size.
+        //
+        // BUG FIX 2026-05-24 (task #109): previous code mistakenly
+        // sized this with `kv_cache_num_blocks` (the BLOCK count,
+        // not the TOKEN count). At kv_cache_block_size=16 the
+        // buffer was 16× too small → prompts >8192 tokens OOB-wrote
+        // the per-token counter index, corrupting CUDA context
+        // (next HtoD failed with AllocFailed). The bug was
+        // pre-existing and only surfaced at zeroclaw's ~15.7k
+        // persona prompts; smaller prefills never tripped it.
+        // Zeroed once via a single cuMemsetD8Async; the kernel
+        // resets each token's slot after use, so the region stays
+        // at all-zeros across requests.
         {
-            let max_tokens = bringup.kv_cache_num_blocks as usize;
+            let max_tokens =
+                (bringup.kv_cache_num_blocks as usize)
+                * (bringup.kv_cache_block_size as usize);
             let counter_b_bytes = max_tokens * 4;
             let counter_b_region = bringup.arena.region(
                 "qwen36_router_topk_batched_counter",
