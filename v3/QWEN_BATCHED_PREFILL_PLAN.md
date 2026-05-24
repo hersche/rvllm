@@ -925,3 +925,37 @@ Each opt-out is independent. Production profiles can stay clean
 (no env knobs needed); operators wanting GEMV diagnostics flip
 the relevant `=0` env. Mistral V8 (#104) and Gemma ViT bf16 (#105)
 stayed correctly default-OFF based on per-model A/B.
+
+
+## Phase 21: Linear-attn v4 ILP accumulator split (task #108, 2026-05-24, +5.6% / +86.4% cumulative)
+
+`gated_delta_rule_prefill_f16_v4_kernel` (commit `4027562`)
+attacks the inner-loop FMA dependency chain. v3 kept ONE
+accumulator per phase (`v_corr`, `o_acc`) → 128 serial FMAs ×
+4-cycle latency = 512-cycle critical path per token. v4 splits
+into 8 parallel partials summed via pairwise tree → 64-cycle
+critical path. Same total FMA count; ILP exposed.
+
+Numerical contract: same as v3 (no inner f16 RTNE). Pairwise tree
+reduction order produces tiny bit differences vs v3, no quality
+regression. Default-flipped ON; opt-out
+`RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V4=0` → v3 fallback verified.
+
+A/B (deterministic 3 runs):
+
+  | Cell                | 1112 tok      | 4412 tok      |
+  |---------------------|---------------|---------------|
+  | GEMV baseline       |   6020 ms     |  24775 ms     |
+  | v3 (#101)           |    861-880 ms |  3782-3830 ms |
+  | **v4 (default-on)** | **817-834 ms**| **3603-3641 ms**|
+  | Win vs v3           |  +5.6%        |  +4.8%        |
+  | Cumulative vs GEMV  | **+86.4%**    | **+85.4%**    |
+
+Cumulative progression vs raw GEMV (single linked summary):
+* Phase 4-7 baseline: 6020 ms
+* Phase 12 dual_silu grouped: 2533 ms (+57.9%)
+* Phase 14 both grouped: 955 ms (+84.1%)
+* Phase 18 all 3 (+ shared dual_silu): 907 ms (+84.9%)
+* Phase 19 all 4 (+ shared down): 873 ms (+85.5%)
+* Phase 20 default-flip (V3): 861-880 ms (+85.7%)
+* **Phase 21 V4 default-on: 817-834 ms (+86.4%)**

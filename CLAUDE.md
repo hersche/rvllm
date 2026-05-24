@@ -1306,6 +1306,34 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 linear-attn v4 ILP accumulator split — task #108 (2026-05-24, +5.6% / +86.4% cumulative, default-on)
+
+`gated_delta_rule_prefill_f16_v4_kernel` (commit `4027562`)
+attacks the per-token inner-loop FMA dependency chain. v3 kept a
+single `v_corr` / `o_acc` accumulator per phase → 128 serial FMAs
+× 4-cycle latency = 512-cycle critical path per token. v4 splits
+into 8 parallel partials summed via pairwise tree → 64-cycle
+critical path. Total FMAs unchanged; ILP exposed for sm_121.
+
+Numerical contract: same as v3 (no inner f16 RTNE; only boundary
+state rounding). Reduction order is pairwise tree — tiny bit
+differences vs v3, no quality regression.
+
+Default-flipped ON in same commit after hardware A/B. Opt-out via
+`RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V4=0` falls back to v3.
+
+A/B (qwen3-6-35b-a3b NVFP4, default-on grouped MMA stack as
+baseline, deterministic 3 runs):
+
+  | Cell                | 1112 tok      | 4412 tok      |
+  |---------------------|---------------|---------------|
+  | v3 baseline         |  861-880 ms   |  3782-3830 ms |
+  | **v4 (default-on)** | **817-834 ms**| **3603-3641 ms**|
+  | Win vs v3           |  **+5.6%**    |  **+4.8%**    |
+  | Cumulative vs GEMV  |  **+86.4%**   |  **+85.4%**   |
+
+Quality verified on 50-word quantum entanglement.
+
 ### Qwen 3.5 27B + E4B audit for dormant fast-paths — task #107 (2026-05-24)
 
 Same investigation pattern as #102 (Gemma 4 NVFP4's MMA_V8 surfaced
