@@ -1306,6 +1306,39 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### Qwen 3.5 27B + E4B audit for dormant fast-paths — task #107 (2026-05-24)
+
+Same investigation pattern as #102 (Gemma 4 NVFP4's MMA_V8 surfaced
+a 14.6× win). Audit results:
+
+**Qwen 3.5 27B (qwen35 bring-up, used by qwen3-6-27b)**:
+* `RVLLM_QWEN35_BATCHED_PREFILL` (default-OFF) — only env-gated
+  dormant fast-path. Hardware A/B on qwen3-6-27b:
+
+  | Cell                    | 1k tok       | 4k tok        |
+  |-------------------------|--------------|---------------|
+  | BATCHED_PREFILL=OFF     | 813-1054 ms  | 10986-11199 ms|
+  | BATCHED_PREFILL=ON      | 813-823  ms  | 11062-11359 ms|
+
+  PARITY within noise — no measurable win. The per-token path is
+  already well-optimised. **Leave default-OFF.**
+* CUTLASS SM120 paths (`RVLLM_QWEN35_*_CUTLASS_MIN_TOKENS`) — wired
+  with sensible defaults (M≥128 gate). Already on.
+* `RVLLM_QWEN35_FP8_GEMV_RESIDUAL_FUSED` — default-on (verified ON
+  in code, `.unwrap_or(true)`).
+
+**Gemma 4 E4B (gemma4 bring-up)**:
+* `RVLLM_FP8_GEMM_CUTLASS_SM120` — default-on (requires explicit
+  `=0` to disable). Already covers E4B's prefill GEMM hot path.
+* Other env knobs are debug/diagnostic (`SPEC_*`, `BOUNDARY_DUMP*`,
+  `SMOKE_*`), not perf gates.
+* No dormant fast-path discovered.
+
+Result: no flips. Both models' prefill paths are already on their
+best available kernels. The #102 pattern (kernel loaded but env-
+gated off) was specific to Gemma 4 NVFP4's MMA_V8 dispatch — the
+audit confirms it doesn't repeat elsewhere on Qwen 3.5 / E4B.
+
 ### qwen36 default-flip: all grouped MMA + linear-attn V3 default-ON — commit `d195eab` (2026-05-24)
 
 Flipped 5 env knobs from default-OFF → default-ON after end-to-end
