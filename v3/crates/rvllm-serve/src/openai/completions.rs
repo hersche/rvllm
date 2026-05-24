@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::openai::chat::StopField;
+use crate::openai::chat::{StopField, StreamOptions};
 use crate::openai::types::{FinishReason, Usage};
 use crate::sampling::SamplingParams;
 
@@ -39,7 +39,10 @@ pub struct CompletionRequest {
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub response_format: Option<serde_json::Value>,
-    pub stream_options: Option<serde_json::Value>,
+    /// See [`crate::openai::chat::StreamOptions`]. Honoured for
+    /// streaming completions (final `usage` chunk before `[DONE]`);
+    /// ignored for non-streaming responses.
+    pub stream_options: Option<StreamOptions>,
 }
 
 impl Default for CompletionRequest {
@@ -122,6 +125,32 @@ pub struct CompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<CompletionChunkChoice>,
+    /// Populated only on the final "usage" chunk emitted when the
+    /// client opted in via `stream_options.include_usage = true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+impl CompletionChunk {
+    pub fn new(
+        id: String,
+        created: u64,
+        model: String,
+        choices: Vec<CompletionChunkChoice>,
+    ) -> Self {
+        Self { id, object: "text_completion", created, model, choices, usage: None }
+    }
+
+    pub fn usage_only(id: String, created: u64, model: String, usage: Usage) -> Self {
+        Self {
+            id,
+            object: "text_completion",
+            created,
+            model,
+            choices: Vec::new(),
+            usage: Some(usage),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

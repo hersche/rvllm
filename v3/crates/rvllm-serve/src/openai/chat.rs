@@ -59,11 +59,12 @@ pub struct ChatCompletionRequest {
     /// uses a different formula). Captured + 400'd until wired.
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
-    /// `stream_options`: clients use this to request usage in the
-    /// final SSE chunk. Captured + 400'd; supporting it is a small
-    /// follow-up but until then we reject so callers don't think
-    /// they got it.
-    pub stream_options: Option<serde_json::Value>,
+    /// `stream_options`: clients (zeroclaw, OpenAI SDKs) set
+    /// `include_usage: true` to ask the server to append a final SSE
+    /// chunk with `choices: []` and `usage: {...}` before `[DONE]`.
+    /// Honoured for streaming responses; ignored when `stream: false`
+    /// (the regular response already carries `usage`).
+    pub stream_options: Option<StreamOptions>,
 
     /// Mistral 3.5's `reasoning_effort` knob. Allowed values:
     /// `"none"` (default — direct reply) and `"high"` (long-form
@@ -125,6 +126,15 @@ impl ChatCompletionRequest {
             seed: self.seed,
         }
     }
+}
+
+/// OpenAI `stream_options` knob. Only `include_usage` is honoured.
+/// Other fields (none currently spec'd) are tolerated as unknown by
+/// `serde(default)` on the parent struct.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct StreamOptions {
+    pub include_usage: Option<bool>,
 }
 
 /// `stop` can be a string, array of strings, or null.
@@ -482,7 +492,10 @@ pub struct ChatAssistantMessage {
 // ─── Streaming (SSE) chunks ──────────────────────────────────────────
 
 /// One SSE chunk. OpenAI streams `data: {..}\n\n` per token, ending
-/// with `data: [DONE]\n\n`.
+/// with `data: [DONE]\n\n`. When the client sent
+/// `stream_options.include_usage = true`, the server emits one extra
+/// chunk with `choices: []` and a populated `usage` immediately
+/// before `[DONE]`. Normal token chunks leave `usage` absent.
 #[derive(Debug, Serialize)]
 pub struct ChatCompletionChunk {
     pub id: String,
@@ -490,6 +503,33 @@ pub struct ChatCompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChatChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+impl ChatCompletionChunk {
+    /// Build a regular token-bearing chunk (no `usage`).
+    pub fn new(
+        id: String,
+        created: u64,
+        model: String,
+        choices: Vec<ChatChunkChoice>,
+    ) -> Self {
+        Self { id, object: "chat.completion.chunk", created, model, choices, usage: None }
+    }
+
+    /// Build the final usage-only chunk (`choices: []`) emitted when
+    /// `stream_options.include_usage = true`.
+    pub fn usage_only(id: String, created: u64, model: String, usage: Usage) -> Self {
+        Self {
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: Vec::new(),
+            usage: Some(usage),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

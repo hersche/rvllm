@@ -257,6 +257,7 @@ fn slash_command_sse(
             },
             finish_reason: Some(FinishReason::Stop),
         }],
+        usage: None,
     };
     let _ = request_id;
     let events: SseStream = Box::pin(stream::iter(vec![
@@ -919,6 +920,11 @@ pub async fn chat_completions(
         // Cycle 37: stream+stop rejection lifted to pre-tokenize above.
         // Hand the admission permit to the stream so it lives as long
         // as the SSE response, not just the handler scope.
+        let include_usage = req
+            .stream_options
+            .as_ref()
+            .and_then(|o| o.include_usage)
+            .unwrap_or(false);
         Ok(ChatCompletionsResponse::Stream(chat_stream_sse(
             model_id,
             tokenizer,
@@ -928,6 +934,7 @@ pub async fn chat_completions(
             remaining,
             request_id,
             Some(_admission),
+            include_usage,
         )))
     } else {
         let _cancel_guard = CancelOnDrop(cancelled.clone());
@@ -1255,6 +1262,10 @@ fn chat_stream_sse(
     // try_admit while the previous request is still actively running
     // on the worker.
     admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    // When true (caller passed `stream_options.include_usage`), emit
+    // one extra chunk with `choices: []` and `usage: {...}` after the
+    // final finish_reason chunk and before `[DONE]`.
+    include_usage: bool,
 ) -> axum::response::Response {
     let id = new_chat_completion_id();
     let created = unix_now_secs();
@@ -1311,7 +1322,18 @@ fn chat_stream_sse(
             streamed_visible: String,
         },
         FlushToolCalls(Vec<ToolCall>),
-        Finish(FinishReason),
+        /// Finish(reason, usage_after) — `usage_after` carries the
+        /// captured (prompt_tokens, completion_tokens) when the caller
+        /// opted into `stream_options.include_usage`. After emitting
+        /// the terminal chunk, the loop transitions to `EmitUsage`
+        /// (if Some) or `Done` (if None).
+        Finish {
+            reason: FinishReason,
+            usage_after: Option<(u32, u32)>,
+        },
+        /// Emit one extra chunk: `choices: []` with `usage` populated.
+        /// Spec'd behavior of `stream_options.include_usage = true`.
+        EmitUsage { prompt: u32, completion: u32 },
         /// Worker errored or its channel closed unexpectedly. Emit an
         /// OpenAI-shaped `data: {"error":{...}}` event, then `[DONE]`.
         EmitError(String),
@@ -1327,6 +1349,13 @@ fn chat_stream_sse(
         cancelled: Arc<AtomicBool>,
         deadline: tokio::time::Instant,
         request_id: Uuid,
+        /// Whether the caller asked for a final usage chunk via
+        /// `stream_options.include_usage = true`.
+        include_usage: bool,
+        /// Set by the Done arm when transitioning through
+        /// FlushToolCalls so the resulting Finish state can still
+        /// carry the captured usage tuple.
+        pending_usage_after: Option<(u32, u32)>,
         // Released on Drop together with the rest of the Ctx — i.e.
         // when the stream ends or the client disconnects. Marked
         // `_` because it is only here for its lifetime.
@@ -1357,6 +1386,8 @@ fn chat_stream_sse(
         cancelled,
         deadline,
         request_id,
+        include_usage,
+        pending_usage_after: None,
         _admission: admission,
     };
     let _ = tokenizer; // keep for clone clarity
@@ -1378,6 +1409,7 @@ fn chat_stream_sse(
                             delta: ChatDelta::role(Role::Assistant),
                             finish_reason: None,
                         }],
+                        usage: None,
                     };
                     ctx.state = S::Content {
                         rx, decoder, accum, emitted, in_tool, token_ids, streamed_visible,
@@ -1462,6 +1494,7 @@ fn chat_stream_sse(
                                                 delta: ChatDelta::content(chunk_text),
                                                 finish_reason: None,
                                             }],
+                                            usage: None,
                                         };
                                         ctx.state = S::Content {
                                             rx, decoder, accum, emitted, in_tool,
@@ -1495,6 +1528,7 @@ fn chat_stream_sse(
                                                     delta: ChatDelta::content(chunk_text),
                                                     finish_reason: None,
                                                 }],
+                                                usage: None,
                                             };
                                             ctx.state = S::Content {
                                                 rx, decoder, accum, emitted, in_tool,
@@ -1550,6 +1584,14 @@ fn chat_stream_sse(
                             // `tool_calls` delta and flip finish to
                             // ToolCalls. Otherwise drain any visible
                             // suffix held back by safe_content_emit_end.
+                            // Capture usage tuple when the client
+                            // requested include_usage so we can emit
+                            // the extra chunk after Finish.
+                            let usage_after = if ctx.include_usage {
+                                Some((prompt_tokens, completion_tokens))
+                            } else {
+                                None
+                            };
                             let parsed = parse_gemma4_tool_calls(&accum);
                             if !parsed.is_empty() {
                                 let calls = parsed
@@ -1563,7 +1605,16 @@ fn chat_stream_sse(
                                         },
                                     })
                                     .collect();
+                                // FlushToolCalls flips finish to
+                                // ToolCalls — carry usage_after via
+                                // ctx by stashing it on the Finish
+                                // state when FlushToolCalls completes.
+                                // Easier: drop the prose-drain branch
+                                // into FlushToolCalls's continuation.
                                 ctx.state = S::FlushToolCalls(calls);
+                                // Stash so the FlushToolCalls arm can
+                                // forward it into the next Finish.
+                                ctx.pending_usage_after = usage_after;
                                 continue;
                             }
                             // No tool call — drain residue. Apply
@@ -1583,11 +1634,12 @@ fn chat_stream_sse(
                                         delta: ChatDelta::content(tail),
                                         finish_reason: None,
                                     }],
+                                    usage: None,
                                 };
-                                ctx.state = S::Finish(finish);
+                                ctx.state = S::Finish { reason: finish, usage_after };
                                 return Some((Ok(sse_json(&chunk)), ctx));
                             }
-                            ctx.state = S::Finish(finish);
+                            ctx.state = S::Finish { reason: finish, usage_after };
                             continue;
                         }
                         // Worker error / channel close used to be mapped to
@@ -1634,11 +1686,13 @@ fn chat_stream_sse(
                             delta: ChatDelta::tool_calls(calls),
                             finish_reason: None,
                         }],
+                        usage: None,
                     };
-                    ctx.state = S::Finish(FinishReason::ToolCalls);
+                    let usage_after = ctx.pending_usage_after.take();
+                    ctx.state = S::Finish { reason: FinishReason::ToolCalls, usage_after };
                     return Some((Ok(sse_json(&chunk)), ctx));
                 }
-                S::Finish(reason) => {
+                S::Finish { reason, usage_after } => {
                     let chunk = ChatCompletionChunk {
                         id: ctx.id.clone(),
                         object: "chat.completion.chunk",
@@ -1649,7 +1703,26 @@ fn chat_stream_sse(
                             delta: ChatDelta::done(),
                             finish_reason: Some(reason),
                         }],
+                        usage: None,
                     };
+                    ctx.state = match usage_after {
+                        Some((p, c)) => S::EmitUsage { prompt: p, completion: c },
+                        None => S::Done,
+                    };
+                    return Some((Ok(sse_json(&chunk)), ctx));
+                }
+                S::EmitUsage { prompt, completion } => {
+                    let usage = crate::openai::types::Usage {
+                        prompt_tokens: prompt,
+                        completion_tokens: completion,
+                        total_tokens: prompt + completion,
+                    };
+                    let chunk = ChatCompletionChunk::usage_only(
+                        ctx.id.clone(),
+                        ctx.created,
+                        ctx.model.clone(),
+                        usage,
+                    );
                     ctx.state = S::Done;
                     return Some((Ok(sse_json(&chunk)), ctx));
                 }
@@ -2046,6 +2119,11 @@ pub async fn completions(
 
     if req.stream {
         // Cycle 37: stream+stop rejection lifted to pre-tokenize above.
+        let include_usage = req
+            .stream_options
+            .as_ref()
+            .and_then(|o| o.include_usage)
+            .unwrap_or(false);
         Ok(CompletionsResponse::Stream(completion_stream_sse(
             model_id,
             tokenizer,
@@ -2054,6 +2132,7 @@ pub async fn completions(
             state.config.sse_keepalive,
             remaining,
             Some(_admission),
+            include_usage,
         )))
     } else {
         let _cancel_guard = CancelOnDrop(cancelled.clone());
@@ -2184,6 +2263,10 @@ fn completion_stream_sse(
     // See chat_stream_sse: the permit lives inside the stream so it
     // is released only when the SSE response ends.
     admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    // Spec'd OpenAI `stream_options.include_usage` flag — when true,
+    // the SSE stream emits one extra `choices: []`/`usage: {...}`
+    // chunk before `[DONE]`.
+    include_usage: bool,
 ) -> axum::response::Response {
     let id = new_completion_id();
     let created = unix_now_secs();
@@ -2194,7 +2277,11 @@ fn completion_stream_sse(
             rx: mpsc::UnboundedReceiver<GenerateEvent>,
             decoder: crate::tokenize::StreamDecoder,
         },
-        Finish(FinishReason),
+        Finish {
+            reason: FinishReason,
+            usage_after: Option<(u32, u32)>,
+        },
+        EmitUsage { prompt: u32, completion: u32 },
         /// Worker errored or its channel closed unexpectedly. Same
         /// rationale as the chat SSE handler — emit a clear OpenAI
         /// error event before `[DONE]` rather than collapsing onto
@@ -2211,6 +2298,7 @@ fn completion_stream_sse(
         model: String,
         cancelled: Arc<AtomicBool>,
         deadline: tokio::time::Instant,
+        include_usage: bool,
         _admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     }
 
@@ -2227,6 +2315,7 @@ fn completion_stream_sse(
         model: model_id,
         cancelled,
         deadline,
+        include_usage,
         _admission: admission,
     };
 
@@ -2272,6 +2361,7 @@ fn completion_stream_sse(
                                     finish_reason: None,
                                     logprobs: None,
                                 }],
+                                usage: None,
                             };
                             ctx.state = S::Content { rx, decoder };
                             return Some((Ok(sse_json(&chunk)), ctx));
@@ -2291,8 +2381,13 @@ fn completion_stream_sse(
                             continue;
                         }
                     },
-                    Some(GenerateEvent::Done { finish, .. }) => {
-                        ctx.state = S::Finish(finish);
+                    Some(GenerateEvent::Done { finish, prompt_tokens, completion_tokens }) => {
+                        let usage_after = if ctx.include_usage {
+                            Some((prompt_tokens, completion_tokens))
+                        } else {
+                            None
+                        };
+                        ctx.state = S::Finish { reason: finish, usage_after };
                         continue;
                     }
                     Some(GenerateEvent::SpeculativeStep { drafted, accepted, cumulative_decoded }) => {
@@ -2323,7 +2418,7 @@ fn completion_stream_sse(
                     }
                     }
                 }
-                S::Finish(reason) => {
+                S::Finish { reason, usage_after } => {
                     let chunk = CompletionChunk {
                         id: ctx.id.clone(),
                         object: "text_completion",
@@ -2335,7 +2430,26 @@ fn completion_stream_sse(
                             finish_reason: Some(reason),
                             logprobs: None,
                         }],
+                        usage: None,
                     };
+                    ctx.state = match usage_after {
+                        Some((p, c)) => S::EmitUsage { prompt: p, completion: c },
+                        None => S::Done,
+                    };
+                    return Some((Ok(sse_json(&chunk)), ctx));
+                }
+                S::EmitUsage { prompt, completion } => {
+                    let usage = crate::openai::types::Usage {
+                        prompt_tokens: prompt,
+                        completion_tokens: completion,
+                        total_tokens: prompt + completion,
+                    };
+                    let chunk = CompletionChunk::usage_only(
+                        ctx.id.clone(),
+                        ctx.created,
+                        ctx.model.clone(),
+                        usage,
+                    );
                     ctx.state = S::Done;
                     return Some((Ok(sse_json(&chunk)), ctx));
                 }
@@ -2418,15 +2532,9 @@ fn reject_v1_unsupported_chat(
             "penalty_unsupported",
         ));
     }
-    if req.stream_options.is_some() {
-        return Err(ApiError::invalid_param(
-            "stream_options (e.g. include_usage) is not yet supported; \
-             usage counts are returned with the final SSE chunk only \
-             on non-streaming requests.",
-            "stream_options",
-            "stream_options_unsupported",
-        ));
-    }
+    // `stream_options.include_usage` is honoured by the SSE path —
+    // see `chat_stream_sse`. Non-streaming requests already carry
+    // `usage` in the regular response body so the flag is a no-op there.
     // `max_completion_tokens` is the OpenAI 2025 rename of
     // `max_tokens` and is what the modern Python / TypeScript SDKs
     // (gpt-4-omni / gpt-4-turbo defaults) actually send. We accept
@@ -2555,13 +2663,7 @@ fn reject_v1_unsupported_completions(req: &CompletionRequest) -> ApiResult<()> {
             "penalty_unsupported",
         ));
     }
-    if req.stream_options.is_some() {
-        return Err(ApiError::invalid_param(
-            "stream_options (e.g. include_usage) is not yet supported.",
-            "stream_options",
-            "stream_options_unsupported",
-        ));
-    }
+    // `stream_options.include_usage` is honoured by `completion_stream_sse`.
     if req.n.is_some_and(|n| n != 1) {
         return Err(ApiError::invalid_param(
             "n must be 1",
@@ -2600,8 +2702,17 @@ fn reject_v1_unsupported_completions(req: &CompletionRequest) -> ApiResult<()> {
     Ok(())
 }
 
+/// Default ceiling for `max_tokens` when the caller omits the field.
+/// Picked so the typical chat reply (long persona answer, multi-step
+/// reasoning) finishes naturally without hitting `finish_reason=length`
+/// while still bounding runaway generations on long-context profiles
+/// (RVLLM_MAX_TOKENS_CAP ≥ 32k). The prior default of 1024 silently
+/// truncated zeroclaw replies mid-sentence — see
+/// rvllm-serve/CLAUDE.md "Phase B" notes.
+const DEFAULT_MAX_NEW_TOKENS: u32 = 8192;
+
 fn resolve_max_new(requested: Option<u32>, cap: u32) -> ApiResult<u32> {
-    let m = requested.unwrap_or(cap.min(1024));
+    let m = requested.unwrap_or(cap.min(DEFAULT_MAX_NEW_TOKENS));
     if m == 0 {
         return Err(ApiError::invalid_param(
             "max_tokens must be > 0",
