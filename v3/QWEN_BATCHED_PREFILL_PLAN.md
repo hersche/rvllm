@@ -995,3 +995,38 @@ Important: all #94..#108 A/B numbers stay VALID. Those tests
 maxed at 4412 tokens, well under the 8192 threshold — the bug
 didn't affect them. This fix UNBLOCKS production usability at
 long prompts; it doesn't change perf.
+
+
+## Phase 23: Large-M validation 16k/32k (task #110, 2026-05-24)
+
+End-to-end Phase 1-5 validation that the session-#94..#108 grouped-MMA
++ linear-attn V4 stack (default-on post-#109) actually wins at
+production-scale prompts.
+
+Setup: stopped support services (chatterbox, whisper-fast,
+vllm-embedding, zeroclaw) freeing ~22 GB host RAM. Bumped
+`RVLLM_ARENA_GB=80` in the mobile profile. Direct API, 3-run
+deterministic, fresh binary md5 `00969a8d`.
+
+  | M       | Phase 1 baseline (all OFF) | Phase 2 all-on (default) | Speedup |
+  |---------|----------------------------|--------------------------|---------|
+  | 1112    | (#108 ref 817 ms)          | 818-819 ms               | held    |
+  | 16000   | 203961-204134 (avg 204042) | 60886-61304 (avg 61019)  | **3.34×** |
+  | 32000   | 489879-489993 (avg 489920) | 204596-205190 (avg 204832)| **2.39×** |
+
+All 12 cells produced coherent multi-sentence German. No quality
+regression at any M. Wins scale inversely with M (fixed-cost
+amortisation pattern).
+
+Phase 5c — full zeroclaw 16k-persona webhook end-to-end returned
+persona-grounded multi-paragraph German reply ("Ich bin **Rusty**.
+Ich bin kein freundlicher Assistent..."). Pre-#109 it returned
+`</think>` garbage.
+
+`RVLLM_ARENA_GB=80` kept in mobile profile permanently — was needed
+for 32k prompts without OOM headroom risk.
+
+Cumulative session perf summary (qwen3-6-35b-a3b NVFP4 mobile):
+* 1112 tok: 6020 → 817 ms (7.4× / +86.4%)
+* 16k tok: 204042 → 61019 ms (3.34× / +70.1%)
+* 32k tok: 489920 → 204832 ms (2.39× / +58.2%)
