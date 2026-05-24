@@ -1306,6 +1306,40 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 router_topk_batched counter unit-bug fix — task #109 (2026-05-24)
+
+Pre-existing bug surfaced when production zeroclaw mobile profile
+hit its 16k-token persona prompt. User saw garbage replies
+("</think>", "- User: Rusty.") to "who are you". Bisect showed
+the bug existed even with ALL session-#94..#108 grouped-MMA opts
+disabled — NOT a regression from those, but an unrelated pre-
+existing problem only surfaced now (no prior tests hit >8192 tok).
+
+**Root cause**: `router_gemv_with_topk_batched` persistent counter
+region (one i32 per token-slot, written by the per-token kernel)
+was sized by `kv_cache_num_blocks` (8192) instead of
+`kv_cache_num_blocks * kv_cache_block_size` (131072). At M > 8192
+the kernel OOB-wrote past the buffer → CUDA context corruption →
+subsequent HtoD failed with AllocFailed → all further requests
+returned "qwen36 per-request reset: MemcpyFailed".
+
+Diagnostic threshold: M=8000 OK, M=12000 FAIL — exactly at the
+8192 block boundary.
+
+Fix in commit `dbe7bbf`: line 2628 sizing changed to
+`kv_cache_num_blocks * kv_cache_block_size`.
+
+Verified post-fix (all defaults ON, fresh binary md5 `00969a8d`):
+* M=15000 direct API → "Hello" (correct).
+* 16k webhook ("who are you") → "Ich bin **Rusty**. Ich bin dein
+  Peer, kein Assistent." (persona-grounded German reply, was
+  garbage before).
+
+Important note: all previous A/B numbers (#94..#108, up to
+4412 tok) remain valid — they were well under the 8192 threshold.
+The optimizations weren't broken; this counter buffer's sizing
+just made M>8192 unusable regardless of any opt being on/off.
+
 ### qwen36 linear-attn v4 ILP accumulator split — task #108 (2026-05-24, +5.6% / +86.4% cumulative, default-on)
 
 `gated_delta_rule_prefill_f16_v4_kernel` (commit `4027562`)
