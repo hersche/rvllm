@@ -11336,7 +11336,32 @@ impl Gemma4Bringup {
             .swap(false, std::sync::atomic::Ordering::AcqRel);
         let skip_decode = force_prefill_only
             || std::env::var_os("RVLLM_DIAG_SKIP_DECODE").is_some();
-        let requested_batch_prefill = parse_truthy_env("RVLLM_BATCH_PREFILL").unwrap_or(false);
+        // ttftbatch task (aa01001ttftbatch) — smart default for the
+        // batch-prefill dispatch. Three regimes:
+        //   * `RVLLM_BATCH_PREFILL=1` — operator force-enables the
+        //     unified multi-Q prefill path regardless of prompt size
+        //     (diagnostic / benchmarking).
+        //   * `RVLLM_BATCH_PREFILL=0` — operator force-disables;
+        //     legacy per-token prefill loop runs even on long prompts.
+        //   * unset — auto-enable when `prompt_len >= BATCH_PREFILL_MIN_TOKENS`.
+        //     Short prompts (<128) stay on per-token: at that scale
+        //     fp8_gemv launch floor dominates and bandwidth-bound
+        //     short calls are cost-parity with the batched path, so
+        //     a flat default-on for tiny prompts adds launch overhead
+        //     with no win. The threshold matches FAST_PATH_M_MAX=127
+        //     in gemma4_layer_exec.rs — below it the M=1 gemv keeps
+        //     the 2-D blockscale fast path; above it CUTLASS SM120
+        //     and the unified-prefill kernel come online.
+        const BATCH_PREFILL_MIN_TOKENS: u32 = 128;
+        let requested_batch_prefill = match std::env::var("RVLLM_BATCH_PREFILL")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") => true,
+            Some("0") | Some("false") | Some("FALSE") | Some("no") => false,
+            _ => prompt_len >= BATCH_PREFILL_MIN_TOKENS,
+        };
         // Vision-splice availability gate (Codex review #1 round 5).
         // The vision-embedding splice into residual_ptr lives ONLY in
         // the batch-prefill code path (the post-EmbeddingGather hook
