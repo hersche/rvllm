@@ -7807,9 +7807,10 @@ impl Qwen36Bringup {
             let use_v2 = std::env::var("RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V2")
                 .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
                 .unwrap_or(false);
+            // Task: flipped default ON 2026-05-24. Opt-out=0.
             let use_v3 = std::env::var("RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V3")
-                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
-                .unwrap_or(false);
+                .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE"))
+                .unwrap_or(true);
             let kfn = if use_v3 {
                 self.outside_kernels.fn_gated_delta_rule_prefill_f16_v3.raw() as CUfunction
             } else if use_v2 {
@@ -10174,9 +10175,11 @@ impl Qwen36Bringup {
                 //   RVLLM_QWEN36_MOE_MMA_DUAL_SILU=1 → task #93 first cut
                 //   (both unset)                    → legacy GEMV
                 // GROUPED takes precedence when both are set.
+                // Task: flipped default ON 2026-05-24 after #103 validation.
+                // Opt-out via RVLLM_QWEN36_MOE_MMA_GROUPED=0.
                 let use_grouped = std::env::var("RVLLM_QWEN36_MOE_MMA_GROUPED")
-                    .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
-                    .unwrap_or(false);
+                    .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE"))
+                    .unwrap_or(true);
                 let use_mma = !use_grouped
                     && std::env::var("RVLLM_QWEN36_MOE_MMA_DUAL_SILU")
                         .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
@@ -10637,9 +10640,10 @@ impl Qwen36Bringup {
             // expert sort + tile_table + grouped MMA against the
             // (k_round-major) silu_b output and atomic-adds the
             // per-row top_w-weighted contributions to rs_b.
+            // Task: flipped default ON 2026-05-24. Opt-out=0.
             let down_grouped = std::env::var("RVLLM_QWEN36_MOE_MMA_DOWN_GROUPED")
-                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
-                .unwrap_or(false);
+                .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE"))
+                .unwrap_or(true);
             #[cfg(feature = "cuda")]
             if down_grouped {
                 use cudarc::driver::sys::*;
@@ -11060,10 +11064,11 @@ impl Qwen36Bringup {
                 // Task #103: opt-in W=4 grouped MMA path. Same arg
                 // signature as the GEMV variant; covers [M=16, N=32]
                 // per block instead of (m=1, n=8). Default-off.
+                // Task: flipped default ON 2026-05-24. Opt-out=0.
                 let use_mma = (n_int % 32 == 0)
                     && std::env::var("RVLLM_QWEN36_MOE_SHARED_MMA")
-                        .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
-                        .unwrap_or(false);
+                        .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE"))
+                        .unwrap_or(true);
                 let (gx, gy, blk, smem_bytes, kfn): (u32, u32, u32, u32, CUfunction) =
                     if use_mma {
                         (((n_int + 31) / 32) as u32,
@@ -11102,10 +11107,11 @@ impl Qwen36Bringup {
             // (NOT fp8_proj_dispatch which would route to a different
             // m≥2 GEMM path; codex round-27 explicit).
             // Task #106: opt-in W=4 grouped MMA path.
+            // Task: flipped default ON 2026-05-24. Opt-out=0.
             let down_use_mma = (n_down as i32 % 32 == 0)
                 && std::env::var("RVLLM_QWEN36_MOE_SHARED_DOWN_MMA")
-                    .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
-                    .unwrap_or(false);
+                    .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE"))
+                    .unwrap_or(true);
             if down_use_mma {
                 #[cfg(feature = "cuda")]
                 unsafe {
