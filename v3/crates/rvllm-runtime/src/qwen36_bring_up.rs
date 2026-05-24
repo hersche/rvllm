@@ -397,6 +397,10 @@ pub struct Qwen36OutsideKernels {
     // Opt-in via `RVLLM_QWEN36_MOE_SHARED_MMA=1`.
     pub fp8_mma_shared_dual_silu_m16_w4c_mod: LoadedModule,
     pub fn_fp8_mma_shared_dual_silu_m16_w4c: KernelFn,
+    // Task #106: grouped MMA for shared-expert down. Opt-in via
+    // `RVLLM_QWEN36_MOE_SHARED_DOWN_MMA=1`.
+    pub fp8_mma_shared_down_m16_w4c_mod: LoadedModule,
+    pub fn_fp8_mma_shared_down_m16_w4c: KernelFn,
     /// Round-26: device-side fill of per-token `positions` and
     /// `context_lens` arrays. Replaces the legacy per-token
     /// `pos_cl_region.copy_from_host(...)` HtoD that raced with
@@ -1948,6 +1952,10 @@ impl Qwen36Bringup {
             kernels.load_ptx("fp8_mma_shared_dual_silu_m16_w4c")?;
         let fn_fp8_mma_shared_dual_silu_m16_w4c = fp8_mma_shared_dual_silu_m16_w4c_mod
             .get_function("fp8_mma_shared_dual_silu_m16_w4c_kernel")?;
+        let fp8_mma_shared_down_m16_w4c_mod =
+            kernels.load_ptx("fp8_mma_shared_down_m16_w4c")?;
+        let fn_fp8_mma_shared_down_m16_w4c = fp8_mma_shared_down_m16_w4c_mod
+            .get_function("fp8_mma_shared_down_m16_w4c_kernel")?;
         let conv_state_advance_batched_f16_mod =
             kernels.load_ptx("conv_state_advance_batched_f16")?;
         let fn_conv_state_advance_batched_f16 = conv_state_advance_batched_f16_mod
@@ -2161,6 +2169,8 @@ impl Qwen36Bringup {
             fn_gated_delta_rule_prefill_f16_v3,
             fp8_mma_shared_dual_silu_m16_w4c_mod,
             fn_fp8_mma_shared_dual_silu_m16_w4c,
+            fp8_mma_shared_down_m16_w4c_mod,
+            fn_fp8_mma_shared_down_m16_w4c,
             conv_state_advance_batched_f16_mod,
             fn_conv_state_advance_batched_f16,
             qwen_fill_pos_slots_i32_mod,
@@ -11091,20 +11101,68 @@ impl Qwen36Bringup {
             // shared down: m=N via Fp8GemvF16InLaunch directly
             // (NOT fp8_proj_dispatch which would route to a different
             // m≥2 GEMM path; codex round-27 explicit).
-            unsafe {
-                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
-                    m: num_tokens,
-                    n: n_down,
-                    k: k_down,
+            // Task #106: opt-in W=4 grouped MMA path.
+            let down_use_mma = (n_down as i32 % 32 == 0)
+                && std::env::var("RVLLM_QWEN36_MOE_SHARED_DOWN_MMA")
+                    .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
+                    .unwrap_or(false);
+            if down_use_mma {
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let mut out_p   = down_sh.device_ptr();
+                    let mut bw      = moe.shared_expert_down_proj.offset_bytes;
+                    let mut bs      = sh_down_bs;
+                    let mut inp     = silu_sh.device_ptr();
+                    let mut m_i     = num_tokens as i32;
+                    let mut n_i     = n_down as i32;
+                    let mut k_i     = k_down as i32;
+                    let mut ncb     = ((k_down + 127) / 128) as i32;
+                    let args = [
+                        (&mut out_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut bw)    as *mut u64 as *mut core::ffi::c_void,
+                        (&mut bs)    as *mut u64 as *mut core::ffi::c_void,
+                        (&mut inp)   as *mut u64 as *mut core::ffi::c_void,
+                        (&mut m_i)   as *mut i32 as *mut core::ffi::c_void,
+                        (&mut n_i)   as *mut i32 as *mut core::ffi::c_void,
+                        (&mut k_i)   as *mut i32 as *mut core::ffi::c_void,
+                        (&mut ncb)   as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let gx = ((n_down + 31) / 32).max(1);
+                    let gy = ((num_tokens + 15) / 16).max(1);
+                    let rc = cuLaunchKernel(
+                        self.outside_kernels.fn_fp8_mma_shared_down_m16_w4c.raw() as CUfunction,
+                        gx, gy, 1,
+                        128, 1, 1,
+                        1600,  // smem: A 512 + 4*B 1024 + ascale 64
+                        self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 moe shared down MMA",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
                 }
-                .launch(
-                    kernel_gemv_unwrap,
-                    down_sh.device_ptr(),
-                    moe.shared_expert_down_proj.offset_bytes,
-                    sh_down_bs,
-                    silu_sh.device_ptr(),
-                    self.stream.raw() as u64,
-                )?;
+            } else {
+                unsafe {
+                    rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                        m: num_tokens,
+                        n: n_down,
+                        k: k_down,
+                    }
+                    .launch(
+                        kernel_gemv_unwrap,
+                        down_sh.device_ptr(),
+                        moe.shared_expert_down_proj.offset_bytes,
+                        sh_down_bs,
+                        silu_sh.device_ptr(),
+                        self.stream.raw() as u64,
+                    )?;
+                }
             }
 
             // shared_gate_dot_sigmoid batched → sigmoid[N] f32.
