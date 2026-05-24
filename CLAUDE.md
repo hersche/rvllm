@@ -1306,6 +1306,30 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 shared-expert down grouped MMA — task #106 (2026-05-24, +3.6% / +85.5% cumulative)
+
+`fp8_mma_shared_down_m16_w4c_kernel` (commit `5ca9131`) extends
+the W=4 cooperative-A grouped MMA pattern from #103 to the
+shared-expert DOWN projection. Single weight, no routing, no
+silu/mul, no top_w, no atomic — dense FP8 GEMM. Per-kblk a_scale
+fold (#99) built in.
+
+Opt-in via `RVLLM_QWEN36_MOE_SHARED_DOWN_MMA=1` (default off).
+
+A/B (qwen3-6-35b-a3b NVFP4, all four grouped MMA paths active,
+deterministic 3 runs):
+
+  | Cell                          | 1112 tok    | 4412 tok    |
+  |-------------------------------|-------------|-------------|
+  | GEMV baseline                 |   6020 ms   |  24775 ms   |
+  | 3-grouped (#103)              |    907 ms   |   3962 ms   |
+  | **All 4 grouped (#106 added)**|   **873 ms**|  **3821 ms**|
+  | Win vs GEMV                   | **+85.5%**  | **+84.6%**  |
+  | Win vs prior (#103)           |  +3.7%      |  +3.6%      |
+
+Quality verified on 50-word quantum entanglement (Einstein "spooky
+action" reference). Default-off regression-checked at baseline.
+
 ### Mistral 3.5 W4A16 MMA_V8 + Gemma 4 ViT bf16 — tasks #104/#105 (2026-05-24)
 
 Two negative-result rollout decisions documented (both keep current

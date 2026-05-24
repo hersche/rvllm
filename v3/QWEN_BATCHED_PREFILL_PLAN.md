@@ -869,3 +869,31 @@ Cumulative progression vs raw GEMV (single linked summary):
 * Phase 12 dual_silu grouped: 2533 ms (+57.9%)
 * Phase 14 both grouped (+ down): 955 ms (+84.1%)
 * **Phase 18 all 3 grouped (+ shared): 907 ms (+84.9%)**
+
+
+## Phase 19: Shared-expert down grouped MMA (task #106, 2026-05-24, +3.6%)
+
+`fp8_mma_shared_down_m16_w4c_kernel` (commit `5ca9131`) symmetric
+follow-up to Phase 18 — applies W=4 coop-A grouped MMA to the
+shared-expert DOWN projection. Single weight, no routing/sort,
+no silu/mul, no atomic — dense FP8 GEMM. Per-kblk a_scale (#99)
+built in.
+
+Opt-in via `RVLLM_QWEN36_MOE_SHARED_DOWN_MMA=1` (default off).
+
+A/B (qwen3-6-35b-a3b NVFP4, all four grouped MMA paths active,
+deterministic):
+
+  | Cell                          | 1112 tok    | 4412 tok    |
+  |-------------------------------|-------------|-------------|
+  | GEMV baseline                 |   6020 ms   |  24775 ms   |
+  | All 4 grouped (incl shared-down)| **873 ms**| **3821 ms** |
+  | Win vs GEMV                   | **+85.5%**  | **+84.6%**  |
+  | Win vs Phase 18               |  +3.7%      |  +3.6%      |
+
+Cumulative progression vs GEMV (linked summary):
+* Phase 4-7 baseline 6020 ms
+* Phase 12 dual_silu grouped: 2533 ms (+57.9%)
+* Phase 14 both grouped (+down): 955 ms (+84.1%)
+* Phase 18 all 3 (+shared dual_silu): 907 ms (+84.9%)
+* **Phase 19 all 4 (+shared down): 873 ms (+85.5%)**
