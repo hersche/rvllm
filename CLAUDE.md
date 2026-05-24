@@ -1306,6 +1306,37 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 default-flip: all grouped MMA + linear-attn V3 default-ON — commit `d195eab` (2026-05-24)
+
+Flipped 5 env knobs from default-OFF → default-ON after end-to-end
+validation in tasks #94/#98/#101/#103/#106. **Production now gets
+the cumulative +85.7% prefill speedup automatically.** All five
+opt-outs are independent, each fully restores its pre-flip
+behaviour via `=0`:
+
+* `RVLLM_QWEN36_MOE_MMA_GROUPED`
+* `RVLLM_QWEN36_MOE_MMA_DOWN_GROUPED`
+* `RVLLM_QWEN36_MOE_SHARED_MMA`
+* `RVLLM_QWEN36_MOE_SHARED_DOWN_MMA`
+* `RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V3`
+
+Hardware A/B (qwen3-6-35b-a3b NVFP4, fresh binary md5
+`f5659dd8`, 3-run deterministic):
+
+  | Cell                              | 1112 tok    | 4412 tok    |
+  |-----------------------------------|-------------|-------------|
+  | All explicitly OFF (=0×5)         |  6010-6033 ms|  -          |
+  | **All default-on (no env)**       | **861-880 ms** | **3782-3830 ms** |
+  | Win vs explicit-off               |  +85.7%     |  n/a        |
+
+Quality verified: 50-word quantum entanglement still gives Einstein
+"spooky action at a distance" reference; smoke ("hi") returns
+"Hello! How can I help you today?" Default-off path matches the
+prior 6020 ms GEMV reference.
+
+Mistral 3.5 V8 (#104, -34% regression there) and Gemma 4 ViT bf16
+(#105, -3.5%) were correctly kept default-OFF.
+
 ### qwen36 shared-expert down grouped MMA — task #106 (2026-05-24, +3.6% / +85.5% cumulative)
 
 `fp8_mma_shared_down_m16_w4c_kernel` (commit `5ca9131`) extends

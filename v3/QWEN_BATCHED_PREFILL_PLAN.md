@@ -897,3 +897,31 @@ Cumulative progression vs GEMV (linked summary):
 * Phase 14 both grouped (+down): 955 ms (+84.1%)
 * Phase 18 all 3 (+shared dual_silu): 907 ms (+84.9%)
 * **Phase 19 all 4 (+shared down): 873 ms (+85.5%)**
+
+
+## Phase 20: Default-flip — all grouped MMA + linear-attn V3 ON (commit `d195eab`, 2026-05-24)
+
+After tasks #94/#98/#101/#103/#106 all validated, flipped 5 env
+knobs from default-OFF → default-ON. Production gets +85.7%
+prefill speedup automatically; each `=0` opt-out fully restores
+the pre-flip behaviour.
+
+Flipped:
+* `RVLLM_QWEN36_MOE_MMA_GROUPED` (#94)
+* `RVLLM_QWEN36_MOE_MMA_DOWN_GROUPED` (#98)
+* `RVLLM_QWEN36_MOE_SHARED_MMA` (#103)
+* `RVLLM_QWEN36_MOE_SHARED_DOWN_MMA` (#106)
+* `RVLLM_QWEN36_LINEAR_ATTN_PREFILL_V3` (#101)
+
+A/B verification (fresh binary md5 `f5659dd8`, 3-run deterministic):
+
+  | Cell                          | 1112 tok    |
+  |-------------------------------|-------------|
+  | All explicitly OFF (=0×5)     |  6010-6033 ms |
+  | All default-on (no env knobs) |   861-880 ms  |
+  | Win                           |   +85.7%    |
+
+Each opt-out is independent. Production profiles can stay clean
+(no env knobs needed); operators wanting GEMV diagnostics flip
+the relevant `=0` env. Mistral V8 (#104) and Gemma ViT bf16 (#105)
+stayed correctly default-OFF based on per-model A/B.
