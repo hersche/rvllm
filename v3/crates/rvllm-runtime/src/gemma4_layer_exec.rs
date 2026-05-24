@@ -749,6 +749,37 @@ pub struct Gemma4MetadataPtrs {
     pub sin: u64,
     pub block_tables: u64,
     pub context_lens: u64,
+    /// aa01001ringbuf0 Stage 2+3: per-layer block_tables variant for
+    /// sliding-attention layers when `RVLLM_KV_RING_BUFFER=1` is set.
+    /// Populated alongside `block_tables` at request-prep time with
+    /// `bt_sliding[seq, b] = seq * sliding_blocks + (b % sliding_blocks)`
+    /// so attention reads physical slot `k % sliding_window`, matching
+    /// the wrapped write that the rope kernel does when its
+    /// `sliding_window > 0`. Set to 0 when the ring-buffer env is
+    /// unset or the layer is full / global — dispatch code falls back
+    /// to `block_tables` in those cases.
+    pub block_tables_sliding: u64,
+}
+
+impl Gemma4MetadataPtrs {
+    /// aa01001ringbuf0 Stage 2+3 — per-layer meta rebinding. When the
+    /// caller observes `ring_buffer_on && layer_type == SlidingAttention`,
+    /// swap `block_tables` to `block_tables_sliding` so the attention
+    /// kernel reads from the wrapped ring. Otherwise the helper returns
+    /// the meta unchanged. Caller is responsible for passing the same
+    /// `ring_buffer_on` flag to the rope launch (kernel `sliding_window`
+    /// arg) — the two MUST move together or attention/rope land in
+    /// different physical slots and quality silently degrades.
+    ///
+    /// Cheap: Copy-derived struct, single pointer swap.
+    #[inline]
+    pub fn for_sliding_layer(self, ring_buffer_on: bool, is_sliding: bool) -> Self {
+        if ring_buffer_on && is_sliding && self.block_tables_sliding != 0 {
+            Self { block_tables: self.block_tables_sliding, ..self }
+        } else {
+            self
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1701,6 +1732,18 @@ pub unsafe fn gemma4_forward_phase(
         Gemma4LayerType::SlidingAttention => (dims.sliding_window as i32) - 1,
         Gemma4LayerType::GlobalAttention => -1,
     };
+
+    // aa01001ringbuf0 Stage 2+3: on sliding-attention layers under the
+    // ring-buffer env, swap meta.block_tables to the per-sliding-layer
+    // ring-pattern table so attention reads wrap modulo sliding_window
+    // in lockstep with the rope kernel's `slot %= sliding_window`
+    // writes. for_sliding_layer is a no-op when env is off or the
+    // table pointer is null (legacy default), keeping the global-layer
+    // and ring-buffer-off paths byte-identical.
+    let ring_buffer_on = crate::gemma4_bring_up::kv_ring_buffer_enabled();
+    let meta_local: Gemma4MetadataPtrs = meta
+        .for_sliding_layer(ring_buffer_on, dims.layer_type == Gemma4LayerType::SlidingAttention);
+    let meta = &meta_local;
 
     #[cfg(feature = "cuda")]
     match phase {
@@ -3581,8 +3624,14 @@ unsafe fn rope_f16kv(
     let mut nkvh = dims.num_kv_heads as i32;
     let mut hd = dims.head_dim as i32;
     let mut rd = dims.rotary_dim as i32;
-    // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
-    let mut sliding_window: i32 = 0;
+    // aa01001ringbuf0 Stage 2+3: per-layer effective sliding_window.
+    let mut sliding_window: i32 = if crate::gemma4_bring_up::kv_ring_buffer_enabled()
+        && dims.layer_type == Gemma4LayerType::SlidingAttention
+    {
+        dims.sliding_window as i32
+    } else {
+        0
+    };
     let args = [
         (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
         (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
@@ -3647,8 +3696,14 @@ unsafe fn rope_f16kv_shadow(
     let mut nkvh = dims.num_kv_heads as i32;
     let mut hd = dims.head_dim as i32;
     let mut rd = dims.rotary_dim as i32;
-    // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
-    let mut sliding_window: i32 = 0;
+    // aa01001ringbuf0 Stage 2+3: per-layer effective sliding_window.
+    let mut sliding_window: i32 = if crate::gemma4_bring_up::kv_ring_buffer_enabled()
+        && dims.layer_type == Gemma4LayerType::SlidingAttention
+    {
+        dims.sliding_window as i32
+    } else {
+        0
+    };
     let args = [
         (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
         (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
@@ -3703,16 +3758,27 @@ unsafe fn rope_fp8kv(
     } else {
         (scratch.k_cache, scratch.v_cache, scratch.k_scale_cache, scratch.v_scale_cache)
     };
+    // aa01001ringbuf0 Stage 2+3: when the ring-buffer env is on AND
+    // this layer is sliding-attention, wrap K/V slot writes by
+    // `slot % sliding_window`. The companion attention dispatch
+    // upstream (gemma4_forward_phase) rebinds meta.block_tables to
+    // the per-sliding-layer ring table so reads stay aligned. Both
+    // sides MUST flip together — see Gemma4MetadataPtrs::for_sliding_layer
+    // documentation for the invariant.
+    let layer_sliding_window: u32 = if crate::gemma4_bring_up::kv_ring_buffer_enabled()
+        && dims.layer_type == Gemma4LayerType::SlidingAttention
+    {
+        dims.sliding_window
+    } else {
+        0
+    };
     gemma4_launcher::FusedRopePartialFp8KvLaunch {
         num_tokens: dims.num_tokens,
         num_heads: dims.num_heads,
         num_kv_heads: dims.num_kv_heads,
         head_dim: dims.head_dim,
         rotary_dim: dims.rotary_dim,
-        // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
-        // The per-layer ring-buffer dispatch wiring lands in a follow-up
-        // commit alongside the host-side per-layer block_tables remap.
-        sliding_window: 0,
+        sliding_window: layer_sliding_window,
     }
     .launch(
         rope_kernel,
@@ -3898,8 +3964,14 @@ unsafe fn rope_nvfp4kv(
         if crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_STOCH_ROUND_V")
             .unwrap_or(false) { 1 } else { 0 };
     // === END CYCLE 31 ===
-    // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
-    let mut sliding_window: i32 = 0;
+    // aa01001ringbuf0 Stage 2+3: per-layer effective sliding_window.
+    let mut sliding_window: i32 = if crate::gemma4_bring_up::kv_ring_buffer_enabled()
+        && dims.layer_type == Gemma4LayerType::SlidingAttention
+    {
+        dims.sliding_window as i32
+    } else {
+        0
+    };
     let mut nt = dims.num_tokens as i32;
     let mut nh = dims.num_heads as i32;
     let mut nkvh = dims.num_kv_heads as i32;

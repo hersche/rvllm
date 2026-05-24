@@ -5310,8 +5310,24 @@ impl Gemma4Nvfp4Bringup {
             let (mut scale_policy, mut v_scale_policy) = read_nvfp4_kv_policies();
             let mut rotate_v: i32 = 0;
             let mut stoch_round_v: i32 = 0;
-            // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
-            let mut sliding_window: i32 = 0;
+            // aa01001ringbuf0 Stage 2+3: per-layer effective sliding_window.
+            // Pre-condition: `_pre_had_layer_idx` already mirrors `layer_idx`
+            // (or is 0 for the layer-0 probe path, which is sliding by
+            // Gemma 4's repeating [sliding x5, global] pattern). When the
+            // ring-buffer env is on AND this layer is sliding-attention,
+            // wrap K/V slot writes by `slot % sliding_window`. Global
+            // layers + ring-buffer-off path pass 0 = no wrap, preserving
+            // byte-equivalence.
+            let mut sliding_window: i32 = if crate::gemma4_bring_up::kv_ring_buffer_enabled()
+                && matches!(
+                    self.arch.layer_types[_pre_had_layer_idx],
+                    rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention
+                )
+            {
+                self.arch.sliding_window_size as i32
+            } else {
+                0
+            };
 
             let args = [
                 (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
@@ -5807,8 +5823,24 @@ impl Gemma4Nvfp4Bringup {
             let (mut scale_policy, mut v_scale_policy) = read_nvfp4_kv_policies();
             let mut rotate_v: i32 = 0;
             let mut stoch_round_v: i32 = 0;
-            // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
-            let mut sliding_window: i32 = 0;
+            // aa01001ringbuf0 Stage 2+3: per-layer effective sliding_window.
+            // Pre-condition: `_pre_had_layer_idx` already mirrors `layer_idx`
+            // (or is 0 for the layer-0 probe path, which is sliding by
+            // Gemma 4's repeating [sliding x5, global] pattern). When the
+            // ring-buffer env is on AND this layer is sliding-attention,
+            // wrap K/V slot writes by `slot % sliding_window`. Global
+            // layers + ring-buffer-off path pass 0 = no wrap, preserving
+            // byte-equivalence.
+            let mut sliding_window: i32 = if crate::gemma4_bring_up::kv_ring_buffer_enabled()
+                && matches!(
+                    self.arch.layer_types[_pre_had_layer_idx],
+                    rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention
+                )
+            {
+                self.arch.sliding_window_size as i32
+            } else {
+                0
+            };
 
             let args = [
                 (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
@@ -6643,8 +6675,24 @@ impl Gemma4Nvfp4Bringup {
             let (mut scale_policy, mut v_scale_policy) = read_nvfp4_kv_policies();
             let mut rotate_v: i32 = 0;
             let mut stoch_round_v: i32 = 0;
-            // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
-            let mut sliding_window: i32 = 0;
+            // aa01001ringbuf0 Stage 2+3: per-layer effective sliding_window.
+            // Pre-condition: `_pre_had_layer_idx` already mirrors `layer_idx`
+            // (or is 0 for the layer-0 probe path, which is sliding by
+            // Gemma 4's repeating [sliding x5, global] pattern). When the
+            // ring-buffer env is on AND this layer is sliding-attention,
+            // wrap K/V slot writes by `slot % sliding_window`. Global
+            // layers + ring-buffer-off path pass 0 = no wrap, preserving
+            // byte-equivalence.
+            let mut sliding_window: i32 = if crate::gemma4_bring_up::kv_ring_buffer_enabled()
+                && matches!(
+                    self.arch.layer_types[_pre_had_layer_idx],
+                    rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention
+                )
+            {
+                self.arch.sliding_window_size as i32
+            } else {
+                0
+            };
             let args = [
                 (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
                 (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
@@ -7145,8 +7193,24 @@ impl Gemma4Nvfp4Bringup {
             let (mut scale_policy, mut v_scale_policy) = read_nvfp4_kv_policies();
             let mut rotate_v: i32 = 0;
             let mut stoch_round_v: i32 = 0;
-            // aa01001ringbuf0 Stage 1: byte-equivalent default — 0 = no wrap.
-            let mut sliding_window: i32 = 0;
+            // aa01001ringbuf0 Stage 2+3: per-layer effective sliding_window.
+            // Pre-condition: `_pre_had_layer_idx` already mirrors `layer_idx`
+            // (or is 0 for the layer-0 probe path, which is sliding by
+            // Gemma 4's repeating [sliding x5, global] pattern). When the
+            // ring-buffer env is on AND this layer is sliding-attention,
+            // wrap K/V slot writes by `slot % sliding_window`. Global
+            // layers + ring-buffer-off path pass 0 = no wrap, preserving
+            // byte-equivalence.
+            let mut sliding_window: i32 = if crate::gemma4_bring_up::kv_ring_buffer_enabled()
+                && matches!(
+                    self.arch.layer_types[_pre_had_layer_idx],
+                    rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention
+                )
+            {
+                self.arch.sliding_window_size as i32
+            } else {
+                0
+            };
             let args = [
                 (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
                 (&mut k_in) as *mut u64 as *mut core::ffi::c_void,

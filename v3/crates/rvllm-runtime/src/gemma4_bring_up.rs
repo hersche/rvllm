@@ -1072,6 +1072,21 @@ pub struct PrefixCacheState {
     pub identity_block_tables_ptr: u64,
     /// Length of the identity table in u32 entries (= num_blocks_total).
     pub identity_block_tables_len: u32,
+    /// aa01001ringbuf0 Stage 2+3 — persistent SLIDING block table for
+    /// sliding-attention layers when `RVLLM_KV_RING_BUFFER=1`. Layout
+    /// is `[0, 1, ..., sliding_blocks-1, 0, 1, ...]` of length
+    /// `num_blocks_total` (ring pattern: `bt[b] = b % sliding_blocks`).
+    /// Mirrors the identity table's allocation pattern — built once
+    /// at init, single async HtoD, reused across every layer dispatch
+    /// for sliding layers. `0` when the env gate is off — dispatch
+    /// then keeps using `identity_block_tables_ptr` / per-call bt.
+    pub sliding_block_tables_ptr: u64,
+    /// Effective sliding_blocks under the ring-buffer gate (=
+    /// `sliding_window / block_size`). When the gate is off this
+    /// equals `num_blocks_total` and the field carries no
+    /// behavior — kept on the struct so PrefixProvenance can
+    /// invalidate cache on flips.
+    pub sliding_blocks: u32,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1457,6 +1472,23 @@ pub fn nvfp4_hadamard_enabled() -> bool {
 /// kernel siblings, ultimately deleting the dead f16 kernels.
 pub fn bf16_residual_enabled() -> bool {
     parse_truthy_env("RVLLM_RESIDUAL_BF16").unwrap_or(true)
+}
+
+/// aa01001ringbuf0 Stage 2+3: master env gate for the sliding-window
+/// KV ring buffer. Default OFF — production keeps the safe
+/// `sliding_blocks = num_blocks_total` baseline (~10 GiB extra KV on
+/// Gemma 4 31B at num_blocks_total=1024). When set to 1, the runtime
+/// restores `sliding_blocks = sliding_window/block_size` (16 blocks
+/// on Gemma 4 sliding_window=1024 + block_size=64), populates a
+/// per-sliding-layer wrapped block_tables, and threads the
+/// sliding_window modulus through the rope kernel for sliding-attention
+/// layers. Full / global layers stay on the linear layout regardless.
+///
+/// PrefixProvenance tracks this env so the prefix cache invalidates
+/// across flips — sliding-layer K/V bytes land in different physical
+/// slots under each mode.
+pub fn kv_ring_buffer_enabled() -> bool {
+    parse_truthy_env("RVLLM_KV_RING_BUFFER").unwrap_or(false)
 }
 
 /// Cycle 55 step 14 master gate: enable end-to-end bf16-native chain
@@ -2791,7 +2823,25 @@ impl Gemma4Bringup {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1024);
-        let sliding_blocks = num_blocks_total;
+        // aa01001ringbuf0 Stage 2+3: when env on, sliding layers ride a
+        // ring buffer sized at `sliding_window / block_size` blocks (16
+        // on Gemma 4 sliding_window=1024 + block_size=32 → 32-block ring,
+        // or sliding_window=1024 + block_size=64 → 16-block ring). The
+        // ring covers exactly the attention window; positions beyond
+        // it are correctly masked by `window_size_left` in the
+        // attention kernel. Env off: legacy full-pool allocation per
+        // sliding layer (~10 GiB extra on 128 GiB arena — acceptable).
+        let ring_buffer_on = kv_ring_buffer_enabled();
+        let sliding_blocks = if ring_buffer_on {
+            let sw = arch.sliding_window_size as u32;
+            // Round up to whole blocks; the rope kernel's modulo writes
+            // slot % sliding_window, but attention dispatches block_idx
+            // = k/block_size → we need a whole-block ring. `max(1)`
+            // guards a degenerate config with sliding_window<block_size.
+            ((sw + block_size - 1) / block_size).max(1)
+        } else {
+            num_blocks_total
+        };
         let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(false);
 
         let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
@@ -2874,6 +2924,27 @@ impl Gemma4Bringup {
             }
         }
 
+        // aa01001ringbuf0 Stage 2+3: per-sliding-layer ring-pattern
+        // block_tables. Layout `[0, 1, ..., sliding_blocks-1, 0, 1,
+        // ...]` of length num_blocks_total — each entry maps the
+        // logical block_idx to its physical ring slot. Attention
+        // dispatch picks this for sliding layers when env on so reads
+        // align with the wrapped rope writes. Allocated regardless
+        // (cheap, 4 KiB) so dispatch can plumb a non-zero pointer
+        // unconditionally; when env off, the ring-pattern is unused
+        // because dispatch routes to the identity table instead.
+        let sliding_bt_region = self.arena.region(
+            "persistent_sliding_block_tables", identity_bytes, 16)?;
+        let sliding_bt_ptr = sliding_bt_region.device_ptr();
+        {
+            let bt: Vec<i32> = (0..num_blocks_total as i32)
+                .map(|b| b % (sliding_blocks as i32))
+                .collect();
+            unsafe {
+                sliding_bt_region.copy_from_host(bytemuck_cast_i32(&bt))?;
+            }
+        }
+
         *guard = Some(PrefixCacheState {
             last_tokens: Vec::new(),
             kv_cache_ptr,
@@ -2889,6 +2960,8 @@ impl Gemma4Bringup {
             provenance: PrefixProvenance::from_env(),
             identity_block_tables_ptr: identity_ptr,
             identity_block_tables_len: num_blocks_total,
+            sliding_block_tables_ptr: sliding_bt_ptr,
+            sliding_blocks,
         });
         Ok(())
     }
@@ -3424,6 +3497,8 @@ impl Gemma4Bringup {
                     sin,
                     block_tables: block_tables.device_ptr(),
                     context_lens: context_lens.device_ptr(),
+                    // aa01001ringbuf0: populated below when env on.
+                    block_tables_sliding: 0,
                 };
 
                 gemma4_forward(
@@ -4000,6 +4075,8 @@ impl Gemma4Bringup {
                     sin,
                     block_tables: block_tables.device_ptr(),
                     context_lens: context_lens.device_ptr(),
+                    // aa01001ringbuf0: populated below when env on.
+                    block_tables_sliding: 0,
                 };
 
                 gemma4_forward(
@@ -10513,7 +10590,9 @@ impl Gemma4Bringup {
         // used directly as common_prefix_len.
         let (kv_cache_ptr, kv_scale_ptr, kv_layer_offsets, kv_scale_layer_offsets,
              kv_total_bytes, kv_scale_total_bytes, common_prefix_len_raw,
-             persistent_identity_bt_ptr, persistent_identity_bt_len) = {
+             persistent_identity_bt_ptr, persistent_identity_bt_len,
+             // aa01001ringbuf0 Stage 2+3
+             persistent_sliding_bt_ptr) = {
             let guard = self.lock_prefix_cache_recover();
             match &*guard {
                 Some(pc) => {
@@ -10609,9 +10688,13 @@ impl Gemma4Bringup {
                         // bytes per request.
                         pc.identity_block_tables_ptr,
                         pc.identity_block_tables_len,
+                        // aa01001ringbuf0 Stage 2+3: per-sliding-layer
+                        // ring-pattern block_tables (0 when env off
+                        // never populated, or when prefix cache absent).
+                        pc.sliding_block_tables_ptr,
                     )
                 }
-                None => (0, 0, Vec::new(), Vec::new(), 0, 0, 0, 0, 0),
+                None => (0, 0, Vec::new(), Vec::new(), 0, 0, 0, 0, 0, 0),
             }
         };
 
@@ -11264,6 +11347,10 @@ impl Gemma4Bringup {
                     positions: positions.device_ptr(), slot_mapping: slot_mapping.device_ptr(),
                     cos, sin,
                     block_tables: block_tables_ptr, context_lens: context_lens.device_ptr(),
+                    // aa01001ringbuf0 Stage 2+3: sliding-layer ring bt
+                    // from the prefix cache. 0 when env off or pc absent
+                    // — dispatch falls back to `block_tables`.
+                    block_tables_sliding: persistent_sliding_bt_ptr,
                 };
                 crate::gemma4_layer_exec::gemma4_forward(
                     dims, &kernels, &w, &scratch, &meta,
@@ -11948,6 +12035,9 @@ impl Gemma4Bringup {
                     positions: positions.device_ptr(), slot_mapping: slot_mapping.device_ptr(),
                     cos, sin,
                     block_tables: block_tables_ptr, context_lens: context_lens.device_ptr(),
+                    // aa01001ringbuf0 Stage 2+3: sliding-layer ring bt
+                    // from the prefix cache. 0 when env off / no pc.
+                    block_tables_sliding: persistent_sliding_bt_ptr,
                 };
                 crate::gemma4_layer_exec::gemma4_forward_phase(
                     dims, &kernels, &w, &scratch, &meta,
