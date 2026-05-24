@@ -840,3 +840,32 @@ only partially the f16 RTNE (v3 +2.3%). Likely candidates: per-token
 FMA throughput (75M FMAs/launch). Both would require deeper rewrite
 (warp-level reduction, multi-token recurrence batching) — multi-week
 scope, parked.
+
+
+## Phase 18: Shared-expert dual_silu grouped MMA (task #103, 2026-05-24, +4%)
+
+`fp8_mma_shared_dual_silu_m16_w4c_kernel` (commit `84625d2`) extends
+the W=4 coop-A grouped MMA pattern from Phase 12 to the SHARED-
+expert FFN. Single per-layer weight matrix (no routing/sort);
+tile mapping is direct (m_block, n_block) grid coverage. Per-kblk
+a_scale fold (Phase 15 fix) built in.
+
+Targets `fp8_gemv_dual_silu_kernel` (4.6% prefill GPU time per
+Phase 16 nsys).
+
+Opt-in via `RVLLM_QWEN36_MOE_SHARED_MMA=1`.
+
+A/B (deterministic 3 runs):
+
+  | Cell                          | 1112 tok    | 4412 tok    |
+  |-------------------------------|-------------|-------------|
+  | GEMV baseline                 |   6020 ms   |  24775 ms   |
+  | All 3 grouped (incl. shared)  |   **907 ms**|  **3962 ms**|
+  | Win vs GEMV                   | **+84.9%**  | **+84.0%**  |
+  | Win vs prior phase            |  +4.0%      |  +3.9%      |
+
+Cumulative progression vs raw GEMV (single linked summary):
+* Phase 4-7 baseline 6020 ms
+* Phase 12 dual_silu grouped: 2533 ms (+57.9%)
+* Phase 14 both grouped (+ down): 955 ms (+84.1%)
+* **Phase 18 all 3 grouped (+ shared): 907 ms (+84.9%)**

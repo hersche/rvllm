@@ -1306,6 +1306,33 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### qwen36 shared-expert dual_silu grouped MMA — task #103 (2026-05-24, +4% / +84.9% cumulative)
+
+`fp8_mma_shared_dual_silu_m16_w4c_kernel` (commit `84625d2`)
+adapts the #96 W=4 cooperative-A MMA pattern to the SHARED-expert
+FFN. No routing/sort needed (single per-layer weight applies to
+all tokens) — tiles map directly to (m_block, n_block) grid
+coverage. Per-kblk a_scale fold (#99 fix) built in.
+
+Targets the 4.6% kernel `fp8_gemv_dual_silu_kernel` from the post-
+#98+#99 nsys profile (800 instances per prefill).
+
+Opt-in via `RVLLM_QWEN36_MOE_SHARED_MMA=1` (default off).
+
+A/B (qwen3-6-35b-a3b NVFP4, all three grouped MMA paths active,
+deterministic 3 runs):
+
+  | Cell                                | 1112 tok    | 4412 tok    |
+  |-------------------------------------|-------------|-------------|
+  | GEMV baseline                       |   6020 ms   |  24775 ms   |
+  | Dual_silu + down grouped (#98)      |    955 ms   |   4116 ms   |
+  | **All 3 grouped (#103 added)**      |   **907 ms**|  **3962 ms**|
+  | Win vs GEMV                         | **+84.9%**  | **+84.0%**  |
+  | Win vs prior (#98)                  |  +4.0%      |  +3.9%      |
+
+Quality verified on 50-word quantum entanglement (coherent + Einstein
+"spooky action" reference). Default-off regression at baseline 6020 ms.
+
 ### gemma4-nvfp4 MLP MMA_V8 default-on — task #102 (2026-05-24, 14.6× prefill speedup)
 
 Discovery: nsys on gemma-4-31b-it-nvfp4 prefill showed `mistral35
