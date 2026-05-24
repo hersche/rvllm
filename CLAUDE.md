@@ -1306,6 +1306,41 @@ Default-off; production stays on the HADAMARD=0 + no-shadow path
 `RVLLM_GEMMA4_SPEC_PRE_HAD_SHADOW=1` alongside `RVLLM_NVFP4
 _HADAMARD=1` + `RVLLM_NVFP4_HADAMARD_V=1`.
 
+### gemma4-nvfp4 MLP MMA_V8 default-on — task #102 (2026-05-24, 14.6× prefill speedup)
+
+Discovery: nsys on gemma-4-31b-it-nvfp4 prefill showed `mistral35
+_w4a16_gemm_mn_bf16_kernel` at **98.4%** of GPU time. The
+companion `mistral35_w4a16_gemm_mma_v8_bf16_kernel` (full
+TensorCore MMA tiled GEMM) was already loaded but gated behind
+`RVLLM_GEMMA4_NVFP4_MLP_MMA_V8` (default OFF — never set in any
+production profile). The source comment in the legacy kernel
+even named the V8 variant as the "next-iteration win".
+
+Flipped default ON in commit `50b7c9d`. Opt-out preserved via
+`RVLLM_GEMMA4_NVFP4_MLP_MMA_V8=0` for diagnostics. Mistral 3.5
+has the analogous flag for the SAME kernel — pattern likely
+applies but parked pending its own per-model A/B.
+
+A/B (gemma-4-31b-it-nvfp4 production profile, 1112-tok prefill,
+max_tokens=1 so wall ≈ all prefill, deterministic 3 runs):
+
+  | Cell                    | wall                       | avg     |
+  |-------------------------|----------------------------|---------|
+  | V8=0 (legacy _mn path)  | 32228 / 32521 / 32536 ms   | 32428 ms|
+  | V8=1 default            |  2219 /  2210 /  2214 ms   |  2214 ms|
+  | **Speedup vs legacy**   |                            | **14.6×**|
+
+Throughput: 35 t/s → 505 t/s prefill at 31B. Output coherence
+verified on quantum entanglement (Einstein "spooky action"
+reference present).
+
+Misframing note: the parent task "apply grouped MMA pattern to
+dense models" was based on a misunderstanding — qwen36's grouped-
+MMA-by-expert-id pattern doesn't translate to dense models (no
+routing). But investigating turned up THIS dormant MMA flag,
+which delivers more than the grouped-MMA pattern ever could have
+for a dense model.
+
 ### qwen36 linear-attn prefill — task #101 (2026-05-24, +2.3% with v3)
 
 Targets the new top hotspot identified by #100 (`gated_delta_rule
