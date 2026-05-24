@@ -176,10 +176,13 @@ pub unsafe fn gemma4_nvfp4_w4a16_gemm_mn(
     let mut m_arg = m as i32;
     let mut n = weight.shape.n as i32;
     let mut k = weight.shape.k as i32;
-    if std::env::var("RVLLM_GEMMA4_NVFP4_MLP_MMA_V8")
-        .ok()
-        .as_deref()
-        == Some("1")
+    // Task #102: MMA_V8 path is 14.5× faster than the _mn fallback on
+    // Gemma 4 31B-NVFP4 prefill (1112 tok 32.4s → 2.2s measured 2026-05-24).
+    // Default-on; opt-out via `RVLLM_GEMMA4_NVFP4_MLP_MMA_V8=0`.
+    let mma_v8_on = std::env::var("RVLLM_GEMMA4_NVFP4_MLP_MMA_V8")
+        .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE"))
+        .unwrap_or(true);
+    if mma_v8_on
         && k % 16 == 0
         && n % 32 == 0
     {
