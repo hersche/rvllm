@@ -50,4 +50,11 @@ export G4N_SPEC_TIMING=1
 export G4N_SPEC_MAX_PROMPT_TOKENS=200000
 export G4N_SPEC_ADAPTIVE_WINDOW_ITERS=3
 export G4N_SPEC_ADAPTIVE_MIN_K=1
-export G4N_SPEC_ADAPTIVE_K=0
+# Task #138 item 1 — adaptive K enabled. At measured 27-43% accept
+# rate on real zeroclaw 14k prompts, fixed K=7 wastes drafter +
+# verify cycles past where the drafter is predictive. Adaptive walks
+# K down toward MIN_K (=1) when the recent window's accept rate falls
+# below 55%, up toward spec_k when >= 90%. Sliding window of 3 iter
+# (G4N_SPEC_ADAPTIVE_WINDOW_ITERS) gives responsive tracking without
+# thrashing.
+export G4N_SPEC_ADAPTIVE_K=1
