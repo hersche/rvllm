@@ -1381,6 +1381,34 @@ impl Gemma4Nvfp4Bringup {
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(4);
+            // Task #132: low-accept-rate windowed bailout. zero_accept
+            // already catches consecutive-zero streaks but misses the
+            // "consistent low but non-zero accept" regime that broke at
+            // p=30% (initial implementation was actively slower; A/B at
+            // 10.9k tokens / 150 max_new: bail@30% = 137 s vs full-spec
+            // = 118 s). Empirical break-even at K=7 with ~900 ms drafter
+            // +verify per iter sits around 8-10% — spec is net-positive
+            // anywhere above that. The default is set CONSERVATIVELY
+            // below that floor so the bailout only fires on a genuinely
+            // broken drafter (e.g. quantization cliff at very long
+            // context). Operators tune up if they want more aggressive
+            // bailing in specific deployments.
+            //
+            // Disable entirely with `G4N_SPEC_LOW_ACCEPT_BAILOUT_PCT=0`.
+            // See the spec-timing eprintln (`G4N_SPEC_TIMING=1`) and the
+            // gemma4-nvfp4 task #132 commit message for the full A/B
+            // table.
+            let low_accept_bailout_window = std::env::var("G4N_SPEC_LOW_ACCEPT_BAILOUT_WINDOW")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(16);
+            let low_accept_bailout_pct = std::env::var("G4N_SPEC_LOW_ACCEPT_BAILOUT_PCT")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(5);
+            let mut low_accept_window_iters: usize = 0;
+            let mut low_accept_window_accepted: usize = 0;
+            let mut low_accept_window_drafts: usize = 0;
 
             while emitted.len() < max_new {
                 let remaining = max_new - emitted.len();
@@ -1540,6 +1568,45 @@ impl Gemma4Nvfp4Bringup {
                     }
                     bailout_elapsed += bailout_t0.elapsed();
                     break;
+                }
+
+                // Task #132: low-accept-rate windowed bailout. Track
+                // accept_rate = accepted/draft_steps over the most recent
+                // `low_accept_bailout_window` iters. Once the window is
+                // full, compare against `low_accept_bailout_pct`; if
+                // below, drain remaining tokens via the non-spec path.
+                // The drafter/verify overhead at K_eff drafts per iter
+                // outweighs the savings from amortizing base forwards
+                // when accept rate is this low — see CLAUDE.md task #132
+                // for the zeroclaw 14k empirical data (26.9% net loss).
+                if low_accept_bailout_pct > 0 {
+                    low_accept_window_iters += 1;
+                    low_accept_window_accepted += n_acc;
+                    low_accept_window_drafts += k_eff;
+                    if low_accept_window_iters >= low_accept_bailout_window
+                        && low_accept_window_drafts > 0
+                    {
+                        let rate_pct =
+                            (low_accept_window_accepted * 100) / low_accept_window_drafts;
+                        if rate_pct < low_accept_bailout_pct {
+                            let bailout_t0 = std::time::Instant::now();
+                            while emitted.len() < max_new {
+                                let next = self.forward_full_to_token(
+                                    t_committed, ctx_len, kv,
+                                )?;
+                                emitted.push(next);
+                                t_committed = next;
+                                ctx_len += 1;
+                                bailout_tokens += 1;
+                            }
+                            bailout_elapsed += bailout_t0.elapsed();
+                            break;
+                        }
+                        // Sliding window: reset to start fresh measurement.
+                        low_accept_window_iters = 0;
+                        low_accept_window_accepted = 0;
+                        low_accept_window_drafts = 0;
+                    }
                 }
             }
 
