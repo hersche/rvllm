@@ -256,6 +256,11 @@
       "path": "fp8_gemv_f16in_scaled_add_devw_then_residual.ptx",
       "sha256": "7d09ca4335dd1349f475f2e7b61fdbb7a4d5f47e4be64528f2142267fcac2d89"
     },
+    "fp8_gemv_mma_m8_w4c": {
+      "bytes": 39459,
+      "path": "fp8_gemv_mma_m8_w4c.ptx",
+      "sha256": "6eb391612752543b2de795cd2cfe15d34a55b30e69b7a10d5cf87c162246565b"
+    },
     "fp8_mma_down_grouped_m16_w4": {
       "bytes": 30793,
       "path": "fp8_mma_down_grouped_m16_w4.ptx",
@@ -776,6 +781,11 @@
       "path": "nvfp4_roundtrip_probe.ptx",
       "sha256": "f9d3b3feca64e2f170f4d2999145a4c779d8d327784fa03cb2e66e7f3a5f929d"
     },
+    "nvfp4kv_dequant_bench": {
+      "bytes": 17167,
+      "path": "nvfp4kv_dequant_bench.ptx",
+      "sha256": "ec8dba04af126ffed70001382f2f01be22b87d52ce4ee51f60b652f619fa313b"
+    },
     "paged_attention_sm89": {
       "bytes": 121426,
       "path": "paged_attention_sm89.ptx",
@@ -1157,5 +1167,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "9f06c3b"
+  "revision": "3c3827e"
 }
