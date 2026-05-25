@@ -636,6 +636,29 @@ pub struct Gemma4Nvfp4Bringup {
     pub embed_token_box: std::sync::Mutex<Box<u32>>,
     /// Held to keep the primary CUDA context alive.
     _ctx: CudaContextHandle,
+    /// Task #136 — heap-stable Box<i32> holding the per-iter drafter
+    /// Q-side rope `position`. The captured graph records this Box's
+    /// address as the HtoD source; per-replay the host updates the
+    /// value in place and re-launches the graph. Replaces the prior
+    /// sync `pos_region.copy_from_host` which was not capture-safe
+    /// (stack-local source dangles by replay time).
+    pub drafter_pos_box: std::sync::Mutex<Box<i32>>,
+    /// Task #136 — heap-stable Box<u32> holding the per-iter drafter
+    /// `t_committed` token id for the K=0 pre-projection step.
+    /// For K>0 the pre-projection reads from `draft_ids_dev`
+    /// (already device-resident); K=0 currently reads from a u32
+    /// arg — capturing requires routing through a stable host
+    /// source via this Box → arena slot HtoD chain.
+    pub drafter_input_token_box: std::sync::Mutex<Box<u32>>,
+    /// Task #136 — captured single-draft-step graph for the
+    /// gemma4-nvfp4 spec drafter. Holds the Box sources used by
+    /// `pos_box` + `input_token_box` plus the CapturedGraph itself.
+    /// Persistent across requests (single drafter per worker).
+    /// `None` until the first `run_drafter_forward_one_token_captured`
+    /// invocation successfully completes `cuStreamBeginCapture`.
+    pub drafter_step_capture: std::sync::Mutex<
+        Option<rvllm_graph::pool::CapturedGraph>,
+    >,
     /// Task #133 — Option B NVFP4 prefix-cache reuse across requests.
     /// Stores the full token sequence (prompt + emitted) whose K/V
     /// landed in `kv_state` after the previous successful generation.
@@ -990,6 +1013,9 @@ impl Gemma4Nvfp4Bringup {
             decode_capture: std::sync::Mutex::new(None),
             embed_token_box: std::sync::Mutex::new(Box::new(0u32)),
             _ctx: ctx,
+            drafter_pos_box: std::sync::Mutex::new(Box::new(0i32)),
+            drafter_input_token_box: std::sync::Mutex::new(Box::new(0u32)),
+            drafter_step_capture: std::sync::Mutex::new(None),
             nvfp4_prefix_cache: std::sync::Mutex::new(None),
         })
     }
@@ -2269,7 +2295,22 @@ impl Gemma4Nvfp4Bringup {
                 )?;
             }
 
-            self.run_drafter_forward_one_token(drafter, workspace, ctx_len, kv)?;
+            // Task #136 — opt-in CUDA Graph capture wrapper. Per spec
+            // iter, the K draft steps share the same `ctx_len` arg
+            // (position is constant across K-steps within one iter,
+            // changes only across spec iters), so the captured graph
+            // covers all K calls. Default-off; opt-in via
+            // `G4N_DRAFTER_GRAPH=1`. Falls through to eager when off
+            // or on capture failure.
+            let use_drafter_graph =
+                std::env::var("G4N_DRAFTER_GRAPH").ok().as_deref() == Some("1");
+            if use_drafter_graph {
+                self.run_drafter_forward_one_token_captured(
+                    drafter, workspace, ctx_len, kv,
+                )?;
+            } else {
+                self.run_drafter_forward_one_token(drafter, workspace, ctx_len, kv)?;
+            }
 
             unsafe {
                 use cudarc::driver::sys::*;
@@ -2873,10 +2914,33 @@ impl Gemma4Nvfp4Bringup {
                 self.model.outside.rope_sin_sliding.offset_bytes,
             )
         };
+        // Task #136 — capture-friendly HtoD: source is the
+        // heap-stable `drafter_pos_box` (Box<i32> on the bringup),
+        // not a stack-local. `pos_region` is arena-allocated → its
+        // device address is deterministic across calls thanks to
+        // `forward_scratch_guard`'s checkpoint+restore, so the
+        // captured graph records a stable (host_src, device_dst)
+        // pair; per-replay the host writes the new value into the
+        // Box and the captured async HtoD picks it up.
         let pos_region = self.arena.region("g4n_drafter_q_rope_pos", 4, 16)?;
         unsafe {
-            let p = position as i32;
-            pos_region.copy_from_host(&p.to_le_bytes())?;
+            use cudarc::driver::sys::*;
+            let mut guard = self.drafter_pos_box.lock().map_err(|_| {
+                corrupt_runtime_err("drafter_pos_box mutex poisoned".into())
+            })?;
+            **guard = position as i32;
+            let src_ptr = guard.as_ref() as *const i32 as *const u8;
+            let rc = cuMemcpyHtoDAsync_v2(
+                pos_region.device_ptr() as CUdeviceptr,
+                src_ptr as *const _,
+                4,
+                self.stream.raw() as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(corrupt_runtime_err(
+                    "forward_drafter_layer_q_side: pos HtoD".into(),
+                ));
+            }
         }
         unsafe {
             use cudarc::driver::sys::*;
@@ -3515,6 +3579,13 @@ impl Gemma4Nvfp4Bringup {
         position: u32,
         kv: &Gemma4Nvfp4KvState,
     ) -> Result<()> {
+        // Task #136 — capture-friendly arena state. Each invocation
+        // takes a checkpoint at entry and restores at exit so the
+        // per-layer pos_region allocations (in forward_drafter_layer_
+        // q_side) land at deterministic device addresses across
+        // calls. Required precondition for CUDA Graph capture of
+        // this function via `run_drafter_forward_one_token_captured`.
+        let drafter_ckpt = self.arena.checkpoint();
         self.forward_drafter_pre_projection(drafter, workspace)?;
         let num_layers = drafter.arch.num_hidden_layers;
         for li in 0..num_layers {
@@ -3524,7 +3595,104 @@ impl Gemma4Nvfp4Bringup {
             self.forward_drafter_layer_mlp_finisher(drafter, workspace, li)?;
         }
         self.forward_drafter_final_to_token(drafter, workspace)?;
+        unsafe {
+            self.arena.restore(drafter_ckpt);
+        }
         Ok(())
+    }
+
+    /// Task #136 — CUDA Graph capture wrapper around
+    /// `run_drafter_forward_one_token`. First call captures the
+    /// entire drafter forward (pre_projection + 4 layers × 4
+    /// sub-launches + final_to_token, ~60-80 kernel launches) into
+    /// a single CapturedGraph. Subsequent calls update the heap-
+    /// stable `drafter_pos_box` value and replay via cuGraphLaunch.
+    ///
+    /// Per-spec-iter savings: K=7 drafts share one captured body.
+    /// Without capture, each of the K drafts pays the ~80 launch
+    /// overhead (~2µs each = ~160µs/draft = ~1.1 ms/iter). With
+    /// capture, the first draft pays once + K-1 replays each cost
+    /// 1 cuGraphLaunch (~5µs). Saves ~150 µs × 6 = 0.9 ms/iter ×
+    /// ~25 iter/zeroclaw-turn = ~22 ms/turn. Small but real on a
+    /// 3-minute turn.
+    ///
+    /// Gated via `G4N_DRAFTER_GRAPH=1`. Default OFF until measured.
+    /// Falls through to eager `run_drafter_forward_one_token` on
+    /// capture failure or when gate is off.
+    pub fn run_drafter_forward_one_token_captured(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        position: u32,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<()> {
+        let stream_u64 = self.stream.raw();
+
+        // Update the heap-stable position source. This happens on
+        // BOTH the first (capture) call and every replay; for replay,
+        // the captured async HtoD inside `forward_drafter_layer_q_
+        // side` reads the new value from this Box at execution time.
+        {
+            let mut guard = self.drafter_pos_box.lock().map_err(|_| {
+                corrupt_runtime_err("drafter_pos_box mutex poisoned".into())
+            })?;
+            **guard = position as i32;
+        }
+
+        // Replay path: if a captured graph already exists, replay it.
+        {
+            let guard = self.drafter_step_capture.lock().map_err(|_| {
+                corrupt_runtime_err("drafter_step_capture mutex poisoned".into())
+            })?;
+            if let Some(captured) = guard.as_ref() {
+                unsafe { captured.replay(stream_u64)?; }
+                return Ok(());
+            }
+        }
+
+        // First call: capture. The body runs eagerly inside
+        // `CapturedGraph::capture` (per its contract). If capture
+        // succeeds we stash the exec for future replays; on failure
+        // we leave the slot None so subsequent calls retry capture
+        // (or stay eager forever if the first capture's body itself
+        // errored out).
+        let layout = rvllm_metadata::MetadataLayout::compute(1, 1);
+        let layout_hash = layout.hash();
+        let fingerprint = rvllm_graph::pool::GraphFingerprint([0u8; 32]);
+        let capture_result = unsafe {
+            rvllm_graph::pool::CapturedGraph::capture(
+                0, 0, layout_hash, fingerprint, stream_u64,
+                || -> Result<()> {
+                    self.run_drafter_forward_one_token(
+                        drafter, workspace, position, kv,
+                    )
+                },
+            )
+        };
+        match capture_result {
+            Ok(g) => {
+                if let Ok(mut guard) = self.drafter_step_capture.lock() {
+                    *guard = Some(g);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "drafter-step graph capture rejected ({e:?}); \
+                     falling back to eager run for this iter"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Task #136 — drop the cached drafter-step graph. Mirrors
+    /// `clear_decode_capture`. Call when env knobs that change the
+    /// drafter forward shape get flipped between requests.
+    pub fn clear_drafter_step_capture(&self) {
+        if let Ok(mut guard) = self.drafter_step_capture.lock() {
+            *guard = None;
+        }
     }
 
     fn forward_scratch_guard(&self) -> ForwardScratchGuard<'_> {
