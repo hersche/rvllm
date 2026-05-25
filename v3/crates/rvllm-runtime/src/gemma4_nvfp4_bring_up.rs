@@ -621,6 +621,61 @@ pub struct Gemma4Nvfp4Bringup {
     pub embed_token_box: std::sync::Mutex<Box<u32>>,
     /// Held to keep the primary CUDA context alive.
     _ctx: CudaContextHandle,
+    /// Task #133 — Option B NVFP4 prefix-cache reuse across requests.
+    /// Stores the full token sequence (prompt + emitted) whose K/V
+    /// landed in `kv_state` after the previous successful generation.
+    /// On the next request, we compute the longest common prefix
+    /// between this and the new prompt; the kv slots [0..lcp) are
+    /// guaranteed to hold valid K/V (we never overwrite them between
+    /// requests since the kv_state persists for the worker lifetime).
+    /// Saves the dominant cost on zeroclaw tool-loop turns where each
+    /// iter sends `persona_prompt + growing_tool_history` — only the
+    /// new tail needs to be prefilled.
+    ///
+    /// Disable via `RVLLM_GEMMA4_NVFP4_PREFIX_CACHE=0`. Default ON.
+    pub nvfp4_prefix_cache:
+        std::sync::Mutex<Option<crate::gemma4_nvfp4_bring_up::Nvfp4PrefixCacheState>>,
+}
+
+/// Persistent cross-request KV-reuse state for the Option B (NVFP4-
+/// weights + NVFP4-KV) path. Task #133.
+///
+/// Lives behind `Gemma4Nvfp4Bringup::nvfp4_prefix_cache`. The cache
+/// is INVALIDATED on any provenance mismatch — KV entries written
+/// under different env-knob configuration are not safely reusable
+/// across runs (e.g. flipping `RVLLM_NVFP4_HADAMARD` changes the
+/// rotation frame K/V are quantized in).
+#[derive(Clone, Debug)]
+pub struct Nvfp4PrefixCacheState {
+    /// Full token sequence whose K/V is in the cache, in order:
+    /// the prompt that was sent, followed by every token emitted
+    /// during the spec / non-spec session.
+    pub last_tokens: Vec<u32>,
+    /// Cap on safe reuse. Set to `prompt_len + emitted.len()` after
+    /// each successful session — every token in `last_tokens` is
+    /// guaranteed to have its K/V written. Matches the fp8-block
+    /// `PrefixCacheState::committed_prefix_len` semantics.
+    pub committed_prefix_len: u32,
+    /// Provenance — config knobs that change the KV layout meaning.
+    /// LCP only counts when this matches the current request's
+    /// effective provenance; else we drop the cache.
+    pub provenance: Nvfp4Provenance,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Nvfp4Provenance {
+    /// Whether NVFP4 KV is on (vs F16). Cache K/V format differs.
+    pub nvfp4_kv: bool,
+    /// Hadamard rotation flag. Rotated K/V can't be reused as
+    /// unrotated and vice versa.
+    pub hadamard: bool,
+    pub hadamard_v: bool,
+    /// Scale policies on K and V sides. Different policies pick
+    /// different per-block scales — reuse would corrupt softmax.
+    pub k_scale_policy: u32,
+    pub v_scale_policy: u32,
+    /// Ring-buffer mode flag. Changes how block_tables index.
+    pub kv_ring_buffer: bool,
 }
 
 impl Gemma4Nvfp4Bringup {
@@ -920,7 +975,112 @@ impl Gemma4Nvfp4Bringup {
             decode_capture: std::sync::Mutex::new(None),
             embed_token_box: std::sync::Mutex::new(Box::new(0u32)),
             _ctx: ctx,
+            nvfp4_prefix_cache: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Task #133 — read current effective NVFP4 provenance.
+    /// Used both at LCP-check time AND at publish time so the
+    /// cache stays consistent with the live config.
+    pub fn current_nvfp4_provenance(&self) -> Nvfp4Provenance {
+        fn b(n: &str) -> bool {
+            crate::gemma4_bring_up::parse_truthy_env(n).unwrap_or(false)
+        }
+        fn parse_policy(v: &str) -> u32 {
+            match v {
+                "amax6" | "0" => 0,
+                "mse" | "1" => 1,
+                _ => 0,
+            }
+        }
+        let global = std::env::var("RVLLM_NVFP4_SCALE_POLICY")
+            .ok()
+            .map(|s| parse_policy(&s))
+            .unwrap_or(0);
+        let k = std::env::var("RVLLM_NVFP4_K_SCALE_POLICY")
+            .ok()
+            .map(|s| parse_policy(&s))
+            .unwrap_or(global);
+        let v = std::env::var("RVLLM_NVFP4_V_SCALE_POLICY")
+            .ok()
+            .map(|s| parse_policy(&s))
+            .unwrap_or(global);
+        Nvfp4Provenance {
+            nvfp4_kv: b("RVLLM_NVFP4_KV"),
+            hadamard: b("RVLLM_NVFP4_HADAMARD"),
+            hadamard_v: b("RVLLM_NVFP4_HADAMARD_V"),
+            k_scale_policy: k,
+            v_scale_policy: v,
+            kv_ring_buffer: crate::gemma4_bring_up::kv_ring_buffer_enabled(),
+        }
+    }
+
+    /// Task #133 — read the cross-request prefix cache and return
+    /// the longest common prefix length between the cache's tokens
+    /// and the new prompt, subject to provenance match + the
+    /// committed_prefix_len cap. Returns 0 to mean "no reuse"
+    /// (fresh request, cache miss, or env-disabled).
+    pub fn nvfp4_prefix_cache_lookup(&self, prompt: &[u32]) -> u32 {
+        // Operator opt-out for diagnostics.
+        if std::env::var("RVLLM_GEMMA4_NVFP4_PREFIX_CACHE").as_deref() == Ok("0") {
+            return 0;
+        }
+        let guard = match self.nvfp4_prefix_cache.lock() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+        let Some(cache) = guard.as_ref() else {
+            return 0;
+        };
+        // Provenance mismatch → KV-meaning differs, can't reuse.
+        let cur = self.current_nvfp4_provenance();
+        if cache.provenance != cur {
+            return 0;
+        }
+        // Compute longest common prefix, capped at committed_prefix_len.
+        let max_lcp = cache.committed_prefix_len.min(cache.last_tokens.len() as u32);
+        let mut lcp: u32 = 0;
+        for (a, b) in prompt
+            .iter()
+            .zip(cache.last_tokens.iter())
+            .take(max_lcp as usize)
+        {
+            if a != b {
+                break;
+            }
+            lcp += 1;
+        }
+        // Leave the LAST prompt token off the LCP — the forward needs
+        // at least one new token to embed + produce the next-token
+        // argmax. If the new prompt is identical (or a prefix of) the
+        // cache, this still leaves room for the closer step.
+        let plen = prompt.len() as u32;
+        if lcp >= plen {
+            lcp = plen.saturating_sub(1);
+        }
+        lcp
+    }
+
+    /// Task #133 — publish the (prompt + emitted) sequence as the
+    /// new cross-request prefix cache. Called after a successful
+    /// spec or non-spec session.
+    pub fn nvfp4_prefix_cache_publish(&self, prompt: &[u32], emitted: &[u32]) {
+        if std::env::var("RVLLM_GEMMA4_NVFP4_PREFIX_CACHE").as_deref() == Ok("0") {
+            return;
+        }
+        let total = prompt.len() + emitted.len();
+        let mut last_tokens = Vec::with_capacity(total);
+        last_tokens.extend_from_slice(prompt);
+        last_tokens.extend_from_slice(emitted);
+        let provenance = self.current_nvfp4_provenance();
+        let cache = Nvfp4PrefixCacheState {
+            committed_prefix_len: last_tokens.len() as u32,
+            last_tokens,
+            provenance,
+        };
+        if let Ok(mut guard) = self.nvfp4_prefix_cache.lock() {
+            *guard = Some(cache);
+        }
     }
 
     /// Stream-6b spec primitive #1: allocate the persistent f16
@@ -1113,12 +1273,26 @@ impl Gemma4Nvfp4Bringup {
         //    `forward_final_to_token`) snapshots base's post-
         //    final-norm hidden for the last prompt token into
         //    `base_last_hidden_ptr`.
-        let mut t_committed = self.forward_prompt_to_token_with_vision(
-            prompt_ids, 0, kv, vision_splice)?;
+        // Task #133 — cross-request LCP reuse (see _greedy_k variant
+        // for the longer rationale; text-only path only).
+        let lcp_k1: u32 = if vision_splice.is_empty() {
+            self.nvfp4_prefix_cache_lookup(prompt_ids)
+        } else {
+            0
+        };
+        let mut t_committed = if lcp_k1 > 0 {
+            let tail = &prompt_ids[lcp_k1 as usize..];
+            self.forward_prompt_to_token_with_vision(tail, lcp_k1, kv, &[])?
+        } else {
+            self.forward_prompt_to_token_with_vision(prompt_ids, 0, kv, vision_splice)?
+        };
         let mut emitted: Vec<u32> = vec![t_committed];
         let mut ctx_len: u32 = prompt_ids.len() as u32;
 
         if emitted.len() >= max_new || stop_token_ids.contains(&t_committed) {
+            if vision_splice.is_empty() {
+                self.nvfp4_prefix_cache_publish(prompt_ids, &emitted);
+            }
             return Ok(SpecSessionStats {
                 emitted,
                 n_iters: 0,
@@ -1204,6 +1378,14 @@ impl Gemma4Nvfp4Bringup {
         }
         self.forward_checkpoint = workspace_checkpoint;
         fence_result?;
+        // Task #133 — publish AFTER fence + arena restore so the cache
+        // only persists on a successful session (errors above bubbled
+        // via `?` already; result is Ok by this point on success).
+        if vision_splice.is_empty() {
+            if let Ok(ref stats) = result {
+                self.nvfp4_prefix_cache_publish(prompt_ids, &stats.emitted);
+            }
+        }
         result
     }
 
@@ -1321,13 +1503,30 @@ impl Gemma4Nvfp4Bringup {
         let mut adaptive_window_accept_count = 0usize;
         let mut adaptive_k_sum = 0usize;
 
-        // Prefill prompt and snapshot the prompt-final base hidden for
-        // drafter step 0. Stream-7: vision_splice (empty for text-only)
-        // overwrites the image-pad rows in residual_dev between embed
-        // and the layer loop.
+        // Task #133 — cross-request prefix-cache reuse for the K>=2
+        // path. Compute LCP with the previously-committed token
+        // sequence; KV slots [0..lcp) are guaranteed to hold valid
+        // K/V from the previous request's prefill+decode that we
+        // never overwrote. Only the new tail [lcp..prompt_len) needs
+        // a fresh forward. Vision splice carries token-positions that
+        // are tied to the FULL prompt indices, so we disable cache
+        // reuse when vision_splice is non-empty (vision tokens'
+        // K/V depend on the visual-embedding splice, which we don't
+        // re-splice on the tail-only path).
+        let lcp: u32 = if vision_splice.is_empty() {
+            self.nvfp4_prefix_cache_lookup(prompt_ids)
+        } else {
+            0
+        };
         let prefill_t0 = std::time::Instant::now();
-        let mut t_committed = self.forward_prompt_to_token_with_vision(
-            prompt_ids, 0, kv, vision_splice)?;
+        let mut t_committed = if lcp > 0 {
+            let tail = &prompt_ids[lcp as usize..];
+            self.forward_prompt_to_token_with_vision(
+                tail, lcp, kv, &[])?
+        } else {
+            self.forward_prompt_to_token_with_vision(
+                prompt_ids, 0, kv, vision_splice)?
+        };
         prefill_elapsed += prefill_t0.elapsed();
         let mut emitted: Vec<u32> = vec![t_committed];
         let mut ctx_len: u32 = prompt_ids.len() as u32;
@@ -1344,6 +1543,10 @@ impl Gemma4Nvfp4Bringup {
                     prefill_elapsed.as_secs_f64() * 1000.0,
                     total_t0.elapsed().as_secs_f64() * 1000.0
                 );
+            }
+            // Task #133 — early-stop path still produced a token; publish.
+            if vision_splice.is_empty() {
+                self.nvfp4_prefix_cache_publish(prompt_ids, &emitted);
             }
             return Ok(SpecSessionStats {
                 emitted,
@@ -1664,6 +1867,14 @@ impl Gemma4Nvfp4Bringup {
         }
         self.forward_checkpoint = workspace_checkpoint;
         fence_result?;
+        // Task #133 — publish cross-request prefix cache on success.
+        // After fence so the KV is fully committed; after arena
+        // restore so any error above already short-circuited via `?`.
+        if vision_splice.is_empty() {
+            if let Ok(ref stats) = result {
+                self.nvfp4_prefix_cache_publish(prompt_ids, &stats.emitted);
+            }
+        }
         result
     }
 
