@@ -122,14 +122,20 @@ pub struct Gemma4Nvfp4KvState {
     /// the production NVFP4 profile). The RoPE+KV-write kernel
     /// uses this when per-token Q scale is off.
     pub q_scale_ptr: u64,
-    /// CUDA-Graph foundation: stable 4-byte device slots holding the
-    /// per-iter scalars consumed by `g4n_fill_pos_slots_i32_indirect`.
-    /// Caller updates these via `copy_from_host_async` on the
-    /// engine's stream right before each `cuGraphLaunch` replay;
-    /// the kernel inside the captured graph then reads the updated
-    /// values. Always allocated (4 bytes × 3 = 12 bytes overhead) so
-    /// the indirect kernel can be wired unconditionally without an
-    /// init-order branch.
+    /// CUDA-Graph foundation: ONE 16-byte device region holding the
+    /// per-iter scalars consumed by `g4n_fill_pos_slots_i32_indirect`
+    /// at contiguous offsets 0/4/8. Caller updates these via a SINGLE
+    /// `cuMemcpyHtoDAsync_v2` of 12 bytes (task #135 — fold of 3 × 4-
+    /// byte HtoDs into 1 × 12-byte HtoD). The fewer-HtoD shape also
+    /// drops the captured-graph node count for fill_pos_slots from
+    /// 4 to 2 (1 HtoD + 1 kernel vs 3 HtoDs + 1 kernel).
+    ///
+    /// The three legacy field names below remain as raw u64 device
+    /// addresses (offsets into the base region) so every existing
+    /// kernel call site that reads `kv.graph_pos_off_ptr` etc. keeps
+    /// working byte-identically. Only the host-side HtoD path changes
+    /// shape.
+    pub graph_scalars_dev_base: u64,
     pub graph_pos_off_ptr: u64,
     pub graph_start_slot_ptr: u64,
     pub graph_num_tokens_ptr: u64,
@@ -190,9 +196,13 @@ impl Gemma4Nvfp4KvState {
         // CUDA-Graph foundation: stable 4-byte slots for the indirect
         // fill_pos_slots kernel. Address is captured into the graph;
         // value is updated per-iter via async HtoD before each replay.
-        let graph_pos_off_region = arena.region("g4n_graph_pos_off", 4, 16)?;
-        let graph_start_slot_region = arena.region("g4n_graph_start_slot", 4, 16)?;
-        let graph_num_tokens_region = arena.region("g4n_graph_num_tokens", 4, 16)?;
+        // Task #135 — single contiguous 16-byte region (12 bytes used
+        // for the 3 i32 scalars at offsets 0/4/8 + 4-byte alignment
+        // padding). Lets fill_pos_slots issue ONE 12-byte HtoD per
+        // call instead of THREE 4-byte HtoDs — fewer captured-graph
+        // nodes + lower per-iter host work in the eager path too.
+        let graph_scalars_region = arena.region("g4n_graph_scalars", 16, 16)?;
+        let graph_scalars_dev_base = graph_scalars_region.device_ptr();
 
         // Initialize block_tables with identity mapping
         // (i32 0..max_pos). Single HtoD copy at allocate
@@ -286,9 +296,14 @@ impl Gemma4Nvfp4KvState {
             slot_mapping_ptr: slot_mapping_region.device_ptr(),
             slot_mapping_sliding_ptr,
             q_scale_ptr: q_scale_region.device_ptr(),
-            graph_pos_off_ptr: graph_pos_off_region.device_ptr(),
-            graph_start_slot_ptr: graph_start_slot_region.device_ptr(),
-            graph_num_tokens_ptr: graph_num_tokens_region.device_ptr(),
+            // Task #135 — three legacy ptrs are now slice offsets
+            // into the single contiguous scalars region. Indirect
+            // kernel call sites pass these unchanged; only the host-
+            // side HtoD shape changed.
+            graph_scalars_dev_base,
+            graph_pos_off_ptr: graph_scalars_dev_base,
+            graph_start_slot_ptr: graph_scalars_dev_base + 4,
+            graph_num_tokens_ptr: graph_scalars_dev_base + 8,
             k_packed_layer_ptrs,
             v_packed_layer_ptrs,
             k_scale_layer_ptrs,
@@ -2332,23 +2347,24 @@ impl Gemma4Nvfp4Bringup {
             .ok().as_deref() == Some("1");
         if use_indirect {
             let stream_raw = self.stream.raw();
-            let pos_off_bytes = position_offset.to_le_bytes();
-            let sslot_bytes = start_slot.to_le_bytes();
-            let n_bytes = num_tokens.to_le_bytes();
+            // Task #135 — pack pos_off / start_slot / num_tokens into
+            // a single 12-byte stack-local buffer + issue ONE 12-byte
+            // HtoDAsync covering the contiguous device region. The
+            // three legacy graph_*_ptr fields are sub-slice offsets
+            // (0/4/8) into the same base address; the indirect kernel
+            // reads them via three separate pointer args as before,
+            // so this is HOST-SIDE shape change only.
+            let mut scalars: [u8; 12] = [0; 12];
+            scalars[0..4].copy_from_slice(&position_offset.to_le_bytes());
+            scalars[4..8].copy_from_slice(&start_slot.to_le_bytes());
+            scalars[8..12].copy_from_slice(&num_tokens.to_le_bytes());
             unsafe {
                 use cudarc::driver::sys::*;
-                // Async HtoD on the engine's stream. The graph_*
-                // device addresses are stable across the worker's
-                // lifetime; the values get updated per fill call.
-                for (dst, src) in [
-                    (kv.graph_pos_off_ptr, pos_off_bytes.as_ptr()),
-                    (kv.graph_start_slot_ptr, sslot_bytes.as_ptr()),
-                    (kv.graph_num_tokens_ptr, n_bytes.as_ptr()),
-                ] {
+                {
                     let rc = cuMemcpyHtoDAsync_v2(
-                        dst as CUdeviceptr,
-                        src as *const _,
-                        4,
+                        kv.graph_scalars_dev_base as CUdeviceptr,
+                        scalars.as_ptr() as *const _,
+                        12,
                         stream_raw as CUstream,
                     );
                     if rc != CUresult::CUDA_SUCCESS {
@@ -8402,17 +8418,23 @@ impl Gemma4Nvfp4Bringup {
             // route through `fill_pos_slots_indirect`. Update the
             // device slot here so the captured kernel sees the
             // new value at replay.
-            let pos_bytes = (position as i32).to_le_bytes();
+            // Task #135 — pack pos_off + start_slot into ONE 8-byte
+            // buffer at offsets 0/4 (both = position). num_tokens at
+            // offset 8 stays at 1 from capture time (the captured
+            // body baked the original cuStreamBeginCapture iter's
+            // num_tokens value). ONE 8-byte HtoD replaces the prior
+            // 2 × 4-byte HtoDs.
+            let pos_i32 = (position as i32).to_le_bytes();
+            let mut pair: [u8; 8] = [0; 8];
+            pair[0..4].copy_from_slice(&pos_i32);
+            pair[4..8].copy_from_slice(&pos_i32);
             unsafe {
                 use cudarc::driver::sys::*;
-                for (dst, src) in [
-                    (kv.graph_pos_off_ptr, pos_bytes.as_ptr()),
-                    (kv.graph_start_slot_ptr, pos_bytes.as_ptr()),
-                ] {
+                {
                     let rc = cuMemcpyHtoDAsync_v2(
-                        dst as CUdeviceptr,
-                        src as *const _,
-                        4,
+                        kv.graph_scalars_dev_base as CUdeviceptr,
+                        pair.as_ptr() as *const _,
+                        8,
                         stream_u64 as CUstream,
                     );
                     if rc != CUresult::CUDA_SUCCESS {
