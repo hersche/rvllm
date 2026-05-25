@@ -501,6 +501,17 @@ pub struct PreHadShadowCache {
     pub full_v_ptr: u64,
 }
 
+/// Internal embed-source variant for
+/// `forward_prompt_to_all_tokens_batched_final_and_snapshot_inner`.
+/// Decouples the verify entry points from the embed-row producer so
+/// the device-slot path (verify-macro prerequisite, task #142) can
+/// share the rest of the pipeline byte-for-byte with the legacy
+/// host-slice path.
+enum PromptEmbedSource<'a> {
+    HostSlice(&'a [u32]),
+    DeviceI32Slot(u64),
+}
+
 pub struct Gemma4Nvfp4Bringup {
     /// Drop order matters: ctx must outlive every CUDA resource
     /// allocated under it. Rust drops fields in declaration
@@ -2104,6 +2115,57 @@ impl Gemma4Nvfp4Bringup {
         }
         self.forward_prompt_to_all_tokens_batched_final_and_snapshot(
             input_tokens,
+            position_start,
+            kv,
+            drafts,
+        )
+    }
+
+    /// Task #142 — verify-macro prerequisite. Variant of
+    /// `verify_base_tokens_batched_with_accept` that sources the K+1
+    /// verify input token ids from a device-resident i32 slot instead
+    /// of a host `&[u32]`. Used by the (parked) full verify-in-macro
+    /// wrap where the K+1 staging
+    ///   slot[0]      = t_committed (HtoD from heap-stable Box)
+    ///   slot[1..K+1] = drafts      (DtoD from drafter's `draft_ids_dev`)
+    /// runs inside the captured graph body, then this function consumes
+    /// the slot without any host reads.
+    ///
+    /// Functionally byte-identical to the host-slice variant: the only
+    /// difference is the embed source. n_acc computation still pulls
+    /// the verify argmaxes through DtoH at the tail (the device-side
+    /// argmax-compare optimization is a follow-up).
+    ///
+    /// `tokens_dev_slot` must be a device-resident i32 array of length
+    /// at least `drafts.len() + 1`. Caller owns the lifetime; this fn
+    /// does not allocate it.
+    pub fn verify_base_tokens_batched_with_accept_from_device_slot(
+        &self,
+        tokens_dev_slot: u64,
+        position_start: u32,
+        kv: &Gemma4Nvfp4KvState,
+        drafts: &[u32],
+    ) -> Result<(Vec<u32>, usize)> {
+        if self.base_last_hidden_device_ptr() == 0 {
+            return Err(corrupt_runtime_err(
+                "verify_base_tokens_batched_with_accept_from_device_slot: \
+                 base_last_hidden_ptr is 0 — call \
+                 ensure_base_last_hidden_buffer before invoking K>=2 verify"
+                    .into(),
+            ));
+        }
+        if tokens_dev_slot == 0 {
+            return Err(corrupt_runtime_err(
+                "verify_base_tokens_batched_with_accept_from_device_slot: \
+                 tokens_dev_slot is 0; call ensure_verify_input_tokens_dev \
+                 + stage slot[0..K+1] before invoking"
+                    .into(),
+            ));
+        }
+        let n_tokens = (drafts.len() + 1) as u32;
+        self.forward_prompt_to_all_tokens_batched_final_and_snapshot_inner(
+            PromptEmbedSource::DeviceI32Slot(tokens_dev_slot),
+            n_tokens,
             position_start,
             kv,
             drafts,
@@ -9229,14 +9291,6 @@ impl Gemma4Nvfp4Bringup {
         kv: &Gemma4Nvfp4KvState,
         drafts: &[u32],
     ) -> Result<(Vec<u32>, usize)> {
-        if std::env::var("G4N_PROMPT_DECODE_FALLBACK").ok().as_deref() == Some("1") {
-            return Err(corrupt_runtime_err(
-                "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
-                 G4N_PROMPT_DECODE_FALLBACK=1 would bypass unified prefill; \
-                 unset it for K>=2 verify"
-                    .into(),
-            ));
-        }
         if prompt.is_empty() {
             return Err(corrupt_runtime_err(
                 "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
@@ -9252,8 +9306,52 @@ impl Gemma4Nvfp4Bringup {
                 drafts.len()
             )));
         }
-
         let n_tokens = prompt.len() as u32;
+        self.forward_prompt_to_all_tokens_batched_final_and_snapshot_inner(
+            PromptEmbedSource::HostSlice(prompt),
+            n_tokens,
+            position_start,
+            kv,
+            drafts,
+        )
+    }
+
+    /// Inner implementation shared by the host-slice + device-slot
+    /// verify entry points. Embed source is the only difference; the
+    /// rest of the pipeline (per-layer attn/post_attn/mlp, final
+    /// rmsnorm + lm_head, argmax + DtoH, n_acc compute, base-last-
+    /// hidden snapshot) is identical.
+    fn forward_prompt_to_all_tokens_batched_final_and_snapshot_inner(
+        &self,
+        source: PromptEmbedSource<'_>,
+        n_tokens: u32,
+        position_start: u32,
+        kv: &Gemma4Nvfp4KvState,
+        drafts: &[u32],
+    ) -> Result<(Vec<u32>, usize)> {
+        if std::env::var("G4N_PROMPT_DECODE_FALLBACK").ok().as_deref() == Some("1") {
+            return Err(corrupt_runtime_err(
+                "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
+                 G4N_PROMPT_DECODE_FALLBACK=1 would bypass unified prefill; \
+                 unset it for K>=2 verify"
+                    .into(),
+            ));
+        }
+        if n_tokens == 0 {
+            return Err(corrupt_runtime_err(
+                "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
+                 n_tokens is 0"
+                    .into(),
+            ));
+        }
+        if (n_tokens as usize) != drafts.len() + 1 {
+            return Err(corrupt_runtime_err(format!(
+                "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
+                 n_tokens={} drafts={} (expected drafts + 1)",
+                n_tokens,
+                drafts.len()
+            )));
+        }
         if (position_start as u64) + (n_tokens as u64) > kv.max_pos as u64 {
             return Err(corrupt_runtime_err(format!(
                 "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
@@ -9273,7 +9371,7 @@ impl Gemma4Nvfp4Bringup {
         let _scratch_guard = self.forward_scratch_guard();
         let hidden = self.arch.hidden_size as u32;
         let vocab = self.arch.vocab_size as u32;
-        let n = prompt.len();
+        let n = n_tokens as usize;
         let max_n_q: usize = self
             .model
             .layers
@@ -9289,9 +9387,27 @@ impl Gemma4Nvfp4Bringup {
             .arena
             .region("g4n_prompt_attn_out_bf16", n * max_n_q * 2, 256)?;
 
-        for (t, &tok) in prompt.iter().enumerate() {
-            let dst = residual_dev.device_ptr() + (t * hidden_bytes) as u64;
-            self.embed_one_token_to_device(tok, dst)?;
+        match source {
+            PromptEmbedSource::HostSlice(prompt) => {
+                if prompt.len() != n {
+                    return Err(corrupt_runtime_err(format!(
+                        "forward_prompt_to_all_tokens_batched_final_and_snapshot: \
+                         host prompt.len()={} != n_tokens={}",
+                        prompt.len(), n
+                    )));
+                }
+                for (t, &tok) in prompt.iter().enumerate() {
+                    let dst = residual_dev.device_ptr() + (t * hidden_bytes) as u64;
+                    self.embed_one_token_to_device(tok, dst)?;
+                }
+            }
+            PromptEmbedSource::DeviceI32Slot(slot_base) => {
+                for t in 0..n {
+                    let dst = residual_dev.device_ptr() + (t * hidden_bytes) as u64;
+                    let slot = slot_base + (t * 4) as u64;
+                    self.embed_one_token_from_device_slot(slot, dst)?;
+                }
+            }
         }
 
         // Per-layer arena checkpoint: see forward_prompt_to_all_tokens_impl.
