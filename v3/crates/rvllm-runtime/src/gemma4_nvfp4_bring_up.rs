@@ -2577,7 +2577,12 @@ impl Gemma4Nvfp4Bringup {
             let mut num_kv_heads_arg: i32 = 0;
             let mut head_dim_arg: i32 = eff_hd as i32;
             let mut rotary_dim_arg: i32 = rotary_dim;
-            let args: [*mut core::ffi::c_void; 15] = [
+            // aa01001ringbuf0 Stage 1 ABI: kernel grew a trailing
+            // `sliding_window` i32 arg. Drafter Q-side rope writes no
+            // KV cache (key_cache/value_cache/slot_mapping all null);
+            // pass 0 = no wrap.
+            let mut sliding_window_arg: i32 = 0;
+            let args: [*mut core::ffi::c_void; 16] = [
                 &mut q_in as *mut _ as *mut _,
                 &mut k_in as *mut _ as *mut _,
                 &mut v_in as *mut _ as *mut _,
@@ -2593,6 +2598,7 @@ impl Gemma4Nvfp4Bringup {
                 &mut num_kv_heads_arg as *mut _ as *mut _,
                 &mut head_dim_arg as *mut _ as *mut _,
                 &mut rotary_dim_arg as *mut _ as *mut _,
+                &mut sliding_window_arg as *mut _ as *mut _,
             ];
             let rc = cuLaunchKernel(
                 self.forward_kernels.fn_rope_partial_f16kv.raw() as CUfunction,
