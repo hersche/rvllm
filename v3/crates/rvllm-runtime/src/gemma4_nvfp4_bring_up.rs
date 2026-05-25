@@ -659,6 +659,20 @@ pub struct Gemma4Nvfp4Bringup {
     pub drafter_step_capture: std::sync::Mutex<
         Option<rvllm_graph::pool::CapturedGraph>,
     >,
+    /// Task #137 — multi-step macro CUgraphExec covering the WHOLE
+    /// K-step drafter loop in `run_drafter_greedy_k_from_state_macro`:
+    /// K iterations of (populate + drafter forward + DtoD to
+    /// draft_ids_dev[k]) collapsed into ONE captured graph. Per spec
+    /// iter the host updates `embed_token_box` (t_committed) +
+    /// `drafter_pos_box` (position=ctx_len) and replays.
+    ///
+    /// The `usize` is the captured `spec_k` value — if adaptive_k or
+    /// configuration changes K between requests, the captured macro
+    /// is dropped and re-captured on the next call. `None` until the
+    /// first successful capture.
+    pub drafter_macro_capture: std::sync::Mutex<
+        Option<(usize, rvllm_graph::pool::CapturedGraph)>,
+    >,
     /// Task #133 — Option B NVFP4 prefix-cache reuse across requests.
     /// Stores the full token sequence (prompt + emitted) whose K/V
     /// landed in `kv_state` after the previous successful generation.
@@ -1016,6 +1030,7 @@ impl Gemma4Nvfp4Bringup {
             drafter_pos_box: std::sync::Mutex::new(Box::new(0i32)),
             drafter_input_token_box: std::sync::Mutex::new(Box::new(0u32)),
             drafter_step_capture: std::sync::Mutex::new(None),
+            drafter_macro_capture: std::sync::Mutex::new(None),
             nvfp4_prefix_cache: std::sync::Mutex::new(None),
         })
     }
@@ -1701,14 +1716,34 @@ impl Gemma4Nvfp4Bringup {
                 let drafts = {
                     let guard = self.drafter.lock().unwrap();
                     let rt = guard.as_ref().unwrap();
-                    self.run_drafter_greedy_k_from_state(
-                        rt,
-                        &workspace,
-                        t_committed,
-                        ctx_len,
-                        k_eff,
-                        kv,
-                    )?
+                    // Task #137 — opt-in MACRO graph: captures the
+                    // whole K-step loop as ONE CUgraphExec, replays
+                    // per spec iter. Default-off; opt-in via
+                    // `G4N_DRAFTER_MACRO=1`. Takes precedence over
+                    // the per-step `G4N_DRAFTER_GRAPH` from #136
+                    // (the macro subsumes per-step capture by
+                    // covering the full K loop).
+                    let use_macro =
+                        std::env::var("G4N_DRAFTER_MACRO").ok().as_deref() == Some("1");
+                    if use_macro {
+                        self.run_drafter_greedy_k_from_state_macro(
+                            rt,
+                            &workspace,
+                            t_committed,
+                            ctx_len,
+                            k_eff,
+                            kv,
+                        )?
+                    } else {
+                        self.run_drafter_greedy_k_from_state(
+                            rt,
+                            &workspace,
+                            t_committed,
+                            ctx_len,
+                            k_eff,
+                            kv,
+                        )?
+                    }
                 };
                 drafter_elapsed += drafter_t0.elapsed();
                 draft_steps_total += drafts.len();
@@ -2344,6 +2379,204 @@ impl Gemma4Nvfp4Bringup {
             self.arena.restore(local_cp);
         }
         Ok(drafts)
+    }
+
+    /// Task #137 — multi-step macro graph wrap of the full K-step
+    /// drafter loop in `run_drafter_greedy_k_from_state`. First call
+    /// at a given `spec_k` captures the entire K iterations
+    /// (populate × K + drafter forward × K + DtoD × K) as ONE
+    /// `CUgraphExec`. Subsequent calls update `embed_token_box`
+    /// (t_committed) + `drafter_pos_box` (ctx_len = position) and
+    /// replay via `cuGraphLaunch`.
+    ///
+    /// vs the per-step captured wrapper (task #136): per-step pays K
+    /// separate `cuGraphLaunch` calls per spec iter (~5 µs each =
+    /// 35 µs/iter). The macro pays ONE `cuGraphLaunch` per iter
+    /// (~5 µs/iter). Saves ~30 µs/iter — small on a 30-50 ms-per-iter
+    /// drafter workload but real on launch-bound future workloads
+    /// where the per-step compute drops.
+    ///
+    /// Per-iter inputs that change across spec iters:
+    ///   * `t_committed` (k=0 populate path → embed_token_box HtoD)
+    ///   * `ctx_len` = position (drafter q-side rope → drafter_pos_box HtoD)
+    /// Both are heap-stable Box sources written before replay; the
+    /// captured async HtoD reads from the Box address at replay time.
+    ///
+    /// Per-iter inputs that stay constant across K-steps within one
+    /// iter:
+    ///   * `position` (= ctx_len, NOT ctx_len + k_step — the existing
+    ///     drafter passes a constant position arg per spec iter; see
+    ///     comment in `run_drafter_greedy_k_from_state` upstream)
+    ///   * `kv` (KvState pointers are stable for the worker lifetime)
+    ///
+    /// Capture invariants:
+    ///   * `spec_k` must match the captured value. If adaptive_k
+    ///     changes K, drop + re-capture.
+    ///   * `draft_ids_dev` arena allocation MUST land at the same
+    ///     device address each call. Achieved by the `local_cp`
+    ///     checkpoint+restore wrapping the body in this function.
+    ///
+    /// Gated via `G4N_DRAFTER_MACRO=1`. Default OFF. Falls through
+    /// to eager `run_drafter_greedy_k_from_state` on capture failure.
+    pub fn run_drafter_greedy_k_from_state_macro(
+        &self,
+        drafter: &crate::gemma4_drafter::Gemma4DrafterRuntime,
+        workspace: &crate::gemma4_drafter::DrafterStepWorkspace,
+        t_committed: u32,
+        ctx_len: u32,
+        spec_k: usize,
+        kv: &Gemma4Nvfp4KvState,
+    ) -> Result<Vec<u32>> {
+        if spec_k == 0 {
+            return Err(corrupt_runtime_err(
+                "run_drafter_greedy_k_from_state_macro: spec_k must be >= 1".into(),
+            ));
+        }
+        if self.base_last_hidden_device_ptr() == 0 {
+            return Err(corrupt_runtime_err(
+                "run_drafter_greedy_k_from_state_macro: base_last_hidden_ptr is 0".into(),
+            ));
+        }
+
+        let stream = self.stream.raw();
+
+        // Stage host-stable sources BEFORE the capture/replay branch.
+        // Both writes target the heap-stable Box<i32>/Box<u32> the
+        // captured HtoD nodes read from at replay time.
+        {
+            let mut g = self.drafter_pos_box.lock().map_err(|_| {
+                corrupt_runtime_err("drafter_pos_box mutex poisoned".into())
+            })?;
+            **g = ctx_len as i32;
+        }
+        {
+            let mut g = self.embed_token_box.lock().map_err(|_| {
+                corrupt_runtime_err("embed_token_box mutex poisoned".into())
+            })?;
+            **g = t_committed;
+        }
+
+        // Pre-allocate draft_ids_dev under a stable checkpoint so the
+        // device address is deterministic across calls. The capture
+        // and replay paths both read/write this same arena region.
+        let local_cp = self.arena.checkpoint();
+        let draft_ids_dev = self.arena.region("g4n_spec_draft_ids", spec_k * 4, 16)?;
+        let draft_ids_ptr = draft_ids_dev.device_ptr();
+
+        // Replay path: if a captured graph for this exact spec_k
+        // exists, replay it.
+        let already_captured: bool = {
+            let guard = self.drafter_macro_capture.lock().map_err(|_| {
+                corrupt_runtime_err("drafter_macro_capture mutex poisoned".into())
+            })?;
+            matches!(guard.as_ref(), Some((k, _)) if *k == spec_k)
+        };
+        if already_captured {
+            let guard = self.drafter_macro_capture.lock().map_err(|_| {
+                corrupt_runtime_err("drafter_macro_capture mutex poisoned".into())
+            })?;
+            if let Some((_, captured)) = guard.as_ref() {
+                unsafe { captured.replay(stream)?; }
+            }
+        } else {
+            // First call (or K changed): drop any stale capture +
+            // capture the K-step body into a new CUgraphExec.
+            {
+                let mut g = self.drafter_macro_capture.lock().map_err(|_| {
+                    corrupt_runtime_err("drafter_macro_capture mutex poisoned".into())
+                })?;
+                *g = None;
+            }
+            let layout = rvllm_metadata::MetadataLayout::compute(1, 1);
+            let layout_hash = layout.hash();
+            let fingerprint = rvllm_graph::pool::GraphFingerprint([0u8; 32]);
+            let capture_result = unsafe {
+                rvllm_graph::pool::CapturedGraph::capture(
+                    0, 0, layout_hash, fingerprint, stream,
+                    || -> Result<()> {
+                        for k_step in 0..spec_k {
+                            if k_step == 0 {
+                                self.populate_drafter_pre_projection_input(
+                                    drafter, workspace, t_committed,
+                                )?;
+                            } else {
+                                let prev_id_dev = draft_ids_ptr
+                                    + ((k_step - 1) * 4) as u64;
+                                self.populate_drafter_pre_projection_input_from_device_token(
+                                    workspace,
+                                    prev_id_dev,
+                                    workspace.out_hidden,
+                                )?;
+                            }
+                            self.run_drafter_forward_one_token(
+                                drafter, workspace, ctx_len, kv,
+                            )?;
+                            unsafe {
+                                use cudarc::driver::sys::*;
+                                let dst = draft_ids_ptr + (k_step * 4) as u64;
+                                let rc = cuMemcpyDtoDAsync_v2(
+                                    dst,
+                                    workspace.out_token_id,
+                                    4,
+                                    stream as CUstream,
+                                );
+                                if rc != CUresult::CUDA_SUCCESS {
+                                    return Err(corrupt_runtime_err(
+                                        "macro: draft id DtoDAsync".into(),
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(())
+                    },
+                )
+            };
+            match capture_result {
+                Ok(g) => {
+                    if let Ok(mut guard) = self.drafter_macro_capture.lock() {
+                        *guard = Some((spec_k, g));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "drafter macro graph capture rejected ({e:?}); \
+                         falling back to eager K-step loop"
+                    );
+                    // Body already ran eagerly during capture attempt
+                    // per CapturedGraph::capture contract.
+                }
+            }
+        }
+
+        // After replay (or first-call capture), fence + DtoH drafts.
+        self.stream.fence()?;
+        let mut drafts = vec![0u32; spec_k];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                drafts.as_mut_ptr() as *mut _,
+                draft_ids_ptr,
+                spec_k * 4,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(corrupt_runtime_err(
+                    "drafter macro: drafts DtoH".into(),
+                ));
+            }
+        }
+        drop(draft_ids_dev);
+        unsafe {
+            self.arena.restore(local_cp);
+        }
+        Ok(drafts)
+    }
+
+    /// Task #137 — drop the cached drafter macro graph. Companion
+    /// to clear_decode_capture / clear_drafter_step_capture.
+    pub fn clear_drafter_macro_capture(&self) {
+        if let Ok(mut guard) = self.drafter_macro_capture.lock() {
+            *guard = None;
+        }
     }
 
     /// Stream-ordered fill of the per-token metadata buffers
