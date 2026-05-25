@@ -603,6 +603,24 @@ pub struct Gemma4Nvfp4Bringup {
     /// allocated → snapshot is a no-op (production path is
     /// undisturbed when spec decode isn't requested).
     pub base_last_hidden_ptr: std::sync::atomic::AtomicU64,
+    /// Task #138 item #2 — capture-friendly device-resident slot
+    /// for the K+1 verify input tokens. Sized for the max spec_k
+    /// the runtime supports (8 tokens for K_max=7), allocated
+    /// ABOVE `forward_checkpoint` so `forward_scratch_guard`'s
+    /// arena.restore() doesn't reclaim it between requests.
+    /// `0` until `ensure_verify_input_tokens_dev()` is called.
+    /// Companion piece for the parked verify-macro extension: the
+    /// macro-graph caller pre-stages the K+1 token ids into this
+    /// slot (slot[0] = t_committed via HtoD from
+    /// verify_t_committed_box, slot[1..K+1] = drafts via DtoD from
+    /// draft_ids_dev), then K+1 calls to
+    /// `embed_one_token_from_device_slot(slot+t*4, residual+t*hidden_bytes)`
+    /// produce all embed rows inside the captured body.
+    pub verify_input_tokens_dev_ptr: std::sync::atomic::AtomicU64,
+    /// Task #138 item #2 — heap-stable Box<u32> host source for
+    /// the verify input's first token (t_committed). Captured
+    /// async HtoD reads from the Box address at replay time.
+    pub verify_t_committed_box: std::sync::Mutex<Box<u32>>,
     /// CUDA-Graph capture state for single-token decode. Captured
     /// lazily on the first `forward_full_to_token_captured` call
     /// and reused for every subsequent decode step.
@@ -1024,6 +1042,8 @@ impl Gemma4Nvfp4Bringup {
             drafter: std::sync::Mutex::new(None),
             pre_had_shadow_cache: std::sync::RwLock::new(None),
             base_last_hidden_ptr: std::sync::atomic::AtomicU64::new(0),
+            verify_input_tokens_dev_ptr: std::sync::atomic::AtomicU64::new(0),
+            verify_t_committed_box: std::sync::Mutex::new(Box::new(0u32)),
             decode_capture: std::sync::Mutex::new(None),
             embed_token_box: std::sync::Mutex::new(Box::new(0u32)),
             _ctx: ctx,
@@ -1193,6 +1213,46 @@ impl Gemma4Nvfp4Bringup {
         self.base_last_hidden_ptr
             .store(region.device_ptr(), Release);
         Ok(())
+    }
+
+    /// Task #138 item #2 — sibling of `ensure_base_last_hidden_buffer`
+    /// that allocates the persistent `verify_input_tokens_dev` slot
+    /// (8 × i32 = 32 bytes, sized for max K=7+1 verify-input tokens).
+    /// Allocated ABOVE `forward_checkpoint` so it survives every
+    /// forward_scratch_guard restore. Idempotent. Caller stages the
+    /// K+1 token ids into the slot via HtoD (slot[0] from
+    /// `verify_t_committed_box`) + DtoD (slot[1..K+1] from
+    /// `draft_ids_dev`); then K+1 calls to
+    /// `embed_one_token_from_device_slot` produce all embed rows
+    /// without host-side per-token reads inside a captured body.
+    pub fn ensure_verify_input_tokens_dev(&mut self) -> Result<()> {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        if self.verify_input_tokens_dev_ptr.load(Acquire) != 0 {
+            return Ok(());
+        }
+        // 8 × 4 = 32 bytes; sized for the max spec_k=7 the runtime
+        // currently supports (input_tokens length = K+1 = 8).
+        let region = self.arena.region("g4n_verify_input_tokens_i32", 32, 16)?;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemsetD8_v2(region.device_ptr(), 0, 32);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(corrupt_runtime_err(
+                    "ensure_verify_input_tokens_dev: zero-init".into(),
+                ));
+            }
+        }
+        self.forward_checkpoint = self.arena.checkpoint();
+        self.verify_input_tokens_dev_ptr
+            .store(region.device_ptr(), Release);
+        Ok(())
+    }
+
+    /// Task #138 item #2 — read-only getter. Returns 0 if
+    /// `ensure_verify_input_tokens_dev` has not been called.
+    pub fn verify_input_tokens_device_ptr(&self) -> u64 {
+        self.verify_input_tokens_dev_ptr
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Stream-6b spec primitive #1: read-only getter for the
@@ -6980,6 +7040,52 @@ impl Gemma4Nvfp4Bringup {
                 dst_dev,
                 self.model.outside.embed_tokens.offset_bytes,
                 tok_region.device_ptr(),
+                stream_u64,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Task #138 item #2 — capture-friendly embed sibling.
+    /// `tok_dev_slot` must point at a device-resident i32 already
+    /// containing the token id (populated by the caller via DtoD
+    /// from another device slot OR HtoD from a heap-stable host
+    /// source — both fine for `cuStreamBeginCapture`). This skips
+    /// the embed_token_box → tok_region HtoD that
+    /// `embed_one_token_to_device` does, because the caller has
+    /// already arranged the device-resident token id.
+    ///
+    /// Use case: the verify-macro extension (parked follow-up of
+    /// task #137) needs to embed K+1 tokens whose ids come from
+    /// (a) t_committed = host u32 → heap-Box → HtoD to slot[0],
+    /// (b) drafts[0..K] = device-resident in `draft_ids_dev` →
+    ///     DtoD to slot[1..K+1].
+    /// Once all K+1 slots are staged, K+1 calls to this helper
+    /// generate the K+1 embed rows without any host-side per-
+    /// token reads inside the captured body.
+    ///
+    /// The kernel ABI matches `embed_one_token_to_device`'s gather
+    /// step — same `fn_embedding_gather_bf16` reading from a
+    /// device-resident i32 token slot and writing to `dst_dev`
+    /// (one row of hidden_size bf16).
+    pub fn embed_one_token_from_device_slot(
+        &self,
+        tok_dev_slot: u64,
+        dst_dev: u64,
+    ) -> Result<()> {
+        let hidden = self.arch.hidden_size as u32;
+        let stream_u64 = self.stream.raw();
+        unsafe {
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens: 1,
+                hidden,
+                vocab: self.arch.vocab_size as u32,
+            }
+            .launch(
+                self.forward_kernels.fn_embedding_gather_bf16,
+                dst_dev,
+                self.model.outside.embed_tokens.offset_bytes,
+                tok_dev_slot,
                 stream_u64,
             )?;
         }
