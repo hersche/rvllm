@@ -979,6 +979,30 @@ impl Gemma4Nvfp4Bringup {
         })
     }
 
+    /// Task #134 — drop the cached decode graph. Use when:
+    ///   * the operator flips an env knob that changes the decode
+    ///     forward shape (e.g. RVLLM_NVFP4_KV, HADAMARD) — the
+    ///     captured graph references device pointers + a baked
+    ///     kv_dtype dispatch that the new config would invalidate;
+    ///   * a future code path moves any device address the capture
+    ///     references (the qwen36 Phase 8 "[graph-cache] address
+    ///     check" pattern is the canonical example);
+    ///   * tests want a clean slate to re-measure capture overhead.
+    ///
+    /// The cuda_worker doesn't call this today because the gemma4-
+    /// nvfp4 KvState pointers are stable for the worker lifetime,
+    /// AND the captured-decode env knobs are read once per process
+    /// (so cross-request flips don't apply). Adding the helper as a
+    /// safety net so the future-self / future-feature has a clean
+    /// way to invalidate.
+    pub fn clear_decode_capture(&self) {
+        if let Ok(mut guard) = self.decode_capture.lock() {
+            // Dropping the tuple drops the CapturedGraph, which
+            // destroys the underlying CUgraphExec.
+            *guard = None;
+        }
+    }
+
     /// Task #133 — read current effective NVFP4 provenance.
     /// Used both at LCP-check time AND at publish time so the
     /// cache stays consistent with the live config.
