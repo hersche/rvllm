@@ -739,6 +739,105 @@ impl Fp8GemvF16InLaunch {
     }
 }
 
+/// Task #144 Phase 2 — host-side launcher for `fp8_gemv_mma_m8_w4c_kernel`
+/// (kernels/fp8_gemv_mma_m8_w4c.cu). Byte-compatible ABI with
+/// `Fp8GemvF16InLaunch`: same args, same scale layout, same output dtype.
+/// The only differences vs the production f16in kernel are:
+///   * Grid (ceil(N/32), 1, 1) instead of (ceil(N/8), M, 1) — block
+///     covers M-dim instead of splitting it across grid rows.
+///   * Block (128, 1, 1) instead of (256, 1, 1) — 4 warps per block
+///     (W=4 cooperative-A pattern from task #96).
+///   * Dynamic smem 1600 bytes (A tile + per-warp B tiles + ascale).
+///   * Internal reduction uses `mma.sync` f8f6f4 m16n8k32 fragments
+///     instead of warp-shuffled scalar FMA.
+///
+/// M is capped at 16 (the MMA fragment row count). For M > 16 the
+/// launcher returns ConfigError so the caller can fall back to
+/// `Fp8GemvF16InLaunch`. K must be a multiple of 128 for the inner
+/// tile loop; K not divisible by 128 still works via the kernel's
+/// ragged-K tail loop but adds scalar ops per (row, n) pair —
+/// acceptable for the typical Gemma 4 / Qwen 3.x decode-path Ks
+/// (256, 512, 5376) which are all multiples of 128.
+pub struct Fp8GemvMmaM8W4cLaunch {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+}
+
+impl Fp8GemvMmaM8W4cLaunch {
+    /// # Safety
+    /// Same lifetime requirements as `Fp8GemvF16InLaunch::launch`.
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        output_f16: u64,
+        weight_fp8: u64,
+        b_chscale: u64,
+        input_f16: u64,
+        stream: u64,
+    ) -> Result<()> {
+        if self.m == 0 || self.n == 0 || self.k == 0 {
+            return Err(rvllm_core::RvllmError::config(
+                rvllm_core::ConfigError::Inconsistent {
+                    reasons: vec![format!(
+                        "Fp8GemvMmaM8W4cLaunch rejects zero dims \
+                         (m={}, n={}, k={})",
+                        self.m, self.n, self.k
+                    )],
+                },
+                "Fp8GemvMmaM8W4cLaunch.dims",
+            ));
+        }
+        if self.m > 16 {
+            return Err(rvllm_core::RvllmError::config(
+                rvllm_core::ConfigError::Inconsistent {
+                    reasons: vec![format!(
+                        "Fp8GemvMmaM8W4cLaunch requires M <= 16 (MMA \
+                         fragment row count); got m={}",
+                        self.m
+                    )],
+                },
+                "Fp8GemvMmaM8W4cLaunch.m",
+            ));
+        }
+        if self.k % 8 != 0 {
+            return Err(rvllm_core::RvllmError::config(
+                rvllm_core::ConfigError::Inconsistent {
+                    reasons: vec![format!(
+                        "Fp8GemvMmaM8W4cLaunch requires K % 8 == 0; got K={}",
+                        self.k
+                    )],
+                },
+                "Fp8GemvMmaM8W4cLaunch.k",
+            ));
+        }
+        let mut output = output_f16;
+        let mut weight = weight_fp8;
+        let mut scale = b_chscale;
+        let mut input = input_f16;
+        let mut m_i = self.m as i32;
+        let mut n_i = self.n as i32;
+        let mut k_i = self.k as i32;
+        let mut num_col_blocks = ((self.k + 127) / 128) as i32;
+        let args = [
+            (&mut output) as *mut u64 as *mut core::ffi::c_void,
+            (&mut weight) as *mut u64 as *mut core::ffi::c_void,
+            (&mut scale) as *mut u64 as *mut core::ffi::c_void,
+            (&mut input) as *mut u64 as *mut core::ffi::c_void,
+            (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+            (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+            (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+            (&mut num_col_blocks) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        let grid = ((self.n + 31) / 32, 1u32, 1u32);
+        let block = (128u32, 1u32, 1u32);
+        // Dynamic smem: [16, 32] A + 4 × [8, 32] B + [16] f32 ascale
+        // = 512 + 1024 + 64 = 1600 bytes.
+        let smem: u32 = 1600;
+        launch_raw(kernel, grid, block, smem, stream, &args)
+    }
+}
+
 pub struct FusedNormAddResidualF16InLaunch {
     pub num_tokens: u32,
     pub hidden: u32,

@@ -868,6 +868,15 @@ pub struct Gemma4LayerKernels {
     /// activation FP8-quant step and runs this kernel directly on the
     /// f16 rmsnorm output.
     pub fp8_gemv_wpr_native_f16in: Option<KernelFn>,
+    /// Task #144 Phase 2 — MMA variant of the f16in FP8 GEMV path
+    /// (`fp8_gemv_mma_m8_w4c_kernel`). Same ABI as `Fp8GemvF16InLaunch`
+    /// but uses `mma.sync` f8f6f4 m16n8k32 fragments under the hood.
+    /// `None` when the PTX is absent or the device is pre-Blackwell.
+    /// Opt-in only — production decode dispatch ignores this unless
+    /// `RVLLM_GEMMA4_NVFP4_FP8_GEMV_MMA=1`. M-cap = 16 (MMA fragment
+    /// row count); call sites bypass to `Fp8GemvF16InLaunch` for
+    /// M > 16.
+    pub fp8_gemv_mma_m8_w4c: Option<KernelFn>,
     /// Cycle 55 step 3 (Phase B): bf16-input sibling of the f16in
     /// kernel above (`fp8_gemv_blockwise_wpr_native_bf16in_kernel`).
     /// `None` on non-Blackwell targets. Used under bf16-native
@@ -1599,19 +1608,49 @@ pub unsafe fn gemma4_forward_phase(
             weights.attn_norm_gamma,
             stream,
         )?;
-        gemma4_launcher::Fp8GemvF16InLaunch {
-            m: dims.num_tokens,
-            n: qkv_rows,
-            k: dims.hidden,
+        // Task #144 Phase 2 — opt-in MMA dispatch. Env-gated; falls
+        // through to the production scalar GEMV when off, when the
+        // kernel is unavailable, when bf16-native is active (the MMA
+        // kernel is f16-input only), or when M > 16 (MMA fragment
+        // row cap). Cross-model invariant: the gate name is gemma4-
+        // nvfp4 specific and the kernel field lives only on the
+        // gemma4 LayerKernels struct, so no other model family sees
+        // this path.
+        let use_fp8_gemv_mma = !bf16_native
+            && dims.num_tokens <= 16
+            && std::env::var("RVLLM_GEMMA4_NVFP4_FP8_GEMV_MMA")
+                .ok().as_deref() == Some("1");
+        if let (true, Some(fn_mma)) =
+            (use_fp8_gemv_mma, kernels.fp8_gemv_mma_m8_w4c)
+        {
+            gemma4_launcher::Fp8GemvMmaM8W4cLaunch {
+                m: dims.num_tokens,
+                n: qkv_rows,
+                k: dims.hidden,
+            }
+            .launch(
+                fn_mma,
+                scratch.q_out,
+                weights.qkv_fp8,
+                weights.qkv_blockscale,
+                scratch.delta_f16,
+                stream,
+            )?;
+        } else {
+            gemma4_launcher::Fp8GemvF16InLaunch {
+                m: dims.num_tokens,
+                n: qkv_rows,
+                k: dims.hidden,
+            }
+            .launch(
+                fn_gemv,
+                scratch.q_out,
+                weights.qkv_fp8,
+                weights.qkv_blockscale,
+                scratch.delta_f16,
+                stream,
+            )?;
         }
-        .launch(
-            fn_gemv,
-            scratch.q_out,
-            weights.qkv_fp8,
-            weights.qkv_blockscale,
-            scratch.delta_f16,
-            stream,
-        )?;
         // Cycle 55 step 13: when bf16-native fast path is enabled,
         // GEMV produced bf16 q_out; narrow to f16 for downstream
         // RoPE+attention which is still f16-typed. Net narrow count
