@@ -1114,7 +1114,31 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
             // one. With output_bf16 plumb live, cycle 55 Stage 3
             // can flip a flag at the caller instead of touching the
             // launcher.
-            let kernel_handle = if output_bf16 {
+            // Task #143 Phase 2: opt-in cp.async-staged sibling kernel
+            // selection. Only the bf16-out variant has a cpasync sibling;
+            // f16-out path is unchanged. Env knob is gemma4-nvfp4-
+            // specific by name; other model families' dispatches will
+            // simply ignore the new kernel even if they happen to set
+            // the env, because their bf16-out branch isn't on this path
+            // (qwen36-nvfp4 has its own dispatcher in qwen36_bring_up).
+            //
+            // Smem fit: cpasync kernel needs an extra
+            //   2 × tile_size × (head_dim / 2) bytes
+            // for K+V packed staging. On head_dim=512 (Gemma 4 global
+            // layers) at tile_size=128 that's +64 KiB, which pushes
+            // total smem over sm_121's ~100 KiB per-block ceiling.
+            // Gate cpasync to head_dim ≤ 256 (sliding-attn layers on
+            // Gemma 4); head_dim=512 layers fall back to the parent
+            // kernel transparently. Verified empirically: head_dim=512
+            // hits CUDA_ERROR_INVALID_VALUE on cuFuncSetAttribute.
+            let use_cpasync = output_bf16
+                && params.head_dim <= 256
+                && std::env::var("RVLLM_GEMMA4_NVFP4_PREFILL_CPASYNC")
+                    .ok().as_deref() == Some("1")
+                && fa2.fn_prefill_nvfp4kv_unified_bf16out_cpasync.is_some();
+            let kernel_handle = if use_cpasync {
+                fa2.fn_prefill_nvfp4kv_unified_bf16out_cpasync
+            } else if output_bf16 {
                 fa2.fn_prefill_nvfp4kv_unified_bf16out
             } else {
                 fa2.fn_prefill_nvfp4kv_unified
@@ -1155,6 +1179,11 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
                 + block_m * MMA_K * 2                      // s_p_f16
                 // s_p_scale removed (post-softmax P in [0,1] = identity scale)
                 + block_m * hd * 4                         // s_acc
+                // Task #143 Phase 2 — cp.async packed K/V staging:
+                // 2 × ts × (hd/2) bytes when dispatch picks the
+                // cpasync sibling (env-gated). Parent kernel ignores
+                // the extra smem (it just doesn't reference it).
+                + if use_cpasync { 2 * ts * (hd / 2) + 16 } else { 0 }
                 + 256;                                     // alignment cushion
 
             if smem_bytes >= 48 * 1024 {
