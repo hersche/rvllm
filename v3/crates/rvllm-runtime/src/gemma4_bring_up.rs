@@ -683,6 +683,15 @@ pub struct Gemma4FusedModules {
     /// step 1) so the M=1 decode QKV + gate_up fast paths don't narrow
     /// bf16→f16-sat at projection entry.
     pub fn_fp8_gemv_wpr_native_bf16in: Option<KernelFn>,
+    /// Task #144 Phase 2 — opt-in MMA variant of the FP8 GEMV path
+    /// (`fp8_gemv_mma_m8_w4c_kernel`). Same ABI as the f16in kernel
+    /// above; uses `mma.sync` f8f6f4 m16n8k32 fragments instead of
+    /// scalar warp-shuffle reduction. Blackwell-only (gated on the
+    /// same `Fp8GemvVariant::WprNativeF16In.available_for` as the
+    /// f16in kernel). `None` when PTX is absent / pre-Blackwell.
+    /// Caller decides per-call whether to use it; production default
+    /// is to ignore it unless `RVLLM_GEMMA4_NVFP4_FP8_GEMV_MMA=1`.
+    pub fn_fp8_gemv_mma_m8_w4c: Option<KernelFn>,
     /// Companion to the V-rotation arm of the NVFP4 RoPE kernel: when
     /// V is stored rotated (V_cache = V·R), attn_out = P·V·R, and we
     /// need to right-multiply attn_out by R^T per (token, head) before
@@ -13546,6 +13555,7 @@ impl Gemma4Bringup {
             scale_cols_f16: self.fused.fn_scale_cols_f16,
             fp8_gemv_wpr_native_f16in: self.fused.fn_fp8_gemv_wpr_native_f16in,
             fp8_gemv_wpr_native_bf16in: self.fused.fn_fp8_gemv_wpr_native_bf16in,
+            fp8_gemv_mma_m8_w4c: self.fused.fn_fp8_gemv_mma_m8_w4c,
             hadamard_unrotate_f16: self.fused.fn_hadamard_unrotate_f16,
             awq_int4_gemv_f16: self.fused.fn_awq_int4_gemv_f16,
             awq_int4_gemm_sm120_wmma: self.fused.fn_awq_int4_gemm_sm120_wmma,
@@ -16536,6 +16546,19 @@ fn load_gemma4_fused(
         _ => None,
     };
 
+    // Task #144 Phase 2 — fp8_gemv MMA variant (mma.sync f8f6f4
+    // m16n8k32). Gemma-4 Blackwell-only (mirrors the WprNativeF16In
+    // gate above). When loaded, the QKV/O/gate_up/down call sites can
+    // dispatch to it behind `RVLLM_GEMMA4_NVFP4_FP8_GEMV_MMA=1`. Falls
+    // back to None on pre-Blackwell.
+    let fn_fp8_gemv_mma_m8_w4c = match target {
+        Some(t) if rvllm_kernels::Fp8GemvVariant::WprNativeF16In.available_for(t) => {
+            let m = loader.load_ptx("fp8_gemv_mma_m8_w4c")?;
+            Some(m.get_function("fp8_gemv_mma_m8_w4c_kernel")?)
+        }
+        _ => None,
+    };
+
     let fused_norm_add_residual_mod = loader.load_ptx("fused_norm_add_residual")?;
     let fn_fused_norm_add_residual =
         fused_norm_add_residual_mod.get_function("fused_norm_add_residual_kernel")?;
@@ -16869,6 +16892,7 @@ fn load_gemma4_fused(
         fp8_gemv_mod,
         fn_fp8_gemv_wpr_native_f16in,
         fn_fp8_gemv_wpr_native_bf16in,
+        fn_fp8_gemv_mma_m8_w4c,
         hadamard_unrotate_f16_mod,
         fn_hadamard_unrotate_f16,
         hadamard_rotate_f16_mod,
