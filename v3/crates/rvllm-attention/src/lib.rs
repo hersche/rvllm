@@ -443,6 +443,21 @@ pub struct Fa2PtxKernels {
     pub fn_prefill_nvfp4kv_bc16_bf16out: Option<rvllm_kernels::KernelFn>,
     /// Cycle 55 step 10: bf16-output unified-prefill kernel handle.
     pub fn_prefill_nvfp4kv_unified_bf16out: Option<rvllm_kernels::KernelFn>,
+    /// Task #143 Phase 2 — cp.async-staged K/V load sibling of the
+    /// bf16-out unified prefill kernel. Same ABI as
+    /// `fn_prefill_nvfp4kv_unified_bf16out`; differs by adding a
+    /// per-tile shared-memory packed-byte staging area + dispatching
+    /// the HBM→smem load via `cp.async.ca.shared.global` instead of
+    /// per-thread `__ldg`. Loaded as a separate PTX module from
+    /// `flash_attention_unified_prefill_nvfp4kv_bf16out_cpasync.ptx`.
+    /// `None` if the PTX is absent. Caller (gemma4-nvfp4 dispatch)
+    /// env-gates selection; production default ignores this and uses
+    /// the parent kernel above.
+    pub fn_prefill_nvfp4kv_unified_bf16out_cpasync: Option<rvllm_kernels::KernelFn>,
+    /// Owning module handle for the cp.async sibling PTX. Kept on the
+    /// struct so the loaded CUmodule outlives the KernelFn handles
+    /// referencing it.
+    pub unified_prefill_nvfp4kv_bf16out_cpasync_mod: Option<rvllm_kernels::LoadedModule>,
     /// Cycle 55 step 10: bf16-output split-decode + reducer handles.
     pub fn_decode_nvfp4kv_split_bf16out: Option<rvllm_kernels::KernelFn>,
     pub fn_decode_nvfp4kv_split_bc16_bf16out: Option<rvllm_kernels::KernelFn>,
@@ -644,6 +659,21 @@ impl Fa2PtxKernels {
                 }
                 Err(_) => (None, None),
             };
+            // Task #143 Phase 2 — cp.async-staged sibling of the
+            // bf16-out unified prefill kernel. Separate PTX module
+            // so older trees without the sibling still bring up.
+            let (
+                unified_prefill_nvfp4kv_bf16out_cpasync_mod,
+                fn_prefill_nvfp4kv_unified_bf16out_cpasync,
+            ) = match loader.load_ptx("flash_attention_unified_prefill_nvfp4kv_bf16out_cpasync") {
+                Ok(m) => {
+                    let f = m.get_function(
+                        "flash_attention_2_prefill_nvfp4kv_unified_bf16out_cpasync_kernel"
+                    ).ok();
+                    (Some(m), f)
+                }
+                Err(_) => (None, None),
+            };
             let (
                 split_decode_nvfp4kv_bf16out_mod,
                 fn_decode_nvfp4kv_split_bf16out,
@@ -746,6 +776,8 @@ impl Fa2PtxKernels {
                 fn_prefill_nvfp4kv_bf16out,
                 fn_prefill_nvfp4kv_bc16_bf16out,
                 fn_prefill_nvfp4kv_unified_bf16out,
+                fn_prefill_nvfp4kv_unified_bf16out_cpasync,
+                unified_prefill_nvfp4kv_bf16out_cpasync_mod,
                 fn_decode_nvfp4kv_split_bf16out,
                 fn_decode_nvfp4kv_split_bc16_bf16out,
                 fn_paged_attn_reduce_bf16,
@@ -786,6 +818,8 @@ impl Fa2PtxKernels {
                 fn_prefill_nvfp4kv_bf16out: None,
                 fn_prefill_nvfp4kv_bc16_bf16out: None,
                 fn_prefill_nvfp4kv_unified_bf16out: None,
+                fn_prefill_nvfp4kv_unified_bf16out_cpasync: None,
+                unified_prefill_nvfp4kv_bf16out_cpasync_mod: None,
                 fn_decode_nvfp4kv_split_bf16out: None,
                 fn_decode_nvfp4kv_split_bc16_bf16out: None,
                 fn_paged_attn_reduce_bf16: None,
