@@ -1608,18 +1608,28 @@ pub unsafe fn gemma4_forward_phase(
             weights.attn_norm_gamma,
             stream,
         )?;
-        // Task #144 Phase 2 — opt-in MMA dispatch. Env-gated; falls
-        // through to the production scalar GEMV when off, when the
-        // kernel is unavailable, when bf16-native is active (the MMA
-        // kernel is f16-input only), or when M > 16 (MMA fragment
-        // row cap). Cross-model invariant: the gate name is gemma4-
-        // nvfp4 specific and the kernel field lives only on the
-        // gemma4 LayerKernels struct, so no other model family sees
-        // this path.
+        // Task #144 Phase 2 + verify-batch step 1 — opt-in MMA dispatch.
+        // Env-gated; falls through to the production scalar GEMV when
+        // off, when the kernel is unavailable, when bf16-native is
+        // active (the MMA kernel is f16-input only), or when M is
+        // outside [4, 16] (below 4 the MMA fragment is too sparse to
+        // win; above 16 the fragment is too small).
+        //
+        // Two independent env knobs:
+        //   * `RVLLM_GEMMA4_NVFP4_FP8_GEMV_MMA=1`         — per-token decode
+        //     (original Phase 2 knob; production stays off because
+        //     M=1 is fragment-1/16 padded and scalar wins on raw FMAs).
+        //   * `RVLLM_GEMMA4_NVFP4_FP8_GEMV_MMA_VERIFY=1` — verify-batch
+        //     (K+1 input tokens per spec iter; at K=7 → M=8, fragment
+        //     1/2 utilized, ~4× FMA throughput vs scalar).
+        let env_mma_decode = std::env::var("RVLLM_GEMMA4_NVFP4_FP8_GEMV_MMA")
+            .ok().as_deref() == Some("1");
+        let env_mma_verify = std::env::var("RVLLM_GEMMA4_NVFP4_FP8_GEMV_MMA_VERIFY")
+            .ok().as_deref() == Some("1");
         let use_fp8_gemv_mma = !bf16_native
+            && dims.num_tokens >= 4
             && dims.num_tokens <= 16
-            && std::env::var("RVLLM_GEMMA4_NVFP4_FP8_GEMV_MMA")
-                .ok().as_deref() == Some("1");
+            && (env_mma_decode || env_mma_verify);
         if let (true, Some(fn_mma)) =
             (use_fp8_gemv_mma, kernels.fp8_gemv_mma_m8_w4c)
         {
@@ -2574,6 +2584,31 @@ pub unsafe fn gemma4_forward_phase(
         // bridge kernel that takes f16 GEMV input + writes bf16
         // residual). Future iteration: wire attention bf16out, then
         // flip this site to bf16-in for true end-to-end bf16.
+        //
+        // Task #144 verify-batch wire-up (Phase 2/3 plan, step 1):
+        // when num_tokens >= 4 (MMA fragment ≥ 25% utilized) AND the
+        // verify env knob is on AND the MMA kernel is loaded, dispatch
+        // to the MMA variant. M=1-3 falls through to scalar (MMA is
+        // compute-less at M<4). bf16-native fast path bypassed
+        // (MMA kernel is f16-input only).
+        let use_mma_verify = dims.num_tokens >= 4
+            && std::env::var("RVLLM_GEMMA4_NVFP4_FP8_GEMV_MMA_VERIFY")
+                .ok().as_deref() == Some("1");
+        if let (true, Some(fn_mma)) = (use_mma_verify, kernels.fp8_gemv_mma_m8_w4c) {
+            gemma4_launcher::Fp8GemvMmaM8W4cLaunch {
+                m: dims.num_tokens,
+                n: dims.hidden,
+                k: q_dim,
+            }
+            .launch(
+                fn_mma,
+                scratch.gemm_f32_tmp,
+                weights.o_fp8,
+                weights.o_blockscale,
+                scratch.attn_out,
+                stream,
+            )?;
+        } else {
         gemma4_launcher::Fp8GemvF16InLaunch {
             m: dims.num_tokens,
             n: dims.hidden,
@@ -2587,6 +2622,7 @@ pub unsafe fn gemma4_forward_phase(
             scratch.attn_out,
             stream,
         )?;
+        }
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
@@ -2879,6 +2915,29 @@ pub unsafe fn gemma4_forward_phase(
             weights.pre_ff_norm_gamma,
             stream,
         )?;
+        // Task #144 verify-batch step 1 — gate_up MMA dispatch.
+        // Same gate as O-proj above. Note gate_up GEMV N = 2*intermediate
+        // = 43008 on Gemma 4 31B (largest of the 4 sites) — biggest
+        // win surface at K=7 verify since each output col benefits
+        // from the same 8-row input staging.
+        let use_mma_verify = dims.num_tokens >= 4
+            && std::env::var("RVLLM_GEMMA4_NVFP4_FP8_GEMV_MMA_VERIFY")
+                .ok().as_deref() == Some("1");
+        if let (true, Some(fn_mma)) = (use_mma_verify, kernels.fp8_gemv_mma_m8_w4c) {
+            gemma4_launcher::Fp8GemvMmaM8W4cLaunch {
+                m: dims.num_tokens,
+                n: 2 * dims.intermediate,
+                k: dims.hidden,
+            }
+            .launch(
+                fn_mma,
+                scratch.gate_up_out,
+                weights.gate_up_fp8,
+                weights.gate_up_blockscale,
+                scratch.delta_f16,
+                stream,
+            )?;
+        } else {
         gemma4_launcher::Fp8GemvF16InLaunch {
             m: dims.num_tokens,
             n: 2 * dims.intermediate,
@@ -2892,6 +2951,7 @@ pub unsafe fn gemma4_forward_phase(
             scratch.delta_f16,
             stream,
         )?;
+        }
     } else if weights.gate_up_chscale != 0 {
         fp8_gemm_channelscale_or_fallback(
             cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,
@@ -3095,6 +3155,28 @@ pub unsafe fn gemma4_forward_phase(
             let grid = (dims.num_tokens, 1, 1);
             rvllm_fused::launch_raw(kernels.fused_gelu_mul_f16, grid, block, 0, stream, &args)?;
         }
+        // Task #144 verify-batch step 1 — down-proj MMA dispatch.
+        // Same gate as O / gate_up. K = intermediate = 21504 (large),
+        // N = hidden = 5376; benefits from MMA at M=8 since the
+        // 8-row input row staging amortizes well across the wide K.
+        let use_mma_verify = dims.num_tokens >= 4
+            && std::env::var("RVLLM_GEMMA4_NVFP4_FP8_GEMV_MMA_VERIFY")
+                .ok().as_deref() == Some("1");
+        if let (true, Some(fn_mma)) = (use_mma_verify, kernels.fp8_gemv_mma_m8_w4c) {
+            gemma4_launcher::Fp8GemvMmaM8W4cLaunch {
+                m: dims.num_tokens,
+                n: dims.hidden,
+                k: dims.intermediate,
+            }
+            .launch(
+                fn_mma,
+                scratch.gemm_f32_tmp,
+                weights.down_fp8,
+                weights.down_blockscale,
+                scratch.gate_up_fp8,
+                stream,
+            )?;
+        } else {
         gemma4_launcher::Fp8GemvF16InLaunch {
             m: dims.num_tokens,
             n: dims.hidden,
@@ -3108,6 +3190,7 @@ pub unsafe fn gemma4_forward_phase(
             scratch.gate_up_fp8,
             stream,
         )?;
+        }
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,

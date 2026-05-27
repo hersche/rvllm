@@ -1563,6 +1563,61 @@ deterministic 3 runs):
 Quality verified on 50-word quantum entanglement (coherent + Einstein
 "spooky action" reference). Default-off regression at baseline 6020 ms.
 
+### aa01001nvfp4gemv — fp8_gemv MMA: NOT applicable to gemma4-nvfp4 (2026-05-27, negative result)
+
+**Outcome: no fp8_gemv work needed on gemma4-nvfp4 — its decode/verify
+GEMMs are already on their best kernels.** The parked
+`aa01001nvfp4gemv` task ("fp8_gemv TensorCore MMA rewrite, 64.3% of
+decode GPU time") was based on a nsys figure from the **fp8-block /
+qwen36** decode path, NOT gemma4-**nvfp4** (Option B). Code-path audit
++ hardware A/B established:
+
+* **gemma4-nvfp4 never calls the `fp8_gemv_blockwise_wpr_native_f16in`
+  family.** That family + the new `fp8_gemv_mma_m8_w4c` MMA sibling
+  (shipped #144 Phase 1-3) serve the gemma4 **fp8-block** path
+  (`Gemma4Layer::execute` in `gemma4_layer_exec.rs`, `weights.*_fp8`).
+  The NVFP4-weights path runs through `gemma4_nvfp4_ops.rs` with the
+  `mistral35_w4a16_*` NVFP4-weight GEMM family.
+* **Verify-batch MLP (M=K+1, up to 8 at K=7) already routes to
+  `fn_w4a16_gemm_mma_v8`** (the persistent-CTA TensorCore MMA kernel)
+  by default — `gemma4_nvfp4_w4a16_gemm_mn` dispatches to MMA_V8 when
+  `RVLLM_GEMMA4_NVFP4_MLP_MMA_V8` is on (default-on, #102) AND
+  `k%16==0 && n%32==0`. All 3 MLP GEMMs at 31B satisfy this
+  (gate/up N=21504, down N=5376, K∈{5376,21504} — all multiples).
+* **Verify-batch attention proj** (QKV/O) uses
+  `gemma4_nvfp4_attn_proj` = `cublaslt.bf16_gemm_f32` (weights stored
+  bf16 after load, not packed NVFP4). It's ~10% of verify GEMM FLOPs;
+  a W4A16-MMA port would need a load-path change to keep weights
+  NVFP4 — not worth it vs the MLP which already dominates and is
+  already MMA'd.
+
+**Hardware A/B** (gemma-4-31b-it-nvfp4, binary md5
+`64a7006f0af5a45598b2fba5c808e416`, 3 prompts × 8 cells of forced-K
+× `RVLLM_GEMMA4_NVFP4_FP8_GEMV_MMA_VERIFY={0,1}`): verify_ms and
+completion md5 **bit-identical** across MMA_VERIFY=0 vs =1 in every
+cell (e.g. p1 verify_ms 14019 vs 14094, md5 85426fcd… both legs) —
+because the dispatch sites the env gates are never reached on the
+nvfp4 path. (Forced-K via systemd `set-environment` was also clobbered
+by the profile's `export G4N_SPEC_ADAPTIVE_K=1`/`RVLLM_GEMMA4_SPEC_K=7`
+since the source-profile drop-in re-exports after Environment=; k_avg
+held at the adaptive-shrunk 2.0-3.3 across all cells, consistent with
+the measured 27-43% accept rate walking K toward MIN_K=1.)
+
+**Shipped this session** (commit on `g4n_p2p3_fp8_gemv_verify`): the
+`RVLLM_GEMMA4_NVFP4_FP8_GEMV_MMA_VERIFY=1` opt-in gate + M≥4 dispatch
+floor extended to all 4 `Fp8GemvF16InLaunch` sites (QKV/O/gate_up/down)
+in `gemma4_layer_exec.rs`. This is a consistency extension of the
+#144-Phase-2 QKV-only wiring — it serves the **fp8-block** Gemma
+variant's spec-verify path (the only consumer of fp8_gemv). Default
+OFF; bit-identical via the fp64 validator (`v3/tools/fp8_gemv_mma_m8_check.py`,
+cos=1.0 at M∈{1,4,8,16}). No effect on gemma4-nvfp4 production.
+
+Net: `aa01001nvfp4gemv` closes as a documented negative result for
+the NVFP4 path. The decode perf lever for gemma4-nvfp4 remains the
+parked `aa01001nvfp4cprefill` cold-prefill rewrite (94.7% of cold-
+prefill GPU time = MLP MMA_V8 56.4% + attention-prefill 38.3%), which
+is a separate kernel family.
+
 ### gemma4-nvfp4 MLP MMA_V8 default-on — task #102 (2026-05-24, 14.6× prefill speedup)
 
 Discovery: nsys on gemma-4-31b-it-nvfp4 prefill showed `mistral35
