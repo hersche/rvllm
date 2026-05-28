@@ -1662,8 +1662,19 @@ measured +12.8% therefore came from **eliminating the per-sub-tile
 transpose store loop + its barrier** (≈1000 barriers + 64 writes/thread
 removed over a 16k global layer), NOT from higher occupancy. The
 occupancy lever is unreachable via smem at hd=512 (s_acc f32 32 KB +
-s_q 16 KB alone = 48 KB) — the viable path is **more warps/block**
-(256 threads → 8 warps → 16.7% at 1 block), tracked next.
+s_q 16 KB alone = 48 KB) — the viable path is **more warps/block**.
+
+**Step 2A-occ (SHIPPED, +5.6% more):** bumped FA2_THREADS 128→256
+(4→8 warps) on the bf16-out kernel → occupancy 8.3%→16.7% (1 block/SM,
+smem-limited; 8 warps / 48). P·V partition `>> 2`→`>> 3`; host block
+dim gated to 256 for this kernel only (f16-out + cpasync siblings keep
+128 + `>> 2`). Byte-identical (md5 81076590). 16k cold-prefill A/B:
+  * Step 2A (128t):     101664 ms (157 t/s)
+  * Step 2A-occ (256t):  96010 ms (166 t/s) = **+5.6% more**
+  * **cumulative +17.7%** vs the original s_v_f16_T + 128t kernel
+    (116594 → 96010 ms, ~20.6 s saved per cold 16k turn).
+Confirms the latency-stall diagnosis — more eligible warps hid the
+stalls. commit `15a32ff`.
 
 Cross-model: the kernel is shared with qwen36-nvfp4 (same bf16-out
 unified prefill, head_dim=256). **qwen36 correctness is covered by the
