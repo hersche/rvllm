@@ -1598,6 +1598,18 @@ MIO-throttle bound, NOT activation-bandwidth bound.**
   * Real lever: reduce dequant MIO instruction count (wider/vectorized
     smem ops, fewer per-nibble loads) or raise occupancy. Narrower
     than the plan assumed.
+  * **Step 1 SHIPPED (+4.6% more, commit `10dc80b`):** the MIO bulk
+    was the A-fragment load — 8 scalar 2-byte LDS per m_local × 8
+    M_TILES = 64 small LDS/k_iter. Since `[c][c+1]` are contiguous
+    bf16 in smem_a and `pack_two_bf16_v8(lo,hi)=(hi<<16)|lo`, a u32
+    LDS at `&smem_a[row][c_even]` is bit-identical to the load+pack
+    (c_lo/c_hi lane-derived even → 4-byte aligned, model-independent).
+    Halves A-side LDS (8→4 per m_local). 16k cold-prefill A/B (on top
+    of the 256t attention): 96010 → 91560 ms = **+4.6%**, **cumulative
+    +21.5%** vs the original kernel (~25 s saved/cold 16k turn).
+    Byte-identical (md5 81076590). Cross-model: shared with Mistral
+    3.5 — byte-equivalent + strictly fewer LDS for any consumer
+    (cannot regress); gemma4 md5-validated, Mistral inherits the proof.
 
 **Attention `flash_attention_2_prefill_nvfp4kv_unified_bf16out_kernel`
 (38.3%): occupancy-bound at 8.3%, NOT barrier-bound.**
