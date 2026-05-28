@@ -221,18 +221,22 @@ mistral35_w4a16_gemm_mma_v8_bf16_kernel(
                 const int row_hi_smem = gid + 8 + m_local * M_PER_TILE;
                 uint32_t a[4];
                 {
-                    const __nv_bfloat16 v0 = smem_a[stage][row_lo_smem][c_lo    ];
-                    const __nv_bfloat16 v1 = smem_a[stage][row_lo_smem][c_lo + 1];
-                    const __nv_bfloat16 v2 = smem_a[stage][row_hi_smem][c_lo    ];
-                    const __nv_bfloat16 v3 = smem_a[stage][row_hi_smem][c_lo + 1];
-                    const __nv_bfloat16 v4 = smem_a[stage][row_lo_smem][c_hi    ];
-                    const __nv_bfloat16 v5 = smem_a[stage][row_lo_smem][c_hi + 1];
-                    const __nv_bfloat16 v6 = smem_a[stage][row_hi_smem][c_hi    ];
-                    const __nv_bfloat16 v7 = smem_a[stage][row_hi_smem][c_hi + 1];
-                    a[0] = pack_two_bf16_v8(v0, v1);
-                    a[1] = pack_two_bf16_v8(v2, v3);
-                    a[2] = pack_two_bf16_v8(v4, v5);
-                    a[3] = pack_two_bf16_v8(v6, v7);
+                    // aa01001nvfp4cprefill MLP-MIO: vectorized A load.
+                    // The two bf16 at [c][c+1] are contiguous in smem,
+                    // and pack_two_bf16_v8(lo,hi) = (hi<<16)|lo, so a
+                    // little-endian u32 load at &smem_a[row][c_even] is
+                    // BIT-IDENTICAL to the prior 2×16-bit-load + pack.
+                    // c_lo/c_hi are lane-derived even values → the
+                    // address is always 4-byte aligned (model-
+                    // independent). Halves A-side LDS (8→4 per m_local)
+                    // to relieve the MIO-throttle the ncu Step-0 profile
+                    // measured (37.9% of cycles on this kernel).
+                    const __nv_bfloat16* rl = &smem_a[stage][row_lo_smem][0];
+                    const __nv_bfloat16* rh = &smem_a[stage][row_hi_smem][0];
+                    a[0] = *reinterpret_cast<const uint32_t*>(rl + c_lo);
+                    a[1] = *reinterpret_cast<const uint32_t*>(rh + c_lo);
+                    a[2] = *reinterpret_cast<const uint32_t*>(rl + c_hi);
+                    a[3] = *reinterpret_cast<const uint32_t*>(rh + c_hi);
                 }
                 asm volatile(
                     "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
