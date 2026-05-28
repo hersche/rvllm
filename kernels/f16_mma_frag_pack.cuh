@@ -77,6 +77,53 @@ __device__ __forceinline__ void pack_b_frag_col_major_n8k16_f16(
     b[1] = *reinterpret_cast<const uint32_t*>(base + n * stride_bytes + k_hi * (int)sizeof(__half));
 }
 
+// Pack per-lane B fragment DIRECTLY from a V tile in NATURAL
+// [token][dim] row-major layout (`s_v[t * head_dim + d]`), without a
+// separate transposed staging buffer. Reproduces exactly the values
+// the `pack_b_frag_col_major_n8k16_f16` path produced after a
+// transpose pass into `s_v_f16_T[d * MMA_K + k_off]`, so the MMA
+// inputs (and therefore the f32 accumulator) are bit-identical — the
+// only difference is 4 strided f16 loads per lane instead of 2
+// contiguous u32 loads from a pre-transposed buffer.
+//
+// Saves the transposed-V smem tile (MMA_K × head_dim × 2 bytes =
+// 16 KB at head_dim=512) plus the per-sub-tile transpose store loop +
+// its barrier. That smem reduction is the occupancy lever for the
+// NVFP4 unified-prefill kernels (ncu measured 8.3% achieved occupancy,
+// 1 block/SM limited by ~100 KB dynamic smem at head_dim=512).
+//
+// Lane → fragment mapping (PTX `row.col`, B is col-major [N][K] with
+// N = output dim, K = token):
+//   n   = lane / 4         (output-dim offset within the 8-wide tile)
+//   k_lo = (lane % 4) * 2,  k_hi = k_lo + 8
+//   b[0] = { V[d, k_lo],   V[d, k_lo+1]   }
+//   b[1] = { V[d, k_lo+8], V[d, k_lo+9]   }
+// where d = d_base + n and V[d, k] is the value at token (k_base_t+k),
+// dim d. Tokens past `tile_len` zero-pad (matches the old transpose
+// loop's `t_src < tile_len ? ... : 0`).
+__device__ __forceinline__ void pack_b_frag_v_natural_n8k16_f16(
+    const __half* s_v,        // [tile_size, head_dim] row-major (token outer)
+    int           head_dim,
+    int           k_base_t,   // first token index of this MMA-K sub-tile
+    int           d_base,     // first output dim (n_base) of this 8-wide tile
+    int           tile_len,   // valid token count in the tile
+    uint32_t      b[2],
+    int           lane)
+{
+    const int n    = lane >> 2;
+    const int d    = d_base + n;
+    const int k_lo = (lane & 3) << 1;
+    const int k_hi = k_lo + 8;
+    auto ld = [&](int k) -> unsigned int {
+        const int t = k_base_t + k;
+        if (t >= tile_len) return 0u;
+        const __half v = s_v[(long long)t * head_dim + d];
+        return (unsigned int)*reinterpret_cast<const unsigned short*>(&v);
+    };
+    b[0] = ld(k_lo)     | (ld(k_lo + 1) << 16);
+    b[1] = ld(k_hi)     | (ld(k_hi + 1) << 16);
+}
+
 // D unpack (16×8 f32) — identical mapping to FP8 m16n8k32 D, reuse.
 __device__ __forceinline__ void unpack_d_frag_to_smem_m16n8(
     float*       smem_d,
