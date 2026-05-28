@@ -58,3 +58,11 @@ export G4N_SPEC_ADAPTIVE_MIN_K=1
 # (G4N_SPEC_ADAPTIVE_WINDOW_ITERS) gives responsive tracking without
 # thrashing.
 export G4N_SPEC_ADAPTIVE_K=1
+
+# Prefix-cache clobber fix (2026-05-28): isolate short divergent
+# auxiliary requests (health checks, reply-intent prechecks, slash
+# commands) in a 16k scratch KV region so they don't overwrite the
+# conversation's KV[0..] and force a cold re-prefill on the next turn.
+# Validated: a "hi" between two 15k turns no longer drops the 2nd
+# turn's prefix-cache hit (lcp 4→512). Opt-out: set =0.
+export RVLLM_GEMMA4_NVFP4_AUX_KV=1

@@ -941,6 +941,43 @@ pub async fn spawn_cuda_worker(
                     }
                 };
 
+                // Prefix-cache clobber fix: optional SCRATCH KV region
+                // for short divergent "auxiliary" requests (health
+                // checks, reply-intent prechecks, slash commands). The
+                // single shared main KV is overwritten front-to-back by
+                // every request, so a short divergent request between
+                // two conversation turns physically corrupts the
+                // conversation's cached KV prefix → cold re-prefill.
+                // Routing aux requests to this isolated region keeps the
+                // main conversation KV + prefix cache intact across the
+                // interleaving. Default OFF (allocate only when
+                // `RVLLM_GEMMA4_NVFP4_AUX_KV=1`); allocated BELOW the
+                // drafter pin so it persists across requests.
+                const AUX_KV_MAX_POS: u32 = 16384;
+                let kv_aux: Option<_> = if std::env::var(
+                    "RVLLM_GEMMA4_NVFP4_AUX_KV").as_deref() == Ok("1")
+                {
+                    match bringup.allocate_aux_kv_state(
+                        AUX_KV_MAX_POS, AUX_KV_MAX_POS,
+                    ) {
+                        Ok(k) => {
+                            tracing::info!(
+                                "gemma4-nvfp4 aux scratch KV allocated \
+                                 (max_pos={AUX_KV_MAX_POS}) — short aux \
+                                 requests isolated from the conversation KV");
+                            Some(k)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "aux scratch KV alloc failed ({e:?}); \
+                                 aux requests fall back to main KV");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 // Spec-decode init (#6b-session): allocate the
                 // persistent base_last_hidden snapshot buffer,
                 // load the drafter checkpoint, and pin the arena
@@ -1172,20 +1209,49 @@ pub async fn spawn_cuda_worker(
                     // a follow-up.
                     if spec_probe_this_request {
                         let stop_vec: Vec<u32> = stop_set.iter().copied().collect();
+                        // Prefix-cache clobber fix: route SHORT DIVERGENT
+                        // requests to the scratch KV so they don't corrupt
+                        // the conversation's cached KV prefix. Heuristic:
+                        // a request is "auxiliary" when a much-longer
+                        // conversation is cached (committed > 2×prompt_len)
+                        // and this request fits the scratch region. That
+                        // matches health-checks / prechecks / slash
+                        // commands (tiny, divergent system prompt) but NOT
+                        // a fresh conversation turn (prompt ≈ cached size)
+                        // nor a continuation (high LCP, large prompt). Only
+                        // active when the scratch region was allocated
+                        // (`RVLLM_GEMMA4_NVFP4_AUX_KV=1`); aux_mode then
+                        // suppresses cache lookup/publish for the call.
+                        let plen = req.prompt_ids.len() as u32;
+                        let committed = bringup.nvfp4_prefix_cache_committed_len();
+                        let is_aux = kv_aux.is_some()
+                            && plen + max_new < AUX_KV_MAX_POS
+                            && committed > plen.saturating_mul(2);
+                        let kv_ref = if is_aux { kv_aux.as_ref().unwrap() } else { &kv };
+                        if is_aux {
+                            bringup.set_nvfp4_aux_mode(true);
+                            tracing::debug!(
+                                "gemma4-nvfp4 aux-route: plen={plen} \
+                                 committed={committed} → scratch KV");
+                        }
                         // Stream-7 spec+vision: route the same
                         // vision_splice_refs the non-spec branch uses
                         // into the spec prefill. Empty slice reduces
                         // to the text-only path byte-identically.
-                        let stats = match if spec_cfg.k == 1 {
+                        let session_result = if spec_cfg.k == 1 {
                             bringup.run_spec_session_nvfp4_greedy_k1_with_vision(
                                 &req.prompt_ids, max_new as usize,
-                                &stop_vec, &kv, &vision_splice_refs)
+                                &stop_vec, kv_ref, &vision_splice_refs)
                         } else {
                             bringup.run_spec_session_nvfp4_greedy_k_with_vision(
                                 &req.prompt_ids, max_new as usize,
-                                spec_cfg.k as usize, &stop_vec, &kv,
+                                spec_cfg.k as usize, &stop_vec, kv_ref,
                                 &vision_splice_refs)
-                        } {
+                        };
+                        if is_aux {
+                            bringup.set_nvfp4_aux_mode(false);
+                        }
+                        let stats = match session_result {
                             Ok(s) => s,
                             Err(e) => {
                                 let _ = req.events_tx.send(GenerateEvent::Error(

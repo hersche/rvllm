@@ -547,6 +547,10 @@ pub struct Gemma4Nvfp4Bringup {
     /// (arena bump points past it) and silently shadow the caller's
     /// pointer to the prior state. We reject the second call instead.
     kv_state_allocated: bool,
+    /// Re-entrancy guard for the auxiliary (scratch) KV region
+    /// (`allocate_aux_kv_state`). Separate from the main guard so the
+    /// aux region can be added once after the main allocation.
+    aux_kv_state_allocated: bool,
     /// Stream-6a (Option B-side spec-decode): kernel loader kept
     /// around for lazy PTX module loads after construction. The
     /// drafter PTX bundle (masked_embedder, flash_attention_decode
@@ -716,6 +720,15 @@ pub struct Gemma4Nvfp4Bringup {
     /// Disable via `RVLLM_GEMMA4_NVFP4_PREFIX_CACHE=0`. Default ON.
     pub nvfp4_prefix_cache:
         std::sync::Mutex<Option<crate::gemma4_nvfp4_bring_up::Nvfp4PrefixCacheState>>,
+    /// Auxiliary-request guard. The worker sets this true (single-
+    /// request-at-a-time) for short divergent requests it routes to a
+    /// SCRATCH KV region (so they don't overwrite the conversation's
+    /// KV[0..] and clobber the prefix cache — see
+    /// `nvfp4_prefix_cache_lookup`'s clobber analysis). While set,
+    /// the prefix-cache lookup returns 0 (no reuse) and publish is a
+    /// no-op (the scratch sequence must not replace the conversation's
+    /// cache slot). Default false → behaviour identical to before.
+    pub nvfp4_aux_mode: std::sync::atomic::AtomicBool,
 }
 
 /// Persistent cross-request KV-reuse state for the Option B (NVFP4-
@@ -1041,6 +1054,7 @@ impl Gemma4Nvfp4Bringup {
             arena,
             forward_checkpoint,
             kv_state_allocated: false,
+            aux_kv_state_allocated: false,
             kernels: loader,
             vit,
             vit_bf16,
@@ -1063,6 +1077,7 @@ impl Gemma4Nvfp4Bringup {
             drafter_step_capture: std::sync::Mutex::new(None),
             drafter_macro_capture: std::sync::Mutex::new(None),
             nvfp4_prefix_cache: std::sync::Mutex::new(None),
+            nvfp4_aux_mode: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1131,9 +1146,31 @@ impl Gemma4Nvfp4Bringup {
     /// and the new prompt, subject to provenance match + the
     /// committed_prefix_len cap. Returns 0 to mean "no reuse"
     /// (fresh request, cache miss, or env-disabled).
+    /// Committed prefix length currently in the cache (0 if empty /
+    /// poisoned). Used by the worker to decide whether an incoming
+    /// short request would clobber a much-longer cached conversation.
+    pub fn nvfp4_prefix_cache_committed_len(&self) -> u32 {
+        match self.nvfp4_prefix_cache.lock() {
+            Ok(g) => g.as_ref().map(|c| c.committed_prefix_len).unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    /// Worker sets this for a request it routes to the scratch KV
+    /// region (short, divergent, would-clobber). While set, prefix-
+    /// cache lookup returns 0 + publish is a no-op.
+    pub fn set_nvfp4_aux_mode(&self, on: bool) {
+        self.nvfp4_aux_mode
+            .store(on, std::sync::atomic::Ordering::Release);
+    }
+
     pub fn nvfp4_prefix_cache_lookup(&self, prompt: &[u32]) -> u32 {
         // Operator opt-out for diagnostics.
         if std::env::var("RVLLM_GEMMA4_NVFP4_PREFIX_CACHE").as_deref() == Ok("0") {
+            return 0;
+        }
+        // Aux request on scratch KV — no conversation reuse.
+        if self.nvfp4_aux_mode.load(std::sync::atomic::Ordering::Acquire) {
             return 0;
         }
         let guard = match self.nvfp4_prefix_cache.lock() {
@@ -1169,6 +1206,25 @@ impl Gemma4Nvfp4Bringup {
         if lcp >= plen {
             lcp = plen.saturating_sub(1);
         }
+        // Diagnostic (task: iter-2 prefix-cache miss). One line per
+        // lookup. Logs how far the LCP got and, on a SHORT match,
+        // where + what the first divergence was, so a multi-iter
+        // zeroclaw turn shows exactly why a cache miss happened.
+        if std::env::var("G4N_PREFIX_CACHE_TRACE").as_deref() == Ok("1") {
+            let div = lcp as usize;
+            let (pa, pb) = (
+                prompt.get(div).copied().unwrap_or(u32::MAX),
+                cache.last_tokens.get(div).copied().unwrap_or(u32::MAX),
+            );
+            eprintln!(
+                "[g4n-prefix-trace] plen={} cache_len={} committed={} lcp={} \
+                 first_div@{}: prompt={} cache={} | prompt_head={:?} cache_head={:?}",
+                plen, cache.last_tokens.len(), cache.committed_prefix_len, lcp,
+                div, pa, pb,
+                &prompt[..prompt.len().min(8)],
+                &cache.last_tokens[..cache.last_tokens.len().min(8)],
+            );
+        }
         lcp
     }
 
@@ -1177,6 +1233,11 @@ impl Gemma4Nvfp4Bringup {
     /// spec or non-spec session.
     pub fn nvfp4_prefix_cache_publish(&self, prompt: &[u32], emitted: &[u32]) {
         if std::env::var("RVLLM_GEMMA4_NVFP4_PREFIX_CACHE").as_deref() == Ok("0") {
+            return;
+        }
+        // Aux request on scratch KV must NOT replace the conversation's
+        // cache slot.
+        if self.nvfp4_aux_mode.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
         let total = prompt.len() + emitted.len();
@@ -4341,6 +4402,34 @@ impl Gemma4Nvfp4Bringup {
         // Re-anchor scratch rewinds above the KV state.
         self.forward_checkpoint = self.arena.checkpoint();
         self.kv_state_allocated = true;
+        Ok(kv)
+    }
+
+    /// Allocate a SECOND, smaller KV region for auxiliary requests
+    /// (prefix-cache clobber fix). Safe to call once after the main
+    /// `allocate_kv_state_with_chunk`: the arena is bump-allocated, so
+    /// the aux region sits ABOVE the main region and the main handle's
+    /// pointers stay valid (distinct region, never overwritten by aux
+    /// forwards). Re-anchors `forward_checkpoint` ABOVE the aux region
+    /// so per-request scratch rewinds preserve BOTH KV states. Must be
+    /// called BEFORE the drafter setup (which pins above this). The
+    /// once-guard on `allocate_kv_state_with_chunk` rejects re-using
+    /// THAT entry point for a second region; this is the sanctioned
+    /// second-region path.
+    pub fn allocate_aux_kv_state(
+        &mut self,
+        max_pos: u32,
+        max_query_tokens: u32,
+    ) -> Result<Gemma4Nvfp4KvState> {
+        if self.aux_kv_state_allocated {
+            return Err(corrupt_runtime_err(
+                "allocate_aux_kv_state called twice".to_string(),
+            ));
+        }
+        let kv = Gemma4Nvfp4KvState::allocate(
+            &self.arena, &self.arch, max_pos, max_query_tokens)?;
+        self.forward_checkpoint = self.arena.checkpoint();
+        self.aux_kv_state_allocated = true;
         Ok(kv)
     }
 
