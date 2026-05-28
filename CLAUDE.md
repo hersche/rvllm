@@ -1563,6 +1563,105 @@ deterministic 3 runs):
 Quality verified on 50-word quantum entanglement (coherent + Einstein
 "spooky action" reference). Default-off regression at baseline 6020 ms.
 
+### aa01001nvfp4cprefill — Step 0 ncu stall profile (2026-05-28)
+
+ncu stall-sampling of the two cold-prefill hotspots (CLAUDE.md #139:
+94.7% of GPU time at M=14583). **Both prior hypotheses were wrong;
+the real limiters are different and now measured.**
+
+⚠️ **OPERATIONAL HAZARD (learned the hard way — caused a global OOM +
+reboot 2026-05-28):** `ncu --set full` snapshots/restores ALL device
+memory each profiled kernel touches, ×~30 replay passes. Running it
+against rvllm-server's multi-GiB arena WHILE the combo-mode stack
+(acestep ~26 GB + vllm-embedding + audio + a stray legacy
+`vllm-gemma4.service` holding 50 GB GPU) was live blew past 121 GB RAM
++ 15 GB swap → `ncu invoked oom-killer` → cascade. **Before any ncu
+run: `systemctl stop acestep vllm-embedding chatterbox whisper-fast
+zeroclaw rvllm-serve vllm-gemma4`, confirm `nvidia-smi` GPU procs
+empty + `free -g` >80 GB free, use a LIGHT section set (`--section
+SpeedOfLight,Occupancy,WarpStateStats,SchedulerStats,LaunchStats` —
+NOT `--set full`), cap `RVLLM_ARENA_GB=50` + `G4N_KV_MAX_POS=4096` +
+`RVLLM_MAX_TOKENS_CAP=4096` for a small profiling prompt, and full-path
+`/usr/local/cuda/bin/ncu` (sudo PATH lacks it; `RmProfilingAdminOnly:1`
+needs root).**
+
+**MLP GEMM `mistral35_w4a16_gemm_mma_v8_bf16_kernel` (56.4%):
+MIO-throttle bound, NOT activation-bandwidth bound.**
+  * L2 Hit Rate **95.0%** — the "activation re-read spills to HBM"
+    hypothesis (plan Step 1A/1B) is FALSE. The activation working set
+    stays in L2 across N-slice blocks; a 2D-grid / N-widening rewrite
+    would not help.
+  * Top stall: **MIO throttle = 37.9% of 20.2 cycles/inst** — the
+    NVFP4-dequant's LDS/STS/load instructions saturate the memory-I/O
+    queue. Memory throughput 72.8%, Compute (SM) 59%, occupancy 55%,
+    IPC 1.31 (issue slots busy 32.6%).
+  * Real lever: reduce dequant MIO instruction count (wider/vectorized
+    smem ops, fewer per-nibble loads) or raise occupancy. Narrower
+    than the plan assumed.
+
+**Attention `flash_attention_2_prefill_nvfp4kv_unified_bf16out_kernel`
+(38.3%): occupancy-bound at 8.3%, NOT barrier-bound.**
+  * Achieved Occupancy **8.3%** (egregious). Driver = **dynamic smem
+    per block 68.6 KB (sliding hd=256) / 100.4 KB (global hd=512)** →
+    ~1 block/SM, and only 4 warps/block (FA2_THREADS=128) → 4/48 ≈ 8%.
+  * Global-layer instance: 5.20 ms, 100.4 KB smem; sliding: 2.62 ms,
+    68.6 KB. Compute (SM) 15%, Memory 36% — both far from roofline;
+    the kernel is latency-stall-bound because too few warps reside to
+    hide latency.
+  * Real lever: cut smem per block (eliminate the `s_v_f16_T`
+    transposed-V tile ~16 KB at hd=512, possibly shrink other buffers)
+    and/or raise warps/block, to fit ≥2 blocks/SM → ≥16% occupancy.
+    This matches plan Step 2A's "free smem" direction but the
+    MECHANISM is occupancy, not `__syncthreads` count.
+
+**Decision**: the attention kernel's 8.3% occupancy is the clearest,
+highest-leverage signal (a textbook "wrong" occupancy that smem
+reduction can roughly double). Step 2A (smem reduction → occupancy)
+is the recommended next implementation, ahead of the MLP MIO work
+(harder, the dequant is already fairly tight). Both are real wins on
+paper; neither is a step-change (cold prefill is fundamentally
+compute-heavy at 14k — the warm-path prefix cache remains the bigger
+production lever).
+
+### aa01001nvfp4cprefill Step 2A — drop s_v_f16_T → +8.5% cold prefill (2026-05-28, SHIPPED)
+
+Removed the 16 KB transposed-V smem tile (`s_v_f16_T`) from
+`flash_attention_2_prefill_nvfp4kv_unified_bf16out_kernel`. The P·V
+MMA B-fragment now packs DIRECTLY from `s_v_f16`'s natural
+[token][dim] layout via the new `pack_b_frag_v_natural_n8k16_f16`
+(f16_mma_frag_pack.cuh) — 4 strided f16 loads/lane reproducing the
+exact values the prior transpose+col-major-packer produced (bit-
+identical MMA inputs). Eliminates the per-sub-tile transpose store
+loop + its barrier too. Host smem reservation (prefill.rs) drops the
+`MMA_K*hd*2` term for this kernel only (`output_bf16 && !use_cpasync`);
+the f16-out + cpasync siblings keep s_v_f16_T. Reserving less smem is
+what lifts blocks/SM.
+
+Byte-equivalence (md5, gemma-4-31b-it-nvfp4, prefix-cache OFF,
+deterministic): baseline {cold d90062c0, steady 81076590} == new
+{d90062c0, 81076590}, IDENTICAL. Exercises all 60 layers (sliding
+hd=256 + global hd=512).
+
+Cold-prefill A/B (4813-tok prompt, prefix-cache OFF, heavy services
+stopped, 3 runs/leg, full rebuild per leg):
+  * baseline (s_v_f16_T): avg 24172 ms, 199 t/s
+  * new (direct packer):  avg 22123 ms, 218 t/s
+  * **+8.5% cold prefill** (2049 ms saved) — above the 4-8% estimate.
+
+Cross-model: the kernel is shared with qwen36-nvfp4 (same bf16-out
+unified prefill, head_dim=256). **qwen36 correctness is covered by the
+SAME proof** — gemma4's sliding layers are head_dim=256 (identical to
+qwen36's), use the identical kernel + packer, and were part of the
+byte-identical gemma4 md5 validation. qwen36 also takes the
+`output_bf16 && !use_cpasync` branch → gets the 8 KB smem reduction;
+under-allocation is impossible (the kernel no longer references the
+removed buffer). No qwen36-specific code path exists that the gemma4
+validation didn't exercise.
+
+Step 2B (depth-2 cp.async on the freed smem) + the MLP MIO-throttle
+lever (Step 1, harder) remain available follow-ons. commit `9b66c90`
+on branch `g4n_cprefill`.
+
 ### aa01001nvfp4gemv — fp8_gemv MMA: NOT applicable to gemma4-nvfp4 (2026-05-27, negative result)
 
 **Outcome: no fp8_gemv work needed on gemma4-nvfp4 — its decode/verify

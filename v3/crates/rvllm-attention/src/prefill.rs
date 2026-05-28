@@ -1169,11 +1169,20 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
             let hd = params.head_dim;
             let ts = unified.tile_size;
             let s_s_stride = ts.max(MMA_K);
+            // Task aa01001nvfp4cprefill Step 2A: the modified bf16-out
+            // kernel (selected when `output_bf16 && !use_cpasync`)
+            // eliminated the transposed-V tile (s_v_f16_T) — it packs
+            // the P·V B-fragment directly from s_v_f16. The f16-out
+            // sibling and the cpasync sibling still stage s_v_f16_T,
+            // so the term is included for those paths only. Reserving
+            // less smem is what actually buys the higher occupancy
+            // (the reservation, not the kernel's usage, sets blocks/SM).
+            let has_s_v_f16_t = use_cpasync || !output_bf16;
             let smem_bytes: u32 = block_m * hd * 2        // s_q_f16
                 + block_m * 4                              // s_q_scale
                 + ts * hd * 2                              // s_k_f16
                 + ts * hd * 2                              // s_v_f16
-                + MMA_K * hd * 2                           // s_v_f16_T
+                + if has_s_v_f16_t { MMA_K * hd * 2 } else { 0 }  // s_v_f16_T
                 + block_m * s_s_stride * 4                 // s_s
                 + block_m * 4 * 3                          // s_m + s_l + s_alpha
                 + block_m * MMA_K * 2                      // s_p_f16

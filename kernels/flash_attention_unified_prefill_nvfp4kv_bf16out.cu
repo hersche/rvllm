@@ -253,8 +253,14 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_bf16out_kernel(
     float*  s_q_scale  = reinterpret_cast<float*>(s_q_f16 + BLOCK_M * head_dim);
     __half* s_k_f16    = reinterpret_cast<__half*>(s_q_scale + BLOCK_M);
     __half* s_v_f16    = s_k_f16 + tile_size * head_dim;
-    __half* s_v_f16_T  = s_v_f16 + tile_size * head_dim;
-    float*  s_s        = reinterpret_cast<float*>(s_v_f16_T + MMA_K * head_dim);
+    // Task aa01001nvfp4cprefill Step 2A: the transposed-V tile
+    // (s_v_f16_T, MMA_K × head_dim = 16 KB at head_dim=512) is
+    // eliminated — the P·V B-fragment now packs directly from
+    // s_v_f16's natural [token][dim] layout via
+    // `pack_b_frag_v_natural_n8k16_f16` (bit-identical MMA inputs).
+    // Saves 16 KB dynamic smem to lift occupancy off the measured
+    // 8.3% (1 block/SM) ceiling.
+    float*  s_s        = reinterpret_cast<float*>(s_v_f16 + tile_size * head_dim);
     float*  s_m        = s_s + BLOCK_M * s_s_stride;
     float*  s_l        = s_m + BLOCK_M;
     float*  s_alpha    = s_l + BLOCK_M;
@@ -507,20 +513,11 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_bf16out_kernel(
             const int k_base_t = ks_i * MMA_K;
             if (k_base_t >= tile_len) break;
 
-            // (1) Transpose V[t=k_base_t..k_base_t+MMA_K) into
-            //     s_v_f16_T[d][0..MMA_K) with zero-pad past tile_len.
-            for (int idx = tid; idx < MMA_K * head_dim; idx += FA2_THREADS) {
-                const int k_off = idx / head_dim;
-                const int d     = idx - k_off * head_dim;
-                const int t_src = k_base_t + k_off;
-                __half v = (t_src < tile_len)
-                    ? s_v_f16[t_src * head_dim + d]
-                    : __float2half(0.0f);
-                s_v_f16_T[d * MMA_K + k_off] = v;
-            }
-            // Sync removed: P-pack below writes s_p_f16 and reads s_s,
-            // doesn't read s_v_f16_T. The downstream sync after P-pack
-            // gates both s_p_f16 + s_v_f16_T visibility for the MMA.
+            // (1) [removed] V transpose into s_v_f16_T — the P·V MMA B
+            //     fragment now reads directly from s_v_f16's natural
+            //     [token][dim] layout (see pack_b_frag_v_natural below).
+            //     Saves the 16 KB transposed tile + this store loop +
+            //     a barrier per sub-tile.
 
             // (2) Pack P[m, t=k_base_t..k_base_t+MMA_K) into s_p_f16
             //     [m, 0..MMA_K) directly. UN-normalized softmax
@@ -564,9 +561,8 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_bf16out_kernel(
                 const int d_lo = n_base + c;
                 const int d_hi = d_lo + 1;
                 uint32_t b[2];
-                rvllm_f16mma::pack_b_frag_col_major_n8k16_f16(
-                    s_v_f16_T + n_base * MMA_K,
-                    /*stride_bytes=*/MMA_K * (int)sizeof(__half), b, lane);
+                rvllm_f16mma::pack_b_frag_v_natural_n8k16_f16(
+                    s_v_f16, head_dim, k_base_t, n_base, tile_len, b, lane);
                 // s_p_scale removed — load s_acc directly with alpha
                 // applied (former pscale_lo / inv_ps_lo were identity).
                 float d_frag[4];
