@@ -1260,12 +1260,25 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
             let total_num_q_blocks =
                 params.num_tokens.div_ceil(unified.block_q) + params.num_seqs;
 
+            // Task aa01001nvfp4cprefill Step 2A-occ: the modified bf16-out
+            // kernel (selected when `output_bf16 && !use_cpasync`) runs
+            // 256 threads / 8 warps to lift occupancy 8.3%→16.7% on
+            // sm_121 (smem-limited to 1 block/SM at 100 KB/SM). Its .cu
+            // sets FA2_THREADS=256 + the `>> 3` n-tile partition. The
+            // f16-out + cpasync siblings keep 128 (their `.cu` still
+            // assumes 4 warps via `>> 2`), so the block dim MUST track
+            // exactly which kernel was selected.
+            let block_threads: u32 = if output_bf16 && !use_cpasync {
+                256
+            } else {
+                FA2_THREADS as u32
+            };
             let rc = cuLaunchKernel(
                 kernel_fn.raw() as CUfunction,
                 total_num_q_blocks,
                 params.num_kv_heads,
                 1,
-                FA2_THREADS as u32,
+                block_threads,
                 1,
                 1,
                 smem_bytes,
