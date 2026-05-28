@@ -50,14 +50,19 @@ export G4N_SPEC_TIMING=1
 export G4N_SPEC_MAX_PROMPT_TOKENS=200000
 export G4N_SPEC_ADAPTIVE_WINDOW_ITERS=3
 export G4N_SPEC_ADAPTIVE_MIN_K=1
-# Task #138 item 1 — adaptive K enabled. At measured 27-43% accept
-# rate on real zeroclaw 14k prompts, fixed K=7 wastes drafter +
-# verify cycles past where the drafter is predictive. Adaptive walks
-# K down toward MIN_K (=1) when the recent window's accept rate falls
-# below 55%, up toward spec_k when >= 90%. Sliding window of 3 iter
-# (G4N_SPEC_ADAPTIVE_WINDOW_ITERS) gives responsive tracking without
-# thrashing.
-export G4N_SPEC_ADAPTIVE_K=1
+# Adaptive K DISABLED 2026-05-28 — measured worse post-MMA. The #138
+# rationale (walk K→1 at low accept) predates the MLP MMA_V8 verify
+# speedup; with that landed, a wider FIXED verifier window wins on
+# aggregate decode tok/s AND per-prompt latency, at identical quality
+# (10/10 canary pass each). Sweep (runtime-tests/results-gemma-nvfp4w-
+# spec-fixed-k{5,6,7}-post-mma-current-note.md):
+#   adaptive K5/window3/minK1 = 29.77 tok/s
+#   fixed K5 = 30.62 | fixed K6 = 31.03 | fixed K7 = 31.65 tok/s
+# Per-prompt: medium_explain 14903→9874 ms (-34%), translation -26%.
+# At the measured 27-43% accept rate adaptive collapsed K toward 1,
+# which is exactly wrong now that the verify pass is cheap. Keep
+# RVLLM_GEMMA4_SPEC_K=7 fixed.
+export G4N_SPEC_ADAPTIVE_K=0
 
 # Prefix-cache clobber fix (2026-05-28): isolate short divergent
 # auxiliary requests (health checks, reply-intent prechecks, slash
