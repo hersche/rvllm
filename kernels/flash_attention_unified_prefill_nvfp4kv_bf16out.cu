@@ -54,7 +54,20 @@
 #include "nvfp4_utils.cuh"
 #include "f16_mma_frag_pack.cuh"
 
-#define FA2_THREADS 128
+// Task aa01001nvfp4cprefill Step 2A-occ: 256 threads (8 warps) per
+// block. GB10 sm_121 has 100 KB smem/SM so the ~84 KB-per-block
+// kernel is smem-limited to 1 block/SM regardless; bumping warps/block
+// 4→8 lifts achieved occupancy 8.3%→16.7% (8 warps / 48 max), giving
+// the latency-stall-bound kernel more eligible warps to hide stalls.
+// The P·V n-tile partition (`n_tiles_total >> 3`) and every
+// `idx += FA2_THREADS` strided loop scale with this; the Q·Kᵀ phase
+// activates only `ceil(tile_len/8)` warps (extra warps idle there,
+// which is fine). Byte-identical output: the P·V n_base coverage set
+// is unchanged, only reassigned across 8 warps instead of 4.
+// MUST be launched with a matching 256-thread block — prefill.rs gates
+// the block dim to this kernel only; the f16-out + cpasync siblings
+// keep 128 threads + their `>> 2` partition.
+#define FA2_THREADS 256
 
 // FP8 byte → f32 (only used for the per-row Q descale at entry).
 __device__ __forceinline__ float fp8kv_decode_byte(unsigned char b) {
@@ -544,7 +557,11 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_bf16out_kernel(
             const int warp_id = tid >> 5;
             const int lane    = tid & 31;
             const int n_tiles_total    = head_dim >> 3;
-            const int n_tiles_per_warp = n_tiles_total >> 2;
+            // 8 warps (FA2_THREADS=256) → divide the n-tiles by 8.
+            // head_dim ∈ {256, 512} → n_tiles_total ∈ {32, 64}, both
+            // divisible by 8. Coverage set {warp*per_warp+nt} is
+            // identical to the prior 4-warp `>> 2` partition.
+            const int n_tiles_per_warp = n_tiles_total >> 3;
             uint32_t a[4];
             rvllm_f16mma::pack_a_frag_row_major_m16k16_f16(
                 s_p_f16, /*stride_bytes=*/MMA_K * (int)sizeof(__half), a, lane);
