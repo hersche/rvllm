@@ -729,6 +729,18 @@ pub struct Gemma4Nvfp4Bringup {
     /// no-op (the scratch sequence must not replace the conversation's
     /// cache slot). Default false → behaviour identical to before.
     pub nvfp4_aux_mode: std::sync::atomic::AtomicBool,
+    /// Cooperative cancellation handle for the spec session. The worker
+    /// sets this to the request's `cancelled` flag (single-request-at-
+    /// a-time) before invoking a spec session and clears it after. The
+    /// session clones it once at entry and checks it at each
+    /// per-iteration boundary, breaking cleanly (returning the tokens
+    /// emitted so far) when set. This is what lets a provider/client
+    /// timeout actually free the GPU worker instead of the
+    /// uncancellable session running to completion and wedging the
+    /// single-in-flight queue (the "no spec_timing for 1200 s" stall).
+    /// `None` → no cancellation (behaviour identical to before).
+    pub nvfp4_cancel:
+        std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 /// Persistent cross-request KV-reuse state for the Option B (NVFP4-
@@ -1078,6 +1090,7 @@ impl Gemma4Nvfp4Bringup {
             drafter_macro_capture: std::sync::Mutex::new(None),
             nvfp4_prefix_cache: std::sync::Mutex::new(None),
             nvfp4_aux_mode: std::sync::atomic::AtomicBool::new(false),
+            nvfp4_cancel: std::sync::Mutex::new(None),
         })
     }
 
@@ -1162,6 +1175,27 @@ impl Gemma4Nvfp4Bringup {
     pub fn set_nvfp4_aux_mode(&self, on: bool) {
         self.nvfp4_aux_mode
             .store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Install (or clear with `None`) the cooperative cancellation flag
+    /// the worker passes from the request. Called immediately before /
+    /// after a spec session so the session can bail at an iteration
+    /// boundary on timeout/disconnect.
+    pub fn set_nvfp4_cancel(
+        &self,
+        flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        if let Ok(mut g) = self.nvfp4_cancel.lock() {
+            *g = flag;
+        }
+    }
+
+    /// Clone the cancel flag once at session entry (avoids a per-iter
+    /// mutex lock — the session then checks the cheap atomic directly).
+    fn nvfp4_cancel_snapshot(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.nvfp4_cancel.lock().ok().and_then(|g| g.clone())
     }
 
     pub fn nvfp4_prefix_cache_lookup(&self, prompt: &[u32]) -> u32 {
@@ -1531,8 +1565,17 @@ impl Gemma4Nvfp4Bringup {
             // 3. Iterate.
             let mut n_iters = 0usize;
             let mut n_accepted_total = 0usize;
+            let cancel_flag = self.nvfp4_cancel_snapshot();
 
             while emitted.len() < max_new {
+                // Cooperative cancel: bail at the iteration boundary on
+                // timeout/disconnect so the worker frees the GPU instead
+                // of running the whole reply uncancellable.
+                if let Some(c) = &cancel_flag {
+                    if c.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                }
                 // (a) Drafter speculation (under guard).
                 let t_draft: u32 = {
                     let guard = self.drafter.lock().unwrap();
@@ -1824,8 +1867,18 @@ impl Gemma4Nvfp4Bringup {
             let mut low_accept_window_iters: usize = 0;
             let mut low_accept_window_accepted: usize = 0;
             let mut low_accept_window_drafts: usize = 0;
+            let cancel_flag = self.nvfp4_cancel_snapshot();
 
             while emitted.len() < max_new {
+                // Cooperative cancel: bail at the iteration boundary on
+                // timeout/disconnect so the worker frees the GPU instead
+                // of running the whole reply uncancellable (the 1200 s
+                // "no spec_timing" queue-wedge).
+                if let Some(c) = &cancel_flag {
+                    if c.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                }
                 let remaining = max_new - emitted.len();
                 if remaining == 1 {
                     let bailout_t0 = std::time::Instant::now();
@@ -1995,6 +2048,11 @@ impl Gemma4Nvfp4Bringup {
                 if zero_accept_bailout_iters > 0 && zero_accept_iters >= zero_accept_bailout_iters {
                     let bailout_t0 = std::time::Instant::now();
                     while emitted.len() < max_new {
+                        if let Some(c) = &cancel_flag {
+                            if c.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                        }
                         let next = self.forward_full_to_token(t_committed, ctx_len, kv)?;
                         emitted.push(next);
                         t_committed = next;
@@ -2026,6 +2084,11 @@ impl Gemma4Nvfp4Bringup {
                         if rate_pct < low_accept_bailout_pct {
                             let bailout_t0 = std::time::Instant::now();
                             while emitted.len() < max_new {
+                                if let Some(c) = &cancel_flag {
+                                    if c.load(std::sync::atomic::Ordering::Relaxed) {
+                                        break;
+                                    }
+                                }
                                 let next = self.forward_full_to_token(
                                     t_committed, ctx_len, kv,
                                 )?;

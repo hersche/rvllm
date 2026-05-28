@@ -1241,6 +1241,13 @@ pub async fn spawn_cuda_worker(
                                 "gemma4-nvfp4 aux-route: plen={plen} \
                                  committed={committed} → scratch KV");
                         }
+                        // Cooperative cancel: hand the request's cancel
+                        // flag to the spec session so a provider/client
+                        // timeout (or disconnect) lets it bail at the
+                        // next iteration boundary instead of running the
+                        // whole reply uncancellable and wedging the
+                        // single-in-flight queue. Cleared right after.
+                        bringup.set_nvfp4_cancel(Some(std::sync::Arc::clone(&req.cancelled)));
                         // Stream-7 spec+vision: route the same
                         // vision_splice_refs the non-spec branch uses
                         // into the spec prefill. Empty slice reduces
@@ -1255,6 +1262,7 @@ pub async fn spawn_cuda_worker(
                                 spec_cfg.k as usize, &stop_vec, kv_ref,
                                 &vision_splice_refs)
                         };
+                        bringup.set_nvfp4_cancel(None);
                         if is_aux {
                             bringup.set_nvfp4_aux_mode(false);
                         }
