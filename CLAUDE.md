@@ -1642,11 +1642,16 @@ deterministic): baseline {cold d90062c0, steady 81076590} == new
 {d90062c0, 81076590}, IDENTICAL. Exercises all 60 layers (sliding
 hd=256 + global hd=512).
 
-Cold-prefill A/B (4813-tok prompt, prefix-cache OFF, heavy services
-stopped, 3 runs/leg, full rebuild per leg):
-  * baseline (s_v_f16_T): avg 24172 ms, 199 t/s
-  * new (direct packer):  avg 22123 ms, 218 t/s
-  * **+8.5% cold prefill** (2049 ms saved) — above the 4-8% estimate.
+Cold-prefill A/B (prefix-cache OFF, heavy services stopped, 3 runs/leg,
+full rebuild per leg):
+  * 4813-tok:  baseline avg 24172 ms (199 t/s) → new 22123 ms (218 t/s)
+    = **+8.5%** (2049 ms saved).
+  * 15973-tok: baseline avg 116594 ms (137 t/s) → new 101664 ms
+    (157 t/s) = **+12.8%** (~14930 ms / ~15 s saved per cold turn).
+  * The win GROWS with prompt length (8.5% → 12.8%) because the global
+    O(M²) attention layers — the occupancy-bound hotspot the smem cut
+    targets — are a larger fraction of total prefill at 16k. Above the
+    plan's 4-8% estimate at production scale.
 
 Cross-model: the kernel is shared with qwen36-nvfp4 (same bf16-out
 unified prefill, head_dim=256). **qwen36 correctness is covered by the
