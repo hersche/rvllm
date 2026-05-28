@@ -64,5 +64,6 @@ export G4N_SPEC_ADAPTIVE_K=1
 # commands) in a 16k scratch KV region so they don't overwrite the
 # conversation's KV[0..] and force a cold re-prefill on the next turn.
 # Validated: a "hi" between two 15k turns no longer drops the 2nd
-# turn's prefix-cache hit (lcp 4→512). Opt-out: set =0.
-export RVLLM_GEMMA4_NVFP4_AUX_KV=1
+# turn's prefix-cache hit (lcp 4→512). DEFAULT-ON in code (cuda_worker
+# .rs); opt-out with RVLLM_GEMMA4_NVFP4_AUX_KV=0. No explicit export
+# needed — the code default is authoritative.

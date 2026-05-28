@@ -954,9 +954,16 @@ pub async fn spawn_cuda_worker(
                 // `RVLLM_GEMMA4_NVFP4_AUX_KV=1`); allocated BELOW the
                 // drafter pin so it persists across requests.
                 const AUX_KV_MAX_POS: u32 = 16384;
-                let kv_aux: Option<_> = if std::env::var(
-                    "RVLLM_GEMMA4_NVFP4_AUX_KV").as_deref() == Ok("1")
-                {
+                // Default-ON (2026-05-28, validated): opt-out via
+                // `RVLLM_GEMMA4_NVFP4_AUX_KV=0`. Isolating short aux
+                // requests is byte-equivalent for the conversation path
+                // and only adds a 16k scratch KV region (~small vs the
+                // 128k main); the win is keeping the prefix-cache hit
+                // alive across interleaved health-checks / prechecks.
+                let aux_kv_enabled = std::env::var("RVLLM_GEMMA4_NVFP4_AUX_KV")
+                    .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE"))
+                    .unwrap_or(true);
+                let kv_aux: Option<_> = if aux_kv_enabled {
                     match bringup.allocate_aux_kv_state(
                         AUX_KV_MAX_POS, AUX_KV_MAX_POS,
                     ) {
