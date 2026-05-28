@@ -98,6 +98,19 @@ Resolution order (first truthy wins): `RVLLM_NVFP4_KV` → `RVLLM_F16_KV` →
 | `RVLLM_DBG_LAYER` | unset | inserts cuStreamSynchronize + per-layer DtoH probes for the first 2 layers | OFF in prod |
 | `RVLLM_NVFP4_SHADOW_F16` | 0 | per-layer f16 shadow KV write + Q snapshot (~2 GiB extra arena) | OFF in prod |
 | `RVLLM_DISABLE_PREFIX_CACHE` | 0 | skip prefix-cache init (every request re-prefills full prompt) | OFF in prod |
+| `RVLLM_GEMMA4_NVFP4_PREFIX_CACHE` | 1 | cross-request LCP prefix-cache reuse (task #133). `=0` disables lookup+publish | ON in prod |
+| `RVLLM_GEMMA4_NVFP4_AUX_KV` | 1 | **default-ON** 16k scratch KV region for short divergent aux requests (health-checks, reply-intent prechecks, slash commands) so they don't clobber the conversation's cached KV prefix. Routed when `cached_committed > 2×prompt_len && plen+max_new < 16384`. `=0` disables (aux requests fall back to main KV → can clobber) | ON in prod |
+| `G4N_PREFIX_CACHE_TRACE` | 0 | one `[g4n-prefix-trace]` line per prefix-cache lookup (plen, cache_len, lcp, first-divergence) — diagnostic for cache-miss investigation | OFF in prod |
+| `RVLLM_GEMMA4_NVFP4_MLP_MMA_V8` | 1 | **default-ON** (task #102) TensorCore MMA W4A16 MLP GEMM (`mistral35_w4a16_gemm_mma_v8`) — 14.6× over the `_mn` fallback. `=0` reverts to scalar GEMV | ON in prod |
+
+Cold-prefill kernel state (gemma4-nvfp4, 2026-05-28, all byte-identical,
+no env knob — baked into the bf16-out unified prefill kernel):
+- `s_v_f16_T` transposed-V smem tile removed; P·V B-fragment packs
+  directly from natural [token][dim] layout (+12.8% cold prefill 16k).
+- bf16-out unified prefill kernel runs 256 threads/block (8 warps,
+  occupancy 8.3→16.7% on sm_121's 100 KB/SM; +17.7% cumulative).
+- MLP GEMM A-fragment load vectorized to u32 LDS (8→4 per m_local),
+  relieving the MIO-throttle (+21.5% cumulative; 116594→91560 ms @ 16k).
 
 ---
 
