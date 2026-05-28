@@ -1649,9 +1649,21 @@ full rebuild per leg):
   * 15973-tok: baseline avg 116594 ms (137 t/s) → new 101664 ms
     (157 t/s) = **+12.8%** (~14930 ms / ~15 s saved per cold turn).
   * The win GROWS with prompt length (8.5% → 12.8%) because the global
-    O(M²) attention layers — the occupancy-bound hotspot the smem cut
-    targets — are a larger fraction of total prefill at 16k. Above the
-    plan's 4-8% estimate at production scale.
+    O(M²) attention layers are a larger fraction of total prefill at
+    16k. Above the plan's 4-8% estimate at production scale.
+
+**Mechanism correction (device query 2026-05-28):** GB10 sm_121 has
+only **100 KB smem/SM** (NOT the 228 KB of datacenter Blackwell;
+`MAX_SHARED_MEMORY_PER_MULTIPROCESSOR=100KB`, opt-in/block=99KB, max
+48 warps/SM). So the 100→84 KB cut did NOT raise blocks/SM — 2 blocks
+need ≤50 KB/block (2×50=100), and the kernel at 84 KB still fits only
+1 block → occupancy stays **8.3%** (1 block × 4 warps / 48). The
+measured +12.8% therefore came from **eliminating the per-sub-tile
+transpose store loop + its barrier** (≈1000 barriers + 64 writes/thread
+removed over a 16k global layer), NOT from higher occupancy. The
+occupancy lever is unreachable via smem at hd=512 (s_acc f32 32 KB +
+s_q 16 KB alone = 48 KB) — the viable path is **more warps/block**
+(256 threads → 8 warps → 16.7% at 1 block), tracked next.
 
 Cross-model: the kernel is shared with qwen36-nvfp4 (same bf16-out
 unified prefill, head_dim=256). **qwen36 correctness is covered by the
