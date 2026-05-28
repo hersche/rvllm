@@ -741,6 +741,19 @@ pub struct Gemma4Nvfp4Bringup {
     /// `None` → no cancellation (behaviour identical to before).
     pub nvfp4_cancel:
         std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+    /// Split-KV decode workspace (paged_attention_v2-style partition
+    /// scratch). Persistent, allocated once above `forward_checkpoint`
+    /// so the per-request scratch-guard restore never reclaims it.
+    /// 0 until `ensure_split_decode_workspace` runs. The single-token
+    /// base decode (`forward_layer_attn_from_residual_dev`, used by the
+    /// bailout + K=1 paths) dispatches the split+reduce kernel pair
+    /// instead of the single-CTA decode when this is allocated, the
+    /// context exceeds one partition, and `RVLLM_GEMMA4_NVFP4_SPLIT_DECODE=1`.
+    /// Mirrors the fp8-block path (gemma4_layer_exec.rs, default-on,
+    /// measured +75% on 15k-ctx bs=1 decode) which the Option B path
+    /// never got.
+    pub split_decode_workspace_ptr: std::sync::atomic::AtomicU64,
+    pub split_decode_workspace_bytes: std::sync::atomic::AtomicU64,
 }
 
 /// Persistent cross-request KV-reuse state for the Option B (NVFP4-
@@ -1091,6 +1104,8 @@ impl Gemma4Nvfp4Bringup {
             nvfp4_prefix_cache: std::sync::Mutex::new(None),
             nvfp4_aux_mode: std::sync::atomic::AtomicBool::new(false),
             nvfp4_cancel: std::sync::Mutex::new(None),
+            split_decode_workspace_ptr: std::sync::atomic::AtomicU64::new(0),
+            split_decode_workspace_bytes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1318,6 +1333,38 @@ impl Gemma4Nvfp4Bringup {
         self.forward_checkpoint = self.arena.checkpoint();
         self.base_last_hidden_ptr
             .store(region.device_ptr(), Release);
+        Ok(())
+    }
+
+    /// Allocate the persistent split-KV decode workspace, sized for the
+    /// worst case (largest head_dim + all q-heads + max partitions at
+    /// `max_pos`). Idempotent. Allocated ABOVE `forward_checkpoint` so
+    /// per-request scratch-guard restores leave it intact. Mirrors the
+    /// fp8-block split path's `fa3_workspace`. Layout per the reduce
+    /// kernel: tmp_out [S=1, H, P, D] f32 + max_logits/exp_sums
+    /// [S=1, H, P] f32 → slots*(D*4) + slots*8 bytes where
+    /// slots = H * P.
+    pub fn ensure_split_decode_workspace(&mut self, max_pos: u32) -> Result<()> {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        if self.split_decode_workspace_ptr.load(Acquire) != 0 {
+            return Ok(());
+        }
+        let part_sz = crate::gemma4_bring_up::effective_partition_size().max(16);
+        let max_parts = max_pos.div_ceil(part_sz).max(1) as u64;
+        let h = self.arch.num_attention_heads as u64;
+        let d = self.arch.head_dim_global as u64;
+        let slots = h * max_parts;
+        let bytes = (slots * d * 4 + slots * 8) as usize;
+        let region = self.arena.region("g4n_split_decode_ws", bytes, 256)?;
+        self.forward_checkpoint = self.arena.checkpoint();
+        self.split_decode_workspace_ptr
+            .store(region.device_ptr(), Release);
+        self.split_decode_workspace_bytes
+            .store(bytes as u64, Release);
+        tracing::info!(
+            "gemma4-nvfp4 split-decode workspace allocated ({bytes} B, \
+             max_parts={max_parts}, part_sz={part_sz}) — long-context \
+             decode can use split-KV when RVLLM_GEMMA4_NVFP4_SPLIT_DECODE=1");
         Ok(())
     }
 
@@ -7915,6 +7962,84 @@ impl Gemma4Nvfp4Bringup {
                 stream_u64,
                 &args,
             )?;
+        }
+
+        // Split-KV decode for long context (the bailout/K=1 per-token
+        // decode hot path). The single-CTA decode below sweeps the full
+        // context in ONE CTA per head — ~585 ms/token at 16k (measured).
+        // Split-KV parallelizes the KV sweep across partitions + a
+        // reduce, mirroring the fp8-block path (gemma4_layer_exec.rs,
+        // measured +75% on 15k-ctx bs=1) which Option B never got.
+        // bf16-out (Option B `attn_out_dev` is bf16). q_scale_cache=0
+        // and q_descale=kv.q_scale_ptr mirror the single-CTA args below.
+        // Gated default-OFF (RVLLM_GEMMA4_NVFP4_SPLIT_DECODE=1) until
+        // byte-coherence + A/B validated on Option B.
+        {
+            use std::sync::atomic::Ordering::Acquire;
+            let split_ws = self.split_decode_workspace_ptr.load(Acquire);
+            // Default-ON (byte-coherent vs single-CTA: md5-identical
+            // greedy output validated; −46% long-context bailout decode
+            // measured at ~17k ctx, mirroring the fp8-block +75%).
+            // Opt-out via RVLLM_GEMMA4_NVFP4_SPLIT_DECODE=0.
+            let split_on = split_ws != 0
+                && crate::gemma4_bring_up::parse_truthy_env(
+                    "RVLLM_GEMMA4_NVFP4_SPLIT_DECODE",
+                )
+                .unwrap_or(true);
+            if split_on {
+                let part_sz = crate::gemma4_bring_up::effective_partition_size().max(16);
+                let cur_ctx = position + 1;
+                let cur_parts = cur_ctx.div_ceil(part_sz).max(1);
+                if cur_parts > 1 {
+                    let max_parts = kv.max_pos.div_ceil(part_sz).max(1);
+                    let slots = (num_q_heads as u64) * (max_parts as u64);
+                    let ws_need = slots * (head_dim as u64) * 4 + slots * 8;
+                    if ws_need <= self.split_decode_workspace_bytes.load(Acquire) {
+                        let backend = if is_global {
+                            &self.attn_backend_global
+                        } else {
+                            &self.attn_backend_sliding
+                        };
+                        let params = rvllm_attention::PagedDecodeParams {
+                            num_seqs: 1,
+                            num_heads: num_q_heads as u32,
+                            num_kv_heads: num_kv_heads as u32,
+                            head_dim: head_dim as u32,
+                            block_size: kv.block_size as u32,
+                            max_blocks_per_seq: kv.max_pos,
+                            num_blocks_total: kv.max_pos,
+                            scale: 1.0,
+                            window_size_left,
+                        };
+                        let decode = rvllm_attention::PagedDecodeNvfp4Launcher::new(backend);
+                        let block_tables =
+                            self.block_tables_ptr_for_layer(kv, _pre_had_layer_idx);
+                        unsafe {
+                            decode.launch_split(
+                                params,
+                                attn_out_dev,
+                                q_fp8_region.device_ptr(),
+                                k_packed,
+                                v_packed,
+                                k_scale,
+                                v_scale,
+                                /*q_scale_cache=*/ 0,
+                                block_tables,
+                                kv.context_lens_ptr,
+                                kv.q_scale_ptr,
+                                split_ws,
+                                part_sz,
+                                max_parts,
+                                cur_parts,
+                                /*partition_offset=*/ 0,
+                                /*output_bf16=*/ true,
+                                stream_u64,
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
         }
 
         unsafe {

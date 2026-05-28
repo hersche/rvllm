@@ -993,6 +993,18 @@ pub async fn spawn_cuda_worker(
                 // mid-forward. Done once at worker startup so
                 // each request can call the Option B spec session
                 // directly.
+                // Split-KV decode workspace (long-context decode speedup,
+                // gated RVLLM_GEMMA4_NVFP4_SPLIT_DECODE=1). Allocated
+                // unconditionally (the single-token decode path it
+                // accelerates is used by both spec bailout and non-spec
+                // decode), BEFORE the drafter pins the arena top. A
+                // failure here is non-fatal — the decode falls back to
+                // the single-CTA path.
+                if let Err(e) = bringup.ensure_split_decode_workspace(g4n_kv_max_pos) {
+                    tracing::warn!(
+                        "ensure_split_decode_workspace failed ({e:?}); \
+                         long-context decode stays on the single-CTA path");
+                }
                 if spec_decode {
                     if let Err(e) = bringup.ensure_base_last_hidden_buffer() {
                         let _ = ready_tx.send(Err(format!(
