@@ -1461,6 +1461,38 @@ impl Gemma4Nvfp4Bringup {
         n
     }
 
+    /// Degenerate-loop guard. Greedy decode at long context can fall
+    /// into a short repeating token cycle and never emit a stop token,
+    /// running to `max_new` (8192) — a ~25-min runaway that times out
+    /// (observed: emitted=4792 via bailout, total 25 min). Detect a
+    /// tail that is a period-`p` (p ≤ 8) cycle repeated many times and
+    /// stop. Thresholds are deliberately conservative — natural text
+    /// (incl. lists / code) essentially never repeats an EXACT ≤8-token
+    /// cycle this many times consecutively, while a runaway repeats it
+    /// hundreds of times — so this fires only on genuine loops, well
+    /// before max_new. Returns true when the emitted tail is degenerate.
+    fn emitted_tail_is_degenerate(emitted: &[u32]) -> bool {
+        let n = emitted.len();
+        for p in 1..=8usize {
+            // Min repeats per period: p=1 → 32 identical tokens;
+            // larger p → ≥12 cycles (so ≥24..96 tokens of exact cycle).
+            let min_reps = if p == 1 { 32 } else { 12 };
+            if n < p * min_reps {
+                continue;
+            }
+            // How many tokens at the tail are periodic with period p?
+            let mut run = 0usize;
+            while run < n - p && emitted[n - 1 - run] == emitted[n - 1 - run - p] {
+                run += 1;
+            }
+            // run+? — the periodic tail covers `run + p` tokens; reps = (run+p)/p.
+            if (run + p) / p >= min_reps {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Stream-6b spec primitive #5: greedy K=1 spec-session
     /// orchestration loop.
     ///
@@ -1613,6 +1645,10 @@ impl Gemma4Nvfp4Bringup {
             let mut n_iters = 0usize;
             let mut n_accepted_total = 0usize;
             let cancel_flag = self.nvfp4_cancel_snapshot();
+            let loop_guard_on = crate::gemma4_bring_up::parse_truthy_env(
+                "G4N_SPEC_LOOP_GUARD",
+            )
+            .unwrap_or(true);
 
             while emitted.len() < max_new {
                 // Cooperative cancel: bail at the iteration boundary on
@@ -1662,6 +1698,9 @@ impl Gemma4Nvfp4Bringup {
                 n_accepted_total += n_acc;
                 n_iters += 1;
                 if stop_token_ids.contains(&t_verify) {
+                    break;
+                }
+                if loop_guard_on && Self::emitted_tail_is_degenerate(&emitted) {
                     break;
                 }
                 t_committed = t_verify;
@@ -1915,6 +1954,10 @@ impl Gemma4Nvfp4Bringup {
             let mut low_accept_window_accepted: usize = 0;
             let mut low_accept_window_drafts: usize = 0;
             let cancel_flag = self.nvfp4_cancel_snapshot();
+            let loop_guard_on = crate::gemma4_bring_up::parse_truthy_env(
+                "G4N_SPEC_LOOP_GUARD",
+            )
+            .unwrap_or(true);
 
             while emitted.len() < max_new {
                 // Cooperative cancel: bail at the iteration boundary on
@@ -2045,6 +2088,12 @@ impl Gemma4Nvfp4Bringup {
                 if hit_stop {
                     break;
                 }
+                // Degenerate-loop guard (opt-out G4N_SPEC_LOOP_GUARD=0):
+                // stop a runaway short-cycle repetition before it runs
+                // to max_new (the 25-min/4792-token timeout class).
+                if loop_guard_on && Self::emitted_tail_is_degenerate(&emitted) {
+                    break;
+                }
                 t_committed = *emitted.last().unwrap();
                 let committed_now_u32 = committed_now as u32;
                 if committed_now_u32 > 0 {
@@ -2105,6 +2154,11 @@ impl Gemma4Nvfp4Bringup {
                         t_committed = next;
                         ctx_len += 1;
                         bailout_tokens += 1;
+                        if stop_token_ids.contains(&next)
+                            || (loop_guard_on && Self::emitted_tail_is_degenerate(&emitted))
+                        {
+                            break;
+                        }
                     }
                     bailout_elapsed += bailout_t0.elapsed();
                     break;
@@ -2143,6 +2197,12 @@ impl Gemma4Nvfp4Bringup {
                                 t_committed = next;
                                 ctx_len += 1;
                                 bailout_tokens += 1;
+                                if stop_token_ids.contains(&next)
+                                    || (loop_guard_on
+                                        && Self::emitted_tail_is_degenerate(&emitted))
+                                {
+                                    break;
+                                }
                             }
                             bailout_elapsed += bailout_t0.elapsed();
                             break;
