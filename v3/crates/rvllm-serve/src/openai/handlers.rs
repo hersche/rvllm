@@ -3216,14 +3216,12 @@ fn coerce_sampling_for_arch(
 ) -> crate::sampling::SamplingDecision {
     use crate::config::ModelFamily;
     // Families whose worker decode path still has NO token sampler and
-    // pick greedily/internally. The Qwen 3.5/3.6 DENSE runtime
-    // (`ModelFamily::Qwen35`, used by qwen3-6-27b) grew a top-k/top-p
-    // temperature sampler — it honours stochastic requests now, so it
-    // is NOT in this set. The Qwen 3.6 MoE runtime (`Qwen36`) and
-    // Mistral 3.5 still sample internally / greedy-only. Gemma 4 (incl.
-    // NVFP4) + E4B sample natively in their own paths.
-    let family_greedy_only =
-        matches!(family, ModelFamily::Qwen36 | ModelFamily::Mistral35);
+    // pick greedily/internally. Both Qwen 3.5/3.6 DENSE (`Qwen35`,
+    // qwen3-6-27b) AND the Qwen 3.6 MoE (`Qwen36`, qwen3-6-35b-a3b) now
+    // have a top-k/top-p temperature sampler in their decode closers —
+    // they honour stochastic requests. Only Mistral 3.5 remains
+    // greedy-only. Gemma 4 (incl. NVFP4) + E4B sample natively.
+    let family_greedy_only = matches!(family, ModelFamily::Mistral35);
     if family_greedy_only && !sampling.is_greedy() {
         // One-shot warn per (process, family) — tracing's default
         // subscriber dedupes by line + field shape, but we still

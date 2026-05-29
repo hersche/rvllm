@@ -18,6 +18,18 @@ export RVLLM_REQUEST_TIMEOUT_SECS=600
 export RVLLM_BATCH_PREFILL=1
 export RVLLM_UNIFIED_PREFILL_MMA=1
 export RVLLM_NVFP4_KV=1
+
+# Repetition penalty (design A, count histogram) for the MoE decode
+# closer. zeroclaw sends only temperature, so the per-token nucleus
+# (top_k=20/top_p=0.95, applied in the worker when unset) + this penalty
+# are the only levers against Qwen3's low-temp phrase repetition. freq
+# subtracts freq*count from each emitted token's logit; min_count=1 is
+# safe at temp=0.6 (sampler diversity protects function words). Set freq
+# to 0 to disable (penalty pass + increment skipped → byte-identical).
+export RVLLM_QWEN36_FREQUENCY_PENALTY=0.3
+export RVLLM_QWEN36_PRESENCE_PENALTY=0.0
+export RVLLM_QWEN36_REP_MIN_COUNT=1
+
 export RVLLM_QWEN36_NVFP4_BATCH_FULL_PREFILL=1
 export RVLLM_QWEN36_NVFP4_UNIFIED_BATCH_FULL_PREFILL=1
 export RVLLM_QWEN36_NVFP4_UNIFIED_BATCH_FULL_FROM=0
