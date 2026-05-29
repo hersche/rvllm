@@ -106,12 +106,73 @@ sudo systemctl restart rvllm-serve
 | Qwen 3.5 27B dense | `qwen35_bring_up.rs` | **wired 2026-05-14** (`mobile-qwen35-rvllm-nvfp4.env`). Five-step landing: KV allocator + dtype field, Qwen-specific `fused_rope_qwen_partial_nvfp4kv` kernel (NeoX partial RoPE with rotary_dim=64, amax6 V policy, no Hadamard), kernel load + Q-side scratch, decode dispatch (per-head FA-2 NVFP4, no GQA cap), prefill via per-token decode fallback. Validated on hardware: text + Qwen3-VL vision. F16 path bit-identical when `RVLLM_NVFP4_KV` is unset. |
 | Qwen 3.6 35B-A3B | `qwen36_bring_up.rs` | **wired 2026-05-15** (`mobile-qwen-rvllm-nvfp4.env`). 4-commit port (~384 LOC, 0dd5d98..d31b8ae): layout plumbing, kernel load, decode dispatch, prefill fallback. Both kernels (`fused_rope_qwen_partial_nvfp4kv` + `flash_attention_2_decode_nvfp4kv_kernel`) reused as-is from the Qwen 3.5 work — only the dispatch wiring is per-family. Per-head decode handles GQA=8 without split-decode. Batched prefill flips to per-token loop on Nvfp4; unified-NVFP4-prefill (PTX exists) is a follow-up. Validated on hardware: text (German ghost joke) + Qwen3-VL vision (same caption as F16 baseline). KV memory at 4096 ctx: 20 MiB packed + 2.5 MiB scales vs 80 MiB F16 (3.5× reduction). F16 path bit-identical when the gate is off. |
 
+## Per-model decode mode: sampling vs greedy (2026-05-29)
+
+`coerce_sampling_for_arch` (`openai/handlers.rs`) is the single source of
+truth for which families honour stochastic sampling vs are forced to
+greedy. zeroclaw sends `default_temperature=0.6`; the handler decides
+per ModelFamily, so the global temp is irrelevant — the family wins.
+
+| Family (ModelFamily) | Model | Mode | Why |
+|---|---|---|---|
+| `Qwen35` | qwen3-6-27b **dense** | **SAMPLING** | greedy makes it repeat; temp=0.6/top_k=20/top_p=0.95 + repetition penalty fixes it |
+| `Qwen36` | qwen3-6-35b-a3b **MoE** | greedy (coerced) | a sampler IS wired but temp sampling REGRESSES it at long context (16k → repetition loops, up to 57/reply); greedy is clean |
+| `Gemma4Nvfp4` | gemma-4-31b-it-nvfp4 | greedy (coerced) | K=7 spec sessions are greedy-only; worker hard-rejects non-greedy |
+| `Gemma4` | gemma-4-e4b-it, gemma4-fp8 | greedy (coerced) | session-loop spec is greedy-only; temp>0 → HTTP 500 without coercion |
+| `Mistral35` | mistral-3.5-nvfp4 | greedy (coerced) | no token sampler wired |
+
+So **only the qwen3-6-27b dense path samples**; everything else is
+greedy (spec-greedy-only, MoE-sampling-instability, or no-sampler).
+Coercion = graceful degrade to greedy (one-shot WARN) instead of
+error/empty-reply. Adding a family to the coerce set is how you pin it
+greedy when sampling is unsupported OR worse.
+
+### qwen35/36 token sampler + repetition penalty (design A)
+
+The dense qwen35 runtime grew a real sampler (`sample_topk_topp_f16`
+kernel in `argmax.cu`) + a count-histogram repetition penalty
+(`qwen_rep_penalty.cu`: `qwen_apply_freq_presence_penalty_f16` +
+`qwen_rep_count_increment`). Both reused in the qwen36 MoE closer
+(dormant there — coerced greedy). Env (qwen35 profile): nucleus default
+top_k=20/top_p=0.95 when client omits; penalty via
+`RVLLM_QWEN3{5,6}_FREQUENCY_PENALTY` / `_PRESENCE_PENALTY` /
+`_REP_MIN_COUNT` (worker-read, mirrors gemma's `RVLLM_REPETITION_PENALTY`).
+freq==0 → byte-identical no-penalty. The shared `argmax_f16_kernel` was
+NOT modified (5 families consume it); the penalty is a separate pass,
+skipped entirely when off.
+
+### Long-context loop tendency + prefix-cache state
+
+- gemma4-nvfp4 (31b): functional cross-request prefix cache (default-ON,
+  #133) + degenerate-loop guard (`b4197f9`). Repeat 16k turns warm.
+- gemma4 (e4b): has the gemma4 prefix cache; spec now OFF (above).
+- qwen36 (35b MoE): prefix cache is a STUB (`init_prefix_cache →
+  unimplemented!()`) → every 16k turn cold-prefills. Open perf item.
+- mistral 3.5 (128B): NO prefix cache + super-linear prefill (597 tok
+  =14s, 2622 tok=178s) → 16k turn = minutes. Impractical for interactive
+  16k-persona use; smaller models (gemma4-31b / qwen) are the lever.
+
 ## Speculative decoding — Gemma 4 family (state as of 2026-05-17)
 
 Active branch: `rusty_sm121_qwen36_26b` (head `2693894`). Not
 yet merged into `rusty_sm121_vision`.
 
-### E4B-it spec — production, 2.46× faster than non-spec
+### E4B-it spec — DEFAULT-OFF since 2026-05-29 (0-acceptance at 16k)
+
+**Update 2026-05-29 (`c67ad54`): `RVLLM_GEMMA4_SPEC_DECODE` flipped to
+0 in the canonical `profiles/gb10/gemma4-e4b-nvfp4` + all ~/.rvllm e4b
+profiles.** The 2.46× win below was only ever validated on SHORT
+prompts. At the production 16k-persona use the drafter acceptance
+collapses to ~0 (measured `accepted_per_verify=0.0`, 0/564 drafts), so
+spec becomes pure overhead (drafter forward + verify forward per token
+vs a plain decode) → the 16k zeroclaw turn is SLOWER with spec on.
+Measured via zeroclaw (16k persona, warm): spec ON timed out >250s;
+spec OFF returns coherent in 13.7s. Drafter dir + K kept in the profile
+for short-prompt benchmarking; re-enable `=1` only for that.
+
+The historical short-prompt result (kept for reference):
+
+### E4B-it spec — short-prompt result, 2.46× faster than non-spec
 
 `mobile-e4b-rvllm-spec.env` (or any profile with
 `RVLLM_GEMMA4_SPEC_DECODE=1` +
