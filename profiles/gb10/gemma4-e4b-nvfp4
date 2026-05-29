@@ -37,8 +37,16 @@ export RVLLM_UNIFIED_PREFILL=1
 export RVLLM_UNIFIED_PREFILL_MMA=1
 export RVLLM_PREFILL_CHUNK_SIZE=2048
 
-# Speculative decoding (E4B drafter, K=4 fixed).
-export RVLLM_GEMMA4_SPEC_DECODE=1
+# Speculative decoding (E4B drafter, K=4) — DEFAULT OFF.
+# Disabled 2026-05-29: at the long-context production use (16k zeroclaw
+# persona) the drafter acceptance collapses to ~0 (measured
+# accepted_per_verify=0.0, 0/564 drafts accepted), so spec becomes PURE
+# OVERHEAD — a drafter forward + verify forward per token instead of a
+# plain decode → the 16k turn is SLOWER with spec on. The 2.46× win was
+# only ever validated on short prompts; it does not hold at 16k. Plain
+# decode is faster for the real workload. Re-enable (=1) only for
+# short-prompt benchmarking. Drafter dir + K kept for that case.
+export RVLLM_GEMMA4_SPEC_DECODE=0
 export RVLLM_GEMMA4_DRAFTER_DIR=/home/r00t/gemma4-e4b-assistant
 export RVLLM_GEMMA4_SPEC_K=4
 export RVLLM_GEMMA4_SPEC_PERF_TRACE=0
