@@ -3228,15 +3228,22 @@ fn coerce_sampling_for_arch(
     //   * Gemma 4 31B NVFP4 (`Gemma4Nvfp4`): the worker hard-rejects
     //     non-greedy (its K=7 spec-decode sessions are greedy-only,
     //     `run_spec_session_nvfp4_greedy_k*`; no logits-out sampler).
-    //     Without coercion a temp>0 request (zeroclaw sends 0.6) errors
-    //     with "non-greedy not supported" → empty reply. Coerce so it
-    //     degrades to its only supported mode instead of failing.
+    //   * Gemma 4 fp8-block + E4B (`Gemma4`): same — their session-loop
+    //     spec decode is greedy-only ("typical-acceptance parked"); a
+    //     temp>0 request hard-errors HTTP 500 ("session-loop spec decode
+    //     is greedy-only"). All Gemma 4 production profiles run spec, so
+    //     coerce the family to greedy. (Verified 2026-05-29 on
+    //     gemma-4-e4b-it: temp=0.6 → 500 without coercion.)
+    // Without coercion a temp>0 request (zeroclaw sends 0.6) fails →
+    // empty reply. Coerce so these degrade to their only supported mode.
     // The DENSE Qwen 3.5/3.6 path (`Qwen35`, qwen3-6-27b) is the OPPOSITE:
     // greedy makes it repeat, sampling fixes it — so it is NOT coerced.
-    // Gemma 4 fp8-block + E4B sample in their own paths.
     let family_greedy_only = matches!(
         family,
-        ModelFamily::Mistral35 | ModelFamily::Qwen36 | ModelFamily::Gemma4Nvfp4
+        ModelFamily::Mistral35
+            | ModelFamily::Qwen36
+            | ModelFamily::Gemma4Nvfp4
+            | ModelFamily::Gemma4
     );
     if family_greedy_only && !sampling.is_greedy() {
         // One-shot warn per (process, family) — tracing's default
@@ -3247,6 +3254,7 @@ fn coerce_sampling_for_arch(
             ModelFamily::Qwen36 => "qwen3-6 (MoE)",
             ModelFamily::Mistral35 => "mistral 3.5",
             ModelFamily::Gemma4Nvfp4 => "gemma-4-31b nvfp4",
+            ModelFamily::Gemma4 => "gemma 4 (fp8/e4b)",
             _ => "unknown",
         };
         tracing::warn!(
