@@ -3225,11 +3225,19 @@ fn coerce_sampling_for_arch(
     //     while greedy stays coherent (0 loops). So the MoE is pinned to
     //     greedy on purpose. The sampler code stays (dormant) for if the
     //     long-context sampling instability is ever fixed.
+    //   * Gemma 4 31B NVFP4 (`Gemma4Nvfp4`): the worker hard-rejects
+    //     non-greedy (its K=7 spec-decode sessions are greedy-only,
+    //     `run_spec_session_nvfp4_greedy_k*`; no logits-out sampler).
+    //     Without coercion a temp>0 request (zeroclaw sends 0.6) errors
+    //     with "non-greedy not supported" → empty reply. Coerce so it
+    //     degrades to its only supported mode instead of failing.
     // The DENSE Qwen 3.5/3.6 path (`Qwen35`, qwen3-6-27b) is the OPPOSITE:
     // greedy makes it repeat, sampling fixes it — so it is NOT coerced.
-    // Gemma 4 (incl. NVFP4) + E4B sample natively.
-    let family_greedy_only =
-        matches!(family, ModelFamily::Mistral35 | ModelFamily::Qwen36);
+    // Gemma 4 fp8-block + E4B sample in their own paths.
+    let family_greedy_only = matches!(
+        family,
+        ModelFamily::Mistral35 | ModelFamily::Qwen36 | ModelFamily::Gemma4Nvfp4
+    );
     if family_greedy_only && !sampling.is_greedy() {
         // One-shot warn per (process, family) — tracing's default
         // subscriber dedupes by line + field shape, but we still
@@ -3238,6 +3246,7 @@ fn coerce_sampling_for_arch(
         let family_name = match family {
             ModelFamily::Qwen36 => "qwen3-6 (MoE)",
             ModelFamily::Mistral35 => "mistral 3.5",
+            ModelFamily::Gemma4Nvfp4 => "gemma-4-31b nvfp4",
             _ => "unknown",
         };
         tracing::warn!(
