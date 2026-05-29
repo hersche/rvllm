@@ -196,6 +196,9 @@ pub struct Qwen35Scratch {
     pub down_out_ptr: u64,     // F16 [hidden]
     pub logits_ptr: u64,       // F32 [vocab]
     pub token_out_ptr: u64,    // i32 [1]
+    /// Repetition-penalty histogram — i32 [vocab], persistent across a
+    /// request, reset per request. Zero unless a penalty is configured.
+    pub rep_count_ptr: u64,
     // ── Phase 2c-B scratch: FP8-quantized intermediate for the
     // dense MLP's down_proj cuBLASLt fp8_gemm_blockwise call.
     pub silu_mid_fp8_ptr: u64,    // FP8 [intermediate]
@@ -230,6 +233,12 @@ pub struct Qwen35OutsideKernels {
     /// (lives in the same argmax.ptx module). Used when the request asks
     /// for stochastic decoding; degenerates to argmax at temp<=0.
     pub fn_sample_topk_topp_f16: KernelFn,
+    /// Repetition-penalty pass (separate module qwen_rep_penalty.ptx).
+    /// `_penalty` subtracts a freq/presence-scaled amount from f16
+    /// logits in place; `_increment` bumps the picked token's count.
+    pub rep_penalty_mod: LoadedModule,
+    pub fn_rep_penalty_f16: KernelFn,
+    pub fn_rep_count_increment: KernelFn,
     // ── Per-layer (Phase 2c-B) — RMSNorm + dense MLP ────────
     pub rmsnorm_inplace_f16_mod: LoadedModule,
     pub fn_rmsnorm_inplace_f16: KernelFn,
@@ -428,6 +437,14 @@ pub struct Qwen35SamplingState {
     pub top_k: std::sync::atomic::AtomicU32,
     pub top_p_bits: std::sync::atomic::AtomicU32,
     pub seed: std::sync::atomic::AtomicU64,
+    /// Repetition penalty (design A, count histogram). `freq`/`presence`
+    /// are the OpenAI-convention penalties; `min_count` gates which
+    /// tokens get penalized (>=). All zero (freq+presence) = disabled →
+    /// the penalty pass + per-token increment are skipped entirely, so
+    /// the decode path is byte-identical to no-penalty.
+    pub freq_penalty_bits: std::sync::atomic::AtomicU32,
+    pub presence_penalty_bits: std::sync::atomic::AtomicU32,
+    pub rep_min_count: std::sync::atomic::AtomicU32,
 }
 
 impl Qwen35Bringup {
@@ -448,6 +465,66 @@ impl Qwen35Bringup {
         self.sampling.top_k.store(top_k, Relaxed);
         self.sampling.top_p_bits.store(top_p.to_bits(), Relaxed);
         self.sampling.seed.store(base_seed, Relaxed);
+    }
+
+    /// Publish per-request repetition-penalty params (design A). Zero
+    /// `frequency_penalty` + `presence_penalty` disables the pass.
+    pub fn set_penalty(
+        &self,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+        min_count: u32,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.sampling.freq_penalty_bits
+            .store(frequency_penalty.to_bits(), Relaxed);
+        self.sampling.presence_penalty_bits
+            .store(presence_penalty.to_bits(), Relaxed);
+        self.sampling.rep_min_count.store(min_count.max(1), Relaxed);
+    }
+
+    /// Snapshot the penalty params. `None` when disabled (both
+    /// penalties ~0) so the decode path skips the penalty pass and the
+    /// per-token count increment entirely.
+    #[cfg(feature = "cuda")]
+    fn penalty_snapshot(&self) -> Option<(f32, f32, i32)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let freq = f32::from_bits(self.sampling.freq_penalty_bits.load(Relaxed));
+        let presence =
+            f32::from_bits(self.sampling.presence_penalty_bits.load(Relaxed));
+        if freq.abs() < f32::EPSILON && presence.abs() < f32::EPSILON {
+            return None;
+        }
+        let min_count = self.sampling.rep_min_count.load(Relaxed).max(1) as i32;
+        Some((freq, presence, min_count))
+    }
+
+    /// Zero the repetition-penalty histogram. Call once per request
+    /// (before generation) so counts never leak across requests.
+    #[cfg(feature = "cuda")]
+    pub fn reset_rep_count(&self) -> Result<()> {
+        let scr = match self.scratch.as_ref() {
+            Some(s) if s.rep_count_ptr != 0 => s,
+            _ => return Ok(()),
+        };
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "reset_rep_count: stream absent".into()))?;
+        let vocab = self.arch.base.vocab_size as usize;
+        // i32[vocab] → vocab u32 slots zeroed on the worker stream.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemsetD32Async(
+                scr.rep_count_ptr, 0, vocab, stream.raw() as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 reset_rep_count memset",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Snapshot the published sampling params. Returns `None` when the
@@ -532,6 +609,89 @@ impl Qwen35Bringup {
                 rvllm_core::CudaErrorKind::LaunchFailed,
                 rvllm_core::CudaCtx::setup(),
             ));
+        }
+        Ok(())
+    }
+
+    /// Repetition-penalty pass + count update around the token
+    /// selection at `logits_ptr`/`out_ptr`. When no penalty is
+    /// configured this is exactly `launch_token_select` (no extra
+    /// launches → byte-identical). When configured: penalize the f16
+    /// logits in place (reading the histogram), select, then bump the
+    /// picked token's count — all on `stream_raw` so the ordering
+    /// penalize → select → increment is correct without a fence.
+    #[cfg(feature = "cuda")]
+    unsafe fn launch_token_select_with_penalty(
+        &self,
+        ker: &Qwen35OutsideKernels,
+        scr: &Qwen35Scratch,
+        logits_ptr: u64,
+        out_ptr: u64,
+        vocab: u32,
+        stream_raw: u64,
+        op_label: &'static str,
+    ) -> Result<()> {
+        use cudarc::driver::sys::*;
+        let penalty = self.penalty_snapshot();
+        if let (Some((freq, presence, min_count)), true) =
+            (penalty, scr.rep_count_ptr != 0)
+        {
+            let mut logits = logits_ptr;
+            let mut count = scr.rep_count_ptr;
+            let mut vsz: i32 = vocab as i32;
+            let mut fp = freq;
+            let mut pp = presence;
+            let mut mc = min_count;
+            let args = [
+                (&mut logits) as *mut u64 as *mut core::ffi::c_void,
+                (&mut count) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vsz) as *mut i32 as *mut core::ffi::c_void,
+                (&mut fp) as *mut f32 as *mut core::ffi::c_void,
+                (&mut pp) as *mut f32 as *mut core::ffi::c_void,
+                (&mut mc) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = vocab.div_ceil(block).min(4096);
+            let rc = cuLaunchKernel(
+                ker.fn_rep_penalty_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 rep-penalty",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        self.launch_token_select(ker, logits_ptr, out_ptr, vocab,
+            stream_raw, op_label)?;
+
+        if penalty.is_some() && scr.rep_count_ptr != 0 {
+            let mut count = scr.rep_count_ptr;
+            let mut tok = out_ptr;
+            let args = [
+                (&mut count) as *mut u64 as *mut core::ffi::c_void,
+                (&mut tok) as *mut u64 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_rep_count_increment.raw() as CUfunction,
+                1, 1, 1, 1, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen35 rep-count increment",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
         }
         Ok(())
     }
@@ -812,6 +972,8 @@ impl Qwen35Bringup {
                 logits_ptr: arena.region(
                     "qwen35_logits", vocab * 4, 16)?.device_ptr(),
                 token_out_ptr: arena.region("qwen35_token_out", 4, 4)?.device_ptr(),
+                rep_count_ptr: arena.region(
+                    "qwen35_rep_count", vocab * 4, 16)?.device_ptr(),
                 silu_mid_fp8_ptr: arena.region(
                     "qwen35_silu_mid_fp8", intermediate, 16)?.device_ptr(),
                 silu_mid_scales_ptr: arena.region(
@@ -868,6 +1030,11 @@ impl Qwen35Bringup {
             let fn_argmax_f16 = argmax_mod.get_function("argmax_f16_kernel")?;
             let fn_sample_topk_topp_f16 =
                 argmax_mod.get_function("sample_topk_topp_f16_kernel")?;
+            let rep_penalty_mod = kernels.load_ptx("qwen_rep_penalty")?;
+            let fn_rep_penalty_f16 = rep_penalty_mod
+                .get_function("qwen_apply_freq_presence_penalty_f16_kernel")?;
+            let fn_rep_count_increment = rep_penalty_mod
+                .get_function("qwen_rep_count_increment_kernel")?;
 
             // Per-layer (Phase 2c-B) — RMSNorm + dense MLP.
             let rmsnorm_inplace_f16_mod = kernels.load_ptx("rmsnorm_inplace_f16")?;
@@ -1058,6 +1225,9 @@ impl Qwen35Bringup {
                 argmax_mod,
                 fn_argmax_f16,
                 fn_sample_topk_topp_f16,
+                rep_penalty_mod,
+                fn_rep_penalty_f16,
+                fn_rep_count_increment,
                 rmsnorm_inplace_f16_mod,
                 fn_rmsnorm_inplace_f16,
                 fp8_gemv_dual_silu_mod,
@@ -5438,8 +5608,8 @@ impl Qwen35Bringup {
             model.outside.lm_head_fp8.scale_ptr,
             stream_raw,
         )?;
-        self.launch_token_select(ker, scr.logits_ptr, scr.token_out_ptr,
-            vocab, stream_raw, "qwen35 finalize")?;
+        self.launch_token_select_with_penalty(ker, scr, scr.logits_ptr,
+            scr.token_out_ptr, vocab, stream_raw, "qwen35 finalize")?;
         stream.fence()?;
         let mut predicted: i32 = 0;
         {

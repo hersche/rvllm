@@ -851,6 +851,11 @@
       "path": "qwen_linear_silu_l2_gqa_f16.ptx",
       "sha256": "0e841e9a6c35c219851e5e35d6a2e339f28754e78b44f115c3f507ce52c62d06"
     },
+    "qwen_rep_penalty": {
+      "bytes": 3007,
+      "path": "qwen_rep_penalty.ptx",
+      "sha256": "6e4d9bd28d2c65008ee772f0c9bab6c195c09ba0c782b7e2a3f955a3fe15741a"
+    },
     "rel_shift_audio_f32": {
       "bytes": 3196,
       "path": "rel_shift_audio_f32.ptx",
@@ -1172,5 +1177,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "63f9438"
+  "revision": "05dac3f"
 }

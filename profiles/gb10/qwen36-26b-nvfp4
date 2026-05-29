@@ -32,6 +32,23 @@ export RVLLM_NVFP4_KV=1
 export RVLLM_NVFP4_HADAMARD=1
 export RVLLM_NVFP4_HADAMARD_V=1
 
+# Repetition penalty (design A, count histogram). zeroclaw sends only
+# temperature, so the per-token nucleus + this penalty are the only
+# levers against Qwen3's tendency to repeat phrases at low temperature
+# ("KI-Kollege ... KI-Kollege", "Brain-DB mit Brain-DB", "großes
+# Sprachmodell ... großes Sprachmodell"). freq subtracts freq*count from
+# each emitted token's logit. min_count=1 (penalize every repeat) is
+# safe HERE because temp=0.6 stochastic sampling already adds enough
+# diversity that mild per-repeat penalty doesn't degrade common function
+# words — verified grammatical on hardware A/B (0.3/1 and 0.5/1 both
+# removed the content-phrase repeats with no German degradation; gemma's
+# min_count=2 gate was for GREEDY decode, a different regime). Set freq
+# to 0 to disable (penalty pass + per-token increment skipped → decode
+# byte-identical to no-penalty).
+export RVLLM_QWEN35_FREQUENCY_PENALTY=0.3
+export RVLLM_QWEN35_PRESENCE_PENALTY=0.0
+export RVLLM_QWEN35_REP_MIN_COUNT=1
+
 # Prompt-lookup speculative decoding: DISABLED by default on this
 # family. End-to-end A/B at 16k zeroclaw-style prompts shows spec OFF
 # is 5-7% faster across (fresh code-gen, refused-echo, short-reply)
