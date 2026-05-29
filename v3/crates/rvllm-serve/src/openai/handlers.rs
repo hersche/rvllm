@@ -3215,13 +3215,21 @@ fn coerce_sampling_for_arch(
     sampling: crate::sampling::SamplingDecision,
 ) -> crate::sampling::SamplingDecision {
     use crate::config::ModelFamily;
-    // Families whose worker decode path still has NO token sampler and
-    // pick greedily/internally. Both Qwen 3.5/3.6 DENSE (`Qwen35`,
-    // qwen3-6-27b) AND the Qwen 3.6 MoE (`Qwen36`, qwen3-6-35b-a3b) now
-    // have a top-k/top-p temperature sampler in their decode closers —
-    // they honour stochastic requests. Only Mistral 3.5 remains
-    // greedy-only. Gemma 4 (incl. NVFP4) + E4B sample natively.
-    let family_greedy_only = matches!(family, ModelFamily::Mistral35);
+    // Force greedy per-family where stochastic decode is WORSE, not just
+    // unsupported. Two distinct reasons here:
+    //   * Mistral 3.5: no token sampler wired (greedy-only mechanically).
+    //   * Qwen 3.6 MoE (`Qwen36`, qwen3-6-35b-a3b): a sampler IS wired,
+    //     but hardware A/B (2026-05-29) showed temperature sampling
+    //     REGRESSES it at long context — at 16k it wanders into
+    //     repetition loops (up to 57 immediate n-gram repeats/reply),
+    //     while greedy stays coherent (0 loops). So the MoE is pinned to
+    //     greedy on purpose. The sampler code stays (dormant) for if the
+    //     long-context sampling instability is ever fixed.
+    // The DENSE Qwen 3.5/3.6 path (`Qwen35`, qwen3-6-27b) is the OPPOSITE:
+    // greedy makes it repeat, sampling fixes it — so it is NOT coerced.
+    // Gemma 4 (incl. NVFP4) + E4B sample natively.
+    let family_greedy_only =
+        matches!(family, ModelFamily::Mistral35 | ModelFamily::Qwen36);
     if family_greedy_only && !sampling.is_greedy() {
         // One-shot warn per (process, family) — tracing's default
         // subscriber dedupes by line + field shape, but we still
