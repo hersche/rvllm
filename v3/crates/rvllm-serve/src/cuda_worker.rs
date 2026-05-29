@@ -1654,29 +1654,37 @@ pub async fn spawn_cuda_worker(
                             continue;
                         }
                         let prompt_len = req.prompt_ids.len() as u32;
-                        // Qwen 3.6 path is greedy-only today: the
-                        // forward_qwen36_decode runtime samples internally
-                        // (returns the picked token, not logits). We reject
-                        // non-greedy sampling explicitly so callers can't
-                        // believe their `temperature`/`top_p`/`top_k`/`seed`
-                        // were honoured. Lift the rejection when Qwen's
-                        // bring-up grows a logits-out variant + sampler.
-                        if !req.sampling.is_greedy() {
-                            // Note: the absent-temperature default now
-                            // resolves to 0.0 (greedy) globally; if the
-                            // client lands here they explicitly asked
-                            // for stochastic. The old hint mentioned
-                            // "omit sampling params" — that's exactly
-                            // the path that USED to fail; corrected.
-                            let _ = req.events_tx.send(GenerateEvent::Error(
-                                "qwen36 path: non-greedy sampling \
-                                 (temperature>0 / top_p<1 / top_k / seed) \
-                                 is not yet supported on Qwen 3.6. Set \
-                                 temperature=0 explicitly, or omit it to \
-                                 take the (now greedy) default."
-                                    .to_string(),
-                            ));
-                            continue;
+                        // Publish per-request sampling to the MoE bring-up.
+                        // The eager closer (forward_qwen36_outside_closer)
+                        // dispatches the sampler vs argmax per token; temp==0
+                        // keeps the greedy argmax. Qwen 3 degrades under
+                        // greedy (weak instruction-following, repetition,
+                        // unreliable tool-calls) — this lets the 35B MoE run
+                        // at its recommended temp=0.6/top_k=20/top_p=0.95.
+                        match req.sampling {
+                            crate::sampling::SamplingDecision::Greedy => {
+                                qwen.set_sampling(0.0, 0, 1.0, 0);
+                            }
+                            crate::sampling::SamplingDecision::Stochastic(s) => {
+                                // Qwen3 nucleus default when the client
+                                // (zeroclaw sends temperature only) omits
+                                // top_k/top_p; explicit request values win.
+                                let top_k = s.top_k.unwrap_or(20);
+                                let top_p = if s.top_p >= 1.0 { 0.95 } else { s.top_p };
+                                qwen.set_sampling(s.temperature, top_k, top_p, s.seed);
+                            }
+                        }
+                        // Repetition penalty (design A), env-driven so the
+                        // temperature-only zeroclaw client still benefits;
+                        // freq+presence==0 → byte-identical no-penalty.
+                        {
+                            let freq = std::env::var("RVLLM_QWEN36_FREQUENCY_PENALTY")
+                                .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+                            let presence = std::env::var("RVLLM_QWEN36_PRESENCE_PENALTY")
+                                .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+                            let min_count = std::env::var("RVLLM_QWEN36_REP_MIN_COUNT")
+                                .ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(2);
+                            qwen.set_penalty(freq, presence, min_count);
                         }
                         // Reset per-request transient state. cuMemsetD8Async
                         // can return real CUDA errors (e.g. context lost
@@ -1684,7 +1692,8 @@ pub async fn spawn_cuda_worker(
                         // would make the next request run on stale state.
                         let reset_ok = qwen.reset_linear_state()
                             .and_then(|_| qwen.reset_kv_cache())
-                            .and_then(|_| qwen.reset_conv_state());
+                            .and_then(|_| qwen.reset_conv_state())
+                            .and_then(|_| qwen.reset_rep_count());
                         if let Err(e) = reset_ok {
                             let _ = req.events_tx.send(GenerateEvent::Error(
                                 format!("qwen36 per-request reset: {e:?}"),
@@ -1781,7 +1790,10 @@ pub async fn spawn_cuda_worker(
                         // Bypasses the per-token loop entirely.
                         let spec_decode_on = std::env::var("RVLLM_QWEN36_SPEC_DECODE")
                             .map(|s| matches!(s.as_str(), "1"|"true"|"TRUE"|"yes"))
-                            .unwrap_or(false);
+                            .unwrap_or(false)
+                            // Prompt-lookup spec verify assumes greedy
+                            // acceptance; never spec a stochastic request.
+                            && req.sampling.is_greedy();
                         let spec_decode_on = if spec_decode_on {
                             let min_prompt_tokens = std::env::var(
                                 "RVLLM_QWEN36_SPEC_MIN_PROMPT_TOKENS",
@@ -1973,8 +1985,16 @@ pub async fn spawn_cuda_worker(
                                 .map(|s| matches!(s.as_str(),
                                     "1"|"true"|"TRUE"|"yes"|"on"))
                                 .unwrap_or(false);
+                        // The captured-graph / workspace decode path uses
+                        // the device-argmax closer, which is greedy-only
+                        // (the sampler lives in the eager closer, and a
+                        // per-token-changing seed can't be captured into a
+                        // replayable graph). Force the eager path for
+                        // stochastic requests so sampling is actually
+                        // honoured instead of silently staying greedy.
                         let need_workspace =
-                            decode_graph_on || decode_workspace_only;
+                            (decode_graph_on || decode_workspace_only)
+                            && req.sampling.is_greedy();
                         // Phase 8 deeper: when multi-step env value
                         // changes mid-process OR the workspace's
                         // arena layout shifts, the cached multi-step

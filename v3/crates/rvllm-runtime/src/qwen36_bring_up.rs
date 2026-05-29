@@ -61,6 +61,17 @@ pub struct Qwen36OutsideKernels {
     /// GPU. Replaces the previous DtoH-of-full-vocab + host-side
     /// scan; the GPU kernel returns a single i32 token id.
     pub fn_argmax_f16: KernelFn,
+    /// temperature + top_k + top_p categorical sampler over the f16
+    /// logits (same argmax.ptx module). Replaces fn_argmax_f16 at the
+    /// eager closer when the request asks for stochastic decode;
+    /// degenerates to argmax at temp<=0.
+    pub fn_sample_topk_topp_f16: KernelFn,
+    /// Repetition-penalty pass + count increment (qwen_rep_penalty.ptx,
+    /// shared with the qwen35 dense path). Skipped when no penalty
+    /// configured → byte-identical to no-penalty.
+    pub rep_penalty_mod: LoadedModule,
+    pub fn_rep_penalty_f16: KernelFn,
+    pub fn_rep_count_increment: KernelFn,
     /// Per-token f16→fp8 amax-quantise. Used by
     /// `fp8_proj_dispatch`'s m≥2 branch to feed cuBLASLt
     /// `fp8_gemm` (which expects fp8 input + per-token f32 scale).
@@ -723,6 +734,15 @@ pub struct Qwen36Bringup {
     // `max_per_expert` + `max_total_tiles` and falls back to per-
     // call `arena.region()` when this prefill exceeds capacity.
     pub mma_sort_scratch: Option<MmaSortScratch>,
+    /// Repetition-penalty histogram (design A) — i32[vocab], allocated
+    /// once at load (persistent across the per-request arena.restore),
+    /// zeroed per request by `reset_rep_count`. 0 until allocated.
+    pub rep_count_ptr: u64,
+    /// Per-request token-sampling + repetition-penalty params. Reuses
+    /// the qwen35 dense path's state struct (identical fields). When
+    /// `temperature <= 0` the MoE token-selection stays on the existing
+    /// argmax — byte-identical to the pre-sampler greedy path.
+    pub sampling: crate::qwen35_bring_up::Qwen35SamplingState,
 }
 
 /// Output of `Qwen36Bringup::forward_qwen_vision`.
@@ -1729,6 +1749,13 @@ impl Qwen36Bringup {
         let argmax_mod = kernels.load_ptx("argmax")?;
         let fn_argmax = argmax_mod.get_function("argmax_kernel")?;
         let fn_argmax_f16 = argmax_mod.get_function("argmax_f16_kernel")?;
+        let fn_sample_topk_topp_f16 =
+            argmax_mod.get_function("sample_topk_topp_f16_kernel")?;
+        let rep_penalty_mod = kernels.load_ptx("qwen_rep_penalty")?;
+        let fn_rep_penalty_f16 = rep_penalty_mod
+            .get_function("qwen_apply_freq_presence_penalty_f16_kernel")?;
+        let fn_rep_count_increment = rep_penalty_mod
+            .get_function("qwen_rep_count_increment_kernel")?;
         let fp8_quantize_per_token_f16_mod = kernels.load_ptx("fp8_quantize_per_token_f16")?;
         let fn_fp8_quantize_per_token_f16 =
             fp8_quantize_per_token_f16_mod.get_function("fp8_quantize_per_token_f16_kernel")?;
@@ -2087,6 +2114,10 @@ impl Qwen36Bringup {
             argmax_mod,
             fn_argmax,
             fn_argmax_f16,
+            fn_sample_topk_topp_f16,
+            rep_penalty_mod,
+            fn_rep_penalty_f16,
+            fn_rep_count_increment,
             fp8_quantize_per_token_f16_mod,
             fn_fp8_quantize_per_token_f16,
             fp8_quantize_per_token_amax_f16_mod,
@@ -2596,6 +2627,8 @@ impl Qwen36Bringup {
             decode_capture: std::sync::Mutex::new(None),
             decode_capture_multi_step: std::sync::Mutex::new(None),
             mma_sort_scratch: None,  // populated below
+            rep_count_ptr: 0,        // populated below
+            sampling: crate::qwen35_bring_up::Qwen35SamplingState::default(),
         };
         // Phase 4b-prep iter25: upload the constant identity block
         // table once. The paged-attention layer used to rebuild it
@@ -2612,6 +2645,15 @@ impl Qwen36Bringup {
                 bt_region.copy_from_host(&bt_host)?;
             }
             bringup.bt_persistent_ptr = bt_region.device_ptr();
+        }
+        // Repetition-penalty histogram (design A): persistent i32[vocab],
+        // allocated here at load so it survives the per-request
+        // arena.restore; zeroed per request by reset_rep_count.
+        {
+            let vocab = bringup.arch.base.vocab_size as usize;
+            let region = bringup.arena.region(
+                "qwen36_rep_count", vocab * 4, 16)?;
+            bringup.rep_count_ptr = region.device_ptr();
         }
         // Phase 8 router+topk fusion: allocate the persistent u32[1]
         // counter the fused kernel uses for atomic last-block
@@ -3059,6 +3101,202 @@ impl Qwen36Bringup {
             .iter()
             .filter(|t| matches!(t, rvllm_loader::LayerAttnType::Full))
             .count() as u32
+    }
+
+    /// Publish per-request token-sampling params (mirrors the qwen35
+    /// dense path). `temperature <= 0` keeps the greedy/argmax closer.
+    pub fn set_sampling(&self, temperature: f32, top_k: u32, top_p: f32, base_seed: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.sampling.temp_bits.store(temperature.to_bits(), Relaxed);
+        self.sampling.top_k.store(top_k, Relaxed);
+        self.sampling.top_p_bits.store(top_p.to_bits(), Relaxed);
+        self.sampling.seed.store(base_seed, Relaxed);
+    }
+
+    /// Publish per-request repetition-penalty params (design A). Zero
+    /// frequency + presence disables the penalty pass.
+    pub fn set_penalty(&self, frequency_penalty: f32, presence_penalty: f32, min_count: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.sampling.freq_penalty_bits.store(frequency_penalty.to_bits(), Relaxed);
+        self.sampling.presence_penalty_bits.store(presence_penalty.to_bits(), Relaxed);
+        self.sampling.rep_min_count.store(min_count.max(1), Relaxed);
+    }
+
+    /// `None` keeps the greedy argmax (temp<=0 or top_k<=1); otherwise
+    /// (temperature, top_k, top_p, seed) with the seed advanced per call.
+    #[cfg(feature = "cuda")]
+    fn sampling_snapshot(&self) -> Option<(f32, i32, f32, u64)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let temp = f32::from_bits(self.sampling.temp_bits.load(Relaxed));
+        let top_k = self.sampling.top_k.load(Relaxed) as i32;
+        if temp <= 0.0 || top_k <= 1 {
+            return None;
+        }
+        let top_p = f32::from_bits(self.sampling.top_p_bits.load(Relaxed));
+        let seed = self.sampling.seed.fetch_add(0x9E3779B97F4A7C15, Relaxed);
+        Some((temp, top_k, top_p, seed))
+    }
+
+    /// `None` when no penalty configured (both ~0) → penalty pass +
+    /// increment skipped.
+    #[cfg(feature = "cuda")]
+    fn penalty_snapshot(&self) -> Option<(f32, f32, i32)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let freq = f32::from_bits(self.sampling.freq_penalty_bits.load(Relaxed));
+        let presence = f32::from_bits(self.sampling.presence_penalty_bits.load(Relaxed));
+        if freq.abs() < f32::EPSILON && presence.abs() < f32::EPSILON {
+            return None;
+        }
+        let min_count = self.sampling.rep_min_count.load(Relaxed).max(1) as i32;
+        Some((freq, presence, min_count))
+    }
+
+    /// Zero the repetition-penalty histogram. Call once per request so
+    /// counts never leak across requests.
+    #[cfg(feature = "cuda")]
+    pub fn reset_rep_count(&self) -> Result<()> {
+        if self.rep_count_ptr == 0 {
+            return Ok(());
+        }
+        let vocab = self.arch.base.vocab_size as usize;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemsetD32Async(
+                self.rep_count_ptr, 0, vocab, self.stream.raw() as CUstream);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 reset_rep_count memset",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Eager-closer token selection over the f16 logits at `logits_ptr`
+    /// into the i32 slot `out_ptr`. When no penalty + greedy this is
+    /// exactly the legacy `fn_argmax_f16` launch (byte-identical). When
+    /// configured: penalize logits in place → select (sampler or argmax)
+    /// → bump the picked token's count, all on `stream_raw`.
+    #[cfg(feature = "cuda")]
+    unsafe fn launch_token_select_with_penalty(
+        &self,
+        logits_ptr: u64,
+        out_ptr: u64,
+        vocab: u32,
+        stream_raw: u64,
+    ) -> Result<()> {
+        use cudarc::driver::sys::*;
+        let ker = &self.outside_kernels;
+        let penalty = self.penalty_snapshot();
+
+        if let (Some((freq, presence, min_count)), true) =
+            (penalty, self.rep_count_ptr != 0)
+        {
+            let mut logits = logits_ptr;
+            let mut count = self.rep_count_ptr;
+            let mut vsz: i32 = vocab as i32;
+            let mut fp = freq;
+            let mut pp = presence;
+            let mut mc = min_count;
+            let args = [
+                (&mut logits) as *mut u64 as *mut core::ffi::c_void,
+                (&mut count) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vsz) as *mut i32 as *mut core::ffi::c_void,
+                (&mut fp) as *mut f32 as *mut core::ffi::c_void,
+                (&mut pp) as *mut f32 as *mut core::ffi::c_void,
+                (&mut mc) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = vocab.div_ceil(block).min(4096);
+            let rc = cuLaunchKernel(
+                ker.fn_rep_penalty_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 rep-penalty",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // Token selection: sampler when stochastic, else argmax.
+        let mut row_ptr = logits_ptr;
+        let mut out = out_ptr;
+        let mut vs: i32 = vocab as i32;
+        let block: u32 = 512;
+        let rc = if let Some((temp, top_k, top_p, seed)) = self.sampling_snapshot() {
+            let mut t = temp;
+            let mut k = top_k;
+            let mut p = top_p;
+            let mut sd = seed;
+            let args = [
+                (&mut row_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vs) as *mut i32 as *mut core::ffi::c_void,
+                (&mut t) as *mut f32 as *mut core::ffi::c_void,
+                (&mut k) as *mut i32 as *mut core::ffi::c_void,
+                (&mut p) as *mut f32 as *mut core::ffi::c_void,
+                (&mut sd) as *mut u64 as *mut core::ffi::c_void,
+            ];
+            cuLaunchKernel(
+                ker.fn_sample_topk_topp_f16.raw() as CUfunction,
+                1, 1, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            )
+        } else {
+            let args = [
+                (&mut row_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vs) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            cuLaunchKernel(
+                ker.fn_argmax_f16.raw() as CUfunction,
+                1, 1, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            )
+        };
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 token select",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+
+        if penalty.is_some() && self.rep_count_ptr != 0 {
+            let mut count = self.rep_count_ptr;
+            let mut tok = out_ptr;
+            let args = [
+                (&mut count) as *mut u64 as *mut core::ffi::c_void,
+                (&mut tok) as *mut u64 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                ker.fn_rep_count_increment.raw() as CUfunction,
+                1, 1, 1, 1, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 rep-count increment",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Phase 4u: zero out the paged KV cache (all full-attn layers).
@@ -13020,39 +13258,18 @@ impl Qwen36Bringup {
         // the winning token id. With the slice-to-last-row above,
         // the argmax now reads from offset 0 (single-row buffer).
         let token_region = self.arena.region("qwen36_pl_token", 4, 16)?;
+        // Token selection: argmax (greedy) by default, or the
+        // temperature/top_k/top_p sampler + repetition penalty when the
+        // request published them via set_sampling/set_penalty. Skips
+        // both extra passes when unset → byte-identical greedy MoE path.
         #[cfg(feature = "cuda")]
         unsafe {
-            use cudarc::driver::sys::*;
-            let mut logits_ptr = logits_region.device_ptr();
-            let mut out_ptr = token_region.device_ptr();
-            let mut vs = vocab as i32;
-            let args = [
-                (&mut logits_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut vs) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let block: u32 = 512;
-            let grid: u32 = 1;
-            let rc = cuLaunchKernel(
-                self.outside_kernels.fn_argmax_f16.raw() as CUfunction,
-                grid,
-                1,
-                1,
-                block,
-                1,
-                1,
-                0,
-                stream_raw as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 argmax_f16 launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
+            self.launch_token_select_with_penalty(
+                logits_region.device_ptr(),
+                token_region.device_ptr(),
+                vocab,
+                stream_raw,
+            )?;
         }
         self.stream.fence()?;
         let mut tok_buf = [0i32; 1];
