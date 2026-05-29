@@ -226,6 +226,10 @@ pub struct Qwen35OutsideKernels {
     pub fn_fused_rmsnorm_fp8_quant: KernelFn,
     pub argmax_mod: LoadedModule,
     pub fn_argmax_f16: KernelFn,
+    /// temperature + top_k + top_p categorical sampler over f16 logits
+    /// (lives in the same argmax.ptx module). Used when the request asks
+    /// for stochastic decoding; degenerates to argmax at temp<=0.
+    pub fn_sample_topk_topp_f16: KernelFn,
     // ── Per-layer (Phase 2c-B) — RMSNorm + dense MLP ────────
     pub rmsnorm_inplace_f16_mod: LoadedModule,
     pub fn_rmsnorm_inplace_f16: KernelFn,
@@ -404,6 +408,133 @@ pub struct Qwen35Bringup {
     /// when the config is missing the keys.
     #[cfg(feature = "cuda")]
     pub la_dims: Option<Qwen35LaDims>,
+    /// Per-request token-sampling state. Set by the worker before each
+    /// generate via [`Qwen35Bringup::set_sampling`]; read at the
+    /// token-selection launch site. When `temperature <= 0` the path
+    /// degenerates to argmax (greedy) — byte-identical to the legacy
+    /// behaviour, so non-sampling callers (and other model families)
+    /// are unaffected. Qwen 3 is documented to repeat/degrade under
+    /// greedy; its recommended sampling is temp=0.6/top_k=20/top_p=0.95.
+    pub sampling: Qwen35SamplingState,
+}
+
+/// Atomically-published token-sampling parameters for the qwen35 decode
+/// loop. f32 values are stored as their bit patterns so the whole struct
+/// stays lock-free (the worker writes once per request, the decode loop
+/// reads once per token and advances `seed`).
+#[derive(Default)]
+pub struct Qwen35SamplingState {
+    pub temp_bits: std::sync::atomic::AtomicU32,
+    pub top_k: std::sync::atomic::AtomicU32,
+    pub top_p_bits: std::sync::atomic::AtomicU32,
+    pub seed: std::sync::atomic::AtomicU64,
+}
+
+impl Qwen35Bringup {
+    /// Publish per-request sampling params before a generate call. The
+    /// decode loop reads these once per token. `temperature <= 0` (or
+    /// `top_k <= 1`) keeps the greedy/argmax path. `base_seed` seeds the
+    /// per-token RNG; the launch site advances it per emitted token so a
+    /// retry with the same seed is reproducible.
+    pub fn set_sampling(
+        &self,
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        base_seed: u64,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.sampling.temp_bits.store(temperature.to_bits(), Relaxed);
+        self.sampling.top_k.store(top_k, Relaxed);
+        self.sampling.top_p_bits.store(top_p.to_bits(), Relaxed);
+        self.sampling.seed.store(base_seed, Relaxed);
+    }
+
+    /// Snapshot the published sampling params. Returns `None` when the
+    /// path should stay greedy (temperature <= 0 or top_k <= 1).
+    #[cfg(feature = "cuda")]
+    fn sampling_snapshot(&self) -> Option<(f32, i32, f32, u64)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let temp = f32::from_bits(self.sampling.temp_bits.load(Relaxed));
+        let top_k = self.sampling.top_k.load(Relaxed) as i32;
+        if temp <= 0.0 || top_k <= 1 {
+            return None;
+        }
+        let top_p = f32::from_bits(self.sampling.top_p_bits.load(Relaxed));
+        // Advance the per-token seed so successive tokens draw independent
+        // uniforms; the kernel also mixes in `row`.
+        let seed = self
+            .sampling
+            .seed
+            .fetch_add(0x9E3779B97F4A7C15, Relaxed);
+        Some((temp, top_k, top_p, seed))
+    }
+
+    /// Launch the per-token LM-head token selection over the f16 logits
+    /// at `logits_ptr` (vocab elems, written by fp8_gemm) into the i32
+    /// slot at `out_ptr`. Greedy by default (`argmax_f16_kernel`);
+    /// dispatches `sample_topk_topp_f16_kernel` when this request
+    /// published `temperature > 0` via [`set_sampling`]. Single block,
+    /// `min(vocab, 1024)` threads — same launch geometry as argmax.
+    #[cfg(feature = "cuda")]
+    unsafe fn launch_token_select(
+        &self,
+        ker: &Qwen35OutsideKernels,
+        logits_ptr: u64,
+        out_ptr: u64,
+        vocab: u32,
+        stream_raw: u64,
+        op_label: &'static str,
+    ) -> Result<()> {
+        use cudarc::driver::sys::*;
+        let block_dim: u32 = vocab.min(1024);
+        let mut row_ptr = logits_ptr;
+        let mut out = out_ptr;
+        let mut vsz: i32 = vocab as i32;
+        let rc = if let Some((temp, top_k, top_p, seed)) = self.sampling_snapshot() {
+            let mut t = temp;
+            let mut k = top_k;
+            let mut p = top_p;
+            let mut sd = seed;
+            let args = [
+                (&mut row_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vsz) as *mut i32 as *mut core::ffi::c_void,
+                (&mut t) as *mut f32 as *mut core::ffi::c_void,
+                (&mut k) as *mut i32 as *mut core::ffi::c_void,
+                (&mut p) as *mut f32 as *mut core::ffi::c_void,
+                (&mut sd) as *mut u64 as *mut core::ffi::c_void,
+            ];
+            cuLaunchKernel(
+                ker.fn_sample_topk_topp_f16.raw() as CUfunction,
+                1, 1, 1, block_dim, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            )
+        } else {
+            let args = [
+                (&mut row_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vsz) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            cuLaunchKernel(
+                ker.fn_argmax_f16.raw() as CUfunction,
+                1, 1, 1, block_dim, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            )
+        };
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                op_label,
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for Qwen35Bringup {
@@ -735,6 +866,8 @@ impl Qwen35Bringup {
                 .get_function("fused_rmsnorm_fp8_quant_kernel")?;
             let argmax_mod = kernels.load_ptx("argmax")?;
             let fn_argmax_f16 = argmax_mod.get_function("argmax_f16_kernel")?;
+            let fn_sample_topk_topp_f16 =
+                argmax_mod.get_function("sample_topk_topp_f16_kernel")?;
 
             // Per-layer (Phase 2c-B) — RMSNorm + dense MLP.
             let rmsnorm_inplace_f16_mod = kernels.load_ptx("rmsnorm_inplace_f16")?;
@@ -924,6 +1057,7 @@ impl Qwen35Bringup {
                 fn_fused_rmsnorm_fp8_quant,
                 argmax_mod,
                 fn_argmax_f16,
+                fn_sample_topk_topp_f16,
                 rmsnorm_inplace_f16_mod,
                 fn_rmsnorm_inplace_f16,
                 fp8_gemv_dual_silu_mod,
@@ -1058,6 +1192,7 @@ impl Qwen35Bringup {
                 cublaslt: Some(cublaslt),
                 cutlass,
                 la_dims: Some(la_dims),
+                sampling: Qwen35SamplingState::default(),
             });
         }
         #[cfg(not(feature = "cuda"))]
@@ -1066,7 +1201,7 @@ impl Qwen35Bringup {
                 "[qwen35] Phase 0 ONLY (no-cuda build): arch validated, \
                  NO weight upload. See v3/QWEN35_BRINGUP_PLAN.md."
             );
-            Ok(Self { paths, arch, arena_bytes })
+            Ok(Self { paths, arch, arena_bytes, sampling: Qwen35SamplingState::default() })
         }
     }
 }
@@ -5303,31 +5438,8 @@ impl Qwen35Bringup {
             model.outside.lm_head_fp8.scale_ptr,
             stream_raw,
         )?;
-        {
-            use cudarc::driver::sys::*;
-            let block_dim: u32 = vocab.min(1024);
-            let mut row_ptr = scr.logits_ptr;
-            let mut out_ptr = scr.token_out_ptr;
-            let mut vsz: i32 = vocab as i32;
-            let args = [
-                (&mut row_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut vsz) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let rc = cuLaunchKernel(
-                ker.fn_argmax_f16.raw() as CUfunction,
-                1, 1, 1, block_dim, 1, 1, 0,
-                stream_raw as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen35 finalize argmax",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup()));
-            }
-        }
+        self.launch_token_select(ker, scr.logits_ptr, scr.token_out_ptr,
+            vocab, stream_raw, "qwen35 finalize")?;
         stream.fence()?;
         let mut predicted: i32 = 0;
         {

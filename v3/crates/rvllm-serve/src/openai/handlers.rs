@@ -534,7 +534,7 @@ pub async fn chat_completions(
     // 500. Lift that to a 400 here, before tokenisation + admission,
     // so callers get a clear "not supported" instead of consuming a
     // queue slot for a doomed request.
-    let sampling = coerce_sampling_for_arch(state.vision_arch, sampling);
+    let sampling = coerce_sampling_for_arch(state.resolved_family, sampling);
     // Modern OpenAI SDKs (Python ≥1.30, TS ≥4.x) send only
     // `max_completion_tokens`. Fall through to it when `max_tokens`
     // is missing — the conflict-vs-equal validation above already
@@ -2132,7 +2132,7 @@ pub async fn completions(
     }
 
     let sampling = req.sampling_params().ensure_supported()?;
-    let sampling = coerce_sampling_for_arch(state.vision_arch, sampling);
+    let sampling = coerce_sampling_for_arch(state.resolved_family, sampling);
     let max_new = resolve_max_new(req.max_tokens, state.config.max_new_tokens_cap)?;
     // Cycle 34 P0 (codex bug #1): completions did not even parse `stop`.
     // Mirror chat-handler validation + post-decode truncation below.
@@ -3211,26 +3211,33 @@ const STOP_MAX_TOKENS: usize = STOP_TAIL_WINDOW - 8;
 /// can fix the upstream request shape at their leisure. Greedy-only
 /// is a runtime limitation, not a user-input error — degrade gracefully.
 fn coerce_sampling_for_arch(
-    arch: crate::router::VisionArch,
+    family: crate::config::ModelFamily,
     sampling: crate::sampling::SamplingDecision,
 ) -> crate::sampling::SamplingDecision {
-    use crate::router::VisionArch;
-    let arch_greedy_only =
-        matches!(arch, VisionArch::Qwen36 | VisionArch::Mistral35 { .. });
-    if arch_greedy_only && !sampling.is_greedy() {
-        // One-shot warn per (process, arch) — tracing's default
+    use crate::config::ModelFamily;
+    // Families whose worker decode path still has NO token sampler and
+    // pick greedily/internally. The Qwen 3.5/3.6 DENSE runtime
+    // (`ModelFamily::Qwen35`, used by qwen3-6-27b) grew a top-k/top-p
+    // temperature sampler — it honours stochastic requests now, so it
+    // is NOT in this set. The Qwen 3.6 MoE runtime (`Qwen36`) and
+    // Mistral 3.5 still sample internally / greedy-only. Gemma 4 (incl.
+    // NVFP4) + E4B sample natively in their own paths.
+    let family_greedy_only =
+        matches!(family, ModelFamily::Qwen36 | ModelFamily::Mistral35);
+    if family_greedy_only && !sampling.is_greedy() {
+        // One-shot warn per (process, family) — tracing's default
         // subscriber dedupes by line + field shape, but we still
         // log every coercion at WARN level so operators see the
         // accumulated count (sampled output stays correct either way).
-        let arch_name = match arch {
-            VisionArch::Qwen36 => "qwen3-6",
-            VisionArch::Mistral35 { .. } => "mistral 3.5",
+        let family_name = match family {
+            ModelFamily::Qwen36 => "qwen3-6 (MoE)",
+            ModelFamily::Mistral35 => "mistral 3.5",
             _ => "unknown",
         };
         tracing::warn!(
-            arch = arch_name,
-            "non-greedy sampling requested on a greedy-only arch — \
-             coercing to greedy (no logits-out variant available; \
+            family = family_name,
+            "non-greedy sampling requested on a greedy-only family — \
+             coercing to greedy (no logits-out sampler available; \
              set temperature=0 explicitly to silence this warning)",
         );
         return crate::sampling::SamplingDecision::Greedy;
