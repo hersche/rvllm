@@ -209,7 +209,10 @@ pub async fn spawn_cuda_worker(
                         // — Qwen 3.5 did not. Match the Qwen 3.6 pattern.
                         let reset_ok = bringup.reset_linear_state()
                             .and_then(|_| bringup.reset_kv_cache())
-                            .and_then(|_| bringup.reset_conv_state());
+                            .and_then(|_| bringup.reset_conv_state())
+                            // Repetition-penalty histogram must start
+                            // empty each request (counts never leak).
+                            .and_then(|_| bringup.reset_rep_count());
                         if let Err(e) = reset_ok {
                             let _ = req.events_tx.send(GenerateEvent::Error(
                                 format!("qwen35 per-request reset: {e:?}"),
@@ -358,6 +361,26 @@ pub async fn spawn_cuda_worker(
                                     s.temperature, top_k, top_p, s.seed,
                                 );
                             }
+                        }
+                        // Repetition penalty (design A). Driven by env
+                        // (mirrors gemma's RVLLM_REPETITION_PENALTY) so
+                        // clients that send no penalty fields — zeroclaw
+                        // sends temperature only — still get the profile
+                        // default. freq+presence both 0 → disabled →
+                        // byte-identical decode. min_count gates which
+                        // tokens are penalized (>=2 protects function
+                        // words; raises only on genuine repetition).
+                        {
+                            let freq = std::env::var("RVLLM_QWEN35_FREQUENCY_PENALTY")
+                                .ok().and_then(|s| s.parse::<f32>().ok())
+                                .unwrap_or(0.0);
+                            let presence = std::env::var("RVLLM_QWEN35_PRESENCE_PENALTY")
+                                .ok().and_then(|s| s.parse::<f32>().ok())
+                                .unwrap_or(0.0);
+                            let min_count = std::env::var("RVLLM_QWEN35_REP_MIN_COUNT")
+                                .ok().and_then(|s| s.parse::<u32>().ok())
+                                .unwrap_or(2);
+                            bringup.set_penalty(freq, presence, min_count);
                         }
                         let spec_decode_on = std::env::var("RVLLM_QWEN35_SPEC_DECODE")
                             .map(|v| v != "0" && !v.is_empty())
