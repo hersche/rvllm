@@ -329,13 +329,37 @@ pub async fn spawn_cuda_worker(
                             }
                             hits >= spec_min_full_draft_hits
                         };
+                        // Publish per-request sampling params to the
+                        // bringup. The decode token-selection site reads
+                        // these once per token: temperature>0 routes to
+                        // the top-k/top-p sampler kernel, temperature==0
+                        // keeps the legacy greedy argmax (byte-identical).
+                        // Qwen 3 degrades under greedy; this is what lets
+                        // it run at its recommended temp=0.6/top_k=20/
+                        // top_p=0.95 instead of being forced to argmax.
+                        match req.sampling {
+                            crate::sampling::SamplingDecision::Greedy => {
+                                bringup.set_sampling(0.0, 0, 1.0, 0);
+                            }
+                            crate::sampling::SamplingDecision::Stochastic(s) => {
+                                bringup.set_sampling(
+                                    s.temperature,
+                                    s.top_k.unwrap_or(0),
+                                    s.top_p,
+                                    s.seed,
+                                );
+                            }
+                        }
                         let spec_decode_on = std::env::var("RVLLM_QWEN35_SPEC_DECODE")
                             .map(|v| v != "0" && !v.is_empty())
                             .unwrap_or(false)
                             && splices.is_empty()
                             && prompt_ids.len() >= spec_min_prompt_tokens
                             && max_new >= spec_min_max_new_tokens
-                            && enough_full_draft_hits;
+                            && enough_full_draft_hits
+                            // Prompt-lookup spec verification assumes greedy
+                            // acceptance; never spec a stochastic request.
+                            && req.sampling.is_greedy();
                         let result = if spec_decode_on {
                             rvllm_runtime::qwen35_spec_decode::run_qwen35_prompt_lookup_spec(
                                 &bringup, &prompt_ids, max_new,
