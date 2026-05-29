@@ -342,11 +342,20 @@ pub async fn spawn_cuda_worker(
                                 bringup.set_sampling(0.0, 0, 1.0, 0);
                             }
                             crate::sampling::SamplingDecision::Stochastic(s) => {
+                                // Qwen 3 is documented to run best at
+                                // top_k=20 / top_p=0.95. Clients that send
+                                // only a temperature (e.g. zeroclaw, which
+                                // exposes no top_k/top_p knob) would
+                                // otherwise sample over the full top-64 cap
+                                // with no nucleus → occasional tail
+                                // degradation. Apply the recommended
+                                // nucleus as the family default when the
+                                // request leaves them unset; explicit
+                                // request values always win.
+                                let top_k = s.top_k.unwrap_or(20);
+                                let top_p = if s.top_p >= 1.0 { 0.95 } else { s.top_p };
                                 bringup.set_sampling(
-                                    s.temperature,
-                                    s.top_k.unwrap_or(0),
-                                    s.top_p,
-                                    s.seed,
+                                    s.temperature, top_k, top_p, s.seed,
                                 );
                             }
                         }
